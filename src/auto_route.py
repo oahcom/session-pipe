@@ -117,19 +117,30 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
 
 
 if __name__ == "__main__":
-    if "--status" in sys.argv:
+    has_json = "--json" in sys.argv
+    # 清除 --json 防止干扰 argparse（虽然没用 argparse，但避免位置参数读取）
+    argv = [a for a in sys.argv[1:] if a != "--json"]
+
+    if "--status" in argv:
         s = status()
-        print(json.dumps(s, ensure_ascii=False, indent=2))
-    elif "--consume" in sys.argv and len(sys.argv) >= 4:
-        # python3 auto_route.py --consume <id> <category> [consumer]
-        fid = int(sys.argv[2])
-        cat = sys.argv[3]
-        c = sys.argv[4] if len(sys.argv) > 4 else "claude"
+        if has_json:
+            print(json.dumps(s, ensure_ascii=False))
+        else:
+            print(json.dumps(s, ensure_ascii=False, indent=2))
+    elif "--consume" in argv and len(argv) >= 3:
+        fid = int(argv[1])
+        cat = argv[2]
+        c = argv[3] if len(argv) > 3 else "claude"
         result = consume_with_linkage(fid, cat, c)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if has_json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         msgs = poll_unconsumed()
-        if not msgs:
+        if has_json:
+            print(json.dumps({"messages": msgs, "count": len(msgs), "status": "active" if msgs else "idle"}, ensure_ascii=False))
+        elif not msgs:
             print("No unconsumed messages.")
         elif "error" in msgs[0]:
             print(f"Error: {msgs[0]['error']}")
