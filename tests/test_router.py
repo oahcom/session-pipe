@@ -51,6 +51,8 @@ def test_parse_consume_categories():
         ([{"source": "bus_client.py read --cat security --limit 5"}], ["security"]),
         # 非 bus 信号 → []
         ([{"source": "systemctl is-active foo.service"}], []),
+        # bus cat=* → ["*"]（通配符）
+        ([{"source": "bus cat=* ts>24h rc=0"}], ["*"]),
         # 多分类
         ([{"source": "bus cat=architecture"}, {"source": "bus cat=code_fix"}], ["architecture", "code_fix"]),
         # 空输入

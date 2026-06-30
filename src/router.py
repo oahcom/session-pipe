@@ -87,7 +87,11 @@ def _parse_consume_categories(input_signals: list[dict]) -> list[str]:
             if "*" not in cats:
                 cats.append("*")
             continue
-        # bus cat=xxx 模式
+        # bus cat=xxx 模式（\w+ 不匹配 *，单独处理）
+        if "bus cat=*" in source:
+            if "*" not in cats:
+                cats.append("*")
+            continue
         for m in re.finditer(r"bus cat=(\w+)", source):
             cat = m.group(1)
             if cat not in cats:
