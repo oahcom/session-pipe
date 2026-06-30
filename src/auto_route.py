@@ -116,9 +116,60 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
     }
 
 
+def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
+    """自动路由消费：对每条未消费消息，选最高优先级消费者执行 consume。
+
+    返回路由结果：每条消息分配给哪个消费者，是否有联动影响。
+    dry_run=True 时只展示分配方案，不实际 consume。
+    """
+    from bus_protocol import Blackboard
+
+    bb = Blackboard()
+    router = get_router()
+    messages = poll_unconsumed()
+    if not messages or "error" in messages[0]:
+        return {"routed": 0, "total": 0, "details": []}
+
+    details: list[dict] = []
+    for msg in messages:
+        if "error" in msg:
+            continue
+        consumers = msg.get("consumers", [])
+        # 消费该分类的角色：按优先级排序，通吃角色排后
+        specific = [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
+        wildcard = [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
+        ordered = specific + wildcard
+
+        if not ordered:
+            details.append({"id": msg["id"], "category": msg["category"], "assigned": None, "reason": "no_consumer"})
+            continue
+
+        primary = ordered[0]
+        affected = [c for c in ordered[1:]]
+
+        if not dry_run:
+            bb.mark_consumed(msg["id"], primary)
+
+        details.append({
+            "id": msg["id"],
+            "category": msg["category"],
+            "title": msg["text"][:60],
+            "assigned": primary,
+            "affected": affected,
+            "priority": msg["priority"],
+        })
+
+    return {
+        "routed": len([d for d in details if d.get("assigned")]),
+        "total": len(messages),
+        "dry_run": dry_run,
+        "details": details,
+    }
+
+
 if __name__ == "__main__":
     has_json = "--json" in sys.argv
-    # 清除 --json 防止干扰 argparse（虽然没用 argparse，但避免位置参数读取）
+    # 清除 --json 防止干扰 argparse
     argv = [a for a in sys.argv[1:] if a != "--json"]
 
     if "--status" in argv:
@@ -127,6 +178,16 @@ if __name__ == "__main__":
             print(json.dumps(s, ensure_ascii=False))
         else:
             print(json.dumps(s, ensure_ascii=False, indent=2))
+    elif "--route-all" in argv:
+        consumer = argv[1] if len(argv) > 1 else "pipeline"
+        result = route_all(consumer=consumer, dry_run="--dry-run" in argv)
+        if has_json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            for d in result["details"]:
+                status_icon = "→" if d.get("assigned") else "✗"
+                print(f"  {status_icon} #{d['id']} [{d['category']}] → {d.get('assigned', 'none')}")
+            print(f"\n路由: {result['routed']}/{result['total']} 条")
     elif "--consume" in argv and len(argv) >= 3:
         fid = int(argv[1])
         cat = argv[2]
