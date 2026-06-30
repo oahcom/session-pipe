@@ -172,11 +172,18 @@ class Router:
     def get_consumers_prioritized(self, category: str) -> list[str]:
         """返回按优先级排序的消费者列表。
 
-        注意：消费者排序依据该分类的优先级，而非角色本身的优先级。
+        规则：
+        1. 消费该分类的消费者
+        2. 按优先级排序：security > code_fix > architecture > 其他
+        3. consume="*"（通吃一切）的角色排最后
         """
         consumers = self.get_consumers(category)
-        # 按分类优先级升序排列（数字越小越优先）
-        consumers.sort(key=lambda _: priority(category))
+        cat_prio = priority(category)
+        # 先按分类优先级，通吃角色排后
+        consumers.sort(key=lambda r: (
+            self._routing.get(r, {}).get("consume", []).count("*"),  # 通吃角色排后
+            cat_prio,  # 同类按分类优先级
+        ))
         return consumers
 
     def role_produce_categories(self, role: str) -> list[str]:
