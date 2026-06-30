@@ -183,6 +183,45 @@ def test_reliability_ttl_pruner():
     print("  ✓ TtlPruner prune_once")
 
 
+def test_idempotent_consume():
+    """幂等消费：同一 fact 被同一消费者多次 safe_consume → 第 1 次 consumed，第 2 次 skipped。"""
+    from reliability import IdempotentConsume
+    from bus_protocol import Blackboard
+    import uuid
+
+    bb = Blackboard()
+    ic = IdempotentConsume()
+    title = f"幂等测试 {uuid.uuid4().hex[:8]}"
+    fid = bb.write("code_fix", title, evidence="幂等测试", src="test")
+
+    r1 = ic.safe_consume(bb, fid, "test_agent")
+    assert r1["status"] == "consumed", f"第一次应 consumed: {r1}"
+
+    r2 = ic.safe_consume(bb, fid, "test_agent")
+    assert r2["status"] == "skipped", f"第二次应 skipped: {r2}"
+    print("  ✓ IdempotentConsume 幂等消费")
+
+
+def test_optimistic_claim():
+    """乐观锁 claim：claim_message 原子标记，重复 claim 返回 already_claimed。"""
+    from reliability import OptimisticClaim
+    from bus_protocol import Blackboard
+    import uuid
+
+    bb = Blackboard()
+    oc = OptimisticClaim()
+    title = f"乐观锁测试 {uuid.uuid4().hex[:8]}"
+    fid = bb.write("architecture", title, evidence="乐观锁测试", src="test")
+
+    r1 = oc.claim_message(bb, fid, "pipeline")
+    assert r1["status"] in ("consumed", "claimed"), f"第一次 claim 应成功: {r1}"
+
+    r2 = oc.claim_message(bb, fid, "pipeline")
+    assert r2.get("already") is True, f"第二次 claim already 应为 True: {r2}"
+    assert r2["status"] == "claimed", f"第二次 claim 状态应为 claimed: {r2}"
+    print("  ✓ OptimisticClaim 乐观锁 claim")
+
+
 if __name__ == "__main__":
     print("=== 集成测试: bus + routing + reliability ===\n")
 
@@ -197,6 +236,8 @@ if __name__ == "__main__":
         test_reliability_metrics,
         test_reliability_health_check,
         test_reliability_ttl_pruner,
+        test_idempotent_consume,
+        test_optimistic_claim,
     ]
 
     passed = 0

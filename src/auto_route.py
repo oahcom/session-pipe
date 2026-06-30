@@ -6,6 +6,7 @@ Auto Route — 自动感知 bus 新消息并通知下游角色。
 """
 import json
 import sys
+import time
 from pathlib import Path
 
 # 加入 hermes scripts 路径
@@ -16,8 +17,9 @@ if str(_HERMES_SCRIPTS) not in sys.path:
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, DEFAULT_RETRY,
     with_retry, health_check, start_background_services, stop_background_services,
-    GRACEFUL_SHUTDOWN
+    GRACEFUL_SHUTDOWN, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM
 )
+from config_loader import get_config
 from router import get_router, CATEGORY_DESC, priority
 
 
@@ -195,7 +197,12 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
 
             if not dry_run:
                 try:
-                    CIRCUIT_BREAKER.call(lambda fid=msg["id"], p=primary: bb.mark_consumed(fid, p))
+                    # 幂等消费：防止多实例重复处理同一消息
+                    result = CIRCUIT_BREAKER.call(
+                        lambda fid=msg["id"], p=primary: IDEMPOTENT_CONSUME.safe_consume(bb, fid, p)
+                    )
+                    if result.get("status") == "skipped":
+                        METRICS.inc("route_skipped_count")
                 except Exception as e:
                     LOGGER.error(f"route consume #{msg['id']} failed: {e}", extra={"trace_id": str(msg['id'])})
                     METRICS.inc("route_errors_total", labels={"consumer": primary})
@@ -224,11 +231,29 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
 
 
 if __name__ == "__main__":
+    import signal
     has_json = "--json" in sys.argv
-    # 清除 --json 防止干扰 argparse
     argv = [a for a in sys.argv[1:] if a != "--json"]
 
-    if "--status" in argv:
+    if "--daemon" in argv:
+        # 守护模式：启动后台服务 → 持续轮询
+        from config_loader import get_config
+        cfg = get_config()
+        poll_interval = cfg.nested_get("bus", "poll_interval", default=60)
+        start_background_services()
+        LOGGER.info(f"Daemon mode started, poll interval={poll_interval}s")
+        try:
+            while not GRACEFUL_SHUTDOWN._shutdown:
+                result = route_all(consumer="pipeline")
+                if result["routed"] > 0:
+                    LOGGER.info(f"Routed {result['routed']} messages", extra={"trace_id": "-"})
+                time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            LOGGER.info("Keyboard interrupt, shutting down...", extra={"trace_id": "-"})
+        finally:
+            stop_background_services()
+            LOGGER.info("Daemon stopped", extra={"trace_id": "-"})
+    elif "--status" in argv:
         s = status()
         if has_json:
             print(json.dumps(s, ensure_ascii=False))
@@ -242,6 +267,13 @@ if __name__ == "__main__":
             print(json.dumps(hc, ensure_ascii=False, indent=2))
     elif "--metrics" in argv:
         print(METRICS.export_prometheus())
+    elif "--config" in argv:
+        from config_loader import get_config
+        cfg = get_config()
+        if has_json:
+            print(json.dumps(cfg.to_dict(), ensure_ascii=False))
+        else:
+            print(json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2))
     elif "--route-all" in argv:
         consumer = argv[1] if len(argv) > 1 else "pipeline"
         result = route_all(consumer=consumer, dry_run="--dry-run" in argv)

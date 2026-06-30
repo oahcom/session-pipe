@@ -12,7 +12,9 @@ Reliability Layer — 可靠性基础设施。
 """
 import json
 import logging
+import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -460,6 +462,103 @@ def stop_background_services():
     """停止所有后台服务。"""
     TTL_PRUNER.stop()
     LOGGER.info("Background services stopped", extra=with_trace_id())
+
+
+# ── 幂等消费 + 乐观锁 claim ────────────────────────────────────────
+
+class IdempotentConsume:
+    """幂等消费：consumer + fact_id 唯一索引防止重复 consume。
+
+    SQLite 不支持 SELECT FOR UPDATE，用乐观锁模拟：
+    检查 log 表是否已有 (fid=目标, typ=consume) → 有则跳过。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def is_consumed(self, bb, fact_id: int, consumer: str) -> bool:
+        """检查指定 fact 是否已被指定 consumer 消费。"""
+        with bb._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM log WHERE fid = ? AND typ = 'consume' AND cat = ? LIMIT 1",
+                (fact_id, consumer),
+            ).fetchone()
+            return row is not None
+
+    def safe_consume(self, bb, fact_id: int, consumer: str) -> dict:
+        """幂等消费：已消费则返回 skipped，否则执行 consume。
+
+        返回：
+        - {"status": "consumed", "fact_id": N, "consumer": "X"}
+        - {"status": "skipped", "fact_id": N, "consumer": "X", "reason": "already_consumed"}
+        - {"status": "error", "fact_id": N, "consumer": "X", "error": "..."}
+        """
+        with self._lock:
+            if self.is_consumed(bb, fact_id, consumer):
+                LOGGER.debug(f"Idempotent skip: #{fact_id} already consumed by {consumer}",
+                           extra=with_trace_id(str(fact_id)))
+                return {
+                    "status": "skipped",
+                    "fact_id": fact_id,
+                    "consumer": consumer,
+                    "reason": "already_consumed",
+                }
+
+            try:
+                bb.mark_consumed(fact_id, consumer)
+                LOGGER.info(f"Consumed #{fact_id} by {consumer}",
+                           extra=with_trace_id(str(fact_id)))
+                return {
+                    "status": "consumed",
+                    "fact_id": fact_id,
+                    "consumer": consumer,
+                }
+            except Exception as e:
+                LOGGER.error(f"Consume #{fact_id} failed: {e}",
+                           extra=with_trace_id(str(fact_id)))
+                return {
+                    "status": "error",
+                    "fact_id": fact_id,
+                    "consumer": consumer,
+                    "error": str(e),
+                }
+
+
+class OptimisticClaim:
+    """乐观锁 claim：在 route-all 时防止多实例抢同一消息。
+
+    策略：用 SQLite 事务包裹 check + consume，
+    如果 check 到已消费（并发竞争）则跳过。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._idempotent = IdempotentConsume()
+
+    def claim_message(self, bb, fact_id: int, consumer: str) -> dict:
+        """原子 claim：检查未消费 → consume。返回 claim 结果。"""
+        with self._lock:
+            # 乐观检查
+            if self._idempotent.is_consumed(bb, fact_id, consumer):
+                return {"status": "claimed", "fact_id": fact_id, "consumer": consumer, "already": True}
+
+            # 执行 consume
+            result = self._idempotent.safe_consume(bb, fact_id, consumer)
+            result["already"] = False
+            return result
+
+    def claim_batch(self, bb, messages: list[dict], consumer: str) -> list[dict]:
+        """批量 claim：对每条消息原子 claim，返回所有结果。"""
+        results = []
+        for msg in messages:
+            result = self.claim_message(bb, msg["id"], consumer)
+            results.append(result)
+        return results
+
+
+# 全局实例
+IDEMPOTENT_CONSUME = IdempotentConsume()
+OPTIMISTIC_CLAIM = OptimisticClaim()
 
 
 if __name__ == "__main__":

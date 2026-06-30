@@ -1,0 +1,82 @@
+# Session Pipeline 配置文件
+# 所有可配置参数集中管理，避免硬编码
+
+# Bus 配置
+bus:
+  # bus 数据库路径（相对 HOME 或绝对路径）
+  # 默认: ~/.hermes/sister_bus/blackboard.db
+  db_path: "~/.hermes/sister_bus/blackboard.db"
+  # 未消费消息轮询间隔（秒）
+  poll_interval: 60
+  # 单次 poll 最大返回消息数
+  max_messages_per_poll: 100
+
+# 重试策略
+retry:
+  max_retries: 3
+  base_delay: 0.5       # 秒
+  max_delay: 10.0       # 秒
+  exponential_base: 2.0
+  # 需要重试的异常类型（全限定名）
+  retry_exceptions:
+    - "sqlite3.OperationalError"
+    - "ConnectionError"
+    - "TimeoutError"
+    - "Exception"       # 兜底
+
+# 熔断器
+circuit_breaker:
+  failure_threshold: 5      # 连续失败 N 次触发熔断
+  recovery_timeout: 30.0    # 熔断后等待恢复秒数
+  half_open_max_calls: 1    # 半开状态允许尝试次数
+
+# 消费者心跳
+heartbeat:
+  stale_threshold: 300      # 超过 N 秒无心跳标记 stale（5 分钟）
+  cleanup_interval: 3600    # 清理过期心跳记录间隔（1 小时）
+
+# TTL 清理
+ttl_pruner:
+  max_age_days: 90          # 保留天数
+  max_facts: 10000          # 最大消息数（超出则按时间从旧到新删除）
+  interval: 3600            # 清理间隔（1 小时）
+  auto_start: true          # 启动时自动运行
+
+# 优先级映射（数字越小越优先）
+priority:
+  security: 1
+  code_fix: 2
+  architecture: 3
+  performance: 4
+  evolution_report: 5
+  reflexion_lesson: 6
+  deception: 7
+  default: 8
+
+# 路由配置
+routing:
+  # route-all 时消费者名称
+  default_consumer: "pipeline"
+  # 是否启用幂等消费
+  idempotent_consume: true
+  # 是否启用乐观锁 claim
+  optimistic_claim: true
+
+# 日志
+logging:
+  level: "INFO"             # DEBUG/INFO/WARNING/ERROR
+  json_output: true         # 结构化 JSON 输出
+  include_trace_id: true    # 注入 trace_id
+
+# 优雅关闭
+graceful_shutdown:
+  timeout: 30.0             # 等待进行中操作完成的最大秒数
+
+# 健康检查
+health:
+  # 健康判定：bus 连通 + 无 stale consumer
+  check_bus_connected: true
+  check_consumer_stale: true
+  # 积压阈值：超过 N 条视为 degraded
+  backlog_warning_threshold: 100
+  backlog_critical_threshold: 500
