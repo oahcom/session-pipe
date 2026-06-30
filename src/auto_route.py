@@ -1,95 +1,132 @@
 #!/usr/bin/env python3
 """
 Auto Route — 自动感知 bus 新消息并通知下游角色。
-
-用于 coordinator 的定期扫描，或 consumer 的推送通知。
+使用 Blackboard 直接 API（不再 subprocess 解析字符串）。
+支持优先级路由和消费联动。
 """
 import json
-import os
-import subprocess
+import sys
 from pathlib import Path
 
-from router import get_consumers, CATEGORY_DESC
+# 加入 hermes scripts 路径
+_HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
+if str(_HERMES_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_HERMES_SCRIPTS))
 
-
-BUS_CLIENT = Path.home() / ".hermes/scripts/bus_client.py"
+from router import get_router, CATEGORY_DESC, priority
 
 
 def poll_unconsumed(category: str | None = None) -> list[dict]:
-    """拉取未消费消息并分类。"""
+    """拉取未消费消息，按优先级排序。
+
+    使用 Blackboard.unconsumed() 直接获取，
+    不再 subprocess + 字符串解析。
+    """
+    from bus_protocol import Blackboard
+
+    bb = Blackboard()
+    router = get_router()
     try:
-        result = subprocess.run(
-            ["python3", str(BUS_CLIENT), "unread", "--all"],
-            capture_output=True, text=True, timeout=10
-        )
-        lines = result.stdout.strip().split("\n")
-
-        messages = []
-        for line in lines:
-            if not line.strip():
+        facts = bb.unconsumed()
+        messages: list[dict] = []
+        for f in facts:
+            if category and f.cat != category:
                 continue
-
-            # Parse line format: [{id}] ({cat}) {text}
-            if "(" in line and ")" in line:
-                id_part = line.split("]")[0].strip("[").strip() if "]" in line else ""
-                cat_part = line.split("(")[1].split(")")[0] if "(" in line else ""
-                text_part = line.split(")")[-1].strip() if ")" in line else line
-
-                if category and cat_part != category:
-                    continue
-
-                messages.append({
-                    "id": id_part,
-                    "category": cat_part,
-                    "text": text_part[:100],
-                    "consumers": get_consumers(cat_part),
-                })
+            messages.append({
+                "id": f.id,
+                "category": f.cat,
+                "text": f.t[:100],
+                "evidence": f.e[:120] if f.e else "",
+                "priority": priority(f.cat),
+                "consumers": router.get_consumers_prioritized(f.cat),
+            })
+        # 按优先级升序排列（高优先级在前）
+        messages.sort(key=lambda m: m["priority"])
         return messages
     except Exception as e:
         return [{"error": str(e)}]
 
 
 def notify_consumers(messages: list[dict]) -> None:
-    """模拟通知消费者。实际通知通过他们自己的 CronCreate 轮询实现。"""
-    # 按消费者分组
-    consumer_map = {}
+    """按优先级通知消费者。"""
+    consumer_map: dict[str, list[dict]] = {}
     for msg in messages:
         for c in msg.get("consumers", []):
             consumer_map.setdefault(c, []).append(msg)
 
     for role, msgs in sorted(consumer_map.items()):
+        # 该角色的消息按优先级排序
+        msgs.sort(key=lambda m: m.get("priority", 99))
         print(f"  {role}: {len(msgs)} 条待消费")
         for m in msgs:
-            print(f"    [{m['category']}] {m['text']}")
+            print(f"    [P{m['priority']}] [{m['category']}] {m['text']}")
+            if m.get("evidence"):
+                print(f"      → {m['evidence']}")
 
 
 def status() -> dict:
     """当前管线状态。"""
     messages = poll_unconsumed()
-
     if not messages or "error" in messages[0]:
         return {"status": "idle", "total": 0}
 
-    # 按分类统计
-    by_cat = {}
+    by_cat: dict[str, dict] = {}
     for m in messages:
         cat = m.get("category", "unknown")
-        by_cat[cat] = by_cat.get(cat, 0) + 1
+        by_cat.setdefault(cat, {"count": 0, "priority": priority(cat)})
+        by_cat[cat]["count"] += 1
+
+    # 按优先级排序的分类统计
+    sorted_cats = dict(
+        sorted(by_cat.items(), key=lambda x: x[1]["priority"])
+    )
 
     return {
         "status": "active" if messages else "idle",
         "total": len(messages),
-        "by_category": by_cat,
+        "by_category": {k: v["count"] for k, v in sorted_cats.items()},
         "oldest": messages[0] if messages else None,
+        "top_priority": min((m.get("priority", 99) for m in messages), default=None),
+    }
+
+
+def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") -> dict:
+    """消费一条消息，联动更新其他角色计数。
+
+    消费联动：
+    - 标记该消息为已消费
+    - 返回其他同样消费该分类的角色列表（供 caller 做后续处理）
+    """
+    from bus_protocol import Blackboard
+
+    bb = Blackboard()
+    router = get_router()
+
+    # 记录消费
+    bb.mark_consumed(fact_id, consumer)
+
+    # 消费联动：获取其他受影响的消费者
+    linked = router.consume_linkage(fact_id, category)
+
+    return {
+        "consumed": fact_id,
+        "by": consumer,
+        "category": category,
+        "linked_consumers": [r for r in linked if r != consumer],
     }
 
 
 if __name__ == "__main__":
-    import sys
-
     if "--status" in sys.argv:
         s = status()
         print(json.dumps(s, ensure_ascii=False, indent=2))
+    elif "--consume" in sys.argv and len(sys.argv) >= 4:
+        # python3 auto_route.py --consume <id> <category> [consumer]
+        fid = int(sys.argv[2])
+        cat = sys.argv[3]
+        c = sys.argv[4] if len(sys.argv) > 4 else "claude"
+        result = consume_with_linkage(fid, cat, c)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         msgs = poll_unconsumed()
         if not msgs:
