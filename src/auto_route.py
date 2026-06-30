@@ -2,7 +2,7 @@
 """
 Auto Route — 自动感知 bus 新消息并通知下游角色。
 使用 Blackboard 直接 API（不再 subprocess 解析字符串）。
-支持优先级路由和消费联动。
+支持优先级路由、消费联动、重试、熔断、心跳、指标。
 """
 import json
 import sys
@@ -13,38 +13,57 @@ _HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
 if str(_HERMES_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_HERMES_SCRIPTS))
 
+from reliability import (
+    LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, DEFAULT_RETRY,
+    with_retry, health_check, start_background_services, stop_background_services,
+    GRACEFUL_SHUTDOWN
+)
 from router import get_router, CATEGORY_DESC, priority
 
 
+@with_retry(DEFAULT_RETRY)
 def poll_unconsumed(category: str | None = None) -> list[dict]:
     """拉取未消费消息，按优先级排序。
 
     使用 Blackboard.unconsumed() 直接获取，
     不再 subprocess + 字符串解析。
+    集成重试、熔断、心跳、指标。
     """
     from bus_protocol import Blackboard
 
     bb = Blackboard()
     router = get_router()
+
+    # 熔断器调用
+    def _do_poll():
+        return bb.unconsumed()
+
     try:
-        facts = bb.unconsumed()
-        messages: list[dict] = []
-        for f in facts:
-            if category and f.cat != category:
-                continue
-            messages.append({
-                "id": f.id,
-                "category": f.cat,
-                "text": f.t[:100],
-                "evidence": f.e[:120] if f.e else "",
-                "priority": priority(f.cat),
-                "consumers": router.get_consumers_prioritized(f.cat),
-            })
-        # 按优先级升序排列（高优先级在前）
-        messages.sort(key=lambda m: m["priority"])
-        return messages
+        facts = CIRCUIT_BREAKER.call(_do_poll)
     except Exception as e:
+        METRICS.inc("poll_errors_total")
+        LOGGER.error(f"poll_unconsumed failed: {e}", extra=LOGGER.handlers[0].formatter.format.__self__.__dict__ if hasattr(LOGGER.handlers[0], "formatter") else {})
         return [{"error": str(e)}]
+
+    HEARTBEAT.beat("pipeline")
+    messages: list[dict] = []
+    for f in facts:
+        if category and f.cat != category:
+            continue
+        messages.append({
+            "id": f.id,
+            "category": f.cat,
+            "text": f.t[:100],
+            "evidence": f.e[:120] if f.e else "",
+            "priority": priority(f.cat),
+            "consumers": router.get_consumers_prioritized(f.cat),
+        })
+    # 按优先级升序排列（高优先级在前）
+    messages.sort(key=lambda m: m["priority"])
+
+    METRICS.inc("poll_count")
+    METRICS.observe("backlog_size", len(messages))
+    return messages
 
 
 def notify_consumers(messages: list[dict]) -> None:
@@ -94,19 +113,42 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
     """消费一条消息，联动更新其他角色计数。
 
     消费联动：
-    - 标记该消息为已消费
-    - 返回其他同样消费该分类的角色列表（供 caller 做后续处理）
+    - 标记该消息为已消费（带重试和熔断）
+    - 返回其他同样消费该分类的角色列表
+    - 记录 metrics 和心跳
     """
     from bus_protocol import Blackboard
 
     bb = Blackboard()
     router = get_router()
+    tid = fact_id
 
-    # 记录消费
-    bb.mark_consumed(fact_id, consumer)
+    # 熔断器保护消费操作
+    def _do_consume():
+        bb.mark_consumed(fact_id, consumer)
+
+    try:
+        CIRCUIT_BREAKER.call(_do_consume)
+    except Exception as e:
+        LOGGER.error(f"consume #{tid} failed: {e}", extra={"trace_id": str(tid)})
+        METRICS.inc("consume_errors_total", labels={"consumer": consumer})
+        return {
+            "consumed": fact_id,
+            "by": consumer,
+            "category": category,
+            "error": str(e),
+        }
+
+    HEARTBEAT.beat(consumer)
+    METRICS.inc("consume_count", labels={"consumer": consumer})
 
     # 消费联动：获取其他受影响的消费者
     linked = router.consume_linkage(fact_id, category)
+
+    LOGGER.info(
+        f"Consumed #{fact_id} [{category}] by {consumer}, linked: {[r for r in linked if r != consumer]}",
+        extra={"trace_id": str(fact_id)}
+    )
 
     return {
         "consumed": fact_id,
@@ -121,6 +163,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
 
     返回路由结果：每条消息分配给哪个消费者，是否有联动影响。
     dry_run=True 时只展示分配方案，不实际 consume。
+    集成 metrics、熔断、心跳。
     """
     from bus_protocol import Blackboard
 
@@ -128,43 +171,56 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
     router = get_router()
     messages = poll_unconsumed()
     if not messages or "error" in messages[0]:
+        METRICS.inc("route_errors_total")
         return {"routed": 0, "total": 0, "details": []}
 
-    details: list[dict] = []
-    for msg in messages:
-        if "error" in msg:
-            continue
-        consumers = msg.get("consumers", [])
-        # 消费该分类的角色：按优先级排序，通吃角色排后
-        specific = [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
-        wildcard = [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
-        ordered = specific + wildcard
+    with METRICS.timer("route_latency_seconds"):
+        details: list[dict] = []
+        for msg in messages:
+            if "error" in msg:
+                continue
+            consumers = msg.get("consumers", [])
+            # 消费该分类的角色：按优先级排序，通吃角色排后
+            specific = [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
+            wildcard = [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
+            ordered = specific + wildcard
 
-        if not ordered:
-            details.append({"id": msg["id"], "category": msg["category"], "assigned": None, "reason": "no_consumer"})
-            continue
+            if not ordered:
+                METRICS.inc("route_orphan_count")
+                details.append({"id": msg["id"], "category": msg["category"], "assigned": None, "reason": "no_consumer"})
+                continue
 
-        primary = ordered[0]
-        affected = [c for c in ordered[1:]]
+            primary = ordered[0]
+            affected = [c for c in ordered[1:]]
 
-        if not dry_run:
-            bb.mark_consumed(msg["id"], primary)
+            if not dry_run:
+                try:
+                    CIRCUIT_BREAKER.call(lambda fid=msg["id"], p=primary: bb.mark_consumed(fid, p))
+                except Exception as e:
+                    LOGGER.error(f"route consume #{msg['id']} failed: {e}", extra={"trace_id": str(msg['id'])})
+                    METRICS.inc("route_errors_total", labels={"consumer": primary})
 
-        details.append({
-            "id": msg["id"],
-            "category": msg["category"],
-            "title": msg["text"][:60],
-            "assigned": primary,
-            "affected": affected,
-            "priority": msg["priority"],
-        })
+            METRICS.inc("route_assigned_count", labels={"role": primary})
 
-    return {
+            details.append({
+                "id": msg["id"],
+                "category": msg["category"],
+                "title": msg["text"][:60],
+                "assigned": primary,
+                "affected": affected,
+                "priority": msg["priority"],
+            })
+
+    result = {
         "routed": len([d for d in details if d.get("assigned")]),
         "total": len(messages),
         "dry_run": dry_run,
         "details": details,
     }
+
+    HEARTBEAT.beat(consumer)
+    LOGGER.info(f"Route-all: {result['routed']}/{result['total']} routed", extra={"trace_id": "-"})
+    return result
 
 
 if __name__ == "__main__":
@@ -178,6 +234,14 @@ if __name__ == "__main__":
             print(json.dumps(s, ensure_ascii=False))
         else:
             print(json.dumps(s, ensure_ascii=False, indent=2))
+    elif "--health" in argv:
+        hc = health_check()
+        if has_json:
+            print(json.dumps(hc, ensure_ascii=False))
+        else:
+            print(json.dumps(hc, ensure_ascii=False, indent=2))
+    elif "--metrics" in argv:
+        print(METRICS.export_prometheus())
     elif "--route-all" in argv:
         consumer = argv[1] if len(argv) > 1 else "pipeline"
         result = route_all(consumer=consumer, dry_run="--dry-run" in argv)
