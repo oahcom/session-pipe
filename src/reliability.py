@@ -561,6 +561,89 @@ IDEMPOTENT_CONSUME = IdempotentConsume()
 OPTIMISTIC_CLAIM = OptimisticClaim()
 
 
+# ── ACK 确认机制 ────────────────────────────────────────────────────
+
+class AckTracker:
+    """消费回执/ACK 确认机制。
+
+    每次 consume 操作记录 ACK（fact_id, consumer, status, timestamp），
+    支持：
+    - trace: 追踪所有消费记录（谁在什么时候消费了什么）
+    - retry: 失败 ACK 可在下次 route 时重试
+    - stats: ACK 状态统计
+    """
+
+    def __init__(self):
+        self._acks: list[dict] = []
+        self._lock = threading.Lock()
+
+    def record_ack(self, fact_id: int, consumer: str, status: str,
+                   category: str = "", error: str = "", ts: float = 0.0) -> dict:
+        """记录一条消费 ACK。返回 ACK 记录。"""
+        ack = {
+            "fact_id": fact_id,
+            "consumer": consumer,
+            "category": category,
+            "status": status,
+            "error": error,
+            "ts": ts or time.time(),
+        }
+        with self._lock:
+            self._acks.append(ack)
+        return ack
+
+    def get_acks(self, fact_id: int = 0, consumer: str = "",
+                 min_ts: float = 0.0, limit: int = 50) -> list[dict]:
+        """查询 ACK 记录。"""
+        with self._lock:
+            results = []
+            for a in reversed(self._acks):
+                if fact_id and a["fact_id"] != fact_id:
+                    continue
+                if consumer and a["consumer"] != consumer:
+                    continue
+                if min_ts > 0 and a["ts"] < min_ts:
+                    continue
+                results.append(a)
+                if len(results) >= limit:
+                    break
+            return results
+
+    def get_failed_acks(self, since: float = 0.0) -> list[dict]:
+        """获取最近失败的 ACK（可重试）。"""
+        return self.get_acks(min_ts=since)[:20]
+
+    def ack_stats(self) -> dict:
+        """ACK 状态统计。"""
+        with self._lock:
+            total = len(self._acks)
+            statuses: dict[str, int] = {}
+            for a in self._acks:
+                statuses[a["status"]] = statuses.get(a["status"], 0) + 1
+            return {"total": total, "by_status": statuses}
+
+    def retry_failed(self, bb) -> int:
+        """重试所有失败的 ACK（status=error）。
+
+        返回成功重试的数量。
+        """
+        from bus_protocol import Blackboard
+        failed = self.get_failed_acks()
+        retried = 0
+        for ack in failed:
+            try:
+                bb.mark_consumed(ack["fact_id"], ack["consumer"])
+                ack["status"] = "retried"
+                ack["error"] = ""
+                retried += 1
+            except Exception as e:
+                ack["error"] = str(e)
+        return retried
+
+
+ACK_TRACKER = AckTracker()
+
+
 if __name__ == "__main__":
     # 自检
     import sys

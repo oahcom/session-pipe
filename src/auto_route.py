@@ -17,7 +17,7 @@ if str(_HERMES_SCRIPTS) not in sys.path:
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, DEFAULT_RETRY,
     with_retry, health_check, start_background_services, stop_background_services,
-    GRACEFUL_SHUTDOWN, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM
+    GRACEFUL_SHUTDOWN, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM, ACK_TRACKER
 )
 from config_loader import get_config
 from router import get_router, CATEGORY_DESC, priority
@@ -112,12 +112,12 @@ def status() -> dict:
 
 
 def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") -> dict:
-    """消费一条消息，联动更新其他角色计数。
+    """消费一条消息，自动标记其他应消费该分类的角色为已消费。
 
-    消费联动：
-    - 标记该消息为已消费（带重试和熔断）
-    - 返回其他同样消费该分类的角色列表
-    - 记录 metrics 和心跳
+    消费联动（P1 修复）：
+    - 主消费者 consume（幂等 + 熔断）
+    - 其他应消费该分类的角色自动标记 consume（联动更新 rc）
+    - 记录 ACK + metrics + 心跳
     """
     from bus_protocol import Blackboard
 
@@ -125,12 +125,23 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
     router = get_router()
     tid = fact_id
 
+    # 获取所有应消费该分类的角色
+    all_consumers = router.get_consumers(category)
+    # 排除主消费者自己
+    linked = [r for r in all_consumers if r != consumer]
+
     # 熔断器保护消费操作
     def _do_consume():
         bb.mark_consumed(fact_id, consumer)
 
     try:
         CIRCUIT_BREAKER.call(_do_consume)
+        # 联动：自动标记其他角色已消费
+        for linked_role in linked:
+            try:
+                bb.mark_consumed(fact_id, linked_role)
+            except Exception:
+                METRICS.inc("consume_errors_total", labels={"consumer": linked_role})
     except Exception as e:
         LOGGER.error(f"consume #{tid} failed: {e}", extra={"trace_id": str(tid)})
         METRICS.inc("consume_errors_total", labels={"consumer": consumer})
@@ -144,11 +155,10 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
     HEARTBEAT.beat(consumer)
     METRICS.inc("consume_count", labels={"consumer": consumer})
 
-    # 消费联动：获取其他受影响的消费者
-    linked = router.consume_linkage(fact_id, category)
+    ACK_TRACKER.record_ack(fact_id, consumer, "consumed", category=category)
 
     LOGGER.info(
-        f"Consumed #{fact_id} [{category}] by {consumer}, linked: {[r for r in linked if r != consumer]}",
+        f"Consumed #{fact_id} [{category}] by {consumer}, auto-linked: {linked}",
         extra={"trace_id": str(fact_id)}
     )
 
@@ -156,17 +166,23 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
         "consumed": fact_id,
         "by": consumer,
         "category": category,
-        "linked_consumers": [r for r in linked if r != consumer],
+        "auto_linked": linked,
     }
 
 
-def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
-    """自动路由消费：对每条未消费消息，选最高优先级消费者执行 consume。
+def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True) -> dict:
+    """自动路由消费：为每条未消费消息并行分配给多个消费者。
 
-    返回路由结果：每条消息分配给哪个消费者，是否有联动影响。
-    dry_run=True 时只展示分配方案，不实际 consume。
-    集成 metrics、熔断、心跳。
+    P1 改进：
+    - 每条消息分配给所有应消费的消费者（不仅是第一个）
+    - 使用 ThreadPoolExecutor 并行消费
+    - 幂等消费防重复
+    - ACK 记录和 metrics
+
+    dry_run=True 时只展示分配方案。
+    parallel=True 时使用线程池并行。
     """
+    from concurrent.futures import ThreadPoolExecutor
     from bus_protocol import Blackboard
 
     bb = Blackboard()
@@ -174,59 +190,92 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False) -> dict:
     messages = poll_unconsumed()
     if not messages or "error" in messages[0]:
         METRICS.inc("route_errors_total")
-        return {"routed": 0, "total": 0, "details": []}
+        return {"routed": 0, "total": 0, "details": [], "dry_run": dry_run, "parallel": parallel}
 
     with METRICS.timer("route_latency_seconds"):
         details: list[dict] = []
+        # 构建分配计划
+        assignments: list[dict] = []
         for msg in messages:
             if "error" in msg:
                 continue
             consumers = msg.get("consumers", [])
-            # 消费该分类的角色：按优先级排序，通吃角色排后
-            specific = [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
-            wildcard = [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
-            ordered = specific + wildcard
-
+            ordered = (
+                [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
+                + [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
+            )
             if not ordered:
                 METRICS.inc("route_orphan_count")
-                details.append({"id": msg["id"], "category": msg["category"], "assigned": None, "reason": "no_consumer"})
+                details.append({"id": msg["id"], "category": msg["category"], "assigned": [], "reason": "no_consumer"})
                 continue
 
-            primary = ordered[0]
-            affected = [c for c in ordered[1:]]
-
-            if not dry_run:
-                try:
-                    # 幂等消费：防止多实例重复处理同一消息
-                    result = CIRCUIT_BREAKER.call(
-                        lambda fid=msg["id"], p=primary: IDEMPOTENT_CONSUME.safe_consume(bb, fid, p)
-                    )
-                    if result.get("status") == "skipped":
-                        METRICS.inc("route_skipped_count")
-                except Exception as e:
-                    LOGGER.error(f"route consume #{msg['id']} failed: {e}", extra={"trace_id": str(msg['id'])})
-                    METRICS.inc("route_errors_total", labels={"consumer": primary})
-
-            METRICS.inc("route_assigned_count", labels={"role": primary})
-
-            details.append({
+            assignments.append({
                 "id": msg["id"],
                 "category": msg["category"],
                 "title": msg["text"][:60],
-                "assigned": primary,
-                "affected": affected,
                 "priority": msg["priority"],
+                "consumers": ordered,
             })
 
+        if dry_run:
+            for a in assignments:
+                details.append({
+                    "id": a["id"],
+                    "category": a["category"],
+                    "title": a["title"],
+                    "assigned": a["consumers"],
+                    "priority": a["priority"],
+                })
+        else:
+            # 并行消费
+            def _do_consume_msg(assignment: dict) -> dict:
+                fid = assignment["id"]
+                cat = assignment["category"]
+                results = []
+                for role in assignment["consumers"]:
+                    try:
+                        r = CIRCUIT_BREAKER.call(
+                            lambda f=fid, rl=role: IDEMPOTENT_CONSUME.safe_consume(bb, f, rl)
+                        )
+                        ack_status = r.get("status", "error")
+                        results.append({"role": role, "status": ack_status})
+                        # ACK 记录
+                        ACK_TRACKER.record_ack(fid, role, ack_status, category=cat,
+                                               error=r.get("error", "") if ack_status == "error" else "")
+                    except Exception as e:
+                        LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
+                                     extra={"trace_id": str(fid)})
+                        METRICS.inc("route_errors_total", labels={"consumer": role})
+                        results.append({"role": role, "status": "error", "error": str(e)})
+                        ACK_TRACKER.record_ack(fid, role, "error", category=cat, error=str(e))
+                HEARTBEAT.beat(cat)
+                METRICS.inc("route_assigned_count", labels={"category": cat})
+                return {
+                    "id": fid,
+                    "category": cat,
+                    "title": assignment["title"],
+                    "assigned": results,
+                    "priority": assignment["priority"],
+                }
+
+            executor = ThreadPoolExecutor(max_workers=min(8, len(assignments) or 1))
+            try:
+                details = list(executor.map(_do_consume_msg, assignments))
+            finally:
+                executor.shutdown(wait=True)
+
+    routed = sum(1 for d in details if d.get("assigned"))
     result = {
-        "routed": len([d for d in details if d.get("assigned")]),
+        "routed": routed,
         "total": len(messages),
         "dry_run": dry_run,
+        "parallel": parallel,
         "details": details,
     }
 
     HEARTBEAT.beat(consumer)
-    LOGGER.info(f"Route-all: {result['routed']}/{result['total']} routed", extra={"trace_id": "-"})
+    LOGGER.info(f"Route-all: {result['routed']}/{result['total']} routed (parallel={parallel})",
+                extra={"trace_id": "-"})
     return result
 
 
@@ -267,6 +316,19 @@ if __name__ == "__main__":
             print(json.dumps(hc, ensure_ascii=False, indent=2))
     elif "--metrics" in argv:
         print(METRICS.export_prometheus())
+    elif "--ack-stats" in argv:
+        stats = ACK_TRACKER.ack_stats()
+        if has_json:
+            print(json.dumps(stats, ensure_ascii=False))
+        else:
+            print(f"ACKs: {stats['total']} total")
+            for s, c in sorted(stats["by_status"].items()):
+                print(f"  {s}: {c}")
+    elif "--ack-retry" in argv:
+        from bus_protocol import Blackboard
+        bb = Blackboard()
+        retried = ACK_TRACKER.retry_failed(bb)
+        print(json.dumps({"retried": retried}, ensure_ascii=False))
     elif "--config" in argv:
         from config_loader import get_config
         cfg = get_config()
