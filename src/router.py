@@ -46,6 +46,8 @@ CATEGORY_DESC: dict[str, str] = {
     "security": "安全告警",
     "performance": "性能发现",
     "deception": "欺骗检测",
+    "monitor_audit": "CCS 监控审计记录",
+    "notice": "系统通知消息",
 }
 
 
