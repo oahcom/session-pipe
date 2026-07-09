@@ -138,7 +138,22 @@ Step: pending → running → completed/failed
 - Workflow 失败 → Task 状态自动更新
 - 多个 Workflow → Task 状态从最新 Workflow 推导
 
-### 测试
+### 测试角色
+
+本项目设两个测试角色（参考 Google SET/TE 体系）：
+
+| 角色 | 职责 | 维护的文件 |
+|------|------|-----------|
+| **SET** (Software Engineer in Test) | 测代码 — 测试框架/工具/CI | `tests/test_helpers.py`, `tests/run.py` |
+| **TE** (Test Engineer) | 测产品 — 场景/探索/Bug报告 | `tests/test_*.py`, `docs/TEST_*.md` |
+
+```bash
+# 跑全部测试 (SET 维护运行器, TE 使用)
+python3 tests/run.py
+
+# 覆盖盲区分析
+python3 tests/run.py --coverage
+```
 
 ```bash
 # 已有自动化测试（全部通过）
