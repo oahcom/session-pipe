@@ -1,30 +1,32 @@
 #!/bin/bash
-# SET-01: git pre-commit hook — 提交前自动跑测试
-# 安装: cp tests/git-hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
-
+# git pre-commit hook: 生产代码改哪个模块就测哪个模块
+# 闭环: 改 production → 自动跑对应测试 → 不通过不让提交
 set -e
 ROOT_DIR=$(git rev-parse --show-toplevel)
 cd "$ROOT_DIR"
 
-echo "=== SET Pre-commit: 运行测试 ==="
+echo "=== pre-commit: 生产代码测试 ==="
 
-# 只跑改动的模块相关测试
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
-RUN_ALL=false
+RUN_WF_DB=false
+RUN_WF_ENGINE=false
+RUN_WF_DAEMON=false
+RUN_CROSS=false
 RUN_ROUTER=false
 RUN_INTEGRATION=false
 RUN_ROLE=false
+RUN_OLD_INTEGRATION=false
 
 for f in $CHANGED; do
     case "$f" in
+        src/workflow_db.py) RUN_WF_DB=true; RUN_CROSS=true ;;
+        src/workflow_engine.py) RUN_WF_ENGINE=true; RUN_CROSS=true ;;
+        src/workflow_daemon.py) RUN_WF_DAEMON=true; RUN_CROSS=true ;;
         src/router.py) RUN_ROUTER=true ;;
-        src/auto_route.py) RUN_INTEGRATION=true ;;
-        src/reliability.py) RUN_INTEGRATION=true ;;
-        src/workflow_db.py) RUN_ALL=true ;;
-        src/workflow_engine.py) RUN_ALL=true ;;
-        src/workflow_daemon.py) RUN_ALL=true ;;
-        tests/*) RUN_ALL=true ;;
+        src/auto_route.py) RUN_ROLE=true ;;
+        src/reliability.py) RUN_OLD_INTEGRATION=true ;;
+        tests/*) RUN_WF_DB=true; RUN_WF_ENGINE=true; RUN_WF_DAEMON=true; RUN_CROSS=true ;;
     esac
 done
 
@@ -35,24 +37,42 @@ run_test() {
     local name=$1
     local cmd=$2
     echo -n "  $name ... "
-    if eval "$cmd" 2>/dev/null | tail -1; then
-        echo "  ✅ $name"
+    if output=$(eval "$cmd" 2>&1); then
+        echo "  ✅"
         PASSED=$((PASSED + 1))
     else
-        echo "  ❌ $name"
+        echo "  ❌"
+        echo "$output" | tail -2
         FAILED=$((FAILED + 1))
     fi
 }
 
-if [ "$RUN_ALL" = true ] || [ "$RUN_ROUTER" = true ]; then
-    run_test "路由逻辑" "python3 tests/test_router.py"
+if [ "$RUN_WF_DB" = true ]; then
+    run_test "workflow_db" "python3 tests/test_workflow_db.py"
 fi
-if [ "$RUN_ALL" = true ] || [ "$RUN_INTEGRATION" = true ]; then
-    run_test "集成测试" "python3 tests/test_integration.py"
+if [ "$RUN_WF_ENGINE" = true ]; then
+    run_test "workflow_engine" "python3 tests/test_workflow_engine.py"
 fi
-if [ "$RUN_ALL" = true ] || [ "$RUN_ROLE" = true ]; then
-    run_test "角色交互" "python3 tests/test_role_interaction.py"
+if [ "$RUN_WF_DAEMON" = true ]; then
+    run_test "workflow_daemon" "python3 tests/test_workflow_daemon.py"
+fi
+if [ "$RUN_CROSS" = true ]; then
+    run_test "cross_component" "python3 tests/test_cross_component.py"
+fi
+if [ "$RUN_ROUTER" = true ]; then
+    run_test "router" "python3 tests/test_router.py"
+fi
+if [ "$RUN_ROLE" = true ]; then
+    run_test "role_integration" "python3 tests/test_role_interaction.py"
+fi
+if [ "$RUN_OLD_INTEGRATION" = true ]; then
+    run_test "integration" "python3 tests/test_integration.py"
 fi
 
-echo "=== 结果: $PASSED 通过, $FAILED 失败 ==="
+if [ "$PASSED" -eq 0 ] && [ "$FAILED" -eq 0 ]; then
+    echo "  (无相关测试)"
+    exit 0
+fi
+
+echo "=== $PASSED 通过, $FAILED 失败 ==="
 [ "$FAILED" -eq 0 ] || exit 1
