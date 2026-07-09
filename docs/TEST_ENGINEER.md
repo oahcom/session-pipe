@@ -37,22 +37,140 @@
 | `docs/TEST_WORKFLOW.md` | **TE** | 工作流测试文档 |
 | CI 配置 | **SET** | 自动化执行 + 报告 |
 
-### 0.3 TE 工作流程（本项目的日常）
+---
+
+## 0A. SET — 任务清单
+
+SET (Software Engineer in Test) **测代码**。对测试基础设施的质量负责。
+
+### SET 任务列表
+
+| ID | 任务 | 频次 | 产出 |
+|----|------|------|------|
+| SET-01 | 维护 `test_helpers.py`：增删改测试工具函数 | 按需 | `test_helpers.py` |
+| SET-02 | 维护 `tests/run.py`：统一运行器 | 按需 | `run.py` |
+| SET-03 | 覆盖盲区分析：`python3 tests/run.py --coverage` | 每周 | 覆盖报告 |
+| SET-04 | 修 flaky test：诊断不稳定测试并修复 | 发现即修 | 测试稳定 |
+| SET-05 | 加 mock / stub / fixture：给 TE 提供新的测试工具 | 按需 | test_helpers 新增函数 |
+| SET-06 | 配置 CI：自动化运行 + 结果通知 | 一次性+维护 | CI 配置 |
+| SET-07 | 测试性能优化：减少测试执行时间 | 按需 | 运行时间降低 |
+| SET-08 | 评估测试框架：是否需要引入 pytest/unittest | 按需 | 决策记录 |
+
+---
+
+## 0B. TE — 任务清单
+
+TE (Test Engineer) **测产品**。对功能的正确性负责。
+
+### TE 任务列表
+
+| ID | 任务 | 频次 | 产出 |
+|----|------|------|------|
+| TE-01 | 跑全部自动化测试：`python3 tests/run.py` | 每次改动后 | 执行结果 |
+| TE-02 | 按场景库执行手动探索测试 | 每次发布前 | 执行日志 |
+| TE-03 | 写 Bug 报告（按 §3.3 格式） | 发现即写 | Bug 报告 |
+| TE-04 | 回归验证：修复后重新执行相关场景 | 修复后 | 验证结果 |
+| TE-05 | 更新场景清单：新增测到的盲区 | 每次测试轮次 | 场景库更新 |
+| TE-06 | 更新 TEST_ENGINEER.md：沉淀测试知识 | 每轮 | 文档更新 |
+| TE-07 | 更新 TEST_WORKFLOW.md：工作流文档 | 架构变更时 | 文档更新 |
+
+---
+
+## 0C. SET — 工作流
+
+### 场景：TE 需要新的测试工具
 
 ```
-1. python3 tests/run.py                     # 跑全部自动化测试
-2. 根据 TEST_ENGINEER.md §4 的场景清单       # 手动执行探索测试
-3. 发现 bug → 按 §3.3 格式写 Bug 报告
-4. 回归验证 → 更新场景清单
+TE: "这个场景需要一个mock数据库的工具"
+   ↓
+SET-01: 分析需求 → 在 test_helpers.py 加函数 → 
+        写使用示例 → 通知 TE
+   ↓
+TE: 验收工具可用
 ```
 
-### 0.4 SET 工作流程（本项目的日常）
+### 场景：覆盖盲区分析
 
 ```
-1. 维护 tests/test_helpers.py               # 测试基础设施
-2. 维护 tests/run.py                        # 运行器
-3. 分析覆盖盲区 → python3 tests/run.py --coverage
-4. 修 flaky test / 加新的测试工具
+SET-03: python3 tests/run.py --coverage
+   ↓
+发现 workflow_db.py 有新增函数未被覆盖
+   ↓
+SET-01: 如果是因为缺少工具导致无法测，加工具函数
+   ↓
+通知 TE: "workflow_db.py 新增了 X 函数，需要补场景"
+   ↓
+TE-02: 写场景 → TE-01: 验证通过
+```
+
+### 场景：flaky test 修复
+
+```
+SET-04: 发现 test_X 间歇性失败
+   ↓
+诊断根因: 并发冲突 / 外部依赖不稳定 / 时序问题
+   ↓
+修复: 加 retry / 加隔离 / 修断言
+   ↓
+SET-04: 连续跑 10 次确认稳定
+```
+
+---
+
+## 0D. TE — 工作流
+
+### 场景：版本发布前测试
+
+```
+TE-01: python3 tests/run.py                    # 全部自动化测试
+   ↓
+全部通过
+   ↓
+TE-02: 按 §4 场景库手动执行探索测试
+   │
+   ├─ 正常路径  → 全部 PASS
+   ├─ 异常路径  → 发现 P1 bug: 删除不存在 workflow 返回了 True
+   └─ 边界条件  → 全部 PASS
+   ↓
+TE-03: 写 Bug 报告 (格式见 §3.3)
+   ↓
+开发修复
+   ↓
+TE-04: 回归验证
+   ↓
+TE-05: 更新场景清单 — 把本次 bug 对应的场景加入
+   ↓
+TE-06: 更新 TEST_ENGINEER.md — 沉淀发现
+```
+
+### 场景：日常回归
+
+```
+TE-01: python3 tests/run.py                    # 跑自动化
+   ↓
+有失败
+   ↓
+TE-03: 分析是真实 bug 还是测试本身的问题
+   ├─ 真实 bug → 写报告 → 通知开发修复
+   └─ 测试问题 → 通知 SET 修复测试
+   ↓
+TE-04: 修复后回归验证
+```
+
+### 场景：架构变更后的全量测试
+
+```
+架构变更: 新增 workflow_daemon.py
+   ↓
+TE-07: 更新 TEST_WORKFLOW.md → 添加 daemon 测试章节
+   ↓
+TE-01: 跑现有测试 → 确认回归覆盖
+   ↓
+TE-02: 探索测试 workflow_daemon
+   ↓
+发现覆盖盲区 → TE-05 更新场景清单
+   ↓
+通知 SET: "daemon 需要 socket mock 工具" → SET-05
 ```
 
 ---
