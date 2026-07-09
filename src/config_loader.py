@@ -55,6 +55,28 @@ def load_config(path: Optional[Path] = None) -> Config:
     return Config(data)
 
 
+def _resolve_exceptions(names: list) -> tuple:
+    """Convert string exception names to Exception classes."""
+    import builtins
+    classes = []
+    for name in names:
+        if isinstance(name, type) and issubclass(name, BaseException):
+            classes.append(name)
+            continue
+        try:
+            cls = getattr(builtins, name, None)
+            if cls and isinstance(cls, type) and issubclass(cls, BaseException):
+                classes.append(cls)
+                continue
+            parts = name.split('.')
+            mod = __import__('.'.join(parts[:-1]), fromlist=[parts[-1]])
+            cls = getattr(mod, parts[-1])
+            classes.append(cls)
+        except (ImportError, AttributeError, ValueError):
+            pass
+    return tuple(classes) if classes else (Exception,)
+
+
 def _default_config() -> dict:
     """内置默认配置（YAML 文件缺失时回退）。"""
     return {

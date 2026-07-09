@@ -9,15 +9,27 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-# 确保 src 在路径中
-_src_dir = str(Path(__file__).resolve().parents[1] / "src")
-if _src_dir not in sys.path:
-    sys.path.insert(0, _src_dir)
+# launcher 路径（环境变量覆盖）
+_launcher_src = os.environ.get(
+    "SESSION_LAUNCHER_DIR",
+    str(Path.home() / "session-launcher" / "src")
+)
+if _launcher_src not in sys.path:
+    sys.path.insert(0, _launcher_src)
 
-# hermes scripts 路径
-_hermes_scripts = str(Path.home() / ".hermes" / "scripts")
+# hermes scripts 路径（环境变量覆盖）
+_hermes_scripts = os.environ.get(
+    "HERMES_SCRIPTS_DIR",
+    str(Path.home() / ".hermes" / "scripts")
+)
 if _hermes_scripts not in sys.path:
     sys.path.insert(0, _hermes_scripts)
+
+# 确保 src 在路径中（必须在最后 insert，确保 position 0）
+_src_dir = str(Path(__file__).resolve().parents[1] / "src")
+if _src_dir in sys.path:
+    sys.path.remove(_src_dir)
+sys.path.insert(0, _src_dir)
 
 
 def test_parse_produce_categories():
@@ -65,16 +77,20 @@ def test_parse_consume_categories():
 
 
 def test_priority_ordering():
-    """分类优先级排序正确：security > code_fix > architecture。"""
+    """分类优先级排序正确：security > code_fix > architecture > prd > system_design > task_spec > performance > evolution_report > reflexion_lesson > deception。"""
     from router import priority
 
     assert priority("security") < priority("code_fix"), "security 应优先于 code_fix"
     assert priority("code_fix") < priority("architecture"), "code_fix 应优先于 architecture"
-    assert priority("architecture") < priority("performance"), "architecture 应优先于 performance"
+    assert priority("architecture") < priority("prd"), "architecture 应优先于 prd"
+    assert priority("prd") < priority("system_design"), "prd 应优先于 system_design"
+    assert priority("system_design") < priority("task_spec"), "system_design 应优先于 task_spec"
+    assert priority("task_spec") < priority("performance"), "task_spec 应优先于 performance"
     assert priority("performance") < priority("evolution_report"), "performance 应优先于 evolution_report"
     assert priority("evolution_report") < priority("reflexion_lesson"), "evolution_report 应优先于 reflexion_lesson"
+    assert priority("reflexion_lesson") < priority("deception"), "reflexion_lesson 应优先于 deception"
     # 未知分类返回默认值（最大优先级数字）
-    assert priority("unknown_cat") == 8
+    assert priority("unknown_cat") == 11
     print("  ✓ priority ordering")
 
 
@@ -121,11 +137,12 @@ def test_router_fallback():
     router = Router(Path("/nonexistent/path"))
     routing = router.routing
 
-    # 默认路由表应有 7 个角色
-    assert len(routing) == 7, f"默认路由表应有 7 个角色，实际 {len(routing)}"
+    # 默认路由表应有 8 个角色（含 product_architect）
+    assert len(routing) == 8, f"默认路由表应有 8 个角色，实际 {len(routing)}"
     assert "maintainer" in routing
     assert "scout" in routing
     assert "consumer" in routing
+    assert "product_architect" in routing
     print("  ✓ router fallback")
 
 

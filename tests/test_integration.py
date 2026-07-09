@@ -11,13 +11,24 @@ import tempfile
 import time
 from pathlib import Path
 
-# 确保路径
-_src_dir = str(Path(__file__).resolve().parents[1] / "src")
-_hermes_scripts = str(Path.home() / ".hermes" / "scripts")
-if _src_dir not in sys.path:
-    sys.path.insert(0, _src_dir)
+# 确保路径（Fix 1: 环境变量覆盖）
+_launcher_src = os.environ.get(
+    "SESSION_LAUNCHER_DIR",
+    str(Path.home() / "session-launcher" / "src")
+)
+_hermes_scripts = os.environ.get(
+    "HERMES_SCRIPTS_DIR",
+    str(Path.home() / ".hermes" / "scripts")
+)
+if _launcher_src not in sys.path:
+    sys.path.insert(0, _launcher_src)
 if _hermes_scripts not in sys.path:
     sys.path.insert(0, _hermes_scripts)
+# 确保 src 在 position 0（优先于 hermes_scripts 中的同名模块）
+_src_dir = str(Path(__file__).resolve().parents[1] / "src")
+if _src_dir in sys.path:
+    sys.path.remove(_src_dir)
+sys.path.insert(0, _src_dir)
 
 
 def test_bus_write_and_unconsumed():
@@ -90,21 +101,26 @@ def test_priority_routing():
 
 
 def test_reliability_retry_policy():
-    """重试策略：指数退避延迟正确。"""
+    """重试策略：指数退避延迟正确（含抖动）。"""
     from reliability import RetryPolicy
     p = RetryPolicy(base_delay=1.0, exponential_base=2.0, max_delay=10.0)
-    assert p.delay(0) == 1.0
-    assert p.delay(1) == 2.0
-    assert p.delay(2) == 4.0
-    assert p.delay(10) == 10.0  # 上限
-    print("  ✓ RetryPolicy 指数退避")
+    # 有抖动时，延迟在 [base, base*1.5] 范围内
+    d0 = p.delay(0)
+    assert 1.0 <= d0 <= 1.5, f"delay(0) 应在 [1.0, 1.5]，实际 {d0}"
+    d1 = p.delay(1)
+    assert 2.0 <= d1 <= 3.0, f"delay(1) 应在 [2.0, 3.0]，实际 {d1}"
+    d2 = p.delay(2)
+    assert 4.0 <= d2 <= 6.0, f"delay(2) 应在 [4.0, 6.0]，实际 {d2}"
+    d10 = p.delay(10)
+    assert d10 == 10.0, f"delay(10) 受 max_delay 限制应为 10.0，实际 {d10}"
+    print("  ✓ RetryPolicy 指数退避(含抖动)")
 
 
 def test_reliability_circuit_breaker():
-    """熔断器：连续失败 → OPEN → 恢复。"""
+    """熔断器：连续失败 → OPEN → HALF_OPEN(需3次成功) → CLOSED。"""
     from reliability import CircuitBreaker, CircuitState, CircuitOpenError
 
-    cb = CircuitBreaker(failure_threshold=2, recovery_timeout=0.1)
+    cb = CircuitBreaker(failure_threshold=2, recovery_timeout=0.1, half_open_max_calls=3)
     call_count = 0
 
     def fail():
@@ -131,10 +147,13 @@ def test_reliability_circuit_breaker():
 
     # 等待恢复
     time.sleep(0.15)
-    result = cb.call(succeed)
-    assert result == "ok"
-    assert cb._state == CircuitState.CLOSED, "恢复后应 CLOSED"
-    print("  ✓ CircuitBreaker 熔断/恢复")
+    # HALF_OPEN 阶段需要 3 次连续成功
+    for _ in range(3):
+        result = cb.call(succeed)
+        assert result == "ok"
+
+    assert cb._state == CircuitState.CLOSED, "3次成功后应 CLOSED"
+    print("  ✓ CircuitBreaker 熔断/恢复(需3次半开成功)")
 
 
 def test_reliability_heartbeat():
@@ -167,7 +186,7 @@ def test_reliability_health_check():
     from reliability import health_check
     hc = health_check()
     assert "status" in hc, "应含 status"
-    assert hc["status"] in ("healthy", "degraded"), f"status 应为 healthy/degraded，实际 {hc['status']}"
+    assert hc["status"] in ("healthy", "degraded", "critical"), f"status 应为 healthy/degraded/critical，实际 {hc['status']}"
     assert "bus" in hc
     assert "consumers" in hc
     assert "circuit_breaker" in hc

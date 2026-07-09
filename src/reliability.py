@@ -25,10 +25,65 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
-# 将 hermes scripts 加入路径
-_HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
+# 将 hermes scripts 加入路径（环境变量优先，回退 HOME）
+_HERMES_SCRIPTS = Path(os.environ.get("HERMES_SCRIPTS_DIR", Path.home() / ".hermes" / "scripts"))
 if str(_HERMES_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_HERMES_SCRIPTS))
+    sys.path.insert(1, str(_HERMES_SCRIPTS))
+
+# 持久化 cursor 存储（Fix 6：防重启重复处理）
+_CURSOR_DB = Path(os.environ.get(
+    "SESSION_PIPELINE_STATE_DIR",
+    str(Path.home() / ".hermes" / "state")
+)) / "pipeline_cursor.db"
+
+def _cursor_db_path() -> Path:
+    """返回 cursor DB 路径，确保目录存在。"""
+    _CURSOR_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(_CURSOR_DB))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    return _CURSOR_DB
+
+def get_last_cursor(consumer: str, category: str = "") -> int:
+    """获取消费者在分类下的最后处理 fact_id。"""
+    conn = sqlite3.connect(str(_cursor_db_path()))
+    try:
+        row = conn.execute(
+            "SELECT last_fact_id FROM cursors WHERE consumer=? AND category=?",
+            (consumer, category)
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+def set_last_cursor(consumer: str, category: str, fact_id: int) -> None:
+    """更新消费者在分类下的最后处理 fact_id。"""
+    conn = sqlite3.connect(str(_cursor_db_path()))
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO cursors(consumer, category, last_fact_id, updated_at) "
+            "VALUES(?,?,?,?)",
+            (consumer, category, fact_id, time.time())
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def init_cursor_db() -> None:
+    """初始化 cursor 表。"""
+    conn = sqlite3.connect(str(_cursor_db_path()))
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cursors("
+            "consumer TEXT, category TEXT, last_fact_id INT, updated_at REAL, "
+            "PRIMARY KEY(consumer, category))"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+# 初始化 cursor DB
+init_cursor_db()
 
 T = TypeVar("T")
 
@@ -93,12 +148,19 @@ class RetryPolicy:
     base_delay: float = 0.5   # 秒
     max_delay: float = 10.0   # 秒
     exponential_base: float = 2.0
-    retry_exceptions: tuple = (Exception,)
+    retry_exceptions: tuple | list = (Exception,)
+
+    def __post_init__(self):
+        # Resolve string exception names to classes
+        if self.retry_exceptions and isinstance(self.retry_exceptions[0], str):
+            from config_loader import _resolve_exceptions
+            self.retry_exceptions = _resolve_exceptions(self.retry_exceptions)
 
     def delay(self, attempt: int) -> float:
-        """计算第 attempt 次重试的延迟（0-indexed）。"""
+        """计算第 attempt 次重试的延迟（0-indexed），含随机抖动防止惊群。"""
+        import random
         d = self.base_delay * (self.exponential_base ** attempt)
-        return min(d, self.max_delay)
+        return min(d + random.uniform(0, d * 0.5), self.max_delay)
 
 
 def with_retry(policy: Optional[RetryPolicy] = None):
@@ -141,15 +203,16 @@ class CircuitState:
 
 @dataclass
 class CircuitBreaker:
-    """熔断器：连续失败 N 次 → OPEN（拒绝调用 M 秒）→ HALF_OPEN（放行 1 次）→ 恢复/再次 OPEN。"""
+    """熔断器：连续失败 N 次 → OPEN（拒绝调用 M 秒）→ HALF_OPEN（连续成功 N 次才恢复）→ CLOSED。"""
     failure_threshold: int = 5
     recovery_timeout: float = 30.0  # 秒
-    half_open_max_calls: int = 1
+    half_open_max_calls: int = 3
 
     _state: str = field(default=CircuitState.CLOSED, init=False)
     _failure_count: int = field(default=0, init=False)
     _last_failure_time: float = field(default=0.0, init=False)
     _half_open_calls: int = field(default=0, init=False)
+    _half_open_successes: int = field(default=0, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def call(self, func: Callable[..., T], *args, **kwargs) -> T:
@@ -179,9 +242,13 @@ class CircuitBreaker:
     def _on_success(self):
         with self._lock:
             if self._state == CircuitState.HALF_OPEN:
-                self._state = CircuitState.CLOSED
-                self._failure_count = 0
-                LOGGER.info("Circuit breaker: CLOSED (recovered)", extra=with_trace_id())
+                self._half_open_successes += 1
+                if self._half_open_successes >= self.half_open_max_calls:
+                    self._state = CircuitState.CLOSED
+                    self._failure_count = 0
+                    self._half_open_successes = 0
+                    LOGGER.info("Circuit breaker: CLOSED (recovered after %d successful calls)",
+                                self.half_open_max_calls, extra=with_trace_id())
             elif self._state == CircuitState.CLOSED:
                 self._failure_count = 0
 
@@ -190,6 +257,7 @@ class CircuitBreaker:
             self._failure_count += 1
             self._last_failure_time = time.time()
             if self._state == CircuitState.HALF_OPEN:
+                self._half_open_successes = 0
                 self._state = CircuitState.OPEN
                 LOGGER.warning("Circuit breaker: OPEN (half-open call failed)", extra=with_trace_id())
             elif self._failure_count >= self.failure_threshold:
@@ -201,6 +269,7 @@ class CircuitBreaker:
             self._state = CircuitState.CLOSED
             self._failure_count = 0
             self._half_open_calls = 0
+            self._half_open_successes = 0
 
 
 class CircuitOpenError(Exception):
@@ -214,6 +283,7 @@ class CircuitOpenError(Exception):
 class ConsumerHeartbeat:
     """消费者心跳管理：记录每个消费者最后活跃时间。"""
     stale_threshold: float = 300.0  # 5 分钟
+    cleanup_interval: float = 3600.0  # 心跳记录清理间隔（Fix 2：从配置读取）
 
     _last_seen: dict[str, float] = field(default_factory=dict, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -353,14 +423,86 @@ class MetricsCollector:
         return "\n".join(lines) + "\n"
 
 
-# 全局实例
-METRICS = MetricsCollector()
-CIRCUIT_BREAKER = CircuitBreaker()
-HEARTBEAT = ConsumerHeartbeat()
-TTL_PRUNER = TtlPruner()
+# 全局实例（懒初始化，从 config_loader 读取配置）
+METRICS = MetricsCollector()  # 无配置依赖，保持即时创建
 
-# 默认重试策略
-DEFAULT_RETRY = RetryPolicy(max_retries=3, base_delay=0.5, max_delay=10.0)
+__all__ = [
+    "METRICS", "CIRCUIT_BREAKER", "HEARTBEAT", "TTL_PRUNER",
+    "DEFAULT_RETRY", "GRACEFUL_SHUTDOWN", "IDEMPOTENT_CONSUME",
+    "OPTIMISTIC_CLAIM", "ACK_TRACKER", "with_retry", "health_check",
+    "start_background_services", "stop_background_services",
+    "reconfigure",
+    "RetryPolicy", "CircuitBreaker", "CircuitState", "CircuitOpenError",
+    "ConsumerHeartbeat", "TtlPruner", "MetricsCollector",
+    "GracefulShutdown", "ShutdownError", "IdempotentConsume",
+    "OptimisticClaim", "AckTracker", "setup_logging", "LOGGER",
+]
+
+# 占位符，在文件末尾由 reconfigure() 填充
+CIRCUIT_BREAKER = None
+HEARTBEAT = None
+TTL_PRUNER = None
+DEFAULT_RETRY = None
+GRACEFUL_SHUTDOWN = None
+
+
+def reconfigure() -> None:
+    """从 config.yaml 读取配置并初始化全局实例。"""
+    global CIRCUIT_BREAKER, HEARTBEAT, TTL_PRUNER, DEFAULT_RETRY, GRACEFUL_SHUTDOWN
+    from config_loader import get_config
+    try:
+        cfg = get_config()
+    except Exception:
+        cfg = None
+
+    if cfg is None:
+        CIRCUIT_BREAKER = CircuitBreaker()
+        HEARTBEAT = ConsumerHeartbeat()
+        TTL_PRUNER = TtlPruner()
+        DEFAULT_RETRY = RetryPolicy()
+        GRACEFUL_SHUTDOWN = GracefulShutdown()
+        return
+
+    r = cfg.nested_get("retry", default={})
+    from config_loader import _resolve_exceptions
+    retry_exc_raw = r.get("retry_exceptions", ["Exception"])
+    retry_exc = _resolve_exceptions(retry_exc_raw) if isinstance(retry_exc_raw, list) else (Exception,)
+    DEFAULT_RETRY = RetryPolicy(
+        max_retries=r.get("max_retries", 3),
+        base_delay=r.get("base_delay", 0.5),
+        max_delay=r.get("max_delay", 10.0),
+        exponential_base=r.get("exponential_base", 2.0),
+        retry_exceptions=retry_exc,
+    )
+    cb = cfg.nested_get("circuit_breaker", default={})
+    CIRCUIT_BREAKER = CircuitBreaker(
+        failure_threshold=cb.get("failure_threshold", 5),
+        recovery_timeout=cb.get("recovery_timeout", 30.0),
+        half_open_max_calls=cb.get("half_open_max_calls", 1),
+    )
+    hb = cfg.nested_get("heartbeat", default={})
+    HEARTBEAT = ConsumerHeartbeat(
+        stale_threshold=hb.get("stale_threshold", 300),
+        cleanup_interval=hb.get("cleanup_interval", 3600),
+    )
+    ttl = cfg.nested_get("ttl_pruner", default={})
+    TTL_PRUNER = TtlPruner(
+        max_age_days=ttl.get("max_age_days", 90),
+        max_facts=ttl.get("max_facts", 10000),
+        interval=ttl.get("interval", 3600),
+    )
+    # Fix 2: 应用 ttl_pruner.auto_start 配置
+    if ttl.get("auto_start", True):
+        TTL_PRUNER.start()
+    gs = cfg.nested_get("graceful_shutdown", default={})
+    GRACEFUL_SHUTDOWN = GracefulShutdown(timeout=gs.get("timeout", 30.0))
+    # 应用 logging 配置（Fix 2：logging.level + logging.json_output）
+    log_cfg = cfg.nested_get("logging", default={})
+    log_level_name = log_cfg.get("level", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    log_json = log_cfg.get("json_output", True)
+    setup_logging(level=log_level, json_output=log_json)
+
 
 
 # ── 优雅关闭 ────────────────────────────────────────────────────────
@@ -410,14 +552,12 @@ class ShutdownError(Exception):
     pass
 
 
-GRACEFUL_SHUTDOWN = GracefulShutdown()
-
-
 # ── 健康检查 ────────────────────────────────────────────────────────
 
 def health_check() -> dict:
-    """健康检查端点返回字典。"""
+    """健康检查端点返回字典。使用 config.yaml 中的 backlog 阈值（Fix 2）。"""
     from bus_protocol import Blackboard
+    from config_loader import get_config
     bb = Blackboard()
     try:
         stats = bb.stats()
@@ -429,13 +569,24 @@ def health_check() -> dict:
         stats = {"total": 0, "by_category": {}}
 
     stale_consumers = HEARTBEAT.get_stale_consumers()
+    total_facts = stats.get("total", 0)
+    # 使用 config 中的 backlog 阈值（Fix 2）
+    cfg = get_config()
+    warn_thresh = cfg.nested_get("health", "backlog_warning_threshold", default=100)
+    crit_thresh = cfg.nested_get("health", "backlog_critical_threshold", default=500)
+    if total_facts >= crit_thresh:
+        status = "critical"
+    elif total_facts >= warn_thresh or stale_consumers:
+        status = "degraded"
+    else:
+        status = "healthy"
 
     return {
-        "status": "healthy" if bus_ok and not stale_consumers else "degraded",
+        "status": status,
         "bus": {
             "connected": bus_ok,
             "error": bus_error,
-            "total_facts": stats.get("total", 0),
+            "total_facts": total_facts,
         },
         "consumers": {
             "stale": stale_consumers,
@@ -564,7 +715,7 @@ OPTIMISTIC_CLAIM = OptimisticClaim()
 # ── ACK 确认机制 ────────────────────────────────────────────────────
 
 class AckTracker:
-    """消费回执/ACK 确认机制。
+    """消费回执/ACK 确认机制，SQLite 持久化。
 
     每次 consume 操作记录 ACK（fact_id, consumer, status, timestamp），
     支持：
@@ -573,41 +724,79 @@ class AckTracker:
     - stats: ACK 状态统计
     """
 
-    def __init__(self):
-        self._acks: list[dict] = []
+    _DEFAULT_DB = Path.home() / ".hermes" / "state" / "ack_tracker.db"
+
+    def __init__(self, db_path: str | None = None):
+        self._db_path = Path(db_path) if db_path else self._DEFAULT_DB
         self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS acks("
+            "fact_id INT, consumer TEXT, category TEXT, "
+            "status TEXT, error TEXT, ts REAL)"
+        )
+        conn.close()
+
+    def _conn(self):
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
     def record_ack(self, fact_id: int, consumer: str, status: str,
                    category: str = "", error: str = "", ts: float = 0.0) -> dict:
         """记录一条消费 ACK。返回 ACK 记录。"""
-        ack = {
-            "fact_id": fact_id,
-            "consumer": consumer,
-            "category": category,
-            "status": status,
-            "error": error,
-            "ts": ts or time.time(),
-        }
+        ts_val = ts or time.time()
         with self._lock:
-            self._acks.append(ack)
-        return ack
+            conn = self._conn()
+            try:
+                conn.execute(
+                    "INSERT INTO acks(fact_id, consumer, category, status, error, ts) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (fact_id, consumer, category, status, error, ts_val),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return {
+            "fact_id": fact_id, "consumer": consumer, "category": category,
+            "status": status, "error": error, "ts": ts_val,
+        }
 
     def get_acks(self, fact_id: int = 0, consumer: str = "",
                  min_ts: float = 0.0, limit: int = 50) -> list[dict]:
         """查询 ACK 记录。"""
+        conditions = []
+        params: list = []
+        if fact_id:
+            conditions.append("fact_id = ?")
+            params.append(fact_id)
+        if consumer:
+            conditions.append("consumer = ?")
+            params.append(consumer)
+        if min_ts > 0:
+            conditions.append("ts >= ?")
+            params.append(min_ts)
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        sql = f"SELECT fact_id, consumer, category, status, error, ts FROM acks{where} ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+
         with self._lock:
-            results = []
-            for a in reversed(self._acks):
-                if fact_id and a["fact_id"] != fact_id:
-                    continue
-                if consumer and a["consumer"] != consumer:
-                    continue
-                if min_ts > 0 and a["ts"] < min_ts:
-                    continue
-                results.append(a)
-                if len(results) >= limit:
-                    break
-            return results
+            conn = self._conn()
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            finally:
+                conn.close()
+        return [
+            {"fact_id": r[0], "consumer": r[1], "category": r[2],
+             "status": r[3], "error": r[4], "ts": r[5]}
+            for r in rows
+        ]
 
     def get_failed_acks(self, since: float = 0.0) -> list[dict]:
         """获取最近失败的 ACK（可重试）。"""
@@ -616,11 +805,15 @@ class AckTracker:
     def ack_stats(self) -> dict:
         """ACK 状态统计。"""
         with self._lock:
-            total = len(self._acks)
-            statuses: dict[str, int] = {}
-            for a in self._acks:
-                statuses[a["status"]] = statuses.get(a["status"], 0) + 1
-            return {"total": total, "by_status": statuses}
+            conn = self._conn()
+            try:
+                total = conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0]
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) FROM acks GROUP BY status"
+                ).fetchall()
+            finally:
+                conn.close()
+        return {"total": total, "by_status": {r[0]: r[1] for r in rows}}
 
     def retry_failed(self, bb) -> int:
         """重试所有失败的 ACK（status=error）。
@@ -633,20 +826,32 @@ class AckTracker:
         for ack in failed:
             try:
                 bb.mark_consumed(ack["fact_id"], ack["consumer"])
-                ack["status"] = "retried"
-                ack["error"] = ""
+                with self._lock:
+                    conn = self._conn()
+                    try:
+                        conn.execute(
+                            "UPDATE acks SET status='retried', error='' "
+                            "WHERE fact_id=? AND consumer=? AND status='error'",
+                            (ack["fact_id"], ack["consumer"]),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
                 retried += 1
-            except Exception as e:
-                ack["error"] = str(e)
+            except Exception:
+                pass
         return retried
 
 
 ACK_TRACKER = AckTracker()
 
+# 模块导入时自动从 config 初始化全局实例
+reconfigure()
+
 
 if __name__ == "__main__":
-    # 自检
     import sys
+    reconfigure()
     print("Reliability module self-check:")
     print(f"  CircuitBreaker: {CIRCUIT_BREAKER._state}")
     print(f"  Heartbeat stale threshold: {HEARTBEAT.stale_threshold}s")

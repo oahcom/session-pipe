@@ -183,12 +183,48 @@ session-pipeline/
     auto_route.py      → 自动路由：新消息 → 通知对应角色
     reliability.py     → 重试/熔断/心跳/TTL/metrics
     config_loader.py   → config.yaml 配置加载
+    workflow_db.py     → 三层架构数据库（Task/Workflow/Template）
+    workflow_daemon.py → 守护进程（推送 prompt 给 CCS）
   config/
     config.yaml        → 配置文件
   tests/
     test_router.py     → 路由映射测试
     test_integration.py→ 集成测试
+  docs/
+    TEST_WORKFLOW.md   → 测试工作流文档
 ```
+
+---
+
+## 工作流系统
+
+### 三层架构
+
+```
+Workflow Template（可复用模板）→ Workflow Instance（具体执行）→ Task（目标）
+```
+
+- **Task** = WHAT（目标）
+- **Workflow Instance** = HOW（流程步骤）
+- **Workflow Template** = 可复用的流程定义
+
+### 文件
+
+| 文件 | 说明 |
+|------|------|
+| `src/workflow_db.py` | 三层架构数据库（SQLite） |
+| `src/workflow_daemon.py` | 守护进程（推送 prompt 给 CCS） |
+| `docs/TEST_WORKFLOW.md` | 测试工作流文档 |
+
+### 状态流转
+
+```
+Task: created → assigned → in_progress → completed/failed/cancelled
+Workflow: created → pending → running → completed/failed/cancelled
+Step: pending → running → completed/failed
+```
+
+详见 `docs/TEST_WORKFLOW.md`
 
 ---
 

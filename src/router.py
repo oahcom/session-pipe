@@ -11,16 +11,24 @@ Session Pipeline Router — 角色间消息路由。
 ponytail: 若角色数超 50+，Router._routing 应改为 SQLite 持久化，避免每次 import 都解析 JSON。
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Optional
 
-# ── 路径自动发现 ──
-# 加入 hermes scripts 目录（保证 bus_protocol 可导入）
-_HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
+# ── 路径自动发现（Fix 1: 环境变量覆盖，fallback Path.home()）──
+# 先确保 src/ 优先级高于 ~/.hermes/scripts（防 hermes_core 遮蔽）
+_SRC_DIR = str(Path(__file__).resolve().parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+_HERMES_SCRIPTS = Path(os.environ.get(
+    "HERMES_SCRIPTS_DIR",
+    str(Path.home() / ".hermes" / "scripts")
+))
 if str(_HERMES_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_HERMES_SCRIPTS))
+    sys.path.insert(1, str(_HERMES_SCRIPTS))
 
 # 项目 A 角色 JSON 目录
 SESSION_ROLES_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
@@ -30,24 +38,49 @@ CATEGORY_PRIORITY = {
     "security": 1,
     "code_fix": 2,
     "architecture": 3,
-    "performance": 4,
-    "evolution_report": 5,
-    "reflexion_lesson": 6,
-    "deception": 7,
+    "prd": 4,
+    "system_design": 5,
+    "task_spec": 6,
+    "performance": 7,
+    "evolution_report": 8,
+    "reflexion_lesson": 9,
+    "deception": 10,
 }
-_DEFAULT_PRIORITY = 8
+_DEFAULT_PRIORITY = 11
 
 # ── 分类描述 ──
 CATEGORY_DESC: dict[str, str] = {
     "reflexion_lesson": "经验教训（消费者沉淀）",
     "code_fix": "代码修复（维护者/开发者产出）",
     "architecture": "架构决策/新发现（侦察兵/管理者产出）",
+    "task_spec": "任务规格（产品架构师产出，给 coordinator 调度）",
     "evolution_report": "进化轮次报告（侦察兵产出）",
     "security": "安全告警",
     "performance": "性能发现",
     "deception": "欺骗检测",
-    "monitor_audit": "CCS 监控审计记录",
-    "notice": "系统通知消息",
+    "monitor_audit": "CCS 监控审计记录（LLM 决策追踪）",
+    "notice": "系统通知消息（可终局检测）",
+}
+_DEFAULT_PRIORITY = 11
+
+# ── 分类描述 ──
+CATEGORY_DESC: dict[str, str] = {
+    "reflexion_lesson": "经验教训（消费者沉淀）",
+    "code_fix": "代码修复（维护者/开发者产出）",
+    "architecture": "架构决策/新发现（侦察兵/管理者产出）",
+    "prd": "产品需求文档（架构师产出）",
+    "system_design": "系统设计文档（架构师产出）",
+    "task_spec": "任务分解规范（架构师产出）",
+    "product_design": "产品设计触发（需架构师消费）",
+    "evolution_report": "进化轮次报告（侦察兵产出）",
+    "security": "安全告警",
+    "performance": "性能发现",
+    "deception": "欺骗检测",
+    "monitor_audit": "CCS 监控审计记录（LLM 决策追踪）",
+    "notice": "系统通知消息（可终局检测）",
+    "blocker": "阻塞问题（任何人可发，需升级处理）",
+    "design_issue": "设计问题（开发者/消费者发，架构师消费）",
+    "ops": "运维事故（关闭者产出）",
 }
 
 
@@ -147,10 +180,11 @@ class Router:
             "maintainer": {"produce": ["code_fix", "architecture"], "consume": ["security"]},
             "scout": {"produce": ["architecture", "evolution_report"], "consume": ["architecture"]},
             "consumer": {"produce": ["reflexion_lesson"], "consume": ["*"]},
-            "developer": {"produce": ["code_fix"], "consume": ["architecture", "code_fix"]},
-            "coordinator": {"produce": ["architecture"], "consume": ["*"]},
+            "developer": {"produce": ["code_fix"], "consume": ["architecture", "code_fix", "task_spec"]},
+            "coordinator": {"produce": ["architecture"], "consume": ["*", "task_spec"]},
             "curator": {"produce": ["architecture"], "consume": []},
-            "closer": {"produce": ["architecture"], "consume": ["code_fix", "architecture"]},
+            "closer": {"produce": ["architecture", "ops"], "consume": ["code_fix", "architecture"]},
+            "product_architect": {"produce": ["prd", "system_design", "task_spec"], "consume": ["architecture", "code_fix", "product_design"]},
         }
 
     @property

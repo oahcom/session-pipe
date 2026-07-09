@@ -5,46 +5,84 @@ Auto Route — 自动感知 bus 新消息并通知下游角色。
 支持优先级路由、消费联动、重试、熔断、心跳、指标。
 """
 import json
+import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
-# 加入 hermes scripts 路径
-_HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
+# 确保 src 目录在 hermes_scripts 之前（防止 hermes_core 遮蔽本地 config_loader）
+_SRC_DIR = str(Path(__file__).resolve().parent)
+if _SRC_DIR in sys.path:
+    sys.path.remove(_SRC_DIR)
+sys.path.insert(0, _SRC_DIR)
+
+# 加入 hermes scripts 路径 (Fix 1: 环境变量覆盖)
+_HERMES_SCRIPTS = Path(os.environ.get(
+    "HERMES_SCRIPTS_DIR",
+    str(Path.home() / ".hermes" / "scripts")
+))
 if str(_HERMES_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_HERMES_SCRIPTS))
+    sys.path.insert(1, str(_HERMES_SCRIPTS))
 
 from reliability import (
-    LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, DEFAULT_RETRY,
+    LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
     with_retry, health_check, start_background_services, stop_background_services,
-    GRACEFUL_SHUTDOWN, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM, ACK_TRACKER
+    reconfigure, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM, ACK_TRACKER,
+    DEFAULT_RETRY, get_last_cursor, set_last_cursor,
 )
+
+
+def _get_retry_policy():
+    import reliability as _rel
+    return _rel.DEFAULT_RETRY or _rel.RetryPolicy()
+
+
+def _get_shutdown():
+    """Lazy access to GRACEFUL_SHUTDOWN (needs _ensure_initialized first)."""
+    import reliability as _rel
+    return _rel.GRACEFUL_SHUTDOWN
 from config_loader import get_config
 from router import get_router, CATEGORY_DESC, priority
+# 延迟导入 launcher.sentinel（避免模块级循环依赖）
+_list_sentinels = None
+def list_sentinels():
+    global _list_sentinels
+    if _list_sentinels is None:
+        import importlib
+        _sentinel_mod = importlib.import_module("sentinel")
+        _list_sentinels = getattr(_sentinel_mod, "list_sentinels", lambda: [])
+    return _list_sentinels()
 
 
 @with_retry(DEFAULT_RETRY)
-def poll_unconsumed(category: str | None = None) -> list[dict]:
+def poll_unconsumed(category: str | None = None, consumer: str | None = None) -> list[dict]:
     """拉取未消费消息，按优先级排序。
 
     使用 Blackboard.unconsumed() 直接获取，
     不再 subprocess + 字符串解析。
     集成重试、熔断、心跳、指标。
+    使用 config.yaml 中的 max_messages_per_poll（Fix 2）。
+    若指定 consumer，跳过 cursor 之前的消息（Fix 6 防重启重复处理）。
     """
     from bus_protocol import Blackboard
+    from config_loader import get_config
 
     bb = Blackboard()
     router = get_router()
+    max_per_poll = get_config().nested_get("bus", "max_messages_per_poll", default=100)
+    # 读取持久化 cursor，跳过已处理消息
+    since_id = get_last_cursor(consumer, "") if consumer else 0
 
     # 熔断器调用
     def _do_poll():
-        return bb.unconsumed()
+        return [f for f in bb.unconsumed() if f.id > since_id][:max_per_poll]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
     except Exception as e:
         METRICS.inc("poll_errors_total")
-        LOGGER.error(f"poll_unconsumed failed: {e}", extra=LOGGER.handlers[0].formatter.format.__self__.__dict__ if hasattr(LOGGER.handlers[0], "formatter") else {})
+        LOGGER.error(f"poll_unconsumed failed: {e}", extra={"trace_id": str(uuid.uuid4())[:8]})
         return [{"error": str(e)}]
 
     HEARTBEAT.beat("pipeline")
@@ -88,8 +126,11 @@ def notify_consumers(messages: list[dict]) -> None:
 def status() -> dict:
     """当前管线状态。"""
     messages = poll_unconsumed()
-    if not messages or "error" in messages[0]:
+    if not messages:
         return {"status": "idle", "total": 0}
+    if "error" in messages[0]:
+        # 区分熔断器错误和其他错误
+        return {"status": "error", "total": 0, "error": messages[0].get("error", "unknown")}
 
     by_cat: dict[str, dict] = {}
     for m in messages:
@@ -178,6 +219,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     - 使用 ThreadPoolExecutor 并行消费
     - 幂等消费防重复
     - ACK 记录和 metrics
+    - Fix 6：poll_unconsumed 用 cursor 过滤已处理消息，route_all 结束更新 cursor
 
     dry_run=True 时只展示分配方案。
     parallel=True 时使用线程池并行。
@@ -187,7 +229,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
 
     bb = Blackboard()
     router = get_router()
-    messages = poll_unconsumed()
+    messages = poll_unconsumed(consumer=consumer)
     if not messages or "error" in messages[0]:
         METRICS.inc("route_errors_total")
         return {"routed": 0, "total": 0, "details": [], "dry_run": dry_run, "parallel": parallel}
@@ -264,6 +306,12 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
             finally:
                 executor.shutdown(wait=True)
 
+            # Fix 6：更新持久化 cursor，重启后不再重复处理已消费的消息
+            if details:
+                max_id = max(d.get("id", 0) for d in assignments)
+                if max_id:
+                    set_last_cursor(consumer, "", max_id)
+
     routed = sum(1 for d in details if d.get("assigned"))
     result = {
         "routed": routed,
@@ -304,7 +352,10 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict:
         }
 
     # 延迟导入 launcher（避免启动时循环依赖）
-    _launcher_src = "/home/administrator/session-launcher/src"
+    _launcher_src = os.environ.get(
+        "SESSION_LAUNCHER_DIR",
+        str(Path.home() / "session-launcher" / "src")
+    )
     if _launcher_src not in sys.path:
         sys.path.insert(0, _launcher_src)
     from launcher import send_to_ccs, is_ccs_running
@@ -416,14 +467,34 @@ if __name__ == "__main__":
     argv = [a for a in sys.argv[1:] if a != "--json"]
 
     if "--daemon" in argv:
-        # 守护模式：启动后台服务 → 持续轮询
+        # 守护模式：单实例锁 + 启动后台服务 → 持续轮询
+        _PID_DIR = Path("/tmp")
+        _PID_FILE = _PID_DIR / "session-pipeline-daemon.pid"
+
+        if _PID_FILE.exists():
+            try:
+                old_pid = int(_PID_FILE.read_text())
+                os.kill(old_pid, 0)  # check if alive
+                print(f"Daemon already running (PID={old_pid}). Exiting.")
+                sys.exit(1)
+            except (OSError, ValueError):
+                pass  # stale PID, overwrite
+        _PID_FILE.write_text(str(os.getpid()))
+
         from config_loader import get_config
         cfg = get_config()
         poll_interval = cfg.nested_get("bus", "poll_interval", default=60)
+        max_per_poll = cfg.nested_get("bus", "max_messages_per_poll", default=100)
+
+        # 应用日志配置
+        log_level = getattr(logging, cfg.nested_get("logging", "level", default="INFO"))
+        log_json = cfg.nested_get("logging", "json_output", default=True)
+        setup_logging(level=log_level, json_output=log_json)
+
         start_background_services()
-        LOGGER.info(f"Daemon mode started, poll interval={poll_interval}s")
+        LOGGER.info(f"Daemon mode started, poll interval={poll_interval}s, max_per_poll={max_per_poll}")
         try:
-            while not GRACEFUL_SHUTDOWN._shutdown:
+            while not _get_shutdown()._shutdown:
                 result = route_all(consumer="pipeline")
                 if result["routed"] > 0:
                     LOGGER.info(f"Routed {result['routed']} messages", extra={"trace_id": "-"})
@@ -432,6 +503,7 @@ if __name__ == "__main__":
             LOGGER.info("Keyboard interrupt, shutting down...", extra={"trace_id": "-"})
         finally:
             stop_background_services()
+            _PID_FILE.unlink(missing_ok=True)
             LOGGER.info("Daemon stopped", extra={"trace_id": "-"})
     elif "--status" in argv:
         s = status()
