@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
 
 # 默认配置文件路径
 _DEFAULT_CONFIG_PATH = Path.home() / "session-pipeline" / "config" / "config.yaml"
@@ -44,14 +48,32 @@ class Config:
 
 
 def load_config(path: Optional[Path] = None) -> Config:
-    """加载 YAML 配置文件。"""
+    """加载 YAML 配置文件。若文件不存在则写入默认配置。"""
     config_path = path or _CONFIG_PATH
     if not config_path.exists():
-        # 返回默认配置
-        return Config(_default_config())
+        cfg = Config(_default_config())
+        # 写入默认配置到磁盘，方便用户自定义
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if _HAS_YAML:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(_default_config(), f, default_flow_style=False,
+                                   allow_unicode=True, sort_keys=False)
+            else:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(_default_config(), f, ensure_ascii=False, indent=2)
+        except (OSError, PermissionError):
+            pass  # 写失败不影响功能
+        return cfg
 
     with open(config_path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+        if _HAS_YAML:
+            data = yaml.safe_load(f) or {}
+        else:
+            import json
+            data = json.load(f) or {}
+    if not isinstance(data, dict):
+        data = {}
     return Config(data)
 
 

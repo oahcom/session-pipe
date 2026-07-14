@@ -20,16 +20,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ── 路径 ───────────────────────────────────────────────────────────
-_HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
-_PIPELINE_SRC = Path.home() / "session-pipeline" / "src"
-_LAUNCHER_SRC = Path.home() / "session-launcher" / "src"
+from paths import SESSION_PIPELINE_SRC as _PIPELINE_SRC
+from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
+from paths import HERMES_SCRIPTS as _HERMES_SCRIPTS
+from paths import HERMES_WORKFLOWS as _WORKFLOWS_DIR
 for p in [_HERMES_SCRIPTS, _PIPELINE_SRC, _LAUNCHER_SRC]:
     if str(p) not in __import__('sys').path:
         __import__('sys').path.insert(0, str(p))
 
 from bus_protocol import Blackboard
 
-_WORKFLOWS_DIR = Path.home() / ".hermes" / "workflows"
 _RUNS_DIR = _WORKFLOWS_DIR / "runs"
 _POLL_SLEEP = 5
 _TIMEOUT_GRACE = 10
@@ -81,7 +81,15 @@ class WorkflowEngine:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._bb = Blackboard()
         self._workflows: dict[str, WorkflowDef] = {}
+        self._composite_runner = None
         self._load_workflows()
+
+    @property
+    def composite_runner(self):
+        if self._composite_runner is None:
+            from composite_runner import CompositeRunner
+            self._composite_runner = CompositeRunner()
+        return self._composite_runner
 
     def _load_workflows(self):
         if not self.workflows_dir.exists():
@@ -105,22 +113,26 @@ class WorkflowEngine:
     # ── API ───────────────────────────────────────────────────────
 
     def start(self, name: str, context: dict = None) -> str:
+        # 尝试作为 atomic workflow 启动
         wf = self._workflows.get(name)
-        if not wf:
-            raise ValueError(f"未知工作流: {name}")
-        if not wf.steps:
-            raise ValueError(f"工作流 {name} 无步骤")
+        if wf:
+            if not wf.steps:
+                raise ValueError(f"工作流 {name} 无步骤")
+            run = WorkflowRun(
+                id=f"wf_{uuid.uuid4().hex[:8]}",
+                workflow_name=name, context=context or {},
+                current_step=wf.steps[0].id,
+            )
+            self._save_run(run)
+            self._write_step_prompt(run, wf.steps[0])
+            self._save_run(run)
+            return run.id
 
-        run = WorkflowRun(
-            id=f"wf_{uuid.uuid4().hex[:8]}",
-            workflow_name=name, context=context or {},
-            current_step=wf.steps[0].id,
-        )
-        self._save_run(run)
-        # 写第一步 prompt 到 bus
-        self._write_step_prompt(run, wf.steps[0])
-        self._save_run(run)
-        return run.id
+        # 尝试作为 composite workflow 启动
+        if name in self.composite_runner.list_chains():
+            return self.composite_runner.start(name, context)
+
+        raise ValueError(f"未知工作流: {name}")
 
     def status(self, wid: str) -> dict:
         run = self._load_run(wid)
@@ -142,8 +154,13 @@ class WorkflowEngine:
 
     # ── daemon loop ───────────────────────────────────────────────
 
+    def tick(self) -> int:
+        """显式推进 composite workflows。返回推进的步数。"""
+        return self.composite_runner.tick()
+
     def run_once(self):
-        """执行一轮：处理所有 running 状态的 work run。"""
+        """执行一轮：处理所有 running 状态的 atomic + composite work run。"""
+        # Atomic workflows
         for run_file in self.runs_dir.glob("*.json"):
             try:
                 run = self._load_run_data(run_file.read_text())
@@ -158,6 +175,8 @@ class WorkflowEngine:
                 self._tick(run, current)
             except Exception:
                 pass
+        # Composite workflows
+        self.composite_runner.tick()
 
     def _tick(self, run: WorkflowRun, step: Step):
         """检查当前步骤的 exit_condition。"""
@@ -224,11 +243,19 @@ class WorkflowEngine:
         self._save_run(run)
 
     def _eval_cond(self, expr: str, run: WorkflowRun) -> bool:
+        """安全评估步骤条件：仅支持 s{id}.status == '状态' 格式。
+        不 eval，仅做模式匹配。"""
         try:
-            return eval(expr, {"__builtins__": {}}, {
-                f"s{i}.status": run.step_results.get(f"s{i}", {}).get("status", "")
-                for i in range(1, 10)
-            })
+            import re
+            # 匹配 s<数字>.status == '<状态>' 模式
+            m = re.search(r"s(\d+)\.status\s*==\s*'([^']+)'", expr)
+            if m:
+                step_num = int(m.group(1))
+                expected_status = m.group(2)
+                step_key = f"s{step_num}"
+                actual = run.step_results.get(step_key, {}).get("status", "")
+                return actual == expected_status
+            return False
         except Exception:
             return False
 

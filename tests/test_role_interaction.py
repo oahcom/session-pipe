@@ -195,7 +195,7 @@ def test_scenario_developer_consumes_tasks():
     # 模拟 developer 读完任务后实现并写 code_fix
     fix_id = bb.write("code_fix", _tag("[developer] 实现告警输入解析器"),
                        evidence="文件: src/alert_parser.py\n验证: py_compile PASS\n关联: bus#" + str(task_id),
-                       src="developer")
+                       src="engineer")
     _CLEANUP_IDS.append(fix_id)
 
     unconsumed = bb.unconsumed()
@@ -222,7 +222,7 @@ def test_scenario_closer_closes_loop():
     # 模拟 developer 完成所有任务
     final_fix = bb.write("code_fix", _tag("[developer] 告警聚合模块全部完成"),
                           evidence="文件: src/alert_parser.py, src/dedup.py, src/output.py\n测试: 所有测试通过",
-                          src="developer")
+                          src="engineer")
     _CLEANUP_IDS.append(final_fix)
 
     # 模拟 closer 确认闭环
@@ -277,7 +277,7 @@ def test_scenario_blocker_escalation():
     # developer 遇到设计阻塞
     blocker_id = bb.write("blocker", _tag("[developer] 告警聚合设计不清楚: 去重窗口策略"),
                            evidence="问题: PRD 说'1分钟内去重'但未指定同一title还是同一IP\n影响: 阻塞 T2 实现",
-                           src="developer")
+                           src="engineer")
     _CLEANUP_IDS.append(blocker_id)
 
     unconsumed = bb.unconsumed()
@@ -302,7 +302,7 @@ def test_scenario_design_issue_feedback():
     # developer 发现设计问题
     issue_id = bb.write("design_issue", _tag("[developer] 告警聚合模块: 单点瓶颈风险"),
                          evidence="问题: 当前设计为单线程聚合, 高并发时可能丢消息\n建议: 加队列缓冲\n影响: 需评估增加 ring buffer",
-                         src="developer")
+                         src="engineer")
     _CLEANUP_IDS.append(issue_id)
 
     unconsumed = bb.unconsumed()

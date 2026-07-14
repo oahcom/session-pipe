@@ -8,58 +8,74 @@ Session Pipeline Router — 角色间消息路由。
 2. 优先级路由：security > code_fix > architecture > 其他
 3. 消费联动：consume 时自动递减其他相关角色的待消费计数
 
-ponytail: 若角色数超 50+，Router._routing 应改为 SQLite 持久化，避免每次 import 都解析 JSON。
 """
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
-# ── 路径自动发现（Fix 1: 环境变量覆盖，fallback Path.home()）──
-# 先确保 src/ 优先级高于 ~/.hermes/scripts（防 hermes_core 遮蔽）
-_SRC_DIR = str(Path(__file__).resolve().parent)
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
-
+# ── 路径自动发现 ──
 _HERMES_SCRIPTS = Path(os.environ.get(
     "HERMES_SCRIPTS_DIR",
     str(Path.home() / ".hermes" / "scripts")
 ))
-if str(_HERMES_SCRIPTS) not in sys.path:
-    sys.path.insert(1, str(_HERMES_SCRIPTS))
 
 # 项目 A 角色 JSON 目录
-SESSION_ROLES_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+SESSION_ROLES_DIR = Path(os.environ.get(
+    "SESSION_ROLES_ROOT",
+    Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+))
+
+# 路由 DB
+import routing_db
 
 # ── 分类优先级（数字越小越优先）──
 CATEGORY_PRIORITY = {
     "security": 1,
+    "security_audit": 1,
     "code_fix": 2,
+    "threat_model": 2,
+    "bug_report": 2,
+    "code_review": 2,
+    "root_cause_analysis": 2,
     "architecture": 3,
+    "test_report": 3,
+    "deployment_report": 3,
+    "tech_decision": 3,
     "prd": 4,
+    "test_plan": 4,
     "system_design": 5,
+    "deployment_plan": 5,
     "task_spec": 6,
+    "user_story": 6,
     "performance": 7,
+    "sprint_report": 7,
     "evolution_report": 8,
     "reflexion_lesson": 9,
+    "feedback": 9,
+    "documentation": 9,
+    "changelog": 9,
     "deception": 10,
-}
-_DEFAULT_PRIORITY = 11
-
-# ── 分类描述 ──
-CATEGORY_DESC: dict[str, str] = {
-    "reflexion_lesson": "经验教训（消费者沉淀）",
-    "code_fix": "代码修复（维护者/开发者产出）",
-    "architecture": "架构决策/新发现（侦察兵/管理者产出）",
-    "task_spec": "任务规格（产品架构师产出，给 coordinator 调度）",
-    "evolution_report": "进化轮次报告（侦察兵产出）",
-    "security": "安全告警",
-    "performance": "性能发现",
-    "deception": "欺骗检测",
-    "monitor_audit": "CCS 监控审计记录（LLM 决策追踪）",
-    "notice": "系统通知消息（可终局检测）",
+    "standup": 10,
+    "retrospective": 10,
+    # ── 补充缺失的角色产出分类 ──
+    "blocker": 2,
+    "design_issue": 3,
+    "product_design": 4,
+    "scheduler": 6,
+    "ccs_health": 6,
+    "cleanup": 9,
+    "skill_audit": 9,
+    "optimization": 7,
+    "monitor_dashboard": 9,
+    "knowledge_distill": 9,
+    "memory_store": 9,
+    "verification": 9,
+    "notice": 9,
+    "workflow": 6,
 }
 _DEFAULT_PRIORITY = 11
 
@@ -81,6 +97,33 @@ CATEGORY_DESC: dict[str, str] = {
     "blocker": "阻塞问题（任何人可发，需升级处理）",
     "design_issue": "设计问题（开发者/消费者发，架构师消费）",
     "ops": "运维事故（关闭者产出）",
+    "user_story": "用户故事（PM产出）",
+    "code_review": "PR 代码审查（engineer产出，reviewer消费）",
+    "test_plan": "测试计划（qa产出）",
+    "test_report": "测试报告（qa产出）",
+    "bug_report": "缺陷报告（qa产出）",
+    "deployment_plan": "部署计划（devops产出）",
+    "deployment_report": "部署结果（devops产出）",
+    "security_audit": "安全审计报告（security产出）",
+    "threat_model": "威胁模型（security产出）",
+    "documentation": "技术文档（writer产出）",
+    "changelog": "变更日志（writer产出）",
+    "standup": "每日站会简报（coordinator产出）",
+    "retrospective": "迭代复盘（coordinator产出）",
+    "sprint_report": "迭代报告（coordinator产出）",
+    "feedback": "用户反馈（pm产出）",
+    "root_cause_analysis": "根因分析报告（investigator产出）",
+    "tech_decision": "技术选型决策（lr产出）",
+    "skill_audit": "技能审计报告（curator产出）",
+    "cleanup": "清理报告（curator产出）",
+    "scheduler": "排期分配（coordinator产出）",
+    "ccs_health": "CCS 健康报告（coordinator产出）",
+    "optimization": "优化建议（optimizer产出）",
+    "monitor_dashboard": "监控仪表盘（devops产出）",
+    "knowledge_distill": "知识蒸馏报告（knowledge_curator产出）",
+    "memory_store": "记忆存储报告（knowledge_curator产出）",
+    "verification": "验证报告（debate_verifier产出）",
+    "workflow": "工作流事件（pipeline路由）",
 }
 
 
@@ -109,13 +152,31 @@ def _parse_produce_categories(output_targets: list[str]) -> list[str]:
 def _parse_consume_categories(input_signals: list[dict]) -> list[str]:
     """从 input_signals 提取消费分类。
 
-    {"source": "bus cat=security"} → ["security"]
-    {"source": "bus_client.py read --cat security"} → ["security"]
-    {"source": "bus_client.py unread --all"} → ["*"]（消费所有）
-    {"source": "systemctl ..."} → []（非 bus 信号）
+    新格式：
+      {"type": "bus", "spec": {"category": "security"}} → ["security"]
+      {"type": "bus", "spec": {"category": "*"}} → ["*"]
+    旧格式（兼容）：
+      {"source": "bus cat=security"} → ["security"]
+      {"source": "bus_client.py read --cat security"} → ["security"]
+      {"source": "bus_client.py unread --all"} → ["*"]
+      {"source": "systemctl ..."} → []（非 bus 信号）
     """
     cats: list[str] = []
     for signal in input_signals:
+        # 新格式：type == "bus" 且 spec.category 存在
+        sig_type = signal.get("type", "")
+        if sig_type == "bus":
+            spec = signal.get("spec", {})
+            category = spec.get("category", "")
+            if category:
+                if category == "*":
+                    if "*" not in cats:
+                        cats.append("*")
+                elif category not in cats:
+                    cats.append(category)
+                continue
+
+        # 旧格式：source 字段（type为空 或 type=bus但category为空时 fallback）
         source = signal.get("source", "")
         # 全量消费标记
         if "unread --all" in source:
@@ -140,19 +201,45 @@ def _parse_consume_categories(input_signals: list[dict]) -> list[str]:
 
 
 class Router:
-    """路由表：从角色 JSON 自动构建，支持硬编码回退。"""
+    """路由表：优先从 SQLite 加载，fallback 到角色 JSON 目录。"""
 
     def __init__(self, roles_dir: Path = SESSION_ROLES_DIR):
         self.roles_dir = roles_dir
-        self._routing = self._build_routing()
+        self._routing = self._load_from_db_or_build()
+
+    def _load_from_db_or_build(self) -> dict:
+        """优先从 DB 加载路由表（仅默认目录），fallback 到角色 JSON 目录。"""
+        if str(self.roles_dir.resolve()) == str(SESSION_ROLES_DIR.resolve()):
+            try:
+                db_routing = routing_db.load_routing()
+                if db_routing:
+                    return db_routing
+            except Exception:
+                pass
+        return self._build_routing()
+
+    def load_from_db(self) -> dict:
+        """重新从 DB 加载路由表，更新 self._routing。"""
+        try:
+            db_routing = routing_db.load_routing()
+            if db_routing:
+                self._routing = db_routing
+        except Exception:
+            pass
+        return self._routing
+
+    def register_role(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
+        """注册/更新角色路由（同时写入 DB 和内存）。"""
+        self._routing[role] = {"produce": produce, "consume": consume}
+        return routing_db.save_routing(role, produce, consume, changed_by)
 
     def _build_routing(self) -> dict:
         """从角色 JSON 文件构建路由表。
 
-        回退：若目录不存在/读取失败，使用硬编码默认值。
+        回退：若目录不存在或为空，返回空 dict（由调用方决定后续行为）。
         """
         if not self.roles_dir.exists():
-            return self._default_routing()
+            return {}
 
         routing: dict = {}
         for json_file in sorted(self.roles_dir.glob("*.json")):
@@ -171,21 +258,7 @@ class Router:
 
             routing[name] = {"produce": produce, "consume": consume}
 
-        return routing if routing else self._default_routing()
-
-    @staticmethod
-    def _default_routing() -> dict:
-        """硬编码回退路由表（当项目 A JSON 不可读时）。"""
-        return {
-            "maintainer": {"produce": ["code_fix", "architecture"], "consume": ["security"]},
-            "scout": {"produce": ["architecture", "evolution_report"], "consume": ["architecture"]},
-            "consumer": {"produce": ["reflexion_lesson"], "consume": ["*"]},
-            "developer": {"produce": ["code_fix"], "consume": ["architecture", "code_fix", "task_spec"]},
-            "coordinator": {"produce": ["architecture"], "consume": ["*", "task_spec"]},
-            "curator": {"produce": ["architecture"], "consume": []},
-            "closer": {"produce": ["architecture", "ops"], "consume": ["code_fix", "architecture"]},
-            "product_architect": {"produce": ["prd", "system_design", "task_spec"], "consume": ["architecture", "code_fix", "product_design"]},
-        }
+        return routing
 
     @property
     def routing(self) -> dict:
@@ -347,8 +420,57 @@ def category_priority(cat: str) -> int:
     return priority(cat)
 
 
+def main():
+    """CLI 入口：register / list / audit。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Session Pipeline Router CLI")
+    sub = parser.add_subparsers(dest="cmd")
+
+    reg = sub.add_parser("register", help="注册/更新角色路由")
+    reg.add_argument("role", help="角色名称")
+    reg.add_argument("--produce", required=True, help="产出分类，逗号分隔")
+    reg.add_argument("--consume", required=True, help="消费分类，逗号分隔")
+    reg.add_argument("--by", default="cli", help="变更来源标识")
+
+    sub.add_parser("list", help="列出路由表")
+
+    aud = sub.add_parser("audit", help="显示审计历史")
+    aud.add_argument("role", nargs="?", help="按角色过滤")
+    aud.add_argument("-n", "--limit", type=int, default=20, help="条目上限")
+
+    args = parser.parse_args()
+
+    if args.cmd == "register":
+        produce = [c.strip() for c in args.produce.split(",") if c.strip()]
+        consume = [c.strip() for c in args.consume.split(",") if c.strip()]
+        r = get_router()
+        r.register_role(args.role, produce, consume, changed_by=args.by)
+        print(json.dumps({"ok": True, "role": args.role, "produce": produce, "consume": consume},
+                         ensure_ascii=False, indent=2))
+
+    elif args.cmd == "list":
+        routing = routing_db.load_routing()
+        if not routing:
+            print("(empty — no roles in DB)")
+        else:
+            for role, data in sorted(routing.items()):
+                print(f"  {role}: produce={data['produce']}  consume={data['consume']}")
+
+    elif args.cmd == "audit":
+        logs = routing_db.audit_log(args.limit)
+        if args.role:
+            logs = [l for l in logs if l["role"] == args.role]
+        if not logs:
+            print("(no audit records)")
+        else:
+            for l in logs:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(l["changed_at"]))
+                print(f"  [{ts}] {l['role']}.{l['field']}: {l['old_value']!r} -> {l['new_value']!r} (by {l['changed_by']})")
+
+    else:
+        parser.print_help()
+
+
 if __name__ == "__main__":
-    r = get_router()
-    print(r.format_pipeline())
-    print()
-    print(json.dumps(r.routing_summary(), ensure_ascii=False, indent=2))
+    main()

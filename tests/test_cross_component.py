@@ -82,11 +82,11 @@ def test_client_create_task_db_sees():
     db_path = _tmp_db()[0]
     from workflow_client import WorkflowClient
     with WorkflowClient("product_architect", db_path=db_path) as client:
-        tid = client.create_task("设计告警模块", assignee="developer", priority=2)
+        tid = client.create_task("设计告警模块", assignee="engineer", priority=2)
         task = client.get_task(tid)
         assert task["title"] == "设计告警模块"
         assert task["assigner"] == "product_architect"
-        assert task["assignee"] == "developer"
+        assert task["assignee"] == "engineer"
         assert task["priority"] == 2
         assert task["status"] == "created"
     os.unlink(db_path)
@@ -172,7 +172,7 @@ def test_engine_advance_to_completion():
          "prompt_template": "设计 {topic}",
          "exit_condition": {"bus_category": "architecture"},
          "max_retries": 0, "condition": "", "rollback_to": ""},
-        {"id": "s2", "title": "实现", "target_role": "developer",
+        {"id": "s2", "title": "实现", "target_role": "engineer",
          "prompt_template": "实现 {topic}",
          "exit_condition": {"bus_category": "code_fix"},
          "max_retries": 0, "condition": "", "rollback_to": ""},
@@ -186,7 +186,7 @@ def test_engine_advance_to_completion():
     eng.run_once()
     assert eng.status(rid)["current_step"] == "s2"
     # 推进 s2
-    bb.write("code_fix", "实现完成", src="developer")
+    bb.write("code_fix", "实现完成", src="engineer")
     eng.run_once()
     assert eng.status(rid)["status"] == "completed"
     # 验证 reflexion_lesson 写入

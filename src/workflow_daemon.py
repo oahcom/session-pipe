@@ -16,9 +16,9 @@ import time
 from pathlib import Path
 
 # 路径设置
-_PIPELINE_SRC = Path.home() / "session-pipeline" / "src"
-_LAUNCHER_SRC = Path.home() / "session-launcher" / "src"
-_HERMES_SCRIPTS = Path.home() / ".hermes" / "scripts"
+from paths import SESSION_PIPELINE_SRC as _PIPELINE_SRC
+from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
+from paths import HERMES_SCRIPTS as _HERMES_SCRIPTS
 for p in [_PIPELINE_SRC, _LAUNCHER_SRC, _HERMES_SCRIPTS]:
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
@@ -97,16 +97,48 @@ def check_and_push():
         db.close()
 
 
+import os
+import signal
+
+_PID_FILE = Path("/tmp/workflow-daemon.pid")
+
+def _acquire_pid_lock() -> bool:
+    """获取 PID 锁，防止双进程竞争。"""
+    if _PID_FILE.exists():
+        try:
+            old_pid = int(_PID_FILE.read_text())
+            os.kill(old_pid, 0)
+            print(f"[daemon] ⚠️ 已有实例 PID={old_pid} 在运行")
+            return False
+        except (OSError, ValueError):
+            _PID_FILE.unlink(missing_ok=True)
+    _PID_FILE.write_text(str(os.getpid()))
+    return True
+
 def daemon_loop(interval: int):
     """守护进程主循环。"""
-    print(f"[daemon] 🚀 Workflow Daemon 启动，间隔 {interval}s")
+    if not _acquire_pid_lock():
+        sys.exit(1)
+    
+    shutdown = False
+    def _handler(s, f):
+        nonlocal shutdown; shutdown = True
+    
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+    
+    print(f"[daemon] 🚀 Workflow Daemon 启动 PID={os.getpid()}, 间隔 {interval}s")
 
-    while True:
-        try:
-            check_and_push()
-        except Exception as e:
-            print(f"[daemon] ⚠️ 轮询异常: {e}")
-        time.sleep(interval)
+    try:
+        while not shutdown:
+            try:
+                check_and_push()
+            except Exception as e:
+                print(f"[daemon] ⚠️ 轮询异常: {e}")
+            time.sleep(interval)
+    finally:
+        _PID_FILE.unlink(missing_ok=True)
+        print("[daemon] 已停止")
 
 
 if __name__ == "__main__":

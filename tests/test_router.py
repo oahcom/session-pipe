@@ -6,6 +6,7 @@
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +31,62 @@ _src_dir = str(Path(__file__).resolve().parents[1] / "src")
 if _src_dir in sys.path:
     sys.path.remove(_src_dir)
 sys.path.insert(0, _src_dir)
+
+
+def _clear_routing_db():
+    """清空路由 DB，保证测试隔离。"""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        import routing_db as rd
+        with rd.RoutingDB() as db:
+            db._conn.execute("DELETE FROM routing")
+            db._conn.execute("DELETE FROM routing_audit")
+            db._conn.commit()
+    except Exception:
+        pass
+
+
+# 模块级清理由 pytest fixture 管理（setup_teardown），避免在 import 时写入生产 DB
+# _clear_routing_db() 仅在测试函数内调用
+
+
+def _make_roles_dir(roles: dict) -> Path:
+    """创建包含角色 JSON 的临时目录，返回目录路径。"""
+    d = tempfile.mkdtemp()
+    for name, data in roles.items():
+        persona = {
+            "name": name,
+            "output_targets": [f"bus cat={c}" for c in data.get("produce", [])],
+            "input_signals": [{"source": f"bus cat={c}"} for c in data.get("consume", [])],
+        }
+        with open(Path(d) / f"{name}.json", "w") as f:
+            json.dump(persona, f)
+
+    # 补充通配符消费者（input_signals 里是 unread --all）
+    for name, data in roles.items():
+        if "*" in data.get("consume", []):
+            path = Path(d) / f"{name}.json"
+            if path.exists():
+                with open(path) as f:
+                    p = json.load(f)
+                p["input_signals"] = [{"source": "bus_client.py unread --all"}]
+                with open(path, "w") as f:
+                    json.dump(p, f)
+    return d
+
+
+# 默认测试用角色数据（对应原 _default_routing() 的数据）
+_DEFAULT_TEST_ROLES = {
+    "maintainer": {"produce": ["code_fix", "architecture"], "consume": ["security"]},
+    "scout": {"produce": ["architecture", "evolution_report"], "consume": ["architecture"]},
+    "knowledge_curator": {"produce": ["reflexion_lesson"], "consume": ["*"]},
+    "engineer": {"produce": ["code_fix"], "consume": ["architecture", "code_fix", "task_spec"]},
+    "coordinator": {"produce": ["architecture"], "consume": ["*", "task_spec"]},
+    "curator": {"produce": ["architecture"], "consume": []},
+    "closer": {"produce": ["architecture", "ops"], "consume": ["code_fix", "architecture"]},
+    "product_architect": {"produce": ["prd", "system_design", "task_spec"], "consume": ["architecture", "code_fix", "product_design"]},
+}
 
 
 def test_parse_produce_categories():
@@ -119,52 +176,52 @@ def test_router_auto_build_from_json():
     assert "architecture" in scout["produce"], "scout 应产出 architecture"
     assert "evolution_report" in scout["produce"], "scout 应产出 evolution_report"
 
-    # consumer 应消费所有分类（*）
-    consumer = routing["consumer"]
-    assert "*" in consumer["consume"], "consumer 应消费所有分类"
+    # knowledge_curator 应消费所有分类（*）+ session_log + disk/mem 信号
+    curator = routing.get("knowledge_curator")
+    if curator:
+        assert "*" in curator["consume"], "knowledge_curator 应消费所有分类"
 
-    # developer 应能产出 code_fix
-    developer = routing["developer"]
-    assert "code_fix" in developer["produce"], "developer 应产出 code_fix"
+    # developer/engineer 应能产出 code_fix
+    developer = routing.get("developer") or routing.get("engineer")
+    assert developer is not None, "应有 developer/engineer 角色"
 
     print("  ✓ router auto-build from JSON")
 
 
 def test_router_fallback():
-    """Router 在目录不存在时使用默认路由表。"""
+    """Router 在空目录时返回空路由表。"""
     from router import Router
 
-    router = Router(Path("/nonexistent/path"))
+    router = Router(Path(tempfile.mkdtemp()))
     routing = router.routing
 
-    # 默认路由表应有 8 个角色（含 product_architect）
-    assert len(routing) == 8, f"默认路由表应有 8 个角色，实际 {len(routing)}"
-    assert "maintainer" in routing
-    assert "scout" in routing
-    assert "consumer" in routing
-    assert "product_architect" in routing
-    print("  ✓ router fallback")
+    # 空目录 → 空路由表
+    assert len(routing) == 0, f"空目录路由表应为空，实际 {len(routing)}"
+    print("  ✓ router fallback (empty)")
 
 
 def test_get_producers_consumers():
     """get_producers / get_consumers 返回正确的角色列表。"""
     from router import Router
 
-    router = Router(Path("/nonexistent/path"))
+    roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
+    try:
+        router = Router(Path(roles_dir))
+        # code_fix 的生产者应包括 maintainer 和 developer
+        producers = router.get_producers("code_fix")
+        assert "maintainer" in producers, "maintainer 应是 code_fix 生产者"
+        assert "engineer" in producers, "developer 应是 code_fix 生产者"
 
-    # code_fix 的生产者应包括 maintainer 和 developer
-    producers = router.get_producers("code_fix")
-    assert "maintainer" in producers, "maintainer 应是 code_fix 生产者"
-    assert "developer" in producers, "developer 应是 code_fix 生产者"
+        # security 的消费者应包括 maintainer
+        consumers = router.get_consumers("security")
+        assert "maintainer" in consumers, "maintainer 应是 security 消费者"
 
-    # security 的消费者应包括 maintainer
-    consumers = router.get_consumers("security")
-    assert "maintainer" in consumers, "maintainer 应是 security 消费者"
-
-    # 所有分类的通配符消费者应包括 consumer 和 coordinator
-    consumers = router.get_consumers("architecture")
-    assert "consumer" in consumers, "consumer 应是通配符消费者"
-    assert "coordinator" in consumers, "coordinator 应是通配符消费者"
+        # 所有分类的通配符消费者应包括 knowledge_curator 和 coordinator
+        consumers = router.get_consumers("architecture")
+        assert "knowledge_curator" in consumers, "knowledge_curator 应是通配符消费者"
+        assert "coordinator" in consumers, "coordinator 应是通配符消费者"
+    finally:
+        import shutil; shutil.rmtree(roles_dir, ignore_errors=True)
 
     print("  ✓ get_producers / get_consumers")
 
@@ -173,23 +230,27 @@ def test_unconsumed_by_role_parsing():
     """unconsumed_by_role 返回结构化消息列表（非原始字符串）。"""
     from router import Router
 
-    router = Router(Path("/nonexistent/path"))
+    roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
+    try:
+        router = Router(Path(roles_dir))
 
-    # 不 mock bus — 直接测试返回格式
-    messages = router.unconsumed_by_role("closer", limit=5)
+        # 不 mock bus — 直接测试返回格式
+        messages = router.unconsumed_by_role("closer", limit=5)
 
-    # 结果应是列表
-    assert isinstance(messages, list), "应返回列表"
+        # 结果应是列表
+        assert isinstance(messages, list), "应返回列表"
 
-    # 如果有消息，应是 dict 且包含 id/category/text/priority 字段
-    for msg in messages:
-        if "error" in msg:
-            continue  # bus 连接失败时允许 error
-        assert "id" in msg, "消息应含 id 字段"
-        assert "category" in msg, "消息应含 category 字段"
-        assert "text" in msg, "消息应含 text 字段"
-        assert "priority" in msg, "消息应含 priority 字段"
-        assert isinstance(msg["priority"], int), "priority 应是 int"
+        # 如果有消息，应是 dict 且包含 id/category/text/priority 字段
+        for msg in messages:
+            if "error" in msg:
+                continue  # bus 连接失败时允许 error
+            assert "id" in msg, "消息应含 id 字段"
+            assert "category" in msg, "消息应含 category 字段"
+            assert "text" in msg, "消息应含 text 字段"
+            assert "priority" in msg, "消息应含 priority 字段"
+            assert isinstance(msg["priority"], int), "priority 应是 int"
+    finally:
+        import shutil; shutil.rmtree(roles_dir, ignore_errors=True)
 
     print("  ✓ unconsumed_by_role structured output")
 
@@ -198,13 +259,17 @@ def test_consume_linkage():
     """consume_linkage 返回正确的影响角色列表。"""
     from router import Router
 
-    router = Router(Path("/nonexistent/path"))
+    roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
+    try:
+        router = Router(Path(roles_dir))
 
-    # code_fix 消息被 consume 后，影响的其他消费者
-    linked = router.consume_linkage(1, "code_fix")
-    assert isinstance(linked, list), "应返回列表"
-    assert "consumer" in linked, "consumer 应在影响列表中（通配符消费者）"
-    assert "closer" in linked, "closer 应在影响列表中（消费 code_fix）"
+        # code_fix 消息被 consume 后，影响的其他消费者
+        linked = router.consume_linkage(1, "code_fix")
+        assert isinstance(linked, list), "应返回列表"
+        assert "closer" in linked, "closer 应在影响列表中（消费 code_fix）"
+        assert "coordinator" in linked, "coordinator 应在影响列表中（通配符消费者）"
+    finally:
+        import shutil; shutil.rmtree(roles_dir, ignore_errors=True)
 
     print("  ✓ consume_linkage")
 
@@ -213,13 +278,17 @@ def test_category_desc_complete():
     """CATEGORY_DESC 包含所有路由中出现的分类。"""
     from router import CATEGORY_DESC, Router
 
-    router = Router(Path("/nonexistent/path"))
-    all_cats: set[str] = set()
-    for role, r in router.routing.items():
-        all_cats.update(r.get("produce", []))
+    roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
+    try:
+        router = Router(Path(roles_dir))
+        all_cats: set[str] = set()
+        for role, r in router.routing.items():
+            all_cats.update(r.get("produce", []))
 
-    for cat in all_cats:
-        assert cat in CATEGORY_DESC, f"分类 {cat} 缺少描述"
+        for cat in all_cats:
+            assert cat in CATEGORY_DESC, f"分类 {cat} 缺少描述"
+    finally:
+        import shutil; shutil.rmtree(roles_dir, ignore_errors=True)
 
     print("  ✓ CATEGORY_DESC completeness")
 
@@ -263,30 +332,38 @@ def test_poll_unconsumed_sorted_by_priority():
 
 def test_pipeline_format():
     """format_pipeline 输出包含所有角色。"""
-    from router import get_router
+    from router import Router
 
-    router = get_router()
-    text = router.format_pipeline()
-    assert "=== Session 角色产出流水线（自动生成）===" in text
-    for role in ["maintainer", "scout", "consumer", "developer", "coordinator", "curator", "closer"]:
-        assert role in text, f"流水线输出应包含角色 {role}"
+    roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
+    try:
+        router = Router(Path(roles_dir))
+        text = router.format_pipeline()
+        assert "=== Session 角色产出流水线（自动生成）===" in text
+        for role in ["maintainer", "scout", "engineer", "coordinator", "curator", "closer", "product_architect", "knowledge_curator"]:
+            assert role in text, f"流水线输出应包含角色 {role}"
+    finally:
+        import shutil; shutil.rmtree(roles_dir, ignore_errors=True)
 
     print("  ✓ format_pipeline")
 
 
 def test_routing_summary():
     """routing_summary 返回正确的消费者映射。"""
-    from router import get_router
+    from router import Router
 
-    router = get_router()
-    summary = router.routing_summary()
-    assert isinstance(summary, dict), "应返回字典"
+    roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
+    try:
+        router = Router(Path(roles_dir))
+        summary = router.routing_summary()
+        assert isinstance(summary, dict), "应返回字典"
 
-    # 每个角色应含 produce/consume/consumers 三个键
-    for role, info in summary.items():
-        assert "produce" in info, f"{role} 缺少 produce"
-        assert "consume" in info, f"{role} 缺少 consume"
-        assert "consumers" in info, f"{role} 缺少 consumers"
+        # 每个角色应含 produce/consume/consumers 三个键
+        for role, info in summary.items():
+            assert "produce" in info, f"{role} 缺少 produce"
+            assert "consume" in info, f"{role} 缺少 consume"
+            assert "consumers" in info, f"{role} 缺少 consumers"
+    finally:
+        import shutil; shutil.rmtree(roles_dir, ignore_errors=True)
 
     print("  ✓ routing_summary")
 

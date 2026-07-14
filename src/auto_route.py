@@ -5,6 +5,7 @@ Auto Route — 自动感知 bus 新消息并通知下游角色。
 支持优先级路由、消费联动、重试、熔断、心跳、指标。
 """
 import json
+import logging
 import os
 import sys
 import time
@@ -17,7 +18,7 @@ if _SRC_DIR in sys.path:
     sys.path.remove(_SRC_DIR)
 sys.path.insert(0, _SRC_DIR)
 
-# 加入 hermes scripts 路径 (Fix 1: 环境变量覆盖)
+# 加入 hermes scripts 路径（环境变量优先）
 _HERMES_SCRIPTS = Path(os.environ.get(
     "HERMES_SCRIPTS_DIR",
     str(Path.home() / ".hermes" / "scripts")
@@ -25,11 +26,13 @@ _HERMES_SCRIPTS = Path(os.environ.get(
 if str(_HERMES_SCRIPTS) not in sys.path:
     sys.path.insert(1, str(_HERMES_SCRIPTS))
 
+# 确保 session-launcher/src 路径可用（for sentinel/routine import）
+
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
     with_retry, health_check, start_background_services, stop_background_services,
-    reconfigure, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM, ACK_TRACKER,
-    DEFAULT_RETRY, get_last_cursor, set_last_cursor,
+    reconfigure, reload_config, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM, ACK_TRACKER,
+    DEFAULT_RETRY, get_last_cursor, set_last_cursor, setup_logging,
 )
 
 
@@ -44,19 +47,25 @@ def _get_shutdown():
     return _rel.GRACEFUL_SHUTDOWN
 from config_loader import get_config
 from router import get_router, CATEGORY_DESC, priority
+from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
 # 延迟导入 launcher.sentinel（避免模块级循环依赖）
 _list_sentinels = None
 def list_sentinels():
+    """读取 CCS 哨兵列表。延迟导入 sentinel（可能不存在于当前 sys.path）。"""
     global _list_sentinels
     if _list_sentinels is None:
         import importlib
+        # 确保 session-launcher/src 在 sys.path 中
+        _launcher_src = str(_LAUNCHER_SRC)
+        if _launcher_src not in sys.path:
+            sys.path.insert(0, _launcher_src)
         _sentinel_mod = importlib.import_module("sentinel")
         _list_sentinels = getattr(_sentinel_mod, "list_sentinels", lambda: [])
     return _list_sentinels()
 
 
 @with_retry(DEFAULT_RETRY)
-def poll_unconsumed(category: str | None = None, consumer: str | None = None) -> list[dict]:
+def poll_unconsumed(category: str | None = None, consumer: str | None = None, instance_id: str = "") -> list[dict]:
     """拉取未消费消息，按优先级排序。
 
     使用 Blackboard.unconsumed() 直接获取，
@@ -64,6 +73,7 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None) ->
     集成重试、熔断、心跳、指标。
     使用 config.yaml 中的 max_messages_per_poll（Fix 2）。
     若指定 consumer，跳过 cursor 之前的消息（Fix 6 防重启重复处理）。
+    instance_id 区分不同 pipeline 实例的 cursor（Fix 7：多实例隔离）。
     """
     from bus_protocol import Blackboard
     from config_loader import get_config
@@ -72,7 +82,7 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None) ->
     router = get_router()
     max_per_poll = get_config().nested_get("bus", "max_messages_per_poll", default=100)
     # 读取持久化 cursor，跳过已处理消息
-    since_id = get_last_cursor(consumer, "") if consumer else 0
+    since_id = get_last_cursor(consumer, "", instance_id) if consumer else 0
 
     # 熔断器调用
     def _do_poll():
@@ -211,254 +221,9 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
     }
 
 
-def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True) -> dict:
-    """自动路由消费：为每条未消费消息并行分配给多个消费者。
 
-    P1 改进：
-    - 每条消息分配给所有应消费的消费者（不仅是第一个）
-    - 使用 ThreadPoolExecutor 并行消费
-    - 幂等消费防重复
-    - ACK 记录和 metrics
-    - Fix 6：poll_unconsumed 用 cursor 过滤已处理消息，route_all 结束更新 cursor
-
-    dry_run=True 时只展示分配方案。
-    parallel=True 时使用线程池并行。
-    """
-    from concurrent.futures import ThreadPoolExecutor
-    from bus_protocol import Blackboard
-
-    bb = Blackboard()
-    router = get_router()
-    messages = poll_unconsumed(consumer=consumer)
-    if not messages or "error" in messages[0]:
-        METRICS.inc("route_errors_total")
-        return {"routed": 0, "total": 0, "details": [], "dry_run": dry_run, "parallel": parallel}
-
-    with METRICS.timer("route_latency_seconds"):
-        details: list[dict] = []
-        # 构建分配计划
-        assignments: list[dict] = []
-        for msg in messages:
-            if "error" in msg:
-                continue
-            consumers = msg.get("consumers", [])
-            ordered = (
-                [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
-                + [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
-            )
-            if not ordered:
-                METRICS.inc("route_orphan_count")
-                details.append({"id": msg["id"], "category": msg["category"], "assigned": [], "reason": "no_consumer"})
-                continue
-
-            assignments.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "title": msg["text"][:60],
-                "priority": msg["priority"],
-                "consumers": ordered,
-            })
-
-        if dry_run:
-            for a in assignments:
-                details.append({
-                    "id": a["id"],
-                    "category": a["category"],
-                    "title": a["title"],
-                    "assigned": a["consumers"],
-                    "priority": a["priority"],
-                })
-        else:
-            # 并行消费
-            def _do_consume_msg(assignment: dict) -> dict:
-                fid = assignment["id"]
-                cat = assignment["category"]
-                results = []
-                for role in assignment["consumers"]:
-                    try:
-                        r = CIRCUIT_BREAKER.call(
-                            lambda f=fid, rl=role: IDEMPOTENT_CONSUME.safe_consume(bb, f, rl)
-                        )
-                        ack_status = r.get("status", "error")
-                        results.append({"role": role, "status": ack_status})
-                        # ACK 记录
-                        ACK_TRACKER.record_ack(fid, role, ack_status, category=cat,
-                                               error=r.get("error", "") if ack_status == "error" else "")
-                    except Exception as e:
-                        LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
-                                     extra={"trace_id": str(fid)})
-                        METRICS.inc("route_errors_total", labels={"consumer": role})
-                        results.append({"role": role, "status": "error", "error": str(e)})
-                        ACK_TRACKER.record_ack(fid, role, "error", category=cat, error=str(e))
-                HEARTBEAT.beat(cat)
-                METRICS.inc("route_assigned_count", labels={"category": cat})
-                return {
-                    "id": fid,
-                    "category": cat,
-                    "title": assignment["title"],
-                    "assigned": results,
-                    "priority": assignment["priority"],
-                }
-
-            executor = ThreadPoolExecutor(max_workers=min(8, len(assignments) or 1))
-            try:
-                details = list(executor.map(_do_consume_msg, assignments))
-            finally:
-                executor.shutdown(wait=True)
-
-            # Fix 6：更新持久化 cursor，重启后不再重复处理已消费的消息
-            if details:
-                max_id = max(d.get("id", 0) for d in assignments)
-                if max_id:
-                    set_last_cursor(consumer, "", max_id)
-
-    routed = sum(1 for d in details if d.get("assigned"))
-    result = {
-        "routed": routed,
-        "total": len(messages),
-        "dry_run": dry_run,
-        "parallel": parallel,
-        "details": details,
-    }
-
-    HEARTBEAT.beat(consumer)
-    LOGGER.info(f"Route-all: {result['routed']}/{result['total']} routed (parallel={parallel})",
-                extra={"trace_id": "-"})
-    return result
-
-
-# ── CCS 路由 ──────────────────────────────────────────────
-
-
-def route_to_ccs(role_name: str, dry_run: bool = False) -> dict:
-    """将指定角色应消费的 bus 消息通过 launcher.send_to_ccs() 推送给对应的 CCS。
-
-    role_name: 角色名（如 maintainer、scout）
-    dry_run: 仅展示分配方案，不实际发送
-
-    如果 CCS 未启动 -> 发一条警告而不是自动启动（由 cron_worker/daemon 负责启动）。
-    返回路由结果字典。
-    """
-    router = get_router()
-    messages = router.unconsumed_by_role(role_name)
-
-    if not messages or (len(messages) == 1 and "error" in messages[0]):
-        return {
-            "role": role_name,
-            "routed": 0,
-            "total": 0,
-            "dry_run": dry_run,
-            "details": [],
-        }
-
-    # 延迟导入 launcher（避免启动时循环依赖）
-    _launcher_src = os.environ.get(
-        "SESSION_LAUNCHER_DIR",
-        str(Path.home() / "session-launcher" / "src")
-    )
-    if _launcher_src not in sys.path:
-        sys.path.insert(0, _launcher_src)
-    from launcher import send_to_ccs, is_ccs_running
-
-    # 检查 CCS 是否运行（dry_run 时跳过）
-    running = is_ccs_running(role_name) if not dry_run else None
-
-    details: list[dict] = []
-    for msg in messages:
-        # 压缩 title + evidence 为自然语言
-        text = msg.get("text", "")
-        evidence = msg.get("evidence", "")
-        body = f"{text}\n\n{evidence}" if evidence else text
-
-        if dry_run:
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "body_preview": body[:120],
-                "action": "dry_run",
-            })
-            continue
-
-        if not running:
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "action": "skipped",
-                "reason": f"CCS {role_name} 未启动",
-            })
-            continue
-
-        result = send_to_ccs(role_name, body)
-        if result.get("success"):
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "action": "routed",
-                "sent_chars": result.get("sent_chars", 0),
-            })
-        else:
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "action": "error",
-                "error": result.get("error", ""),
-            })
-
-    routed = sum(1 for d in details if d.get("action") == "routed")
-    out = {
-        "role": role_name,
-        "routed": routed,
-        "total": len(messages),
-        "dry_run": dry_run,
-        "details": details,
-    }
-    if not dry_run and not running:
-        out["warning"] = f"CCS {role_name} 未启动，消息未推送（由 cron_worker/daemon 负责启动）"
-
-    HEARTBEAT.beat(role_name)
-    METRICS.inc("route_to_ccs_count", labels={"role": role_name})
-    LOGGER.info(f"Route-to-CCS {role_name}: {routed}/{len(messages)} routed (dry_run={dry_run})",
-                extra={"trace_id": "-"})
-    return out
-
-
-def route_all_to_ccs(dry_run: bool = False) -> dict:
-    """对所有有未消费消息的角色，并行调用 route_to_ccs()。
-
-    dry_run=True 时只展示分配方案。
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    router = get_router()
-    roles = list(router.routing.keys())
-    details: list[dict] = []
-
-    with ThreadPoolExecutor(max_workers=min(8, len(roles) or 1)) as executor:
-        futures = {executor.submit(route_to_ccs, role, dry_run): role for role in roles}
-        for future in futures:
-            role = futures[future]
-            try:
-                result = future.result()
-                if result["total"] > 0:
-                    details.append(result)
-            except Exception as e:
-                LOGGER.error(f"route_all_to_ccs role {role} failed: {e}",
-                             extra={"trace_id": "-"})
-                details.append({
-                    "role": role, "routed": 0, "total": -1, "error": str(e),
-                })
-
-    result = {
-        "routed": sum(d.get("routed", 0) for d in details),
-        "total": sum(d.get("total", 0) for d in details),
-        "dry_run": dry_run,
-        "details": details,
-    }
-
-    HEARTBEAT.beat("pipeline")
-    LOGGER.info(f"Route-all-to-CCS: {result['routed']}/{result['total']} routed (dry_run={dry_run})",
-                extra={"trace_id": "-"})
-    return result
+# ── 路由分发（从 auto_route_routing 导入）──
+from auto_route_routing import route_all, route_to_ccs, route_all_to_ccs, dispatch_investigator
 
 
 if __name__ == "__main__":
@@ -492,10 +257,14 @@ if __name__ == "__main__":
         setup_logging(level=log_level, json_output=log_json)
 
         start_background_services()
-        LOGGER.info(f"Daemon mode started, poll interval={poll_interval}s, max_per_poll={max_per_poll}")
+        # 启动时从 DB 加载最新路由表
+        get_router().load_from_db()
+        _daemon_instance_id = f"pipeline_{uuid.uuid4().hex[:8]}"
+        LOGGER.info(f"Daemon mode started, poll interval={poll_interval}s, max_per_poll={max_per_poll}, instance_id={_daemon_instance_id}")
         try:
             while not _get_shutdown()._shutdown:
-                result = route_all(consumer="pipeline")
+                reload_config()
+                result = route_all(consumer="pipeline", instance_id=_daemon_instance_id)
                 if result["routed"] > 0:
                     LOGGER.info(f"Routed {result['routed']} messages", extra={"trace_id": "-"})
                 time.sleep(poll_interval)
@@ -586,6 +355,16 @@ if __name__ == "__main__":
                     icon = {"routed": "  →", "skipped": "  ⊘", "error": "  ✗", "dry_run": "  □"}.get(d.get("action"), "  ?")
                     print(f"    {icon} #{d['id']} [{d['category']}] {d.get('action', '')} {d.get('reason', '')} {d.get('error', '')}")
             print(f"\n总路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
+    elif "--dispatch-investigator" in argv:
+        cat = argv[1] if len(argv) > 1 else "code_fix"
+        result = dispatch_investigator(category=cat, dry_run="--dry-run" in argv)
+        if has_json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            for d in result["details"]:
+                icon = {"routed": "→", "dry_run": "□"}.get(d.get("action"), "?")
+                print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned_investigator', '?')}")
+            print(f"\n分派: {result['dispatched']}/{result['total']} 条")
     else:
         msgs = poll_unconsumed()
         if has_json:

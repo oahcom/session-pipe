@@ -40,7 +40,7 @@ SIMPLE_STEPS = [
     {"id": "s1", "title": "调研", "target_role": "scout",
      "prompt_template": "请调研 {topic}", "exit_condition": {"bus_category": "architecture"},
      "max_retries": 0, "condition": "", "rollback_to": ""},
-    {"id": "s2", "title": "实现", "target_role": "developer",
+    {"id": "s2", "title": "实现", "target_role": "engineer",
      "prompt_template": "请实现 {topic}", "exit_condition": {"bus_category": "code_fix"},
      "max_retries": 1, "condition": "", "rollback_to": ""},
 ]
@@ -250,7 +250,7 @@ def test_advance_finishes():
     run.current_step = "s2"
     run.step_results["s1"] = {"status": "done", "ts": time.time()}
     eng._save_run(run)
-    eng._bb.write("code_fix", "实现了", src="developer")
+    eng._bb.write("code_fix", "实现了", src="engineer")
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -304,7 +304,7 @@ def test_conditional_step_blocks():
          "prompt_template": "调研{topic}",
          "exit_condition": {"bus_category": "notice", "text_contains": "TESTCOND_S1_DONE"},
          "max_retries": 0, "condition": "", "rollback_to": ""},
-        {"id": "s2", "title": "有条件的步骤", "target_role": "developer",
+        {"id": "s2", "title": "有条件的步骤", "target_role": "engineer",
          "prompt_template": "实现{topic}",
          "exit_condition": {"bus_category": "notice", "text_contains": "TESTCOND_S2_DONE"},
          "max_retries": 0, "condition": "s1.status == 'done'", "rollback_to": ""},
@@ -412,9 +412,11 @@ def test_run_once_empty():
 def test_run_once_missing_workflow_def():
     wf_dir = _make_wf_dir()
     eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("ghost")
-    if rid:  # 如果正常情况下不会走到这里
-        eng.run_once()
+    try:
+        eng.start("ghost")
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "ghost" in str(e)
 
 
 # ── CLI ──────────────────────────────────────────────────────────

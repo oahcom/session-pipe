@@ -1,33 +1,59 @@
 # 测试工作流文档
 
+> 验证时间：2026-07-10
+
 ## 如何运行全部测试
 
 ```bash
+# session-pipeline（132 pass / 1 fail）
 cd /home/administrator/session-pipeline
+python3 -m pytest tests/ -v
 
-# 全部测试（132 个）
-python3 tests/test_router.py           # 路由逻辑（13 个）
-python3 tests/test_integration.py      # 集成测试（12 个）
-python3 tests/test_role_interaction.py  # 角色交互（10 个）
-python3 tests/test_workflow_db.py       # WorkflowDB 数据库（36 个）
-python3 tests/test_workflow_engine.py   # WorkflowEngine 执行引擎（30 个）
-python3 tests/test_workflow_daemon.py   # WorkflowDaemon 守护进程（14 个）
-python3 tests/test_cross_component.py   # 跨组件集成（17 个）
+# hermes-session-roles（24 pass）
+cd /home/administrator/hermes-session-roles
+python3 -m pytest tests/ -v
+
+# session-launcher（22 pass / 2 fail）
+cd /home/administrator/session-launcher
+python3 -m pytest tests/ -v
 ```
 
-## 自动化测试覆盖情况
+## 已实现测试
+
+### session-pipeline（132 pass / 1 fail）
+
+| 测试文件 | 数量 | 通过 | 失败 | 覆盖模块 |
+|---------|------|------|------|----------|
+| test_workflow_db.py | 36 | 36 | 0 | Template/Task/Workflow CRUD, 权限, 状态同步, 进度计算, 链式创建, 日志审计 |
+| test_workflow_engine.py | 31 | 30 | 1 | 加载, start/status/cancel, tick/advance, 超时/重试, 条件步骤, workspace_summary, 持久化 |
+| test_cross_component.py | 17 | 17 | 0 | DB+Client 一致性, DB+Engine 联动, 并发操作, 权限规则, 链式生命周期, Bus联动 |
+| test_router.py | 13 | 13 | 0 | router.py, auto_route.py |
+| test_integration.py | 12 | 12 | 0 | bus_protocol, auto_route, reliability, router |
+| test_role_interaction.py | 10 | 10 | 0 | bus 通信, 角色交互, 路由优先级 |
+| test_workflow_daemon.py | 14 | 14 | 0 | connect_feed, push_prompt, check_and_push, daemon_loop |
+
+失败详情：
+- `test_workflow_engine.py::test_run_once_missing_workflow_def` — ValueError（workflow 定义缺失路径）
+
+### hermes-session-roles（24 pass）
 
 | 测试文件 | 数量 | 覆盖模块 |
 |---------|------|----------|
-| test_router.py | 13 | router.py, auto_route.py |
-| test_integration.py | 12 | bus_protocol, auto_route, reliability, router |
-| test_role_interaction.py | 10 | bus 通信, 角色交互, 路由优先级 |
-| test_workflow_db.py | 36 | Template/Task/Workflow CRUD, 权限, 状态同步, 进度计算, 链式创建, 日志审计 |
-| test_workflow_engine.py | 30 | 加载, start/status/cancel, tick/advance, 超时/重试, 条件步骤, workspace_summary, 持久化 |
-| test_workflow_daemon.py | 14 | connect_feed, push_prompt, check_and_push, daemon_loop |
-| test_cross_component.py | 17 | DB+Client 一致性, DB+Engine 联动, 并发操作, 权限规则, 链式生命周期, Bus联动 |
+| test_search.py | 15 | 中文/英文/同义词搜索 |
+| test_registry.py | 9 | Role/Persona 加载、注册、验证 |
 
-**总计：132 个测试**
+### session-launcher（22 pass / 2 fail）
+
+| 测试文件 | 数量 | 通过 | 失败 | 覆盖模块 |
+|---------|------|------|------|----------|
+| test_ccs_socket.py | 12 | 12 | 0 | Streamer capture, CLI send, socket 监听 |
+| test_e2e_mock.py | 12 | 10 | 2 | Session 生命周期端到端 |
+
+失败详情：
+- `test_e2e_mock.py::test_main_no_work` — assert 2 == 0（exit code 不符预期）
+- `test_e2e_mock.py::test_main_shell_output_format` — export 行输出为空
+
+**总计：180 pass / 3 fail（跨三个项目）**
 
 ## 手动测试点
 

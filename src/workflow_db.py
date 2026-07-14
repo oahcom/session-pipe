@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-DB_PATH = Path.home() / ".hermes" / "state" / "workflows.db"
+from paths import WORKFLOWS_DB as DB_PATH
 
 
 class WorkflowDB:
