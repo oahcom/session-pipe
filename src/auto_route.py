@@ -226,69 +226,154 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
 from auto_route_routing import route_all, route_to_ccs, route_all_to_ccs, dispatch_investigator
 
 
+# ── CLI 辅助函数 ──────────────────────────────────────────
+
+def _output_json(data, has_json):
+    """JSON 或 pretty-print 输出。"""
+    if has_json:
+        print(json.dumps(data, ensure_ascii=False))
+    else:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _run_daemon():
+    """守护模式入口：单实例锁 → 持续轮询。"""
+    import signal
+    _PID_DIR = Path("/tmp")
+    _PID_FILE = _PID_DIR / "session-pipeline-daemon.pid"
+
+    if _PID_FILE.exists():
+        try:
+            old_pid = int(_PID_FILE.read_text())
+            os.kill(old_pid, 0)
+            print(f"Daemon already running (PID={old_pid}). Exiting.")
+            sys.exit(1)
+        except (OSError, ValueError):
+            pass
+    _PID_FILE.write_text(str(os.getpid()))
+
+    from config_loader import get_config
+    cfg = get_config()
+    poll_interval = cfg.nested_get("bus", "poll_interval", default=60)
+    log_level = getattr(logging, cfg.nested_get("logging", "level", default="INFO"))
+    log_json = cfg.nested_get("logging", "json_output", default=True)
+    setup_logging(level=log_level, json_output=log_json)
+
+    start_background_services()
+    get_router().load_from_db()
+    _daemon_instance_id = f"pipeline_{uuid.uuid4().hex[:8]}"
+    LOGGER.info(f"Daemon started, poll_interval={poll_interval}s, instance_id={_daemon_instance_id}")
+    try:
+        while not _get_shutdown()._shutdown:
+            reload_config()
+            result = route_all(consumer="pipeline", instance_id=_daemon_instance_id)
+            if result["routed"] > 0:
+                LOGGER.info(f"Routed {result['routed']} messages", extra={"trace_id": "-"})
+            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        LOGGER.info("Shutting down...")
+    finally:
+        stop_background_services()
+        _PID_FILE.unlink(missing_ok=True)
+        LOGGER.info("Daemon stopped")
+
+
+def _cli_route_all(argv, flags, has_json):
+    """--route-all CLI。"""
+    consumer = argv[1] if len(argv) > 1 else "pipeline"
+    result = route_all(consumer=consumer, dry_run="--dry-run" in flags)
+    if has_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for d in result["details"]:
+            icon = "→" if d.get("assigned") else "✗"
+            print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned', 'none')}")
+        print(f"\n路由: {result['routed']}/{result['total']} 条")
+
+
+def _cli_consume(argv, has_json):
+    """--consume CLI。"""
+    fid = int(argv[1])
+    cat = argv[2]
+    c = argv[3] if len(argv) > 3 else "claude"
+    result = consume_with_linkage(fid, cat, c)
+    _output_json(result, has_json)
+
+
+def _cli_route_to_ccs(argv, dry_run, has_json):
+    """--route-to-ccs CLI。"""
+    if len(argv) < 2:
+        print("Usage: --route-to-ccs <role_name> [--dry-run]", file=sys.stderr)
+        sys.exit(1)
+    role = argv[1]
+    result = route_to_ccs(role, dry_run=dry_run)
+    if has_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for d in result["details"]:
+            icon = {"routed": "→", "skipped": "⊘", "error": "✗", "dry_run": "□"}.get(d.get("action"), "?")
+            print(f"  {icon} #{d['id']} [{d['category']}] {d.get('action', '')} {d.get('reason', '')} {d.get('error', '')}")
+        print(f"\n路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
+        if result.get("warning"):
+            print(f"警告: {result['warning']}")
+
+
+def _cli_route_all_to_ccs(dry_run, has_json):
+    """--route-all-to-ccs CLI。"""
+    result = route_all_to_ccs(dry_run=dry_run)
+    if has_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for rd in result["details"]:
+            print(f"  {rd['role']}: {rd['routed']}/{rd['total']} routed")
+            for d in rd.get("details", []):
+                icon = {"routed": "  →", "skipped": "  ⊘", "error": "  ✗", "dry_run": "  □"}.get(d.get("action"), "  ?")
+                print(f"    {icon} #{d['id']} [{d['category']}] {d.get('action', '')} {d.get('reason', '')} {d.get('error', '')}")
+        print(f"\n总路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
+
+
+def _cli_dispatch_investigator(argv, dry_run, has_json):
+    """--dispatch-investigator CLI。"""
+    cat = argv[1] if len(argv) > 1 else "code_fix"
+    result = dispatch_investigator(category=cat, dry_run=dry_run)
+    if has_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for d in result["details"]:
+            icon = {"routed": "→", "dry_run": "□"}.get(d.get("action"), "?")
+            print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned_investigator', '?')}")
+        print(f"\n分派: {result['dispatched']}/{result['total']} 条")
+
+
 if __name__ == "__main__":
     import signal
     has_json = "--json" in sys.argv
     argv = [a for a in sys.argv[1:] if a != "--json"]
+    flags = set(argv)
+    _daemon_flag = "--daemon" in flags
+    _health_flag = "--health" in flags
+    _status_flag = "--status" in flags
+    _metrics_flag = "--metrics" in flags
+    _ack_stats_flag = "--ack-stats" in flags
+    _ack_retry_flag = "--ack-retry" in flags
+    _config_flag = "--config" in flags
+    _route_all_flag = "--route-all" in flags
+    _consume_flag = "--consume" in flags
+    _routetoccs_flag = "--route-to-ccs" in flags
+    _routetoccsall_flag = "--route-all-to-ccs" in flags
+    _dispatch_flag = "--dispatch-investigator" in flags
+    _dry_run = "--dry-run" in flags
 
-    if "--daemon" in argv:
-        # 守护模式：单实例锁 + 启动后台服务 → 持续轮询
-        _PID_DIR = Path("/tmp")
-        _PID_FILE = _PID_DIR / "session-pipeline-daemon.pid"
-
-        if _PID_FILE.exists():
-            try:
-                old_pid = int(_PID_FILE.read_text())
-                os.kill(old_pid, 0)  # check if alive
-                print(f"Daemon already running (PID={old_pid}). Exiting.")
-                sys.exit(1)
-            except (OSError, ValueError):
-                pass  # stale PID, overwrite
-        _PID_FILE.write_text(str(os.getpid()))
-
-        from config_loader import get_config
-        cfg = get_config()
-        poll_interval = cfg.nested_get("bus", "poll_interval", default=60)
-        max_per_poll = cfg.nested_get("bus", "max_messages_per_poll", default=100)
-
-        # 应用日志配置
-        log_level = getattr(logging, cfg.nested_get("logging", "level", default="INFO"))
-        log_json = cfg.nested_get("logging", "json_output", default=True)
-        setup_logging(level=log_level, json_output=log_json)
-
-        start_background_services()
-        # 启动时从 DB 加载最新路由表
-        get_router().load_from_db()
-        _daemon_instance_id = f"pipeline_{uuid.uuid4().hex[:8]}"
-        LOGGER.info(f"Daemon mode started, poll interval={poll_interval}s, max_per_poll={max_per_poll}, instance_id={_daemon_instance_id}")
-        try:
-            while not _get_shutdown()._shutdown:
-                reload_config()
-                result = route_all(consumer="pipeline", instance_id=_daemon_instance_id)
-                if result["routed"] > 0:
-                    LOGGER.info(f"Routed {result['routed']} messages", extra={"trace_id": "-"})
-                time.sleep(poll_interval)
-        except KeyboardInterrupt:
-            LOGGER.info("Keyboard interrupt, shutting down...", extra={"trace_id": "-"})
-        finally:
-            stop_background_services()
-            _PID_FILE.unlink(missing_ok=True)
-            LOGGER.info("Daemon stopped", extra={"trace_id": "-"})
-    elif "--status" in argv:
-        s = status()
-        if has_json:
-            print(json.dumps(s, ensure_ascii=False))
-        else:
-            print(json.dumps(s, ensure_ascii=False, indent=2))
-    elif "--health" in argv:
-        hc = health_check()
-        if has_json:
-            print(json.dumps(hc, ensure_ascii=False))
-        else:
-            print(json.dumps(hc, ensure_ascii=False, indent=2))
-    elif "--metrics" in argv:
+    # ── dispatch ──
+    if _daemon_flag:
+        _run_daemon()
+    elif _status_flag:
+        _output_json(status(), has_json)
+    elif _health_flag:
+        _output_json(health_check(), has_json)
+    elif _metrics_flag:
         print(METRICS.export_prometheus())
-    elif "--ack-stats" in argv:
+    elif _ack_stats_flag:
         stats = ACK_TRACKER.ack_stats()
         if has_json:
             print(json.dumps(stats, ensure_ascii=False))
@@ -296,75 +381,24 @@ if __name__ == "__main__":
             print(f"ACKs: {stats['total']} total")
             for s, c in sorted(stats["by_status"].items()):
                 print(f"  {s}: {c}")
-    elif "--ack-retry" in argv:
+    elif _ack_retry_flag:
         from bus_protocol import Blackboard
         bb = Blackboard()
         retried = ACK_TRACKER.retry_failed(bb)
         print(json.dumps({"retried": retried}, ensure_ascii=False))
-    elif "--config" in argv:
+    elif _config_flag:
         from config_loader import get_config
-        cfg = get_config()
-        if has_json:
-            print(json.dumps(cfg.to_dict(), ensure_ascii=False))
-        else:
-            print(json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2))
-    elif "--route-all" in argv:
-        consumer = argv[1] if len(argv) > 1 else "pipeline"
-        result = route_all(consumer=consumer, dry_run="--dry-run" in argv)
-        if has_json:
-            print(json.dumps(result, ensure_ascii=False))
-        else:
-            for d in result["details"]:
-                status_icon = "→" if d.get("assigned") else "✗"
-                print(f"  {status_icon} #{d['id']} [{d['category']}] → {d.get('assigned', 'none')}")
-            print(f"\n路由: {result['routed']}/{result['total']} 条")
-    elif "--consume" in argv and len(argv) >= 3:
-        fid = int(argv[1])
-        cat = argv[2]
-        c = argv[3] if len(argv) > 3 else "claude"
-        result = consume_with_linkage(fid, cat, c)
-        if has_json:
-            print(json.dumps(result, ensure_ascii=False))
-        else:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-    elif "--route-to-ccs" in argv:
-        if len(argv) < 2:
-            print("Usage: --route-to-ccs <role_name> [--dry-run]", file=sys.stderr)
-            sys.exit(1)
-        role = argv[1]
-        dry_run = "--dry-run" in argv
-        result = route_to_ccs(role, dry_run=dry_run)
-        if has_json:
-            print(json.dumps(result, ensure_ascii=False))
-        else:
-            for d in result["details"]:
-                icon = {"routed": "→", "skipped": "⊘", "error": "✗", "dry_run": "□"}.get(d.get("action"), "?")
-                print(f"  {icon} #{d['id']} [{d['category']}] {d.get('action', '')} {d.get('reason', '')} {d.get('error', '')}")
-            print(f"\n路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
-            if result.get("warning"):
-                print(f"警告: {result['warning']}")
-    elif "--route-all-to-ccs" in argv:
-        dry_run = "--dry-run" in argv
-        result = route_all_to_ccs(dry_run=dry_run)
-        if has_json:
-            print(json.dumps(result, ensure_ascii=False))
-        else:
-            for role_detail in result["details"]:
-                print(f"  {role_detail['role']}: {role_detail['routed']}/{role_detail['total']} routed")
-                for d in role_detail["details"]:
-                    icon = {"routed": "  →", "skipped": "  ⊘", "error": "  ✗", "dry_run": "  □"}.get(d.get("action"), "  ?")
-                    print(f"    {icon} #{d['id']} [{d['category']}] {d.get('action', '')} {d.get('reason', '')} {d.get('error', '')}")
-            print(f"\n总路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
-    elif "--dispatch-investigator" in argv:
-        cat = argv[1] if len(argv) > 1 else "code_fix"
-        result = dispatch_investigator(category=cat, dry_run="--dry-run" in argv)
-        if has_json:
-            print(json.dumps(result, ensure_ascii=False))
-        else:
-            for d in result["details"]:
-                icon = {"routed": "→", "dry_run": "□"}.get(d.get("action"), "?")
-                print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned_investigator', '?')}")
-            print(f"\n分派: {result['dispatched']}/{result['total']} 条")
+        _output_json(get_config().to_dict(), has_json)
+    elif _route_all_flag:
+        _cli_route_all(argv, flags, has_json)
+    elif _consume_flag and len(argv) >= 3:
+        _cli_consume(argv, has_json)
+    elif _routetoccs_flag:
+        _cli_route_to_ccs(argv, _dry_run, has_json)
+    elif _routetoccsall_flag:
+        _cli_route_all_to_ccs(_dry_run, has_json)
+    elif _dispatch_flag:
+        _cli_dispatch_investigator(argv, _dry_run, has_json)
     else:
         msgs = poll_unconsumed()
         if has_json:
