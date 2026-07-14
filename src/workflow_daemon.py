@@ -98,6 +98,7 @@ def check_and_push():
 
 
 import os
+import threading
 import signal
 
 _PID_FILE = Path("/tmp/workflow-daemon.pid")
@@ -124,8 +125,9 @@ def daemon_loop(interval: int):
     def _handler(s, f):
         nonlocal shutdown; shutdown = True
     
-    signal.signal(signal.SIGTERM, _handler)
-    signal.signal(signal.SIGINT, _handler)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _handler)
     
     print(f"[daemon] 🚀 Workflow Daemon 启动 PID={os.getpid()}, 间隔 {interval}s")
 

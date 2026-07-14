@@ -49,8 +49,8 @@ def _cleanup(bb: Blackboard):
 
 
 def _check(msg: str, cond: bool):
-    print(f"  {'✅' if cond else '❌'} {msg}")
-    return cond
+    assert cond, msg
+    print(f"  ✅ {msg}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -70,7 +70,7 @@ def test_scenario_architect_receives_design_request():
 
     unconsumed = bb.unconsumed()
     found = [f for f in unconsumed if f.id == fid]
-    return _check("coordinator → architecture bus: 消息可读到", len(found) == 1)
+    _check("coordinator → architecture bus: 消息可读到", len(found) == 1)
 
 
 def test_scenario_architect_publishes_prd():
@@ -102,11 +102,10 @@ def test_scenario_architect_publishes_system_design():
 
     unconsumed = bb.unconsumed()
     found = [f for f in unconsumed if f.id == fid]
-    ok = _check("product_architect → system_design bus: 设计可存储", len(found) == 1)
+    _check("product_architect → system_design bus: 设计可存储", len(found) == 1)
 
     # 验证设计内容包含 Mermaid 图
-    ok &= _check("system_design 含 Mermaid 图", "mermaid" in design_md)
-    return ok
+    _check("system_design 含 Mermaid 图", "mermaid" in design_md)
 
 
 def test_scenario_architect_publishes_task_spec():
@@ -129,14 +128,13 @@ def test_scenario_architect_publishes_task_spec():
 
     unconsumed = bb.unconsumed()
     found = [f for f in unconsumed if f.id == fid]
-    ok = _check("product_architect → task_spec bus: 任务可发布", len(found) == 1)
+    _check("product_architect → task_spec bus: 任务可发布", len(found) == 1)
 
     # 验证任务格式正确
-    ok &= _check("任务分解 JSON 可解析", len(tasks) >= 1)
-    ok &= _check(f"切片数正确: T1/T2/T3 = {len(tasks)}", len(tasks) == 3)
+    _check("任务分解 JSON 可解析", len(tasks) >= 1)
+    _check(f"切片数正确: T1/T2/T3 = {len(tasks)}", len(tasks) == 3)
     for t in tasks:
-        ok &= _check(f"'{t['title']}' 有验收标准", len(t['acceptance_criteria']) >= 1)
-    return ok
+        _check(f"'{t['title']}' 有验收标准", len(t['acceptance_criteria']) >= 1)
 
 
 def test_scenario_coordinator_detects_tasks():
@@ -149,12 +147,11 @@ def test_scenario_coordinator_detects_tasks():
     routing = router.routing
 
     # 验证 coordinator 消费 task_spec
-    ok = True
     if "coordinator" in routing:
         consume = routing["coordinator"].get("consume", [])
-        ok = _check("coordinator 消费 task_spec", "task_spec" in consume or "*" in consume)
+        _check("coordinator 消费 task_spec", "task_spec" in consume or "*" in consume)
     else:
-        ok = _check("coordinator 在路由表中 (fallback)", "coordinator" in routing)
+        _check("coordinator 在路由表中 (fallback)", "coordinator" in routing)
 
     # 验证优先级排序
     priorities = {
@@ -163,20 +160,18 @@ def test_scenario_coordinator_detects_tasks():
         "system_design": priority("system_design"),
         "task_spec": priority("task_spec"),
     }
-    ok &= _check("security(1) < prd(4)", priorities["security"] < priorities["prd"])
-    ok &= _check("prd(4) < system_design(5)", priorities["prd"] < priorities["system_design"])
-    ok &= _check("system_design(5) < task_spec(6)", priorities["system_design"] < priorities["task_spec"])
+    _check("security(1) < prd(4)", priorities["security"] < priorities["prd"])
+    _check("prd(4) < system_design(5)", priorities["prd"] < priorities["system_design"])
+    _check("system_design(5) < task_spec(6)", priorities["system_design"] < priorities["task_spec"])
 
     # 验证 product_architect 能产出设计任务
     if "product_architect" in routing:
         produce = routing["product_architect"].get("produce", [])
-        ok &= _check("product_architect 产出 prd", "prd" in produce)
-        ok &= _check("product_architect 产出 system_design", "system_design" in produce)
-        ok &= _check("product_architect 产出 task_spec", "task_spec" in produce)
+        _check("product_architect 产出 prd", "prd" in produce)
+        _check("product_architect 产出 system_design", "system_design" in produce)
+        _check("product_architect 产出 task_spec", "task_spec" in produce)
     else:
-        ok = _check("product_architect 在路由表中", "product_architect" in routing)
-
-    return ok
+        _check("product_architect 在路由表中", "product_architect" in routing)
 
 
 def test_scenario_developer_consumes_tasks():
@@ -208,9 +203,9 @@ def test_scenario_developer_consumes_tasks():
         if f.id == fix_id:
             fix_consumers.append(f)
 
-    ok = _check("developer → code_fix: 实现可验证", len(fix_consumers) >= 1)
-    ok &= _check("code_fix 关联到原始 task_spec", str(task_id) in [f.e for f in fix_consumers][0] if fix_consumers else "")
-    return ok
+    _check("developer → code_fix: 实现可验证", len(fix_consumers) >= 1)
+    if fix_consumers:
+        _check("code_fix 关联到原始 task_spec", str(task_id) in [f.e for f in fix_consumers][0])
 
 
 def test_scenario_closer_closes_loop():
@@ -236,12 +231,7 @@ def test_scenario_closer_closes_loop():
 
     unconsumed = bb.unconsumed()
     open_tasks = [f for f in unconsumed if f.id == final_fix or f.id == closer_note]
-    ok = _check("closer → architecture: 闭环通知可写入", closer_note > 0)
-
-    # 验证闭环报告包含引用信息
-    unread = bb.unconsumed()
-    closer_msgs = [f for f in unread if f.cat == "architecture" and "closer" in f.src]
-    return ok
+    _check("closer → architecture: 闭环通知可写入", closer_note > 0)
 
 
 def test_scenario_product_design_request_product_architect():
@@ -258,14 +248,13 @@ def test_scenario_product_design_request_product_architect():
 
     unconsumed = bb.unconsumed()
     found = [f for f in unconsumed if f.id == fid]
-    ok = _check("product_design 分类: 可存储", len(found) == 1)
+    _check("product_design 分类: 可存储", len(found) == 1)
 
     # 验证 product_architect 能消费此分类
     from router import get_router
     router = get_router()
     consumers = router.get_consumers("product_design")
-    ok &= _check("product_design → 架构师可消费", "product_architect" in consumers)
-    return ok
+    _check("product_design → 架构师可消费", "product_architect" in consumers)
 
 
 def test_scenario_blocker_escalation():
@@ -282,15 +271,14 @@ def test_scenario_blocker_escalation():
 
     unconsumed = bb.unconsumed()
     found = [f for f in unconsumed if f.id == blocker_id]
-    ok = _check("blocker 分类: 开发者可提阻塞", len(found) == 1)
+    _check("blocker 分类: 开发者可提阻塞", len(found) == 1)
 
     # 模拟架构师回复
     unblock_id = bb.write("blocker", _tag("[product_architect] RE: 告警聚合去重窗口"),
                            evidence="回复: 按同一title去重, 窗口1分钟\n原问题: bus#" + str(blocker_id),
                            src="product_architect")
     _CLEANUP_IDS.append(unblock_id)
-    ok &= _check("blocker 分类: 架构师可回复阻塞", unblock_id > 0)
-    return ok
+    _check("blocker 分类: 架构师可回复阻塞", unblock_id > 0)
 
 
 def test_scenario_design_issue_feedback():
@@ -307,17 +295,16 @@ def test_scenario_design_issue_feedback():
 
     unconsumed = bb.unconsumed()
     found = [f for f in unconsumed if f.id == issue_id]
-    ok = _check("design_issue 分类: 开发者可反馈设计问题", len(found) == 1)
+    _check("design_issue 分类: 开发者可反馈设计问题", len(found) == 1)
 
     # 验证架构师能消费
     from router import get_router
     router = get_router()
     consumers = router.get_consumers("design_issue")
-    ok &= _check("design_issue → 架构师可消费", "product_architect" in consumers or any(
+    _check("design_issue → 架构师可消费", "product_architect" in consumers or any(
         c.get("consume", []) == ["*"] or "design_issue" in c.get("consume", [])
         for c in [{}, {}]
     ))
-    return ok
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -350,13 +337,10 @@ def main():
     passed = 0
     failed = 0
     for name, fn in tests:
-        print(f"  [{name.replace(chr(40),'').replace(chr(41),'')}]")
+        print(f"  [{name}]")
         try:
-            ok = fn()
-            if ok:
-                passed += 1
-            else:
-                failed += 1
+            fn()
+            passed += 1
         except Exception as e:
             print(f"      ❌ 异常: {e}")
             import traceback
