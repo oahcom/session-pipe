@@ -43,7 +43,7 @@ def test_connect_feed_sets_timeout(mock_socket_cls):
 
 # ── push_prompt_to_ccs ──────────────────────────────────────────
 
-@patch("workflow_daemon.connect_feed")
+@patch("pipeflow.daemon.connect_feed")
 def test_push_prompt_sends_publish(mock_connect):
     mock_sock = MagicMock()
     mock_connect.return_value = mock_sock
@@ -58,14 +58,14 @@ def test_push_prompt_sends_publish(mock_connect):
     mock_sock.close.assert_called_once()
 
 
-@patch("workflow_daemon.connect_feed")
+@patch("pipeflow.daemon.connect_feed")
 def test_push_prompt_handles_connection_error(mock_connect):
     mock_connect.side_effect = ConnectionRefusedError("socket not available")
     ok = daemon.push_prompt_to_ccs("dev", "test")
     assert not ok
 
 
-@patch("workflow_daemon.connect_feed")
+@patch("pipeflow.daemon.connect_feed")
 def test_push_prompt_handles_timeout(mock_connect):
     mock_connect.side_effect = socket.timeout("timeout")
     ok = daemon.push_prompt_to_ccs("dev", "test")
@@ -74,8 +74,8 @@ def test_push_prompt_handles_timeout(mock_connect):
 
 # ── check_and_push — need mock WorkflowDB ───────────────────────
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_with_pending(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -105,8 +105,8 @@ def test_check_and_push_with_pending(mock_push, mock_db_cls):
     mock_db.close.assert_called_once()
 
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_skips_empty(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -116,8 +116,8 @@ def test_check_and_push_skips_empty(mock_push, mock_db_cls):
     mock_db.close.assert_called_once()
 
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_no_template_id(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -130,8 +130,8 @@ def test_check_and_push_no_template_id(mock_push, mock_db_cls):
     mock_db.close.assert_called_once()
 
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_missing_template(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -145,8 +145,8 @@ def test_check_and_push_missing_template(mock_push, mock_db_cls):
     mock_db.close.assert_called_once()
 
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_empty_steps(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -162,8 +162,8 @@ def test_check_and_push_empty_steps(mock_push, mock_db_cls):
     mock_db.close.assert_called_once()
 
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_replaces_context_vars(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -185,8 +185,8 @@ def test_check_and_push_replaces_context_vars(mock_push, mock_db_cls):
     mock_db.close.assert_called_once()
 
 
-@patch("workflow_daemon.WorkflowDB")
-@patch("workflow_daemon.push_prompt_to_ccs")
+@patch("pipeflow.daemon.WorkflowDB")
+@patch("pipeflow.daemon.push_prompt_to_ccs")
 def test_check_and_push_push_failure_does_not_update(mock_push, mock_db_cls):
     mock_db = MagicMock()
     mock_db_cls.return_value = mock_db
@@ -210,7 +210,7 @@ def test_check_and_push_push_failure_does_not_update(mock_push, mock_db_cls):
 
 # ── daemon_loop (smoke test) ────────────────────────────────────
 
-@patch("workflow_daemon.check_and_push")
+@patch("pipeflow.daemon.check_and_push")
 def test_daemon_loop_interrupt(mock_check):
     """daemon_loop 收到异常后继续运行。"""
     call_count = 0

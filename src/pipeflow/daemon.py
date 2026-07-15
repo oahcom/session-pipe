@@ -10,8 +10,11 @@ Workflow Daemon — 监控 workflow 表，推送 prompt 给运行中的 CCS。
 """
 
 import json
+import os
+import signal
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -93,11 +96,6 @@ def check_and_push():
                         print(f"[daemon] 📤 workflow {instance_id} → {assignee}")
     finally:
         db.close()
-
-
-import os
-import threading
-import signal
 
 _PID_FILE = Path("/tmp/workflow-daemon.pid")
 
