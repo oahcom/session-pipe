@@ -14,7 +14,7 @@ if str(_HERMES_SCRIPTS) not in sys.path:
     sys.path.insert(1, str(_HERMES_SCRIPTS))
 
 from config_loader import get_config
-from router import get_router, CATEGORY_DESC, priority
+import router as _rt_mod
 from composite_runner import CompositeRunner
 
 from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, GRACEFUL_SHUTDOWN
@@ -48,7 +48,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     from auto_route import poll_unconsumed as _poll
 
     bb = Blackboard()
-    router = get_router()
+    router = _rt_mod.get_router()
     messages = _poll(consumer=consumer, instance_id=instance_id)
     if not messages or "error" in messages[0]:
         METRICS.inc("route_errors_total")
@@ -147,95 +147,77 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     return result
 
 
-def route_to_ccs(role_name: str, dry_run: bool = False) -> dict:
-    """将指定角色应消费的 bus 消息通过 launcher.send_to_ccs() 推送给对应的 CCS。
+def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
+    """将指定角色应消费的 bus 消息通过 ccs.py send 推送给对应的 CCS。
 
-    role_name: 角色名（如 maintainer、scout）
-    dry_run: 仅展示分配方案，不实际发送
-
-    如果 CCS 未启动 -> 发一条警告而不是自动启动（由 cron_worker/daemon 负责启动）。
-    返回路由结果字典。
+    dry_run=True 时只展示分配方案。
     """
-    router = get_router()
-    messages = router.unconsumed_by_role(role_name)
+    from auto_route import poll_unconsumed as _poll
+    from routing.rdb import RoutingDB as _RDB
 
-    if not messages or (len(messages) == 1 and "error" in messages[0]):
-        return {
-            "role": role_name,
-            "routed": 0,
-            "total": 0,
-            "dry_run": dry_run,
-            "details": [],
-        }
+    router = _rt_mod.get_router()
+    category_limit = 10
 
-    # 延迟导入 launcher（避免启动时循环依赖）
-    from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
-    _launcher_src = str(_LAUNCHER_SRC)
-    if _launcher_src not in sys.path:
-        sys.path.insert(0, _launcher_src)
-    from launcher import send_to_ccs, is_ccs_running
+    # 消费该角色未消费的消息
+    messages = _poll(consumer=role_name, limit=category_limit)
+    if not messages or "error" in messages[0]:
+        return {"role": role_name, "routed": 0, "total": 0, "dry_run": dry_run, "details": []}
 
-    # 检查 CCS 是否运行（dry_run 时跳过）
-    running = is_ccs_running(role_name) if not dry_run else None
+    # 子进程调 ccs.py 发消息，规避 routing 包名冲突
+    _ccs_cli = str(Path.home() / "session-launcher" / "src" / "ccs.py")
+    _launcher_env = {**os.environ, "PYTHONPATH": str(Path.home() / "session-launcher" / "src")}
 
-    details: list[dict] = []
+    def _send(role, msg):
+        import subprocess as _sp, json as _json
+        r = _sp.run([sys.executable, _ccs_cli, "send", "--from", "pipeline", role, msg],
+                     capture_output=True, text=True, timeout=15, env=_launcher_env)
+        err = ""
+        if r.returncode != 0:
+            try: err = _json.loads(r.stdout).get("error", r.stderr[:100])
+            except: err = r.stderr[:100] or "exit=" + str(r.returncode)
+        return {"success": r.returncode == 0, "sent_chars": len(msg), "error": err}
+
+    def _is_running(role):
+        import subprocess as _sp
+        r = _sp.run([sys.executable, _ccs_cli, "status-role", role],
+                     capture_output=True, text=True, timeout=10, env=_launcher_env)
+        return "未运行" not in r.stdout
+
+    running = _is_running(role_name) if not dry_run else None
+    details = []
+    body_facts: list[dict] = []
+
     for msg in messages:
-        # 压缩 title + evidence 为自然语言
-        text = msg.get("text", "")
-        evidence = msg.get("evidence", "")
-        body = f"{text}\n\n{evidence}" if evidence else text
+        if "error" in msg:
+            continue
+        body = f"[{msg['category']}] {msg['text']}"
+        if msg.get("evidence"):
+            body += f"\n证据: {msg['evidence']}"
+        body_facts.append({"id": msg["id"], "category": msg["category"],
+                           "text": body[:500], "consumers": msg.get("consumers", [])})
 
         if dry_run:
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "body_preview": body[:120],
-                "action": "dry_run",
-            })
+            details.append({"id": msg["id"], "category": msg["category"],
+                            "action": "dry_run", "body_preview": body[:100]})
             continue
 
         if not running:
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "action": "skipped",
-                "reason": f"CCS {role_name} 未启动",
-            })
+            details.append({"id": msg["id"], "category": msg["category"],
+                            "action": "skipped", "reason": f"CCS {role_name} 未启动"})
             continue
 
-        result = send_to_ccs(role_name, body)
+        result = _send(role_name, body)
         if result.get("success"):
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "action": "routed",
-                "sent_chars": result.get("sent_chars", 0),
-            })
+            details.append({"id": msg["id"], "category": msg["category"],
+                            "action": "routed", "sent_chars": result.get("sent_chars", 0)})
         else:
-            details.append({
-                "id": msg["id"],
-                "category": msg["category"],
-                "action": "error",
-                "error": result.get("error", ""),
-            })
+            details.append({"id": msg["id"], "category": msg["category"],
+                            "action": "failed", "error": result.get("error", "unknown")})
 
-    routed = sum(1 for d in details if d.get("action") == "routed")
-    out = {
-        "role": role_name,
-        "routed": routed,
-        "total": len(messages),
-        "dry_run": dry_run,
-        "details": details,
-    }
-    if not dry_run and not running:
-        out["warning"] = f"CCS {role_name} 未启动，消息未推送（由 cron_worker/daemon 负责启动）"
-
-    HEARTBEAT.beat(role_name)
+    result = {"role": role_name, "routed": sum(1 for d in details if d["action"] == "routed"),
+              "total": len(messages), "dry_run": dry_run, "details": details}
     METRICS.inc("route_to_ccs_count", labels={"role": role_name})
-    LOGGER.info(f"Route-to-CCS {role_name}: {routed}/{len(messages)} routed (dry_run={dry_run})",
-                extra={"trace_id": "-"})
-    return out
-
+    return result
 
 def route_all_to_ccs(dry_run: bool = False) -> dict:
     """对所有有未消费消息的角色，并行调用 route_to_ccs()。
@@ -244,7 +226,7 @@ def route_all_to_ccs(dry_run: bool = False) -> dict:
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    router = get_router()
+    router = _rt_mod.get_router()
     roles = list(router.routing.keys())
     details: list[dict] = []
 
@@ -276,6 +258,26 @@ def route_all_to_ccs(dry_run: bool = False) -> dict:
     return result
 
 
+_INVESTIGATOR_PYTHON_KEYWORDS = ["python", "traceback", "importerror", "typeerror",
+    "valueerror", "keyerror", "attributeerror", "indentationerror", "modulenotfounderror",
+    "zerodivisionerror", "filenotfounderror", "jsondecode", "unicodedecode",
+    "sqlite3", "sqlalchemy", "django", "flask", "fastapi", "pytest", "unittest",
+    ".py", "requirements.txt", "pip install", "poetry", "pipenv", "setup.py",
+    "pyproject.toml", "site-packages", "egg-info", "__pycache__", ".pyc"]
+
+_INVESTIGATOR_SENIOR_KEYWORDS = ["crash", "segfault", "oom", "deadlock", "race",
+    "memory leak", "file descriptor leak", "socket hang", "connection refused",
+    "timeout", "corruption", "data loss", "inconsistency", "infinite loop",
+    "stack overflow", "concurrent", "mutex", "semaphore", "thread safe",
+    "distributed", "cascade", "thundering herd", "split brain",
+    "replication lag", "quorum", "consensus", "raft", "paxos",
+    "kernel", "systemd", "cgroup", "namespace", "overlayfs", "cni",
+    "iptables", "ebpf", "tcpdump", "tcp", "udp", "dns", "tls", "ssl",
+    "webrtc", "sip", "rtp", "h264", "h265", "opus", "ffmpeg", "gstreamer",
+    "cross-platform", "cross-architecture", "endian", "alignment", "mmap",
+    "dma", "interrupt", "firmware", "driver", "kernel module"]
+
+
 def _match_investigator(evidence: str) -> str:
     """根据证据文本匹配 investigator 角色。"""
     if not evidence:
@@ -299,7 +301,7 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
     dry_run: 仅展示分配方案，不实际路由
     """
     from bus_protocol import Blackboard
-    router = get_router()
+    router = _rt_mod.get_router()
 
     bb = Blackboard()
     facts = bb.read(cat=category, limit=50)

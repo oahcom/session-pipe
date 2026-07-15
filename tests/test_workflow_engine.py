@@ -19,9 +19,9 @@ if _PIPELINE_SRC not in sys.path:
 from workflow_engine import WorkflowEngine, WorkflowDef, WorkflowRun, Step
 
 # Patch _TIMEOUT_GRACE to make timeout tests fast (not wait 10+ seconds)
-import workflow_engine
-_orig_grace = workflow_engine._TIMEOUT_GRACE
-workflow_engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
+import pipeflow.engine
+_orig_grace = pipeflow.engine._TIMEOUT_GRACE
+pipeflow.engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
 
 
 def _make_wf_dir():
@@ -189,7 +189,7 @@ def test_tick_completes_on_last_step():
     _write_wf(wf_dir, "quick", single_step)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("quick", {"topic": "x"})
-    eng._bb.write("code_fix", "完成了", src="test")
+    eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -250,7 +250,7 @@ def test_advance_finishes():
     run.current_step = "s2"
     run.step_results["s1"] = {"status": "done", "ts": time.time()}
     eng._save_run(run)
-    eng._bb.write("code_fix", "实现了", src="engineer")
+    eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"

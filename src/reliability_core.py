@@ -25,10 +25,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
-# 将 hermes scripts 加入路径（环境变量优先，回退 HOME）
-_HERMES_SCRIPTS = Path(os.environ.get("HERMES_SCRIPTS_DIR", Path.home() / ".hermes" / "scripts"))
-if str(_HERMES_SCRIPTS) not in sys.path:
-    sys.path.insert(1, str(_HERMES_SCRIPTS))
+from paths import ensure_paths
+ensure_paths()
 
 # 持久化 cursor 存储（Fix 6：防重启重复处理）
 _CURSOR_DB = Path(os.environ.get(
@@ -331,7 +329,7 @@ class ConsumerHeartbeat:
 
 class TtlPruner:
     """定期调用 bus_protocol.Blackboard.prune() 清理过期消息。"""
-    def __init__(self, max_age_days: int = 90, max_facts: int = 10000, interval: float = 3600.0):
+    def __init__(self, max_age_days: int = 7, max_facts: int = 5000, interval: float = 900.0):
         self.max_age_days = max_age_days
         self.max_facts = max_facts
         self.interval = interval

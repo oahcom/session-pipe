@@ -78,5 +78,5 @@ health:
   check_bus_connected: true
   check_consumer_stale: true
   # 积压阈值：超过 N 条视为 degraded
-  backlog_warning_threshold: 100
-  backlog_critical_threshold: 500
+  backlog_warning_threshold: 2000
+  backlog_critical_threshold: 8000

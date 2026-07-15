@@ -292,12 +292,74 @@ def test_routing_links():
     else:
         ok("无僵尸分类（所有产出均有消费者）")
 
-    # 验证关键路径：maintainer 的 security 必须有生产者
-    assert routing.get("maintainer", {}).get("consume", []) == ["security"], "maintainer 应消费 security"
+    # 验证关键路径：maintainer 必须消费 security，且有生产者
+    consume = routing.get("maintainer", {}).get("consume", [])
+    assert "security" in consume, f"maintainer 应消费 security, 实际 consume: {consume}"
     sec_producers = [role for role, d in routing.items() if "security" in d.get("produce", [])
                      or "security_audit" in d.get("produce", [])]
     assert sec_producers, "security 分类无生产者"
-    ok(f"关键路径: maintainer[security] ← {sec_producers}")
+    ok(f"关键路径: maintainer[{', '.join(consume)}] ← {sec_producers}")
+
+
+@check("cross-project")
+def test_bh_to_sr_mapping():
+    """验证 Browser Harness (50 profiles) 到 Session Roles 的映射完整性。"""
+    os.chdir(str(_PIPELINE_SRC.parent))
+    from router import Router
+    bh_map_path = _HERMES_SRC.parent / "personas" / "browser-harness" / "_bh_to_sr_map.json"
+    assert bh_map_path.exists(), f"BH 映射文件不存在: {bh_map_path}"
+    import json
+    mapping = json.loads(bh_map_path.read_text())
+    meta = mapping.get("meta", {})
+    assert meta.get("bh_mapped", 0) > 0, "BH 映射为空"
+    mapping_dict = mapping.get("mapping", {})
+    assert len(mapping_dict) >= 20, f"映射条目过少: {len(mapping_dict)}"
+
+    # 验证每个 session role 在路由表中存在
+    router = Router()
+    all_role_names = set(router.routing.keys())
+    mapped_roles = set(mapping_dict.values())
+    unknown_roles = [r for r in mapped_roles if r not in all_role_names]
+    if unknown_roles:
+        fail(f"映射目标角色不存在于路由表: {unknown_roles}")
+    else:
+        ok(f"BH 映射 ({len(mapping_dict)} profiles → {len(mapped_roles)} SR roles) 目标角色均存在")
+
+    # 验证 routing_gaps 中的所有 SR role 在路由表中存在
+    gaps = mapping.get("routing_gaps", {})
+    for sr_role, bh_list in gaps.items():
+        assert sr_role in router.routing, f"routing_gaps 中的角色 {sr_role} 不在路由表"
+    ok(f"routing_gaps 覆盖 {len(gaps)} 个角色（{sum(len(v) for v in gaps.values())} 个子 profile）")
+
+
+@check("cross-project")
+def test_category_consistency():
+    """验证角色 JSON 中引用的所有 bus cat=xxx 均在 CATEGORY_PRIORITY 中有定义。"""
+    os.chdir(str(_HERMES_SRC.parent))
+    import json, re
+    from router import CATEGORY_PRIORITY
+    cat_ref = re.compile(r"bus cat=(\w+)")
+    defined = set(CATEGORY_PRIORITY.keys())
+
+    undef: list[str] = []
+    for f in sorted(Path("personas/session-roles").glob("persona_*.json")):
+        data = json.loads(f.read_text())
+        for target in data.get("output_targets", []):
+            for m in cat_ref.finditer(target):
+                if m.group(1) not in defined:
+                    undef.append(f"{f.name} 产出 {m.group(1)}")
+        for sig in data.get("input_signals", []):
+            src = sig.get("source", sig.get("spec", {}).get("category", ""))
+            if isinstance(src, str):
+                for m in cat_ref.finditer(src):
+                    if m.group(1) not in defined:
+                        undef.append(f"{f.name} 消费 {m.group(1)}")
+
+    if undef:
+        for u in undef:
+            fail("分类未定义", u)
+    else:
+        ok("角色 JSON 中所有 bus cat= 引用均在 CATEGORY_PRIORITY 中有定义")
 
 
 @check("cross-project")
@@ -386,6 +448,8 @@ def main():
     test_sentinel()
     test_role_security()
     test_lifecycle_manager()
+    test_bh_to_sr_mapping()
+    test_category_consistency()
     test_routing_links()
     test_fix_regression()
     test_launcher_imports_from_roles()

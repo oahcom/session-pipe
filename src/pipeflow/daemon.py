@@ -16,14 +16,10 @@ import time
 from pathlib import Path
 
 # 路径设置
-from paths import SESSION_PIPELINE_SRC as _PIPELINE_SRC
-from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
-from paths import HERMES_SCRIPTS as _HERMES_SCRIPTS
-for p in [_PIPELINE_SRC, _LAUNCHER_SRC, _HERMES_SCRIPTS]:
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+from paths import ensure_paths
+ensure_paths()
 
-from workflow_db import WorkflowDB
+from pipeflow.db import WorkflowDB
 
 FEED_SOCKET = "/tmp/sister_bus_feed.sock"
 INTERVAL = 30  # 秒

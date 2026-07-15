@@ -1,9 +1,13 @@
+#!/usr/bin/env python3
 """paths.py — 集中管理路径常量（反模式 #10 修复）
 
 所有路径在此定义，各模块从此导入，不再硬编码 Path.home()。
 环境变量可覆盖，支持测试和部署环境切换。
+
+ensure_paths() 统一管理跨项目 sys.path，替代 6 个文件的独立实现。
 """
 import os
+import sys
 from pathlib import Path
 
 _HOME = Path.home()
@@ -49,3 +53,22 @@ SESSION_ROLES_PERSONAS = SESSION_ROLES_ROOT / "personas" / "session-roles"
 # ── Hermes 工作流 ──
 HERMES_WORKFLOWS = _HOME / ".hermes" / "workflows"
 HERMES_WORKFLOW_CHAINS = HERMES_WORKFLOWS / "chains"
+
+
+def ensure_paths() -> None:
+    """统一注册跨项目 sys.path，替代 6 个文件各自实现。
+
+    按优先级排列：
+    1. session-pipeline/src 在前（防止 hermes_core 遮蔽本地模块）
+    2. session-launcher/src 居中（sentinel / launcher 模块）
+    3. hermes scripts 垫后（bus_protocol 等基础设施）
+    """
+    _entries: list[Path] = [
+        SESSION_PIPELINE_SRC.resolve(),
+        SESSION_LAUNCHER_SRC.resolve(),
+        Path(HERMES_SCRIPTS).resolve(),
+    ]
+    for p in reversed(_entries):
+        s = str(p)
+        if s not in sys.path:
+            sys.path.insert(0, s)

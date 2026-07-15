@@ -268,6 +268,30 @@ heartbeat:
 
 ---
 
+## 守护进程注册
+
+pipeline daemon 可注册为 systemd 服务（WSL2 可能不可用）：
+
+```bash
+# service 文件位置（手动安装）
+cp ~/.config/systemd/user/session-pipeline-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable session-pipeline-daemon.service
+systemctl --user start session-pipeline-daemon.service
+
+# 当 systemd 不可用时的 fallback
+bash ~/session-launcher/scripts/start_daemons.sh
+```
+
+workflow-engine 同：
+
+```bash
+systemctl --user enable workflow-engine.service
+systemctl --user start workflow-engine.service
+```
+
+---
+
 ## 协作红线
 
 1. **不直接创建 CCS** — CCS 生命周期由 session-launcher 管理
