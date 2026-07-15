@@ -44,6 +44,7 @@ def _cursor_db_path() -> Path:
 
 def get_last_cursor(consumer: str, category: str = "", instance_id: str = "") -> int:
     """获取消费者在分类下的最后处理 fact_id。"""
+    _ensure_cursor_db()
     conn = sqlite3.connect(str(_cursor_db_path()))
     try:
         row = conn.execute(
@@ -56,6 +57,7 @@ def get_last_cursor(consumer: str, category: str = "", instance_id: str = "") ->
 
 def set_last_cursor(consumer: str, category: str, fact_id: int, instance_id: str = "") -> None:
     """更新消费者在分类下的最后处理 fact_id。"""
+    _ensure_cursor_db()
     conn = sqlite3.connect(str(_cursor_db_path()))
     try:
         conn.execute(
@@ -93,8 +95,16 @@ def init_cursor_db() -> None:
     finally:
         conn.close()
 
-# 初始化 cursor DB
-init_cursor_db()
+# 初始化 cursor DB（延迟到首次使用，避免 import 时副作用）
+_CURSOR_INITIALIZED = False
+
+def _ensure_cursor_db():
+    """惰性初始化 cursor DB，仅在首次调用时建表。"""
+    global _CURSOR_INITIALIZED
+    if _CURSOR_INITIALIZED:
+        return
+    init_cursor_db()
+    _CURSOR_INITIALIZED = True
 
 T = TypeVar("T")
 

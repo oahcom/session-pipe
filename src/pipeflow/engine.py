@@ -13,6 +13,7 @@ Workflow Engine — 数据驱动的对话工作流执行引擎。
 """
 
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -389,18 +390,21 @@ if __name__ == "__main__":
 # 允许工作流步骤之间存在 DAG 依赖关系
 # 步骤可以并行执行，前置条件满足后自动触发
 
+_dag_lock = threading.Lock()
 _DAG_RUNNING: dict[str, set] = {}  # run_id -> set of completed steps
 
 def dag_step_done(run_id: str, step_id: str) -> list[str]:
     """标记 DAG 步骤完成，返回可解锁的下游步骤列表。"""
-    if run_id not in _DAG_RUNNING:
-        _DAG_RUNNING[run_id] = set()
-    _DAG_RUNNING[run_id].add(step_id)
-    return list(_DAG_RUNNING[run_id])
+    with _dag_lock:
+        if run_id not in _DAG_RUNNING:
+            _DAG_RUNNING[run_id] = set()
+        _DAG_RUNNING[run_id].add(step_id)
+        return list(_DAG_RUNNING[run_id])
 
 def dag_ready_steps(run_id: str, dag: dict[str, list[str]]) -> list[str]:
     """返回 DAG 中当前可执行的步骤（所有前置依赖已完成）。"""
-    completed = _DAG_RUNNING.get(run_id, set())
+    with _dag_lock:
+        completed = _DAG_RUNNING.get(run_id, set())
     ready = []
     for step, deps in dag.items():
         if step in completed:
@@ -411,6 +415,7 @@ def dag_ready_steps(run_id: str, dag: dict[str, list[str]]) -> list[str]:
 
 def dag_reset(run_id: str) -> None:
     """重置 DAG 状态。"""
-    _DAG_RUNNING.pop(run_id, None)
+    with _dag_lock:
+        _DAG_RUNNING.pop(run_id, None)
 
 
