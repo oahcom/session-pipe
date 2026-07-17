@@ -349,16 +349,24 @@ def test_conditional_blocks_when_not_met():
 # ── Persistence ──────────────────────────────────────────────────
 
 def test_run_persists_on_tick():
+    """tick 推进后状态持久化到磁盘，新引擎能读到。"""
     wf_dir = _make_wf_dir()
     _write_wf(wf_dir, "test", SIMPLE_STEPS)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test", {"topic": "x"})
-    eng._bb.write("research", "结果", src="scout")
+    # s1 的 exit_condition 是 bus_category=architecture
+    eng._bb.write("architecture", "调研结果", src="scout")
     eng.run_once()
-    # 重新加载验证持久化
+    # 当前引擎内存中应已推进到 s2
+    s1 = eng.status(rid)
+    assert s1["current_step"] == "s2", f"推进后应 s2: {s1['current_step']}"
+    # 新引擎重读磁盘验证持久化
     eng2 = WorkflowEngine(workflows_dir=wf_dir)
-    s = eng2.status(rid)
-    assert s["current_step"] == "s2", f"持久化后应 s2: {s['current_step']}"
+    s2 = eng2.status(rid)
+    assert s2["current_step"] == "s2", f"持久化后应 s2: {s2['current_step']}"
+    # 验证 s1 的结果也已持久化
+    assert "s1" in s2["results"], f"s1 结果未持久化: {s2['results']}"
+    assert s2["results"]["s1"]["status"] == "done"
 
 
 def test_corrupted_run_file():
