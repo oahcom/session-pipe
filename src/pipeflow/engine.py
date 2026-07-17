@@ -42,6 +42,7 @@ class Step:
     max_retries: int = 0
     condition: str = ""
     rollback_to: str = ""
+    verify: str = ""  # shell command, exit 0 = pass, non-zero = fail
 
 
 @dataclass
@@ -184,12 +185,41 @@ class WorkflowEngine:
         timeout = ec.get("timeout_minutes", 30) * 60
         max_retries = step.max_retries
 
+        # 只匹配工作流启动后写入的新消息，过滤老消息跨工作流串匹配
+        last_ts = run.step_results.get(step.id, {}).get("poll_since", run.created_at)
+
         # 检查匹配
-        if self._check_exit(cat, src_filter, text_filter):
+        if self._check_exit(cat, src_filter, text_filter, created_after=last_ts):
+            # 验证产出物（如有 verify 命令）
+            if step.verify:
+                import subprocess
+                # 展开上下文变量
+                ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
+                vcmd = step.verify
+                for k, val in ctx.items():
+                    vcmd = vcmd.replace(f"{{{k}}}", str(val))
+                ver = subprocess.run(
+                    vcmd, shell=True, capture_output=True, timeout=30
+                )
+                if ver.returncode != 0:
+                    err = ver.stderr.decode()[:200] or "verify failed"
+                    self._bb.write("blocker",
+                        f"[workflow] {run.workflow_name} {step.id} 验证不通过: {err}",
+                        src="workflow_engine")
+                    # ponytail: 不更新 poll_since，下次 tick 可重试同一消息。加 when: 引入重试计数限制防死循环
+                    return
+
             # 完成当前步骤
             run.step_results[step.id] = {"status": "done", "ts": time.time()}
             self._advance(run)
             return
+
+        # 更新 poll_since 为当前时间持久化，下一轮不重复匹配
+        run.step_results[step.id] = {
+            **run.step_results.get(step.id, {}),
+            "poll_since": time.time()
+        }
+        self._save_run(run)
 
         # 检查超时
         elapsed = time.time() - (run.step_results.get(step.id, {}).get("ts", run.created_at))
@@ -205,14 +235,16 @@ class WorkflowEngine:
                     src="workflow_engine")
             self._save_run(run)
 
-    def _check_exit(self, cat: str, src_filter: str, text_filter: str) -> bool:
+    def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> bool:
         """检查 bus 中是否有匹配 exit_condition 的消息（不消费）。"""
-        # 使用 read() 而非 unconsumed()，避免消费消息导致目标角色读不到
+        # ponytail: 基于 id 的增量过滤，避免老消息跨工作流串匹配。升级路径：每个 exit msg 标 workflow_id
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         for f in facts:
             if src_filter and f.src != src_filter:
                 continue
             if text_filter and text_filter not in f.t:
+                continue
+            if created_after and f.ts < created_after:
                 continue
             return True
         return False
