@@ -32,104 +32,30 @@ SESSION_ROLES_DIR = Path(os.environ.get(
 # 路由 DB
 from routing.rdb import RoutingDB as routing_db
 
-# ── 分类优先级（数字越小越优先）──
-CATEGORY_PRIORITY = {
-    "security": 1,
-    "security_audit": 1,
-    "code_fix": 2,
-    "threat_model": 2,
-    "bug_report": 2,
-    "code_review": 2,
-    "root_cause_analysis": 2,
-    "architecture": 3,
-    "test_report": 3,
-    "deployment_report": 3,
-    "tech_decision": 3,
-    "prd": 4,
-    "test_plan": 4,
-    "system_design": 5,
-    "deployment_plan": 5,
-    "task_spec": 6,
-    "user_story": 6,
-    "performance": 7,
-    "sprint_report": 7,
-    "evolution_report": 8,
-    "reflexion_lesson": 9,
-    "feedback": 9,
-    "documentation": 9,
-    "changelog": 9,
-    "deception": 10,
-    "standup": 10,
-    "retrospective": 10,
-    # ── 补充缺失的角色产出分类 ──
-    "blocker": 2,
-    "design_issue": 3,
-    "product_design": 4,
-    "scheduler": 6,
-    "ccs_health": 6,
-    "cleanup": 9,
-    "skill_audit": 9,
-    "optimization": 7,
-    "monitor_dashboard": 9,
-    "knowledge_distill": 9,
-    "memory_store": 9,
-    "verification": 9,
-    "notice": 9,
-    "workflow": 6,
-    "report": 9,
-    "vuln_report": 3,
-    "debate": 9,
+# ── 规范Bus分类注册表 ──
+# 从 canonical_categories.py 加载（单一权威来源）
+# 若 JSON 不存在，回退到静态字典
+_CANONICAL_PATH = Path(os.environ.get(
+    "BUS_CANONICAL_PATH",
+    str(Path.home() / ".hermes" / "data" / "bus_canonical.json")
+))
+if _CANONICAL_PATH.exists():
+    try:
+        _CANONICAL = json.loads(_CANONICAL_PATH.read_text())["categories"]
+    except (json.JSONDecodeError, KeyError):
+        _CANONICAL = {}
+else:
+    _CANONICAL = {}
+
+CATEGORY_PRIORITY: dict[str, int] = {
+    cat: info["priority"]
+    for cat, info in _CANONICAL.items()
 }
 _DEFAULT_PRIORITY = 11
 
-# ── 分类描述 ──
 CATEGORY_DESC: dict[str, str] = {
-    "reflexion_lesson": "经验教训（消费者沉淀）",
-    "code_fix": "代码修复（维护者/开发者产出）",
-    "architecture": "架构决策/新发现（侦察兵/管理者产出）",
-    "prd": "产品需求文档（架构师产出）",
-    "system_design": "系统设计文档（架构师产出）",
-    "task_spec": "任务分解规范（架构师产出）",
-    "product_design": "产品设计触发（需架构师消费）",
-    "evolution_report": "进化轮次报告（侦察兵产出）",
-    "security": "安全告警",
-    "performance": "性能发现",
-    "deception": "欺骗检测",
-    "monitor_audit": "CCS 监控审计记录（LLM 决策追踪）",
-    "notice": "系统通知消息（可终局检测）",
-    "blocker": "阻塞问题（任何人可发，需升级处理）",
-    "design_issue": "设计问题（开发者/消费者发，架构师消费）",
-    "ops": "运维事故（关闭者产出）",
-    "user_story": "用户故事（PM产出）",
-    "code_review": "PR 代码审查（engineer产出，reviewer消费）",
-    "test_plan": "测试计划（qa产出）",
-    "test_report": "测试报告（qa产出）",
-    "bug_report": "缺陷报告（qa产出）",
-    "deployment_plan": "部署计划（devops产出）",
-    "deployment_report": "部署结果（devops产出）",
-    "security_audit": "安全审计报告（security产出）",
-    "threat_model": "威胁模型（security产出）",
-    "documentation": "技术文档（writer产出）",
-    "changelog": "变更日志（writer产出）",
-    "standup": "每日站会简报（coordinator产出）",
-    "retrospective": "迭代复盘（coordinator产出）",
-    "sprint_report": "迭代报告（coordinator产出）",
-    "feedback": "用户反馈（pm产出）",
-    "root_cause_analysis": "根因分析报告（investigator产出）",
-    "tech_decision": "技术选型决策（lr产出）",
-    "skill_audit": "技能审计报告（curator产出）",
-    "cleanup": "清理报告（curator产出）",
-    "scheduler": "排期分配（coordinator产出）",
-    "ccs_health": "CCS 健康报告（coordinator产出）",
-    "optimization": "优化建议（optimizer产出）",
-    "monitor_dashboard": "监控仪表盘（devops产出）",
-    "knowledge_distill": "知识蒸馏报告（knowledge_curator产出）",
-    "memory_store": "记忆存储报告（knowledge_curator产出）",
-    "verification": "验证报告（debate_verifier产出）",
-    "report": "通用报告（browser-harness产出）",
-    "vuln_report": "漏洞报告（security产出）",
-    "debate": "辩论记录（debate_verifier产出）",
-    "workflow": "工作流事件（pipeline路由）",
+    cat: info["description"]
+    for cat, info in _CANONICAL.items()
 }
 
 
