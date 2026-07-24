@@ -20,7 +20,7 @@ from pathlib import Path
 # 确保 session-pipeline/src 优先
 # 不能依赖 ensure_paths() 因为它会把 session-launcher/src 加在前面
 # 而 launcher 的 lifecycle/manager.py 已被删除
-_src = str(Path(__file__).resolve().parent.parent / "src")
+_src = str(Path(__file__).resolve().parent.parent)
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
