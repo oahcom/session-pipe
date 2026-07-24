@@ -16,7 +16,7 @@ _PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
-from workflow_engine import WorkflowEngine, WorkflowDef, WorkflowRun, Step
+from pipeflow.engine import WorkflowEngine, WorkflowDef, WorkflowRun, Step
 
 # Patch _TIMEOUT_GRACE to make timeout tests fast (not wait 10+ seconds)
 import pipeflow.engine
@@ -276,23 +276,26 @@ def test_timeout_triggers_retry():
     assert run.step_retries.get("s1", 0) >= 1, f"应有重试计数: {run.step_retries}"
 
 
-def test_max_retries_exceeded():
+def test_timeout_escalates_not_fails():
+    """超时不自动失败，改为升级提醒。"""
     wf_dir = _make_wf_dir()
     steps = [{"id": "s1", "title": "调研", "target_role": "scout",
               "prompt_template": "调研{topic}",
               "exit_condition": {"bus_category": "notice", "text_contains": "TESTMAXRETRY_NOMATCH_456",
                                  "timeout_minutes": 0.001},
               "max_retries": 1, "condition": "", "rollback_to": ""}]
-    _write_wf(wf_dir, "fail_test", steps)
+    _write_wf(wf_dir, "timeout_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("fail_test", {"topic": "x"})
+    rid = eng.start("timeout_test", {"topic": "x"})
     time.sleep(1.5)
     eng.run_once()
-    # retry=0 + 1次重试 = retry=1，然后再次超时 → failed
+    # 超时后应仍 running（不自动失败）
     time.sleep(1.5)
     eng.run_once()
     s = eng.status(rid)
-    assert s["status"] == "failed", f"应 failed: {s['status']}"
+    assert s["status"] == "running", f"超时不自动失败: {s['status']}"
+    # 验证升级计数增加
+    assert "s1" in s.get("retries", {}), "应记录超时次数"
 
 
 # ── Conditional Steps ────────────────────────────────────────────
@@ -396,7 +399,7 @@ def test_workspace_summary_in_prompt():
     wf_dir = _make_wf_dir()
     ws_dir = Path.home() / ".hermes" / "workspace" / "test_ws_project"
     ws_dir.mkdir(parents=True, exist_ok=True)
-    (ws_dir / "PRD.md").write_text("# 需求文档 测试数据")
+    (ws_dir / "PRD.md").write_text("# 需求文档 WS_SUMMARY_UNIQUE_8899")
     steps = [{"id": "s1", "title": "调研", "target_role": "scout",
               "prompt_template": "项目情况: {workspace_summary}",
               "exit_condition": {"bus_category": "notice", "text_contains": "TESTWS_998877"},
@@ -404,9 +407,9 @@ def test_workspace_summary_in_prompt():
     _write_wf(wf_dir, "ws_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("ws_test", {"topic": "x", "project_name": "test_ws_project"})
-    all_facts = eng._bb.read(cat="workflow")
-    matched = [f for f in all_facts if "需求文档" in f.t]
-    assert len(matched) >= 1, "workspace_summary 应被替换到 prompt 中"
+    all_facts = eng._bb.read(cat="workflow", limit=500)
+    matched = [f for f in all_facts if "WS_SUMMARY_UNIQUE_8899" in f.t]
+    assert len(matched) >= 1, f"workspace_summary 应被替换到 prompt 中 (found {len(matched)} in {len(all_facts)})"
 
 
 # ── Run once 不崩溃 ──────────────────────────────────────────────
@@ -476,7 +479,7 @@ if __name__ == "__main__":
         ("exit_condition 按文本", test_check_exit_by_text),
         ("advance 完成", test_advance_finishes),
         ("超时触发重试", test_timeout_triggers_retry),
-        ("超过最大重试失败", test_max_retries_exceeded),
+        ("超时不自动失败", test_timeout_escalates_not_fails),
         ("条件步骤推进", test_conditional_step_blocks),
         ("条件不满足阻塞", test_conditional_blocks_when_not_met),
         ("run 持久化", test_run_persists_on_tick),

@@ -101,8 +101,8 @@ def test_prompt_rendering():
 @check("pipeline")
 def test_router():
     os.chdir(str(_PIPELINE_SRC.parent))
-    from router import Router, priority, CATEGORY_PRIORITY
-    from routing_db import RoutingDB
+    from routing.router import Router, priority, CATEGORY_PRIORITY
+    from routing.rdb import RoutingDB
     r = Router()
     routing = r.routing
     assert len(routing) >= 2, f"路由表空或太小: {len(routing)}"
@@ -247,7 +247,7 @@ def test_pipeline_imports_from_launcher():
 def test_routing_links():
     """验证路由链接完整性：每个被消费的分类至少有一个生产者。"""
     os.chdir(str(_PIPELINE_SRC.parent))
-    from router import Router, CATEGORY_DESC
+    from routing.router import Router, CATEGORY_DESC
     r = Router()
     routing = r.routing
 
@@ -305,7 +305,7 @@ def test_routing_links():
 def test_bh_to_sr_mapping():
     """验证 Browser Harness (50 profiles) 到 Session Roles 的映射完整性。"""
     os.chdir(str(_PIPELINE_SRC.parent))
-    from router import Router
+    from routing.router import Router
     bh_map_path = _HERMES_SRC.parent / "personas" / "browser-harness" / "_bh_to_sr_map.json"
     assert bh_map_path.exists(), f"BH 映射文件不存在: {bh_map_path}"
     import json
@@ -337,7 +337,7 @@ def test_category_consistency():
     """验证角色 JSON 中引用的所有 bus cat=xxx 均在 CATEGORY_PRIORITY 中有定义。"""
     os.chdir(str(_HERMES_SRC.parent))
     import json, re
-    from router import CATEGORY_PRIORITY
+    from routing.router import CATEGORY_PRIORITY
     cat_ref = re.compile(r"bus cat=(\w+)")
     defined = set(CATEGORY_PRIORITY.keys())
 

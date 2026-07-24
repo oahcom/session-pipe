@@ -38,7 +38,7 @@ def _clear_routing_db():
     try:
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-        import routing_db as rd
+        from routing import rdb as rd
         with rd.RoutingDB() as db:
             db._conn.execute("DELETE FROM routing")
             db._conn.execute("DELETE FROM routing_audit")
@@ -91,7 +91,7 @@ _DEFAULT_TEST_ROLES = {
 
 def test_parse_produce_categories():
     """output_targets 正确解析为产出分类列表。"""
-    from router import _parse_produce_categories
+    from routing.router import _parse_produce_categories
 
     cases = [
         # (input, expected)
@@ -109,7 +109,7 @@ def test_parse_produce_categories():
 
 def test_parse_consume_categories():
     """input_signals 正确解析为消费分类列表。"""
-    from router import _parse_consume_categories
+    from routing.router import _parse_consume_categories
 
     cases = [
         # unread --all → ["*"]
@@ -135,7 +135,7 @@ def test_parse_consume_categories():
 
 def test_priority_ordering():
     """分类优先级排序正确：security > code_fix > architecture > prd > system_design > task_spec > performance > evolution_report > reflexion_lesson > deception。"""
-    from router import priority
+    from routing.router import priority
 
     assert priority("security") < priority("code_fix"), "security 应优先于 code_fix"
     assert priority("code_fix") < priority("architecture"), "code_fix 应优先于 architecture"
@@ -153,7 +153,7 @@ def test_priority_ordering():
 
 def test_router_auto_build_from_json():
     """Router 从项目 A 的 JSON 文件自动生成路由表。"""
-    from router import Router
+    from routing.router import Router
 
     roles_dir = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
     if not roles_dir.exists():
@@ -190,7 +190,7 @@ def test_router_auto_build_from_json():
 
 def test_router_fallback():
     """Router 在空目录时返回空路由表。"""
-    from router import Router
+    from routing.router import Router
 
     router = Router(Path(tempfile.mkdtemp()))
     routing = router.routing
@@ -202,7 +202,7 @@ def test_router_fallback():
 
 def test_get_producers_consumers():
     """get_producers / get_consumers 返回正确的角色列表。"""
-    from router import Router
+    from routing.router import Router
 
     roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
     try:
@@ -228,7 +228,7 @@ def test_get_producers_consumers():
 
 def test_unconsumed_by_role_parsing():
     """unconsumed_by_role 返回结构化消息列表（非原始字符串）。"""
-    from router import Router
+    from routing.router import Router
 
     roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
     try:
@@ -257,7 +257,7 @@ def test_unconsumed_by_role_parsing():
 
 def test_consume_linkage():
     """consume_linkage 返回正确的影响角色列表。"""
-    from router import Router
+    from routing.router import Router
 
     roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
     try:
@@ -276,7 +276,7 @@ def test_consume_linkage():
 
 def test_category_desc_complete():
     """CATEGORY_DESC 包含所有路由中出现的分类。"""
-    from router import CATEGORY_DESC, Router
+    from routing.router import CATEGORY_DESC, Router
 
     roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
     try:
@@ -295,7 +295,7 @@ def test_category_desc_complete():
 
 def test_status_format():
     """status() 返回正确的字典结构。"""
-    from auto_route import status
+    from routing.auto import status
 
     s = status()
     assert "status" in s, "应含 status 字段"
@@ -313,8 +313,8 @@ def test_status_format():
 
 def test_poll_unconsumed_sorted_by_priority():
     """poll_unconsumed 返回的消息按优先级排序。"""
-    from auto_route import poll_unconsumed
-    from router import priority
+    from routing.auto import poll_unconsumed
+    from routing.router import priority
 
     messages = poll_unconsumed()
     if not messages or "error" in messages[0]:
@@ -332,7 +332,7 @@ def test_poll_unconsumed_sorted_by_priority():
 
 def test_pipeline_format():
     """format_pipeline 输出包含所有角色。"""
-    from router import Router
+    from routing.router import Router
 
     roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
     try:
@@ -349,7 +349,7 @@ def test_pipeline_format():
 
 def test_routing_summary():
     """routing_summary 返回正确的消费者映射。"""
-    from router import Router
+    from routing.router import Router
 
     roles_dir = _make_roles_dir(_DEFAULT_TEST_ROLES)
     try:

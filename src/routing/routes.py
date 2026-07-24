@@ -14,8 +14,8 @@ if str(_HERMES_SCRIPTS) not in sys.path:
     sys.path.insert(1, str(_HERMES_SCRIPTS))
 
 from config_loader import get_config
-import router as _rt_mod
-from composite_runner import CompositeRunner
+from routing import router as _rt_mod
+from pipeflow.composite import CompositeRunner
 
 from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, GRACEFUL_SHUTDOWN
 from reliability import with_retry, DEFAULT_RETRY, get_last_cursor, set_last_cursor
@@ -45,7 +45,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
         instance_id = f"pipeline_{uuid.uuid4().hex[:8]}"
 
     # 延迟导入规避循环依赖（poll_unconsumed 定义在 auto_route.py）
-    from auto_route import poll_unconsumed as _poll
+    from routing.auto import poll_unconsumed as _poll
 
     bb = Blackboard()
     router = _rt_mod.get_router()
@@ -152,7 +152,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
 
     dry_run=True 时只展示分配方案。
     """
-    from auto_route import poll_unconsumed as _poll
+    from routing.auto import poll_unconsumed as _poll
     from routing.rdb import RoutingDB as _RDB
 
     router = _rt_mod.get_router()

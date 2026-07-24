@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""paths.py — 集中管理路径常量（反模式 #10 修复）
+"""paths.py — 集中管理路径常量
 
-所有路径在此定义，各模块从此导入，不再硬编码 Path.home()。
-环境变量可覆盖，支持测试和部署环境切换。
-
-ensure_paths() 统一管理跨项目 sys.path，替代 6 个文件的独立实现。
+所有路径从 hermes_bus.config 统一导入，消除重复定义。
 """
 import os
 import sys
@@ -12,10 +9,15 @@ from pathlib import Path
 
 _HOME = Path.home()
 
-# ── Hermes 脚本路径 ──
-HERMES_SCRIPTS = Path(_HOME / ".hermes" / "scripts")
-BUS_CLIENT = HERMES_SCRIPTS / "bus_client.py"
-BUS_PROTOCOL = HERMES_SCRIPTS / "bus_protocol.py"
+# ── 从 hermes_bus.config 统一导入 ──
+from hermes_bus.config import (
+    BUS_CLIENT, BUS_PROTOCOL,
+    SISTER_BUS_CCS_SOCK, SISTER_BUS_FEED_SOCK,
+    SISTER_BUS_DKK_SOCK, SISTER_BUS_SSK_SOCK,
+    SESSION_LAUNCHER_SRC as _SESSION_LAUNCHER_SRC,
+    SESSION_ROLES_ROOT,
+    CCS_WORKSPACES,
+)
 
 # ── 数据目录 ──
 HERMES_STATE = _HOME / ".hermes" / "state"
@@ -31,16 +33,9 @@ HERMES_BACKUPS = _HOME / ".hermes" / "backups"
 WORKFLOW_GUIDE = HERMES_TEMPLATES / "WORKFLOW_GUIDE.md"
 
 # ── 项目根目录 ──
-SESSION_LAUNCHER_SRC = Path(os.environ.get('SESSION_LAUNCHER_SRC', str(Path.home() / 'session-launcher' / 'src')))
+HERMES_SCRIPTS = Path(_HOME / ".hermes" / "scripts")
+SESSION_LAUNCHER_SRC = Path(_SESSION_LAUNCHER_SRC)
 SESSION_PIPELINE_SRC = Path(__file__).resolve().parent
-SESSION_ROLES_ROOT = _HOME / "hermes-session-roles"
-
-# ── Sister Bus ──
-SISTER_BUS_CCS_SOCK = Path("/tmp/sister_bus_ccs.sock")
-SISTER_BUS_FEED_SOCK = Path("/tmp/sister_bus_feed.sock")
-
-# ── 工作空间 ──
-CCS_WORKSPACES = _HOME / "ccs-workspaces"
 
 # ── 哨兵目录 ──
 CCS_SENTINEL_DIR = Path("/tmp/ccs-sentinels")
@@ -56,14 +51,8 @@ HERMES_WORKFLOW_CHAINS = HERMES_WORKFLOWS / "chains"
 
 
 def ensure_paths() -> None:
-    """统一注册跨项目 sys.path，替代 6 个文件各自实现。
-
-    按优先级排列：
-    1. session-pipeline/src 在前（防止 hermes_core 遮蔽本地模块）
-    2. session-launcher/src 居中（sentinel / launcher 模块）
-    3. hermes scripts 垫后（bus_protocol 等基础设施）
-    """
-    _entries: list[Path] = [
+    """统一注册跨项目 sys.path。"""
+    _entries = [
         SESSION_PIPELINE_SRC.resolve(),
         SESSION_LAUNCHER_SRC.resolve(),
         Path(HERMES_SCRIPTS).resolve(),
@@ -72,3 +61,10 @@ def ensure_paths() -> None:
         s = str(p)
         if s not in sys.path:
             sys.path.insert(0, s)
+    # session-pipeline 的 lifecycle 包必须优先于 session-launcher（其 manager.py 已删除）
+    # 加父目录（src），这样 import lifecycle 能找到 lifecycle/__init__.py
+    _psrc = str(SESSION_PIPELINE_SRC.resolve())
+    sys.path.insert(0, _psrc)
+    # 如果 launcher 的 lifecycle 已被缓存，清除缓存
+    if "lifecycle" in sys.modules:
+        del sys.modules["lifecycle"]

@@ -48,7 +48,7 @@ def tmp_db(module: str = "workflow_db") -> tuple:
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     f.close()
     if module == "workflow_db":
-        from workflow_db import WorkflowDB
+        from pipeflow.db import WorkflowDB
         return f.name, WorkflowDB(f.name)
     raise ValueError(f"未知模块: {module}")
 

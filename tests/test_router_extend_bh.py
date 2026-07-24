@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from router import Router, _parse_produce_categories
+from routing.router import Router, _parse_produce_categories
 
 
 @pytest.fixture

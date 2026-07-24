@@ -17,6 +17,9 @@ from __future__ import annotations
 from paths import ensure_paths
 ensure_paths()
 
+import json
+import uuid
+
 from bus_protocol import Blackboard
 from pipeflow.models import CompositeRun, CompositeRunDB
 from pathlib import Path
@@ -218,6 +221,7 @@ class CompositeRunner:
 
         try:
             from workflow.client import WorkflowClient
+            from lifecycle.manager import LifecycleManager
             with WorkflowClient("coordinator") as wf:
                 task_id = wf.create_task(
                     f"[{run.name}] {title}",
@@ -225,6 +229,15 @@ class CompositeRunner:
                     assignee=role,
                 )
                 wf_id = wf.create(role, title, task_id=task_id)
+
+                # 用 LifecycleManager 启动子工作流
+                with LifecycleManager("coordinator") as lm:
+                    try:
+                        lm.start_wf(wf_id, current_step_id=step_id)
+                    except Exception as e:
+                        import logging as _lg
+                        _lg.getLogger("composite.dispatch").warning(
+                            "LM start_wf 失败 %s: %s", wf_id, e)
 
                 # 记录子工作流 ID
                 run.sub_runs.setdefault(step_id, []).append(wf_id)

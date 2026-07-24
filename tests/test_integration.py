@@ -61,7 +61,7 @@ def test_bus_mark_consumed():
 def test_route_all_e2e():
     """route-all 端到端：写入消息 → route_all 消费 → 状态 idle。"""
     from bus_protocol import Blackboard
-    from auto_route import route_all, status
+    from routing.auto import route_all, status
 
     bb = Blackboard()
     import uuid
@@ -81,8 +81,8 @@ def test_route_all_e2e():
 def test_priority_routing():
     """优先级路由：security 消息应被 security 消费者先消费。"""
     from bus_protocol import Blackboard
-    from auto_route import route_all
-    from router import priority
+    from routing.auto import route_all
+    from routing.router import priority
 
     bb = Blackboard()
     import uuid

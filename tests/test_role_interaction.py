@@ -141,7 +141,7 @@ def test_scenario_coordinator_detects_tasks():
     """
     场景 5：coordinator 自动检测 task_spec 分类的消息并排序
     """
-    from router import get_router, priority
+    from routing.router import get_router, priority
 
     router = get_router()
     routing = router.routing
@@ -251,7 +251,7 @@ def test_scenario_product_design_request_product_architect():
     _check("product_design 分类: 可存储", len(found) == 1)
 
     # 验证 product_architect 能消费此分类
-    from router import get_router
+    from routing.router import get_router
     router = get_router()
     consumers = router.get_consumers("product_design")
     _check("product_design → 架构师可消费", "product_architect" in consumers)
@@ -298,7 +298,7 @@ def test_scenario_design_issue_feedback():
     _check("design_issue 分类: 开发者可反馈设计问题", len(found) == 1)
 
     # 验证架构师能消费
-    from router import get_router
+    from routing.router import get_router
     router = get_router()
     consumers = router.get_consumers("design_issue")
     _check("design_issue → 架构师可消费", "product_architect" in consumers or any(

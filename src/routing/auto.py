@@ -46,7 +46,7 @@ def _get_shutdown():
     import reliability as _rel
     return _rel.GRACEFUL_SHUTDOWN
 from config_loader import get_config
-import router as _rt_mod
+from routing import router as _rt_mod
 from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
 # 延迟导入 launcher.sentinel（避免模块级循环依赖）
 _list_sentinels = None

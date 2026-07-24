@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-Workflow Engine — 数据驱动的对话工作流执行引擎。
+Workflow Engine --- 数据驱动的对话工作流执行引擎。
 
 通过 Sister Bus 与 CCS 会话交互，执行 JSON 定义的工作流。
-工作流来自 ~/.hermes/workflows/*.json，运行状态持久化到 runs/*.json。
-
-用法：
-  python3 src/workflow_engine.py start <name> --context '{"key":"val"}'
-  python3 src/workflow_engine.py status <workflow_id>
-  python3 src/workflow_engine.py cancel <workflow_id>
-  python3 src/workflow_engine.py run     # 以守护模式轮询
+工作流来自 ~/.hermes/workflows/*.json，运行状态持久化到 runs/*.json，
+同时扫描 SQLite 中的 production 工作流实例并自动推进。
 """
 
 import json
-import threading
 import time
 import uuid
+import subprocess as _sp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-# ── 路径 ───────────────────────────────────────────────────────────
 from paths import ensure_paths
 ensure_paths()
 from paths import HERMES_WORKFLOWS as _WORKFLOWS_DIR
@@ -30,6 +24,9 @@ from bus_protocol import Blackboard
 _RUNS_DIR = _WORKFLOWS_DIR / "runs"
 _POLL_SLEEP = 5
 _TIMEOUT_GRACE = 10
+_ESCALATED_AFTER = 2
+_FAIL_AFTER = 3
+_REMINDER_INTERVAL = 120
 
 
 @dataclass
@@ -39,10 +36,14 @@ class Step:
     target_role: str
     prompt_template: str
     exit_condition: dict
+    type: str = "single"  # handoff/review/single/gate/notify
+    completion_check: dict = None
     max_retries: int = 0
     condition: str = ""
     rollback_to: str = ""
-    verify: str = ""  # shell command, exit 0 = pass, non-zero = fail
+    verify: str = ""
+    failure_patterns: list[str] = None
+    subflow_template: str = ""  # 该步骤对应的子工作流模板名
 
 
 @dataclass
@@ -51,6 +52,7 @@ class WorkflowDef:
     title: str
     description: str
     steps: list[Step]
+    loop: Optional[dict] = None
 
 
 @dataclass
@@ -80,14 +82,22 @@ class WorkflowEngine:
         self._bb = Blackboard()
         self._workflows: dict[str, WorkflowDef] = {}
         self._composite_runner = None
+        self._lm = None
         self._load_workflows()
 
     @property
     def composite_runner(self):
         if self._composite_runner is None:
-            from composite_runner import CompositeRunner
+            from pipeflow.composite import CompositeRunner
             self._composite_runner = CompositeRunner()
         return self._composite_runner
+
+    @property
+    def _lifecycle(self):
+        if self._lm is None:
+            from lifecycle.manager import LifecycleManager
+            self._lm = LifecycleManager("workflow_engine")
+        return self._lm
 
     def _load_workflows(self):
         if not self.workflows_dir.exists():
@@ -97,21 +107,59 @@ class WorkflowEngine:
                 continue
             try:
                 data = json.loads(f.read_text())
-                steps = [Step(**s) for s in data.get("steps", [])]
+                steps = [Step(**{k: v for k, v in s.items() if k in Step.__dataclass_fields__}) for s in data.get("steps", [])]
                 self._workflows[data["name"]] = WorkflowDef(
                     name=data["name"], title=data.get("title", ""),
                     description=data.get("description", ""), steps=steps,
+                    loop=data.get("loop"),
                 )
             except Exception as e:
                 print(f"  [wf] 加载 {f.name} 失败: {e}")
+        # 也从 SQLite 加载模板（仅默认目录时）
+        if self.workflows_dir != _WORKFLOWS_DIR:
+            return
+        try:
+            lm = self._lifecycle
+            rows = lm._conn.execute(
+                "SELECT template_id, name, description, steps_json FROM workflow_templates"
+            ).fetchall()
+            for row in rows:
+                t = dict(row)
+                tid = t["template_id"]
+                if tid in self._workflows:
+                    continue
+                raw = json.loads(t.get("steps_json") or "[]")
+                if not raw or not isinstance(raw, list) or not isinstance(raw[0], dict):
+                    continue
+                steps = []
+                for s in raw:
+                    s_clean = {}
+                    for k, v in s.items():
+                        if k == "step_id":
+                            s_clean["id"] = v
+                        elif k in Step.__dataclass_fields__:
+                            s_clean[k] = v
+                    if "exit_condition" not in s_clean:
+                        s_clean["exit_condition"] = {}
+                    if "target_role" not in s_clean:
+                        continue
+                    try:
+                        steps.append(Step(**s_clean))
+                    except Exception:
+                        continue
+                if not steps:
+                    continue
+                self._workflows[tid] = WorkflowDef(
+                    name=tid, title=t.get("name", tid),
+                    description=t.get("description", ""), steps=steps,
+                )
+        except Exception as e:
+            print(f"  [wf] SQLite 模板加载失败: {e}")
 
     def list_workflows(self) -> list[str]:
         return sorted(self._workflows.keys())
 
-    # ── API ───────────────────────────────────────────────────────
-
     def start(self, name: str, context: dict = None) -> str:
-        # 尝试作为 atomic workflow 启动
         wf = self._workflows.get(name)
         if wf:
             if not wf.steps:
@@ -122,15 +170,36 @@ class WorkflowEngine:
                 current_step=wf.steps[0].id,
             )
             self._save_run(run)
+            self._upsert_template(name, wf)
+            try:
+                self._lifecycle.start_wf(run.id, current_step_id=wf.steps[0].id,
+                                          template_id=name)
+            except Exception as e:
+                print(f"  [wf] LM start_wf 失败: {e}", flush=True)
             self._write_step_prompt(run, wf.steps[0])
-            self._save_run(run)
             return run.id
 
-        # 尝试作为 composite workflow 启动
         if name in self.composite_runner.list_chains():
             return self.composite_runner.start(name, context)
 
         raise ValueError(f"未知工作流: {name}")
+
+    def _upsert_template(self, name: str, wf: WorkflowDef):
+        try:
+            steps = [
+                {"step_id": s.id, "title": s.title, "type": s.type,
+                 "target_role": s.target_role,
+                 "prompt_template": s.prompt_template,
+                 "max_retries": s.max_retries,
+                 "verify": s.verify,
+                 "subflow_template": s.subflow_template}
+                for s in wf.steps
+            ]
+            self._lifecycle.upsert_template(
+                name, wf.title, wf.description, steps
+            )
+        except Exception as e:
+            print(f"  [wf] upsert template 失败: {e}", flush=True)
 
     def status(self, wid: str) -> dict:
         run = self._load_run(wid)
@@ -150,15 +219,15 @@ class WorkflowEngine:
         self._save_run(run)
         return True
 
-    # ── daemon loop ───────────────────────────────────────────────
-
     def tick(self) -> int:
-        """显式推进 composite workflows。返回推进的步数。"""
         return self.composite_runner.tick()
 
     def run_once(self):
-        """执行一轮：处理所有 running 状态的 atomic + composite work run。"""
-        # Atomic workflows
+        # 确保工作流涉及的角色存活
+        for _wf_row in self._lifecycle._conn.execute("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')").fetchall():
+            self._ensure_role_alive(_wf_row["assignee"])
+
+        # JSON 文件工作流
         for run_file in self.runs_dir.glob("*.json"):
             try:
                 run = self._load_run_data(run_file.read_text())
@@ -173,11 +242,168 @@ class WorkflowEngine:
                 self._tick(run, current)
             except Exception:
                 pass
-        # Composite workflows
-        self.composite_runner.tick()
 
+        # SQLite production 工作流 — 复用 _lifecycle 连接避免泄漏
+        try:
+            lm = self._lifecycle
+            lm._conn.execute("SELECT 1").fetchone()
+        except Exception:
+            pass
+        try:
+            lm = self._lifecycle
+            rows = lm._conn.execute(
+                "SELECT instance_id, template_id, current_step_id, step_results, created_at, status "
+                "FROM workflow_instances WHERE status IN ('pending','running')"
+            ).fetchall()
+            for row in rows:
+                inst = dict(row)
+                if inst.get("status") == "pending":
+                    lm._conn.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
+                    lm._conn.commit()
+                inst = dict(row)
+                wf_name = inst.get("template_id") or ""
+                wf = self._workflows.get(wf_name)
+                if not wf:
+                    continue
+                step_id = inst.get("current_step_id", "")
+                step = next((s for s in wf.steps if s.id == step_id), None)
+                if not step:
+                    continue
+                results = json.loads(inst.get("step_results") or "{}")
+                step_status = results.get(step_id, {}).get("status", "")
+
+                # 步骤尚未开始（首次检测到）→ 发初始提示词给角色
+                if not step_status:
+                    task = lm._conn.execute(
+                        "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
+                        (inst["instance_id"],)
+                    ).fetchone()
+                    task_title = task["title"] if task else wf_name
+                    task_desc = task["description"] if task else ""
+                    prompt = step.prompt_template
+                    prompt = prompt.replace("{title}", task_title)
+                    prompt = prompt.replace("{description}", task_desc)
+                    prompt = prompt.replace("{assignee}", step.target_role)
+                    self._send_to_role(step.target_role, prompt)
+                    # 标记已通知
+                    results[step_id] = {"status": "notified", "notified_at": time.time()}
+                    lm._conn.execute(
+                        "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                        (json.dumps(results, ensure_ascii=False), inst["instance_id"])
+                    )
+                    lm._conn.commit()
+                    continue
+
+                # completion_check 步骤已完成 → 自动推进到下一步
+                if step.completion_check and step_status in ("step_done_ready", "completed"):
+                    self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
+                    continue
+
+                # exit_condition 步骤 → 检查 bus 消息匹配
+                if step.exit_condition.get("bus_category") and step_status in ("notified", "running"):
+                    _created = inst.get("created_at") or time.time()
+                    run = WorkflowRun(
+                        id=inst["instance_id"], workflow_name=wf_name,
+                        context={}, current_step=step_id,
+                        status="running", step_results=results,
+                        created_at=_created, updated_at=_created,
+                    )
+                    self._tick(run, step)
+        except Exception as _sqle:
+            import logging as _lg
+            _lg.getLogger("engine.sqlite_block").warning("生产工作流扫描异常: %s", _sqle)
+
+        self.composite_runner.tick()
+        self._scan_tasks()
+
+    def _advance_production_wf(self, wf_id: str, lm, wf_name: str, step_id: str,
+                                results: dict = None):
+        """推进生产工作流到下一步，并通知目标角色。"""
+        try:
+            conn = lm._conn
+            wf = self._workflows.get(wf_name)
+            if not wf:
+                return
+            steps = wf.steps
+            idx = next((i for i, s in enumerate(steps) if s.id == step_id), -1)
+            if idx < 0:
+                return
+            # 最后一步 → 检查所有子工作流是否全部完成
+            if idx + 1 >= len(steps):
+                _all_subs_done = True
+                for _sid, _sdata in (results or {}).items():
+                    _sf = _sdata.get("subflow_id", "")
+                    if _sf:
+                        _st = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
+                        if not _st or _st["status"] != "completed":
+                            _all_subs_done = False
+                            break
+                if _all_subs_done:
+                    conn.execute("UPDATE workflow_instances SET status='completed' WHERE instance_id=?", (wf_id,))
+                    conn.commit()
+                    self._bb.write("workflow",
+                        f"[workflow] {wf_name} 完成: {len(steps)} 步",
+                        src="workflow_engine")
+                return
+            # 推进到下一步
+            next_step = steps[idx + 1]
+            conn.execute("UPDATE workflow_instances SET current_step_id=? WHERE instance_id=? AND current_step_id=?",
+                        (next_step.id, wf_id, step_id))
+            new_results = dict(results or {})
+            new_results[next_step.id] = {"status": "pending", "assigned_at": time.time()}
+            conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                        (json.dumps(new_results, ensure_ascii=False), wf_id))
+            conn.commit()
+            # 通知目标角色
+            task = conn.execute(
+                "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
+                (wf_id,)
+            ).fetchone()
+            task_title = task["title"] if task else wf_name
+            task_desc = task["description"] if task else ""
+            prompt = next_step.prompt_template
+            prompt = prompt.replace("{title}", task_title)
+            prompt = prompt.replace("{description}", task_desc)
+            prompt = prompt.replace("{assignee}", next_step.target_role)
+            self._send_to_role(next_step.target_role, prompt,
+                               wf_id=wf_id, step_id=next_step.id)
+            # 如果步骤有子工作流模板 → 自动创建子工作流
+            if next_step.subflow_template:
+                try:
+                    _sub_wf = self._workflows.get(next_step.subflow_template)
+                    if _sub_wf and _sub_wf.steps and _sub_wf.steps[0].target_role == next_step.target_role:
+                        _prev_done = ""
+                        if idx >= 0:
+                            _prev_done = results.get(step_id, {}).get("completed_by", "")
+                        if not _prev_done:
+                            _prev_wf = conn.execute("SELECT assigner FROM workflow_instances WHERE instance_id=?", (wf_id,)).fetchone()
+                            _prev_done = _prev_wf["assigner"] if _prev_wf else "pm"
+                        _task_id = f"task_sub_{uuid.uuid4().hex[:8]}"
+                        _wf_id = f"wf_sub_{uuid.uuid4().hex[:12]}"
+                        conn.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
+                            (_task_id, f"{wf_name}/{next_step.id}: {next_step.title}", task_desc, _prev_done, next_step.target_role, time.time(), time.time(), next_step.subflow_template))
+                        conn.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at) VALUES (?,?,?,?,?,'pending','s1',?,?)",
+                            (_wf_id, next_step.subflow_template, _task_id, _prev_done, next_step.target_role, json.dumps({}), time.time()))
+                        conn.commit()
+                        new_results[next_step.id]["subflow_id"] = _wf_id
+                        conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(new_results, ensure_ascii=False), wf_id))
+                        conn.commit()
+                except Exception:
+                    pass
+        except Exception as e:
+            # 异常时通知目标角色排查修复
+            try:
+                _target_role = wf_name if 'wf_name' in dir() else step_id
+            except Exception:
+                _target_role = ""
+            import logging as _lg
+            _lg.getLogger("engine.advance").warning("推进生产工作流失败 %s: %s", wf_id, e)
+    
     def _tick(self, run: WorkflowRun, step: Step):
-        """检查当前步骤的 exit_condition。"""
+        # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
+        if run.status in ("completed", "cancelled"):
+            return
         ec = step.exit_condition
         cat = ec.get("bus_category", "")
         src_filter = ec.get("source_contains", "")
@@ -185,59 +411,97 @@ class WorkflowEngine:
         timeout = ec.get("timeout_minutes", 30) * 60
         max_retries = step.max_retries
 
-        # 只匹配工作流启动后写入的新消息，过滤老消息跨工作流串匹配
         last_ts = run.step_results.get(step.id, {}).get("poll_since", run.created_at)
 
-        # 检查匹配
         if self._check_exit(cat, src_filter, text_filter, created_after=last_ts):
-            # 验证产出物（如有 verify 命令）
             if step.verify:
-                import subprocess
-                # 展开上下文变量
                 ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
                 vcmd = step.verify
                 for k, val in ctx.items():
                     vcmd = vcmd.replace(f"{{{k}}}", str(val))
-                ver = subprocess.run(
-                    vcmd, shell=True, capture_output=True, timeout=30
-                )
+                ver = _sp.run(vcmd, shell=True, capture_output=True, timeout=30)
                 if ver.returncode != 0:
                     err = ver.stderr.decode()[:200] or "verify failed"
                     self._bb.write("blocker",
                         f"[workflow] {run.workflow_name} {step.id} 验证不通过: {err}",
                         src="workflow_engine")
-                    # ponytail: 不更新 poll_since，下次 tick 可重试同一消息。加 when: 引入重试计数限制防死循环
                     return
 
-            # 完成当前步骤
+            try:
+                self._lifecycle.complete_step(run.id, step.id)
+            except Exception as e:
+                print(f"  [wf] LM complete_step 失败: {e}", flush=True)
+
             run.step_results[step.id] = {"status": "done", "ts": time.time()}
             self._advance(run)
             return
 
-        # 更新 poll_since 为当前时间持久化，下一轮不重复匹配
         run.step_results[step.id] = {
             **run.step_results.get(step.id, {}),
             "poll_since": time.time()
         }
         self._save_run(run)
 
-        # 检查超时
         elapsed = time.time() - (run.step_results.get(step.id, {}).get("ts", run.created_at))
-        if elapsed > timeout + _TIMEOUT_GRACE:
-            attempt = run.step_retries.get(step.id, 0) + 1
-            if attempt <= max_retries:
-                run.step_retries[step.id] = attempt
-                self._write_step_prompt(run, step)
-            else:
-                run.status = "failed"
-                self._bb.write("blocker",
-                    f"[workflow] {run.workflow_name} 步骤 {step.id} 失败(超过最大重试)",
-                    src="workflow_engine")
-            self._save_run(run)
+        if elapsed < timeout:
+            last_reminder = run.step_results.get(step.id, {}).get("last_reminder", 0)
+            if last_reminder > 0 and time.time() - last_reminder > _REMINDER_INTERVAL:
+                remaining = int((timeout - elapsed) / 60)
+                hint = f"⏰ {step.id}（{step.title}）运行中，剩余约 {remaining} 分钟"
+                self._send_to_role(step.target_role, hint)
+                run.step_results[step.id]["last_reminder"] = time.time()
+                self._save_run(run)
+            return
+
+        # 从 step_results 读持久化的超时计数
+        timeout_count = run.step_results.get(step.id, {}).get("timeout_count", 0) + 1
+        run.step_results[step.id] = {
+            **run.step_results.get(step.id, {}),
+            "timeout_count": timeout_count,
+        }
+
+        # 每次超时重发提示词给目标角色
+        hint = f"⏱️ {step.id} 已超时 ({timeout_count}回)，请尽快完成"
+        self._write_step_prompt(run, step, extra_prompt=hint)
+
+        # 每 3 次通知 coordinator
+        if timeout_count % 3 == 0:
+            warning = f"[workflow] {run.workflow_name} {step.id} 持续超时 ({timeout_count}×)，业务侧重点关注"
+            self._bb.write("blocker", warning, src="workflow_engine")
+            try:
+                self._lifecycle.escalate_step(run.id, step.id, reason=warning)
+            except Exception:
+                pass
+            self._send_to_role("coordinator", warning)
+
+        # 持久化到 SQLite（不只是 JSON 文件）
+        self._save_run(run)
+        try:
+            lm = self._lifecycle
+            lm._conn.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(run.step_results, ensure_ascii=False), run.id)
+            )
+            lm._conn.commit()
+        except Exception:
+            pass
+
+    def _check_session_alive(self, role: str, since: float) -> bool:
+        try:
+            session_dir = Path.home() / ".claude" / "projects" \
+                / f"-home-administrator-ccs-workspaces/{role}"
+            if not session_dir.exists():
+                return False
+            latest = max(session_dir.glob("*.jsonl"),
+                         key=lambda f: f.stat().st_mtime) if list(session_dir.glob("*.jsonl")) else None
+            if not latest:
+                return False
+            age = time.time() - latest.stat().st_mtime
+            return age < 300
+        except Exception:
+            return False
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> bool:
-        """检查 bus 中是否有匹配 exit_condition 的消息（不消费）。"""
-        # ponytail: 基于 id 的增量过滤，避免老消息跨工作流串匹配。升级路径：每个 exit msg 标 workflow_id
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         for f in facts:
             if src_filter and f.src != src_filter:
@@ -250,15 +514,17 @@ class WorkflowEngine:
         return False
 
     def _advance(self, run: WorkflowRun):
-        """推进到下一步或完成。"""
         wf = self._workflows.get(run.workflow_name)
         if not wf:
             return
         idx = next((i for i, s in enumerate(wf.steps) if s.id == run.current_step), -1)
         if idx < 0 or idx + 1 >= len(wf.steps):
             run.status = "completed"
+            try:
+                self._lifecycle.close_wf(run.id)
+            except Exception as e:
+                print(f"  [wf] LM close_wf 失败: {e}", flush=True)
             self._save_run(run)
-            # 完成后写 workflow 记录（不写 reflexion_lesson）
             elapsed = run.updated_at - run.created_at
             self._bb.write("workflow",
                 f"[workflow] {run.workflow_name} 完成: {len(wf.steps)} 步, 耗时 {elapsed:.0f}s",
@@ -268,15 +534,13 @@ class WorkflowEngine:
         if next_step.condition and not self._eval_cond(next_step.condition, run):
             return
         run.current_step = next_step.id
+        run.step_results[next_step.id] = {"status": "running", "ts": time.time()}
         self._write_step_prompt(run, next_step)
         self._save_run(run)
 
     def _eval_cond(self, expr: str, run: WorkflowRun) -> bool:
-        """安全评估步骤条件：仅支持 s{id}.status == '状态' 格式。
-        不 eval，仅做模式匹配。"""
         try:
             import re
-            # 匹配 s<数字>.status == '<状态>' 模式
             m = re.search(r"s(\d+)\.status\s*==\s*'([^']+)'", expr)
             if m:
                 step_num = int(m.group(1))
@@ -288,22 +552,85 @@ class WorkflowEngine:
         except Exception:
             return False
 
-    def _write_step_prompt(self, run: WorkflowRun, step: Step):
-        """发送 step prompt 到 bus。"""
-        ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
+    def _ensure_role_alive(self, role: str) -> bool:
+        """检查角色的 CCS 是否存活（tmux 会话），不存活则拉起。存活则确保进 /loop。"""
+        alive = _sp.run(
+            ["tmux", "has-session", "-t", f"ccs-{role}"],
+            capture_output=True, timeout=3,
+        ).returncode == 0
+        if alive:
+            # 注入 /loop 确保角色进入工作循环（防止 standby 卡死）
+            _sp.run(
+                ["tmux", "send-keys", "-t", f"ccs-{role}", "/loop", "Enter"],
+                capture_output=True, timeout=3,
+            )
+            return True
 
-        # 收集 workspace_summary
+        # 拉起 CCS
+        _ccs_cli = Path(__file__).resolve().parent.parent.parent.parent / "session-launcher" / "src" / "ccs.py"
+        try:
+            _sp.run(
+                ["python3", str(_ccs_cli), "start", role, "--no-attach",
+                 "--drive", "loop"],
+                capture_output=True, timeout=30,
+            )
+            for _ in range(15):
+                time.sleep(1)
+                if _sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
+                           capture_output=True, timeout=3).returncode == 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _send_to_role(self, role: str, prompt: str,
+                       wf_id: str = "", step_id: str = ""):
+        """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
+        self._ensure_role_alive(role)
+        prompt = "/goal " + prompt
+        # task_spec 携带完整提示词（角色 loop 读 bus 拿到全部上下文）
+        title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
+        self._bb.write("task_spec", title, evidence=prompt, src="workflow_engine")
+        # ccs send 推送全文
+        _ccs_cli = Path(__file__).resolve().parent.parent.parent.parent / "session-launcher" / "src" / "ccs.py"
+        try:
+            _sp.run(
+                ["python3", str(_ccs_cli), "send", "workflow_engine", role, prompt,
+                 "--from", "workflow_engine"],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            try:
+                from routing.partner import PartnerClient
+                PartnerClient("workflow_engine").force_send(role, prompt)
+            except Exception:
+                pass
+
+    def _write_step_prompt(self, run: WorkflowRun, step: Step, extra_prompt: str = ""):
+        ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
         if "{workspace_summary}" in step.prompt_template:
             ws_dir = Path.home() / ".hermes" / "workspace" / ctx.get("project_name", "")
             ctx["workspace_summary"] = self._collect_workspace_summary(ws_dir)
-
-        prompt = step.prompt_template
+        # 从 SQLite 补 task 上下文
+        if "{title}" in step.prompt_template or "{description}" in step.prompt_template:
+            try:
+                lm = self._lifecycle
+                task = lm._conn.execute(
+                    "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
+                    (run.id,)
+                ).fetchone()
+                if task:
+                    ctx["title"] = task["title"]
+                    ctx["description"] = task["description"]
+                    ctx["assignee"] = step.target_role
+            except Exception:
+                pass
+        prompt = step.prompt_template + "\n" + extra_prompt if extra_prompt else step.prompt_template
         for k, v in ctx.items():
             prompt = prompt.replace(f"{{{k}}}", str(v))
-        self._bb.write("workflow", prompt, src="workflow_engine")
+        self._send_to_role(step.target_role, prompt)
 
     def _collect_workspace_summary(self, ws_dir: Path) -> str:
-        """收集 workspace 下的关键文件摘要。"""
         if not ws_dir.exists():
             return "workspace 不存在"
         parts = []
@@ -315,7 +642,6 @@ class WorkflowEngine:
         return "\n".join(parts) if parts else "workspace 为空"
 
     def _save_run(self, run: WorkflowRun):
-        """原子性保存工作流运行状态。"""
         run.updated_at = time.time()
         data = json.dumps({
             "id": run.id, "workflow_name": run.workflow_name,
@@ -340,8 +666,60 @@ class WorkflowEngine:
         except Exception:
             return None
 
+    def _scan_tasks(self):
+        try:
+            lm = self._lifecycle
+            lm._conn.execute("SELECT 1").fetchone()
+        except Exception:
+            pass
+        try:
+            lm = self._lifecycle
+            conn = lm._conn
+            rows = conn.execute(
+                "SELECT DISTINCT t.task_id, t.status FROM tasks t "
+                "JOIN workflow_instances wi ON t.task_id = wi.task_id "
+                "WHERE t.status NOT IN ('completed', 'failed', 'cancelled')"
+            ).fetchall()
+            for row in rows:
+                task_id = row["task_id"]
+                inst_rows = conn.execute(
+                    "SELECT status FROM workflow_instances WHERE task_id=?",
+                    (task_id,)
+                ).fetchall()
+                statuses = [dict(r)["status"] for r in inst_rows]
+                if not statuses:
+                    continue
+                if all(s in ("completed", "failed", "cancelled") for s in statuses):
+                    ts = "completed" if all(s == "completed" for s in statuses) else "failed"
+                    conn.execute(
+                        "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
+                        (ts, time.time(), task_id))
+                    conn.commit()
+            # 子工作流完成 → 推进父工作流
+            for _sub_row in conn.execute(
+                "SELECT wi.instance_id, wi.step_results FROM workflow_instances wi "
+                "WHERE wi.status='running' AND wi.template_id IN (SELECT template_id FROM workflow_templates)"
+            ).fetchall():
+                _sr = json.loads(_sub_row["step_results"] or "{}")
+                for _step_id, _sdata in _sr.items():
+                    _sf = _sdata.get("subflow_id", "")
+                    if _sf:
+                        _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
+                        if _sub_status and _sub_status["status"] == "completed":
+                            _sdata["status"] = "completed"
+                            _sdata["completed_at"] = time.time()
+                            conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                            conn.commit()
+                            # 推进父工作流
+                            _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
+                            if _tmpl:
+                                _wf = self._workflows.get(_tmpl["template_id"])
+                                if _wf:
+                                    self._advance_production_wf(_sub_row["instance_id"], lm, _tmpl["template_id"], _step_id, _sr)
+        except Exception:
+            pass
 
-# ── CLI ───────────────────────────────────────────────────────────
 
 def main():
     import argparse, sys, os, signal
@@ -371,7 +749,6 @@ def main():
     _PID_FILE = Path("/tmp") / "workflow-engine-daemon.pid"
 
     def _daemon_loop(interval: int):
-        # 单实例锁
         if _PID_FILE.exists():
             try:
                 old = int(_PID_FILE.read_text())
@@ -417,37 +794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ── DAG 步骤支持（Hatchet 模式）──
-# 允许工作流步骤之间存在 DAG 依赖关系
-# 步骤可以并行执行，前置条件满足后自动触发
-
-_dag_lock = threading.Lock()
-_DAG_RUNNING: dict[str, set] = {}  # run_id -> set of completed steps
-
-def dag_step_done(run_id: str, step_id: str) -> list[str]:
-    """标记 DAG 步骤完成，返回可解锁的下游步骤列表。"""
-    with _dag_lock:
-        if run_id not in _DAG_RUNNING:
-            _DAG_RUNNING[run_id] = set()
-        _DAG_RUNNING[run_id].add(step_id)
-        return list(_DAG_RUNNING[run_id])
-
-def dag_ready_steps(run_id: str, dag: dict[str, list[str]]) -> list[str]:
-    """返回 DAG 中当前可执行的步骤（所有前置依赖已完成）。"""
-    with _dag_lock:
-        completed = _DAG_RUNNING.get(run_id, set())
-    ready = []
-    for step, deps in dag.items():
-        if step in completed:
-            continue
-        if all(d in completed for d in deps):
-            ready.append(step)
-    return ready
-
-def dag_reset(run_id: str) -> None:
-    """重置 DAG 状态。"""
-    with _dag_lock:
-        _DAG_RUNNING.pop(run_id, None)
-
-

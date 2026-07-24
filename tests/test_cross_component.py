@@ -28,8 +28,8 @@ for p in reversed([_launcher_src, _pipeline_src, _hermes_scripts]):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from workflow_db import WorkflowDB
-from workflow_engine import WorkflowEngine, WorkflowDef, Step
+from pipeflow.db import WorkflowDB
+from pipeflow.engine import WorkflowEngine, WorkflowDef, Step
 from bus_protocol import Blackboard
 
 
@@ -84,7 +84,7 @@ def test_client_create_task_db_sees():
     """Client 创建 task → DB 能查到，状态、assigner 正确。"""
     db_path = _tmp_db()[0]
     from workflow.client import WorkflowClient
-    from workflow_db import WorkflowDB
+    from pipeflow.db import WorkflowDB
     # pre-create template for Gate validation
     db = WorkflowDB(db_path)
     tmpl_id = db.create_template("fix", "修复模板", {"steps": [{"id": "s1"}]})

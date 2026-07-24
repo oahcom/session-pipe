@@ -16,6 +16,15 @@ DB_PATH = Path.home() / ".hermes" / "state" / "composite_runs.db"
 
 
 @dataclass
+class LoopConfig:
+    """工作流循环控制配置。"""
+    schedule: str = ""
+    max_iterations: int = 0
+    rest_if_no_work: bool = True
+    idle_timeout_minutes: int = 60
+
+
+@dataclass
 class CompositeRun:
     run_id: str
     name: str

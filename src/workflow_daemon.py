@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """thin wrapper — re-export from pipeflow.daemon"""
-from pipeflow.daemon import daemon_loop, connect_feed, push_prompt_to_ccs, check_and_push, INTERVAL
-__all__ = ['daemon_loop', 'connect_feed', 'push_prompt_to_ccs', 'check_and_push']
+from pipeflow.daemon import daemon_loop, INTERVAL
+__all__ = ['daemon_loop']
 
 if __name__ == "__main__":
     import argparse

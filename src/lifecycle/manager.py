@@ -65,6 +65,17 @@ class LifecycleManager:
 
     # ── 状态查询 ─────────────────────────────────
 
+    def upsert_template(self, template_id: str, name: str,
+                         description: str, steps: list[dict]) -> None:
+        """写入或更新工作流模板定义。"""
+        self._conn.execute("""
+            INSERT OR REPLACE INTO workflow_templates
+            (template_id, name, description, steps_json, created_at, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (template_id, name, description,
+              json.dumps(steps, ensure_ascii=False), time.time()))
+        self._conn.commit()
+
     def get_wf(self, wf_id: str) -> Optional[dict]:
         row = self._conn.execute(
             "SELECT * FROM workflow_instances WHERE instance_id=?", (wf_id,)
@@ -111,21 +122,31 @@ class LifecycleManager:
 
     # ── 核心操作（并发安全） ─────────────────────
 
-    def start_wf(self, wf_id: str) -> bool:
+    def start_wf(self, wf_id: str, current_step_id: str = "s1",
+                  template_id: str = "") -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
-                    "UPDATE workflow_instances SET status='running' "
-                    "WHERE instance_id=? AND status='pending'", (wf_id,)
+                    "UPDATE workflow_instances SET status='running', "
+                    "current_step_id=? WHERE instance_id=? AND status='pending'",
+                    (current_step_id, wf_id)
                 )
-                self._conn.commit()
                 if cur.rowcount == 0:
-                    return False
+                    # engine 直接启动的工作流（无前置 task），INSERT 完整行
+                    self._conn.execute("""
+                        INSERT OR IGNORE INTO workflow_instances
+                        (instance_id, assigner, assignee, status, current_step_id,
+                         template_id, created_at)
+                        VALUES (?, 'workflow_engine', 'workflow_engine', 'running',
+                                ?, ?, ?)
+                    """, (wf_id, current_step_id,
+                          template_id or None, time.time()))
+                self._conn.commit()
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
                 self._log(wf_id, task_id, "wf_started",
-                          detail=f"workflow started by {self.role}")
+                          detail=f"workflow started by {self.role}, step={current_step_id}")
                 return True
             except Exception:
                 self._conn.rollback()
@@ -282,7 +303,7 @@ class LifecycleManager:
         if not executor:
             return
         try:
-            from workflow.client import CCS_CLI
+            from workflow.client import get_ccs_cli as _get_ccs_cli
             import subprocess as _sp
             status = "✅ 通过" if approved else "❌ 拒绝"
             msg = (
@@ -296,8 +317,9 @@ class LifecycleManager:
                 msg += f"原因: {reason}\n"
             if not approved:
                 msg += "\n请根据拒绝原因修改后重新提交。"
+            _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
-                ["python3", str(CCS_CLI), "send", "coordinator", executor, msg,
+                ["python3", _ccs_cli, "send", "coordinator", executor, msg,
                  "--from", self.role],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
@@ -490,16 +512,28 @@ class LifecycleManager:
         # 构建审批提示词
         approval_prompt = step.get("approval_prompt", "")
         if not approval_prompt:
+            step_title = step.get('title', '')
+            completed_by = results.get(step_id, {}).get('completed_by', 'unknown')
+            step_prompt = (step.get('prompt_template', '') or '')[:800]
             approval_prompt = (
-                f"步骤 {step_id}（{step.get('title', '')}）已完成，请审查质量并确认。\n"
-                f"完成者: {results.get(step_id, {}).get('completed_by', '未知')}\n"
-                f"用密钥审批: python3 src/ccs.py send {self.role} {assigner} "
-                f'"confirm {wf_id} {step_id} {token}"'
+                f"## 审批请求: 步骤 {step_id} - {step_title}\n\n"
+                f"### 基本信息\n"
+                f"- 工作流: {wf_id}\n"
+                f"- 步骤: {step_id} - {step_title}\n"
+                f"- 执行人: {completed_by}\n"
+                f"- 审批密钥: {token}（有效期 1 小时）\n\n"
+                f"### 审查要点\n"
+                f"1. 完整性 - 是否完成步骤要求的所有产出？\n"
+                f"2. 正确性 - 产出物是否符合质量标准？\n"
+                f"3. 可追溯性 - 产出物路径和来源是否可验证？\n"
+                f"4. 风险 - 是否存在未提及的风险或副作用？\n\n"
+                f"### 步骤原始要求\n"
+                f"{step_prompt}\n"
             )
 
         # ccs send-safe 给 assigner
         try:
-            from workflow.client import CCS_CLI
+            from workflow.client import get_ccs_cli as _get_ccs_cli
             import subprocess as _sp
             msg = (
                 f"[workflow] 步骤审批请求\n\n"
@@ -509,8 +543,9 @@ class LifecycleManager:
                 f"有效期: 1小时\n\n"
                 f"审批提示:\n{approval_prompt}"
             )
+            _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
-                ["python3", str(CCS_CLI), "send", self.role, assigner, msg,
+                ["python3", _ccs_cli, "send", self.role, assigner, msg,
                  "--from", self.role],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
@@ -740,3 +775,62 @@ class LifecycleManager:
 
     def close(self):
         self._conn.close()
+
+    # ── Engine 集成 ─────────────────────────────
+
+    def get_run(self, wf_id: str) -> Optional[dict]:
+        """返回工作流运行的轻量快照，供 engine 查询状态。"""
+        wf = self.get_wf(wf_id)
+        if not wf:
+            return None
+        template = self._get_template(wf.get("template_id"))
+        steps = template.get("steps", []) if template else []
+        results = self._parse_results(wf)
+        current_step = wf.get("current_step_id", "")
+        return {
+            "id": wf_id,
+            "status": wf.get("status", ""),
+            "current_step": current_step,
+            "steps": steps,
+            "step_results": results,
+            "created": wf.get("created_at"),
+        }
+
+    # ── 升级与重分配 ────────────────────────────
+
+    def escalate_step(self, wf_id: str, step_id: str,
+                      reason: str = "") -> dict:
+        """升级步骤：标记 escalated + 写日志 + 返回 coordinator 角色名。"""
+        with self._lock:
+            results = self._parse_results(self._get_wf_unsafe(wf_id) or {})
+            step_result = results.setdefault(step_id, {})
+            step_result["escalated"] = True
+            step_result["escalated_at"] = time.time()
+            step_result["escalated_by"] = self.role
+            if reason:
+                step_result["escalation_reason"] = reason
+            self._conn.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(results, ensure_ascii=False), wf_id))
+            self._conn.commit()
+            task_id = (self._get_wf_unsafe(wf_id) or {}).get("task_id")
+            self._log(wf_id, task_id, "step_escalated",
+                      detail=f"step {step_id}: {reason}")
+            return {"wf_id": wf_id, "step_id": step_id, "role": "coordinator"}
+
+    def reassign_step(self, wf_id: str, step_id: str, new_role: str) -> bool:
+        """重分配步骤到新角色：改 step_results 中的 target_role。"""
+        with self._lock:
+            results = self._parse_results(self._get_wf_unsafe(wf_id) or {})
+            step_result = results.setdefault(step_id, {})
+            step_result["reassigned_to"] = new_role
+            step_result["reassigned_at"] = time.time()
+            step_result["reassigned_by"] = self.role
+            self._conn.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(results, ensure_ascii=False), wf_id))
+            self._conn.commit()
+            task_id = (self._get_wf_unsafe(wf_id) or {}).get("task_id")
+            self._log(wf_id, task_id, "step_reassigned",
+                      detail=f"{step_id} → {new_role}")
+            return True

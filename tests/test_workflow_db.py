@@ -15,7 +15,7 @@ _PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
-from workflow_db import WorkflowDB
+from pipeflow.db import WorkflowDB
 
 
 def _count_tables(db):
