@@ -217,7 +217,7 @@ class CompositeRunner:
         step_id = step.get("id", run.current_step_id)
 
         try:
-            from workflow_client import WorkflowClient
+            from workflow.client import WorkflowClient
             with WorkflowClient("coordinator") as wf:
                 task_id = wf.create_task(
                     f"[{run.name}] {title}",

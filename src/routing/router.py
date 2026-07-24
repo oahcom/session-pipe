@@ -29,8 +29,9 @@ SESSION_ROLES_DIR = Path(os.environ.get(
     Path.home() / "hermes-session-roles" / "personas" / "session-roles"
 ))
 
-# 路由 DB
-from routing.rdb import RoutingDB as routing_db
+# 路由 DB（全局单例）
+from routing.rdb import RoutingDB
+routing_db = RoutingDB()
 
 # ── 规范Bus分类注册表 ──
 # 从 canonical_categories.py 加载（单一权威来源）

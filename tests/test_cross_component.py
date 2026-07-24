@@ -60,7 +60,7 @@ def test_db_client_same_schema():
     """WorkflowDB 和 WorkflowClient 连同一个 DB 应能操作。"""
     db_path = _tmp_db()[0]
     db = WorkflowDB(db_path)
-    from workflow_client import WorkflowClient
+    from workflow.client import WorkflowClient
     client = WorkflowClient("test_role", db_path=db_path)
     # DB 创建模板
     tmpl_id = db.create_template("shared_tmpl", "共享模板", {"steps": [{"id": "s1"}]})
@@ -83,7 +83,7 @@ def test_db_client_same_schema():
 def test_client_create_task_db_sees():
     """Client 创建 task → DB 能查到，状态、assigner 正确。"""
     db_path = _tmp_db()[0]
-    from workflow_client import WorkflowClient
+    from workflow.client import WorkflowClient
     from workflow_db import WorkflowDB
     # pre-create template for Gate validation
     db = WorkflowDB(db_path)
@@ -293,7 +293,7 @@ def test_permission_delete_consistency():
     wid2 = db.create_workflow(tid2, "tmpl", "carol", "dan")
     db.close()
 
-    from workflow_client import WorkflowClient
+    from workflow.client import WorkflowClient
     with WorkflowClient("carol", db_path=db_path) as client:
         # carol(assigner) 不能删
         assert client.delete_task(tid2) == False
