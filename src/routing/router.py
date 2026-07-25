@@ -11,31 +11,29 @@ Session Pipeline Router — 角色间消息路由。
 """
 import json
 import os
-import re
-import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-# ── 路径自动发现 ──
-_HERMES_SCRIPTS = Path(os.environ.get(
-    "HERMES_SCRIPTS_DIR",
-    str(Path.home() / ".hermes" / "scripts")
-))
+# ── 角色路由数据：使用 shared_loader 的导出结果 ──
+# 不再直接 parse 角色 JSON（hermes-session-roles 的 shared_loader 负责解析）
+_ROLES_EXPORT_PATH = Path.home() / ".hermes" / "data" / "roles_export.json"
 
-# 项目 A 角色 JSON 目录
-SESSION_ROLES_DIR = Path(os.environ.get(
-    "SESSION_ROLES_ROOT",
-    Path.home() / "hermes-session-roles" / "personas" / "session-roles"
-))
+def _load_roles_export() -> dict:
+    """加载 shared_loader 导出的角色路由数据。"""
+    if _ROLES_EXPORT_PATH.exists():
+        try:
+            data = json.loads(_ROLES_EXPORT_PATH.read_text())
+            return {r["name"]: r for r in data.get("roles", [])}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
 
-# 路由 DB（全局单例）
+# ── 路由 DB（全局单例） ──
 from routing.rdb import RoutingDB
 routing_db = RoutingDB()
 
 # ── 规范Bus分类注册表 ──
-# 从 canonical_categories.py 加载（单一权威来源）
-# 若 JSON 不存在，回退到静态字典
 _CANONICAL_PATH = Path(os.environ.get(
     "BUS_CANONICAL_PATH",
     str(Path.home() / ".hermes" / "data" / "bus_canonical.json")
@@ -65,91 +63,21 @@ def priority(category: str) -> int:
     return CATEGORY_PRIORITY.get(category, _DEFAULT_PRIORITY)
 
 
-def _parse_produce_categories(output_targets: list[str]) -> list[str]:
-    """从 output_targets 提取产出分类。
-
-    "bus cat=code_fix 修复方案" → ["code_fix"]
-    "git commit" → []（忽略非 bus 目标）
-    "bus consume" → []（消费动作，非产出）
-    """
-    cats: list[str] = []
-    for target in output_targets:
-        m = re.search(r"bus cat=(\w+)", target)
-        if m:
-            cat = m.group(1)
-            if cat not in cats:
-                cats.append(cat)
-    return cats
-
-
-def _parse_consume_categories(input_signals: list[dict]) -> list[str]:
-    """从 input_signals 提取消费分类。
-
-    新格式：
-      {"type": "bus", "spec": {"category": "security"}} → ["security"]
-      {"type": "bus", "spec": {"category": "*"}} → ["*"]
-    旧格式（兼容）：
-      {"source": "bus cat=security"} → ["security"]
-      {"source": "bus_client.py read --cat security"} → ["security"]
-      {"source": "bus_client.py unread --all"} → ["*"]
-      {"source": "systemctl ..."} → []（非 bus 信号）
-    """
-    cats: list[str] = []
-    for signal in input_signals:
-        # 新格式：type == "bus" 且 spec.category 存在
-        sig_type = signal.get("type", "")
-        if sig_type == "bus":
-            spec = signal.get("spec", {})
-            category = spec.get("category", "")
-            if category:
-                if category == "*":
-                    if "*" not in cats:
-                        cats.append("*")
-                elif category not in cats:
-                    cats.append(category)
-                continue
-
-        # 旧格式：source 字段（type为空 或 type=bus但category为空时 fallback）
-        source = signal.get("source", "")
-        # 全量消费标记
-        if "unread --all" in source:
-            if "*" not in cats:
-                cats.append("*")
-            continue
-        # bus cat=xxx 模式（\w+ 不匹配 *，单独处理）
-        if "bus cat=*" in source:
-            if "*" not in cats:
-                cats.append("*")
-            continue
-        for m in re.finditer(r"bus cat=(\w+)", source):
-            cat = m.group(1)
-            if cat not in cats:
-                cats.append(cat)
-        # bus_client.py read --cat xxx 模式
-        for m in re.finditer(r"--cat (\w+)", source):
-            cat = m.group(1)
-            if cat not in cats:
-                cats.append(cat)
-    return cats
-
-
 class Router:
-    """路由表：优先从 SQLite 加载，fallback 到角色 JSON 目录。"""
+    """路由表：优先从 SQLite 加载，fallback 到 shared_loader 导出。"""
 
-    def __init__(self, roles_dir: Path = SESSION_ROLES_DIR):
-        self.roles_dir = roles_dir
+    def __init__(self):
         self._routing = self._load_from_db_or_build()
 
     def _load_from_db_or_build(self) -> dict:
-        """优先从 DB 加载路由表（仅默认目录），fallback 到角色 JSON 目录。"""
-        if str(self.roles_dir.resolve()) == str(SESSION_ROLES_DIR.resolve()):
-            try:
-                db_routing = routing_db.load_routing()
-                if db_routing:
-                    return db_routing
-            except Exception:
-                pass
-        return self._build_routing()
+        """优先从 DB 加载路由表，fallback 到 shared_loader 导出。"""
+        try:
+            db_routing = routing_db.load_routing()
+            if db_routing:
+                return db_routing
+        except Exception:
+            pass
+        return self._build_from_export()
 
     def load_from_db(self) -> dict:
         """重新从 DB 加载路由表，更新 self._routing。"""
@@ -166,45 +94,28 @@ class Router:
         self._routing[role] = {"produce": produce, "consume": consume}
         return routing_db.save_routing(role, produce, consume, changed_by)
 
-    def _build_routing(self) -> dict:
-        """从角色 JSON 文件构建路由表。
-
-        回退：若目录不存在或为空，返回空 dict（由调用方决定后续行为）。
-        """
-        if not self.roles_dir.exists():
+    def _build_from_export(self) -> dict:
+        """从 shared_loader 导出的 roles_export.json 构建路由表。"""
+        roles = _load_roles_export()
+        if not roles:
             return {}
 
         routing: dict = {}
-        for json_file in sorted(self.roles_dir.glob("*.json")):
-            try:
-                with open(json_file) as f:
-                    persona = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-
-            name = persona.get("name")
-            if not name:
-                continue
-
-            produce = _parse_produce_categories(persona.get("output_targets", []))
-            consume = _parse_consume_categories(persona.get("input_signals", []))
-
+        for name, r in roles.items():
+            produce = r.get("routing", {}).get("produce", [])
+            consume = r.get("routing", {}).get("consume", [])
             routing[name] = {"produce": produce, "consume": consume}
 
         # Extend routing from Browser Harness config
         routing = self._extend_from_bh_config(routing)
-
         return routing
 
     def _extend_from_bh_config(self, routing: dict) -> dict:
-        """Extend routing with Browser Harness profiles.
-
-        Loads _bh_route_config.json (relative to roles_dir parent/personas/browser-harness/)
-        and adds produce categories for each BH profile mapped to a session role.
-        """
-        # Try roles_dir-relative path first, fallback to global
-        local_bh = self.roles_dir.parent / "browser-harness" / "_bh_route_config.json"
-        bh_config_path = Path(os.environ.get("BH_ROUTE_CONFIG", str(local_bh)))
+        """Extend routing with Browser Harness profiles. (from _bh_route_config.json)"""
+        bh_config_path = Path(os.environ.get(
+            "BH_ROUTE_CONFIG",
+            str(Path.home() / "hermes-session-roles" / "personas" / "browser-harness" / "_bh_route_config.json")
+        ))
         if not bh_config_path.exists():
             return routing
         try:
