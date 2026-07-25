@@ -42,7 +42,8 @@ def reconfigure() -> None:
     from config_loader import get_config
     try:
         cfg = get_config()
-    except Exception:
+    except Exception as _e:
+        LOGGER.warning("[reliability] get_config 失败: %s", _e)
         cfg = None
 
     if cfg is None:
@@ -112,6 +113,7 @@ def _config_mtime() -> float:
     try:
         return os.path.getmtime(_CONFIG_FILE)
     except OSError:
+        LOGGER.warning("[reliability] config.yaml 不可读")
         return 0.0
 
 

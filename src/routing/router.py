@@ -11,13 +11,16 @@ Session Pipeline Router — 角色间消息路由。
 """
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
+from paths import HERMES_STATE, SESSION_ROLES_ROOT
+
 # ── 角色路由数据：使用 shared_loader 的导出结果 ──
 # 不再直接 parse 角色 JSON（hermes-session-roles 的 shared_loader 负责解析）
-_ROLES_EXPORT_PATH = Path.home() / ".hermes" / "data" / "roles_export.json"
+_ROLES_EXPORT_PATH = HERMES_STATE.parent / "data" / "roles_export.json"
 
 def _load_roles_export() -> dict:
     """加载 shared_loader 导出的角色路由数据。"""
@@ -25,8 +28,8 @@ def _load_roles_export() -> dict:
         try:
             data = json.loads(_ROLES_EXPORT_PATH.read_text())
             return {r["name"]: r for r in data.get("roles", [])}
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as _e:
+            print(f"  [router] WARNING: roles_export 加载失败: {_e}", file=sys.stderr)
     return {}
 
 # ── 路由 DB（全局单例） ──
@@ -36,12 +39,13 @@ routing_db = RoutingDB()
 # ── 规范Bus分类注册表 ──
 _CANONICAL_PATH = Path(os.environ.get(
     "BUS_CANONICAL_PATH",
-    str(Path.home() / ".hermes" / "data" / "bus_canonical.json")
+    str(HERMES_STATE.parent / "data" / "bus_canonical.json")
 ))
 if _CANONICAL_PATH.exists():
     try:
         _CANONICAL = json.loads(_CANONICAL_PATH.read_text())["categories"]
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, KeyError) as _e:
+        print(f"  [router] WARNING: bus_canonical 解析失败: {_e}", file=sys.stderr)
         _CANONICAL = {}
 else:
     _CANONICAL = {}
@@ -75,8 +79,8 @@ class Router:
             db_routing = routing_db.load_routing()
             if db_routing:
                 return db_routing
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
         return self._build_from_export()
 
     def load_from_db(self) -> dict:
@@ -85,8 +89,8 @@ class Router:
             db_routing = routing_db.load_routing()
             if db_routing:
                 self._routing = db_routing
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
         return self._routing
 
     def register_role(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
@@ -114,13 +118,14 @@ class Router:
         """Extend routing with Browser Harness profiles. (from _bh_route_config.json)"""
         bh_config_path = Path(os.environ.get(
             "BH_ROUTE_CONFIG",
-            str(Path.home() / "hermes-session-roles" / "personas" / "browser-harness" / "_bh_route_config.json")
+            str(SESSION_ROLES_ROOT / "personas" / "browser-harness" / "_bh_route_config.json")
         ))
         if not bh_config_path.exists():
             return routing
         try:
             bh_data = json.loads(bh_config_path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as _e:
+            print(f"  [router] WARNING: BH config 加载失败: {_e}", file=sys.stderr)
             return routing
 
         profiles = bh_data.get("bh_profiles", {})
