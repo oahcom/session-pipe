@@ -280,27 +280,8 @@ class WorkflowClient:
         self._log(wf_id=wf_id, action="completed", detail=f"summary={summary}")
 
     def _sync_task_from_workflows(self, task_id: str):
-        rows = self._conn.execute(
-            "SELECT status FROM workflow_instances WHERE task_id=?", (task_id,)
-        ).fetchall()
-        statuses = [dict(r)["status"] for r in rows]
-        if not statuses:
-            return
-        if all(s == "completed" for s in statuses):
-            task_status = "completed"
-        elif any(s == "failed" for s in statuses):
-            task_status = "failed"
-        elif any(s == "cancelled" for s in statuses):
-            task_status = "cancelled"
-        elif any(s in ("running", "pending") for s in statuses):
-            task_status = "in_progress"
-        else:
-            task_status = "completed"
-            import logging
-            logging.getLogger("workflow.client").warning(
-                "_sync_task_from_workflows(%s): 未匹配的状态 %s, 默认 completed", task_id, statuses)
-        self._conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-                          (task_status, time.time(), task_id))
+        from workflow.sync import sync_task_status
+        sync_task_status(self._conn, task_id)
         self._conn.commit()
 
     def fail(self, wf_id: str, reason: str):

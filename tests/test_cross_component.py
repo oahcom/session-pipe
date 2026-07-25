@@ -164,11 +164,15 @@ def test_engine_start_then_db_status():
     s = eng.status(rid)
     assert s["status"] == "running"
     assert s["workflow"] == "research"
-    # 验证 run 文件存在
-    run_file = wf_dir / "runs" / f"{rid}.json"
-    assert run_file.exists()
-    raw = json.loads(run_file.read_text())
-    assert raw["current_step"] == "s1"
+    # 验证 SQLite 记录存在
+    lm = eng._lifecycle
+    row = lm._conn.execute(
+        "SELECT current_step_id, status FROM workflow_instances WHERE instance_id=?",
+        (rid,)
+    ).fetchone()
+    assert row is not None, "workflow instance not in SQLite"
+    assert row["current_step_id"] == "s1"
+    assert row["status"] == "running"
 
 
 def test_engine_advance_to_completion():
@@ -345,8 +349,8 @@ def test_engine_writes_step_prompt_to_bus():
     eng = WorkflowEngine(workflows_dir=wf_dir)
     eng.start("prompt_test", {"topic": "紧急安全漏洞"})
     bb = eng._bb
-    facts = bb.read(cat="workflow")
-    matched = [f for f in facts if "紧急安全漏洞" in f.t]
+    facts = bb.read(cat="task_spec", limit=500)
+    matched = [f for f in facts if "紧急安全漏洞" in (f.t or "") or "紧急安全漏洞" in (f.e or "")]
     assert len(matched) >= 1, "Engine 应将步骤 prompt 写入 bus"
 
 

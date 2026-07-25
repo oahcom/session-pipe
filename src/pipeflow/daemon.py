@@ -7,7 +7,9 @@ Workflow Daemon — 驱动工作流引擎，主动推进工作流步骤。
 - running -> 检测 exit_condition + 超时升级 + 提醒心跳
 
 用法：
-  python3 workflow_daemon.py --interval 30
+  python3 pipeflow/daemon.py --interval 30
+
+sys.path 由 paths.py 集中管理，本文件不修改 sys.path。
 """
 
 import os
@@ -17,17 +19,13 @@ import threading
 import time
 from pathlib import Path
 
-# 确保 session-pipeline/src 优先
-# 不能依赖 ensure_paths() 因为它会把 session-launcher/src 加在前面
-# 而 launcher 的 lifecycle/manager.py 已被删除
-_src = str(Path(__file__).resolve().parent.parent)
-if _src not in sys.path:
-    sys.path.insert(0, _src)
+# 自愈 sys.path: 从文件位置推导 src/ 路径，支持从任意目录直接执行
+_src = Path(__file__).resolve().parent.parent
+if str(_src) not in sys.path:
+    sys.path.insert(0, str(_src))
 
-# 手动确保 pipeline 的 lifecycle 包已被加载（阻止 launcher 的 lifecycle 占位）
-_pl = str(Path(_src) / "lifecycle")
-if _pl not in sys.path:
-    sys.path.insert(0, _pl)
+from paths import ensure_paths
+ensure_paths()
 
 from pipeflow.engine import WorkflowEngine
 
@@ -73,10 +71,7 @@ def daemon_loop(interval: int):
                 eng.run_once()
             except Exception as e:
                 print(f"[daemon] run_once 异常: {e}")
-            try:
-                eng.tick()
-            except Exception as e:
-                print(f"[daemon] tick 异常: {e}")
+            # NOTE: engine.tick() 是 run_once() 的别名，不再重复调用
             time.sleep(interval)
     finally:
         _PID_FILE.unlink(missing_ok=True)

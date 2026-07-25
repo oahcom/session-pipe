@@ -35,7 +35,7 @@ def test_daemon_loop_runs_engine(mock_engine_cls):
     t.start()
     time.sleep(0.15)
     assert mock_eng.run_once.call_count >= 2, f"run_once 调用次数: {mock_eng.run_once.call_count}"
-    assert mock_eng.tick.call_count >= 2, f"tick 调用次数: {mock_eng.tick.call_count}"
+    # NOTE: tick() 是 run_once() 的别名，已在 daemon 循环中去除重复调用
     pid_file.unlink(missing_ok=True)
 
 

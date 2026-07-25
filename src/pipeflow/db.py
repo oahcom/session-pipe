@@ -12,6 +12,8 @@ Workflow Database — SQLite 存储工作流模板、实例和任务记录。
   created → pending → running → completed/failed/cancelled
   ↓
   step: pending → running → completed/failed
+
+Schema 统一在 workflow/db.py 定义，本文件复用之。
 """
 
 import json
@@ -22,18 +24,17 @@ from pathlib import Path
 from typing import Any, Optional
 
 from paths import WORKFLOWS_DB as DB_PATH
+from workflow.db import create_connection
 
 
 class WorkflowDB:
     """工作流 + 任务 SQLite 数据库。"""
 
-    def __init__(self, db_path: str | Path = DB_PATH):
-        self.db_path = Path(db_path).expanduser()
+    def __init__(self, db_path: str | Path = None):
+        self.db_path = Path(db_path).expanduser() if db_path else DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), timeout=10)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._init_schema()
+        # 使用 workflow/db.py 的统一 schema 初始化器
+        self._conn = create_connection(str(self.db_path))
 
     def __enter__(self):
         return self
@@ -41,73 +42,6 @@ class WorkflowDB:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
-
-    def _init_schema(self):
-        self._conn.executescript("""
-            -- 工作流模板（可复用）
-            CREATE TABLE IF NOT EXISTS workflow_templates (
-                template_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                steps_json TEXT NOT NULL,
-                steps_mermaid TEXT,
-                created_at REAL NOT NULL
-            );
-
-            -- 工作流实例（具体执行）
-            CREATE TABLE IF NOT EXISTS workflow_instances (
-                instance_id TEXT PRIMARY KEY,
-                template_id TEXT,
-                task_id TEXT NOT NULL,
-                assigner TEXT NOT NULL,
-                assignee TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                current_step_id TEXT,
-                step_results TEXT DEFAULT '{}',
-                context TEXT DEFAULT '{}',
-                created_at REAL NOT NULL,
-                completed_at REAL,
-                FOREIGN KEY (task_id) REFERENCES tasks(task_id),
-                FOREIGN KEY (template_id) REFERENCES workflow_templates(template_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_instances_task ON workflow_instances(task_id);
-            CREATE INDEX IF NOT EXISTS idx_instances_assignee ON workflow_instances(assignee);
-            CREATE INDEX IF NOT EXISTS idx_instances_status ON workflow_instances(status);
-
-            -- 任务（目标）
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT,
-                assigner TEXT NOT NULL,
-                assignee TEXT,
-                priority INTEGER DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'created',
-                current_workflow_id TEXT,
-                progress TEXT DEFAULT '{}',
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                completed_at REAL,
-                tags TEXT DEFAULT '[]',
-                context TEXT DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_tasks_assigner ON tasks(assigner);
-            CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
-
-            -- 操作日志
-            CREATE TABLE IF NOT EXISTS workflow_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                workflow_instance_id TEXT,
-                task_id TEXT,
-                action TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                detail TEXT,
-                ts REAL NOT NULL
-            );
-        """)
-        self._conn.commit()
 
     def _log(self, workflow_instance_id: str = None, task_id: str = None,
              action: str = "", actor: str = "", detail: str = ""):
@@ -178,12 +112,10 @@ class WorkflowDB:
         if not row:
             return None
         task = dict(row)
-        # 从 workflow_instances 推导进度
         task["progress"] = self._compute_progress(task_id)
         return task
 
     def _compute_progress(self, task_id: str) -> dict:
-        """从 workflow_instances 推导任务进度。"""
         rows = self._conn.execute(
             "SELECT * FROM workflow_instances WHERE task_id=? ORDER BY created_at",
             (task_id,)
@@ -235,7 +167,6 @@ class WorkflowDB:
         task = self.get_task(task_id)
         if not task:
             return False
-        # 只有接收者或系统可以删除，下达者不能删
         if task['assigner'] == actor and actor != "system":
             return False
         self._log(task_id=task_id, action="deleted", actor=actor)
@@ -285,7 +216,6 @@ class WorkflowDB:
               first_step.get("id"), now, json.dumps(context or {}, ensure_ascii=False)))
         self._conn.commit()
 
-        # 更新 Task 的 current_workflow_id
         self._conn.execute("UPDATE tasks SET current_workflow_id=?, status='in_progress' WHERE task_id=?",
                            (instance_id, task_id))
         self._conn.commit()
@@ -339,7 +269,6 @@ class WorkflowDB:
         self._conn.execute(f"UPDATE workflow_instances SET {', '.join(updates)} WHERE instance_id=?", params)
         self._conn.commit()
 
-        # 如果工作流完成，更新 Task 状态
         if 'status' in kwargs and kwargs['status'] in ('completed', 'failed', 'cancelled'):
             wf = self.get_workflow(instance_id)
             if wf:
@@ -349,33 +278,12 @@ class WorkflowDB:
         return True
 
     def _sync_task_from_workflows(self, task_id: str):
-        """从 workflow_instances 同步 Task 状态。"""
-        rows = self._conn.execute(
-            "SELECT status FROM workflow_instances WHERE task_id=?", (task_id,)
-        ).fetchall()
-        statuses = [dict(r)["status"] for r in rows]
-
-        if not statuses:
-            return
-
-        # 如果所有工作流都完成，Task 完成
-        if all(s == "completed" for s in statuses):
-            task_status = "completed"
-        # 如果任何工作流失败，Task 失败
-        elif any(s == "failed" for s in statuses):
-            task_status = "failed"
-        # 如果有 running 或 pending，Task 进行中
-        elif any(s in ("running", "pending") for s in statuses):
-            task_status = "in_progress"
-        else:
-            task_status = "completed"
-
-        self._conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-                          (task_status, time.time(), task_id))
+        """从 workflow_instances 同步 Task 状态（委托 workflow.sync）。"""
+        from workflow.sync import sync_task_status
+        sync_task_status(self._conn, task_id)
         self._conn.commit()
 
     def delete_workflow(self, instance_id: str, actor: str = "system") -> bool:
-        """删除工作流（只有接收者或系统可以删除，下达者不能删）。"""
         wf = self.get_workflow(instance_id)
         if not wf:
             return False
@@ -383,13 +291,13 @@ class WorkflowDB:
             return False
         self._log(workflow_instance_id=instance_id, task_id=wf['task_id'], action="deleted", actor=actor)
         self._conn.execute("DELETE FROM workflow_instances WHERE instance_id=?", (instance_id,))
-        self._conn.commit()
+        # sync 后再 commit，确保 task 状态更新不丢失
         self._sync_task_from_workflows(wf['task_id'])
+        self._conn.commit()
         return True
 
     def chain_workflows(self, task_id: str, template_names: list[str],
                         assigner: str, assignee: str) -> list[str]:
-        """创建工作流链，返回 instance_id 列表。"""
         instance_ids = []
         for name in template_names:
             wf_id = self.create_workflow(task_id, name, assigner, assignee)
@@ -397,7 +305,7 @@ class WorkflowDB:
                 instance_ids.append(wf_id)
         return instance_ids
 
-    # ── 日志 ──────────────────────────────────────────────────
+    # ── 日志 ──
 
     def get_logs(self, workflow_instance_id: str = None, task_id: str = None,
                  limit: int = 50) -> list[dict]:

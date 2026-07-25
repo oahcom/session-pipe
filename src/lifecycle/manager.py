@@ -62,6 +62,7 @@ class LifecycleManager:
         self._conn = sqlite3.connect(str(self.db_path), timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_schema()
 
     # ── 状态查询 ─────────────────────────────────
 
@@ -136,25 +137,27 @@ class LifecycleManager:
     # ── 核心操作（并发安全） ─────────────────────
 
     def start_wf(self, wf_id: str, current_step_id: str = "s1",
-                  template_id: str = "") -> bool:
+                  template_id: str = "", context: dict = None) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                ctx_json = json.dumps(context or {}, ensure_ascii=False)
                 cur = self._conn.execute(
                     "UPDATE workflow_instances SET status='running', "
-                    "current_step_id=? WHERE instance_id=? AND status='pending'",
-                    (current_step_id, wf_id)
+                    "current_step_id=?, context=? WHERE instance_id=? AND status='pending'",
+                    (current_step_id, ctx_json, wf_id)
                 )
                 if cur.rowcount == 0:
                     # engine 直接启动的工作流（无前置 task），INSERT 完整行
+                    task_id_val = "wf_" + wf_id[-8:]
                     self._conn.execute("""
                         INSERT OR IGNORE INTO workflow_instances
-                        (instance_id, assigner, assignee, status, current_step_id,
-                         template_id, created_at)
-                        VALUES (?, 'workflow_engine', 'workflow_engine', 'running',
-                                ?, ?, ?)
-                    """, (wf_id, current_step_id,
-                          template_id or None, time.time()))
+                        (instance_id, task_id, assigner, assignee, status, current_step_id,
+                         template_id, created_at, context)
+                        VALUES (?, ?, 'workflow_engine', 'workflow_engine', 'running',
+                                ?, ?, ?, ?)
+                    """, (wf_id, task_id_val, current_step_id,
+                          template_id or None, time.time(), ctx_json))
                 self._conn.commit()
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
@@ -440,18 +443,18 @@ class LifecycleManager:
                 self._conn.rollback()
                 raise
 
-    def close_wf(self, wf_id: str):
+    def close_wf(self, wf_id: str, status: str = "completed"):
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
-                    "UPDATE workflow_instances SET status='completed', completed_at=? "
-                    "WHERE instance_id=?", (time.time(), wf_id)
+                    "UPDATE workflow_instances SET status=?, completed_at=? "
+                    "WHERE instance_id=?", (status, time.time(), wf_id)
                 )
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
                 self._sync_task_unsafe(task_id)
-                self._log_unsafe(wf_id, task_id, "wf_closed", detail="workflow completed")
+                self._log_unsafe(wf_id, task_id, "wf_closed", detail=f"workflow {status}")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -738,24 +741,8 @@ class LifecycleManager:
     def _sync_task_unsafe(self, task_id: Optional[str]):
         if not task_id:
             return
-        rows = self._conn.execute(
-            "SELECT status FROM workflow_instances WHERE task_id=?", (task_id,)
-        ).fetchall()
-        statuses = [dict(r)["status"] for r in rows]
-        if not statuses:
-            return
-        if all(s == "completed" for s in statuses):
-            ts = "completed"
-        elif any(s == "failed" for s in statuses):
-            ts = "failed"
-        elif any(s in ("running", "pending", "step_done_ready") for s in statuses):
-            ts = "in_progress"
-        else:
-            ts = "completed"
-        self._conn.execute(
-            "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-            (ts, time.time(), task_id)
-        )
+        from workflow.sync import sync_task_status
+        sync_task_status(self._conn, task_id)
 
     def _get_all_steps_unsafe(self, template_id: Optional[str]) -> list:
         t = self._get_template(template_id)
@@ -895,6 +882,32 @@ class LifecycleManager:
             (json.dumps(results, ensure_ascii=False), wf_id))
         self._conn.commit()
         return True
+
+    def _ensure_schema(self):
+        """初始化数据库 schema（如不存在）。"""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS workflow_templates (
+                template_id TEXT PRIMARY KEY, name TEXT, description TEXT, steps_json TEXT,
+                created_at REAL, is_active INTEGER DEFAULT 1,
+                trigger_scene TEXT, allowed_initiators TEXT, allowed_executors TEXT,
+                max_duration_hours INTEGER DEFAULT 24, quality_standards TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS workflow_instances (
+                instance_id TEXT PRIMARY KEY, template_id TEXT, task_id TEXT,
+                assigner TEXT, assignee TEXT, status TEXT DEFAULT 'pending',
+                current_step_id TEXT DEFAULT 's1', step_results TEXT, created_at REAL,
+                completed_at REAL, parent_wf_id TEXT, subflow_source_step_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS workflow_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_instance_id TEXT, task_id TEXT,
+                action TEXT, actor TEXT, detail TEXT, ts REAL
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY, title TEXT, description TEXT,
+                assigner TEXT, assignee TEXT, status TEXT,
+                created_at REAL, updated_at REAL, parent_task_id TEXT
+            );
+        """)
 
     def close(self):
         self._conn.close()

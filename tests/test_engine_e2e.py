@@ -256,10 +256,12 @@ def test_reminder_heartbeat(mock_send):
     eng = WorkflowEngine(d)
     rid = eng.start("heartbeat", {})
 
-    # 模拟长时间运行：设 last_reminder 为 120 秒前，这样下次 tick 会触发心跳
-    run = eng._load_run(rid)
-    run.step_results.setdefault("s1", {})["last_reminder"] = time.time() - 121
-    eng._save_run(run)
+    # 模拟长时间运行：直接通过 engine 的数据库连接设置 last_reminder
+    eng._lifecycle._conn.execute(
+        "UPDATE workflow_instances SET step_results = json_set(COALESCE(step_results, '{}'), '$.s1.last_reminder', ?) WHERE instance_id = ?",
+        (time.time() - 121, rid)
+    )
+    eng._lifecycle._conn.commit()
 
     eng.run_once()
 

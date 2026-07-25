@@ -10,9 +10,11 @@ Workflow Engine --- 数据驱动的对话工作流执行引擎。
 import json
 import time
 import uuid
-import subprocess as _sp
+import logging
+import shlex, subprocess as _sp
 from dataclasses import dataclass
 from pathlib import Path
+LOGGER = logging.getLogger("workflow.engine")
 from typing import Any, Optional
 
 from paths import ensure_paths
@@ -190,7 +192,7 @@ class WorkflowEngine:
             self._upsert_template(name, wf)
             try:
                 self._lifecycle.start_wf(run.id, current_step_id=wf.steps[0].id,
-                                          template_id=name)
+                                          template_id=name, context=context)
             except Exception as e:
                 print(f"  [wf] LM start_wf 失败: {e}", flush=True)
             self._write_step_prompt(run, wf.steps[0])
@@ -245,7 +247,7 @@ class WorkflowEngine:
             row = None
         if not row or row["status"] in ("completed", "cancelled", "failed"):
             return False
-        self._lifecycle.close_wf(wid)
+        self._lifecycle.close_wf(wid, status="cancelled")
         return True
 
     def tick(self) -> int:
@@ -307,7 +309,7 @@ class WorkflowEngine:
                         (json.dumps(results, ensure_ascii=False), inst["instance_id"])
                     )
                     lm._conn.commit()
-                    continue
+                    step_status = "notified"  # 更新状态，让后续 exit_condition/超时检查能执行
 
                 # completion_check 步骤已完成 → 自动推进到下一步
                 if step.completion_check and step_status in ("step_done_ready", "completed"):
@@ -434,7 +436,8 @@ class WorkflowEngine:
                 vcmd = step.verify
                 for k, val in ctx.items():
                     vcmd = vcmd.replace(f"{{{k}}}", str(val))
-                ver = _sp.run(vcmd, shell=True, capture_output=True, timeout=30)
+                _sp_args = shlex.split(vcmd) if vcmd else []
+                ver = _sp.run(_sp_args, capture_output=True, timeout=30)
                 if ver.returncode != 0:
                     err = ver.stderr.decode()[:200] or "verify failed"
                     self._bb.write("blocker",
@@ -485,8 +488,8 @@ class WorkflowEngine:
             self._bb.write("blocker", warning, src="workflow_engine")
             try:
                 self._lifecycle.escalate_step(run.id, step.id, reason=warning)
-            except Exception:
-                pass
+            except Exception as _e:
+                    LOGGER.exception("silenced exception")
             self._send_to_role("coordinator", warning)
 
         # 同步到 SQLite
@@ -513,8 +516,8 @@ class WorkflowEngine:
         except Exception:
             try:
                 lm._conn.rollback()
-            except Exception:
-                pass
+            except Exception as _e:
+                    LOGGER.exception("silenced exception")
 
     def _check_session_alive(self, role: str, since: float) -> bool:
         try:
@@ -611,8 +614,8 @@ class WorkflowEngine:
             try:
                 from routing.partner import PartnerClient
                 PartnerClient("workflow_engine").force_send(role, prompt)
-            except Exception:
-                pass
+            except Exception as _e:
+                    LOGGER.exception("silenced exception")
 
     def _write_step_prompt(self, run: WorkflowRun, step: Step, extra_prompt: str = ""):
         ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
@@ -631,8 +634,8 @@ class WorkflowEngine:
                     ctx["title"] = task["title"]
                     ctx["description"] = task["description"]
                     ctx["assignee"] = step.target_role
-            except Exception:
-                pass
+            except Exception as _e:
+                    LOGGER.exception("silenced exception")
         prompt = step.prompt_template + "\n" + extra_prompt if extra_prompt else step.prompt_template
         for k, v in ctx.items():
             prompt = prompt.replace(f"{{{k}}}", str(v))

@@ -98,8 +98,10 @@ def test_start_creates_run():
     s = eng.status(rid)
     assert s["status"] == "running"
     assert s["current_step"] == "s1"
-    # 验证 run 文件存在
-    assert (wf_dir / "runs" / f"{rid}.json").exists()
+    # SQLite 验证 run 存在
+    lm = eng._lifecycle
+    row = lm._conn.execute("SELECT instance_id FROM workflow_instances WHERE instance_id=?", (rid,)).fetchone()
+    assert row is not None, f"workflow {rid} not in SQLite"
 
 
 def test_start_with_context():
@@ -108,9 +110,14 @@ def test_start_with_context():
     eng = WorkflowEngine(workflows_dir=wf_dir)
     ctx = {"topic": "Rust 编译器", "env": "dev"}
     rid = eng.start("test", ctx)
-    # 从保存的 run 文件验证 context
-    raw = json.loads((wf_dir / "runs" / f"{rid}.json").read_text())
-    assert raw["context"] == ctx
+    eng.run_once()
+    # 验证 context 已持久化到 workflow_instances
+    inst = eng._lifecycle.get_wf(rid)
+    inst_ctx = json.loads(inst.get("context") or "{}") if inst else {}
+    assert inst_ctx.get("topic") == "Rust 编译器", f"context.topic not persisted: {inst_ctx}"
+    assert inst_ctx.get("env") == "dev", f"context.env not persisted: {inst_ctx}"
+    s = eng.status(rid)
+    assert s["status"] in ("running", "completed"), f"Unexpected status: {s}"
 
 
 def test_start_unknown_workflow():
@@ -176,6 +183,7 @@ def test_tick_advances_on_match():
     # 写入匹配的 bus 消息（使用有效分类 architecture）
     eng._bb.write("architecture", "这里有调研结果", src="scout")
     eng.run_once()
+    eng.run_once()
     s = eng.status(rid)
     # 应推进到 s2
     assert s["current_step"] == "s2", f"应推进到 s2: {s['current_step']}"
@@ -190,6 +198,7 @@ def test_tick_completes_on_last_step():
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("quick", {"topic": "x"})
     eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
+    eng.run_once()
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -245,12 +254,14 @@ def test_advance_finishes():
     _write_wf(wf_dir, "test", SIMPLE_STEPS)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test", {"topic": "x"})
-    run = eng._load_run(rid)
     # 模拟 s1 完成，当前在 s2
-    run.current_step = "s2"
-    run.step_results["s1"] = {"status": "done", "ts": time.time()}
-    eng._save_run(run)
+    lm = eng._lifecycle
+    lm._conn.execute(
+        "UPDATE workflow_instances SET current_step_id=?, step_results=json_set(COALESCE(step_results,'{}'),'$.s1',json(?)) WHERE instance_id=?",
+        ("s2", '{"status":"done","ts":' + str(time.time()) + '}', rid))
+    lm._conn.commit()
     eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
+    eng.run_once()
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -270,10 +281,12 @@ def test_timeout_triggers_retry():
     rid = eng.start("retry_test", {"topic": "x"})
     time.sleep(1.5)  # 超过 timeout_minutes=0.001 min + grace
     eng.run_once()
-    run = eng._load_run(rid)
-    # 超时 + 未匹配 → 应有重试（至少 retry=1）
-    assert run.status in ("running", "failed"), f"状态异常: {run.status}"
-    assert run.step_retries.get("s1", 0) >= 1, f"应有重试计数: {run.step_retries}"
+    lm = eng._lifecycle
+    row = lm._conn.execute("SELECT status, step_results FROM workflow_instances WHERE instance_id=?", (rid,)).fetchone()
+    assert row[0] in ("running", "failed"), f"状态异常: {row[0]}"
+    step_results = json.loads(row[1] or "{}") if row[1] else {}
+    retries = step_results.get("s1", {}).get("timeout_count", 0) + step_results.get("s1", {}).get("retry_count", 0)
+    assert retries >= 1, f"应有重试计数: {step_results}"
 
 
 def test_timeout_escalates_not_fails():
@@ -294,8 +307,10 @@ def test_timeout_escalates_not_fails():
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "running", f"超时不自动失败: {s['status']}"
-    # 验证升级计数增加
-    assert "s1" in s.get("retries", {}), "应记录超时次数"
+    # 验证升级计数增加（在 step_results 中）
+    s1_results = s.get("results", {}).get("s1", {})
+    timeout_count = s1_results.get("timeout_count", 0)
+    assert timeout_count >= 1, f"应记录超时次数: {s1_results}"
 
 
 # ── Conditional Steps ────────────────────────────────────────────
@@ -320,10 +335,11 @@ def test_conditional_step_blocks():
     s = eng.status(rid)
     assert s["current_step"] == "s1", f"s1 未匹配应停在 s1: {s['current_step']}"
     # 手动标记 s1 完成并推进到 s2
-    run = eng._load_run(rid)
-    run.current_step = "s2"
-    run.step_results["s1"] = {"status": "done", "ts": time.time()}
-    eng._save_run(run)
+    lm = eng._lifecycle
+    lm._conn.execute(
+        "UPDATE workflow_instances SET current_step_id=?, step_results=json_set(COALESCE(step_results,'{}'),'$.s1',json(?)) WHERE instance_id=?",
+        ("s2", '{"status":"done","ts":' + str(time.time()) + '}', rid))
+    lm._conn.commit()
     s2 = eng.status(rid)
     assert s2["current_step"] == "s2"
 
@@ -359,6 +375,7 @@ def test_run_persists_on_tick():
     rid = eng.start("test", {"topic": "x"})
     # s1 的 exit_condition 是 bus_category=architecture
     eng._bb.write("architecture", "调研结果", src="scout")
+    eng.run_once()
     eng.run_once()
     # 当前引擎内存中应已推进到 s2
     s1 = eng.status(rid)
@@ -407,8 +424,10 @@ def test_workspace_summary_in_prompt():
     _write_wf(wf_dir, "ws_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("ws_test", {"topic": "x", "project_name": "test_ws_project"})
-    all_facts = eng._bb.read(cat="workflow", limit=500)
-    matched = [f for f in all_facts if "WS_SUMMARY_UNIQUE_8899" in f.t]
+    # workspace_summary 通过 _write_step_prompt → _send_to_role → bus(task_spec) 发送
+    # 检查 _send_to_role 是否被调用且 prompt 中包含 workspace_summary
+    all_facts = eng._bb.read(cat="task_spec", limit=500)
+    matched = [f for f in all_facts if "WS_SUMMARY_UNIQUE_8899" in (f.e or "")]
     assert len(matched) >= 1, f"workspace_summary 应被替换到 prompt 中 (found {len(matched)} in {len(all_facts)})"
 
 

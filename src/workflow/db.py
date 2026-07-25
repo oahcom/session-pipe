@@ -58,6 +58,9 @@ SCHEMA_SQL = """
         detail TEXT,
         ts REAL NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_instances_task ON workflow_instances(task_id);
+    CREATE INDEX IF NOT EXISTS idx_instances_assignee ON workflow_instances(assignee);
+    CREATE INDEX IF NOT EXISTS idx_instances_status ON workflow_instances(status);
 """
 
 
@@ -71,6 +74,7 @@ def create_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     # 迁移：已存在的 DB 添加新列
     _migrate_add_column(conn, "workflow_instances", "parent_wf_id", "TEXT")
     _migrate_add_column(conn, "workflow_instances", "subflow_source_step_id", "TEXT")
+    _migrate_add_column(conn, "workflow_instances", "context", "TEXT DEFAULT '{}'")
     _migrate_add_column(conn, "tasks", "parent_task_id", "TEXT")
     conn.commit()
     return conn
