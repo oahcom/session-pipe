@@ -51,6 +51,12 @@ class WorkflowDef:
     title: str
     description: str
     steps: list[Step]
+    workflow_id: str = ""
+    trigger_scene: list[str] = None
+    allowed_initiators: list[str] = None
+    allowed_executors: list[str] = None
+    max_duration_hours: int = 24
+    quality_standards: str = ""
     loop: Optional[dict] = None
 
 
@@ -106,9 +112,25 @@ class WorkflowEngine:
             try:
                 data = json.loads(f.read_text())
                 steps = [Step(**{k: v for k, v in s.items() if k in Step.__dataclass_fields__}) for s in data.get("steps", [])]
+                # 模板质量自动校验
+                try:
+                    from template_registry import _validate_meta as _vmeta
+                    _vr = _vmeta(data)
+                    if not _vr.passed:
+                        print(f"  [wf] 警告: {f.name} 质量检查不通过:")
+                        for _e in _vr.errors[:4]:
+                            print(f"        - {_e}")
+                except Exception:
+                    pass
                 self._workflows[data["name"]] = WorkflowDef(
                     name=data["name"], title=data.get("title", ""),
                     description=data.get("description", ""), steps=steps,
+                    workflow_id=data.get("workflow_id", "WL-" + data["name"]),
+                    trigger_scene=data.get("trigger_scene") or [],
+                    allowed_initiators=data.get("allowed_initiators") or [],
+                    allowed_executors=data.get("allowed_executors") or [],
+                    max_duration_hours=data.get("max_duration_hours", 24),
+                    quality_standards=data.get("quality_standards", ""),
                     loop=data.get("loop"),
                 )
             except Exception as e:
@@ -150,6 +172,11 @@ class WorkflowEngine:
                 self._workflows[tid] = WorkflowDef(
                     name=tid, title=t.get("name", tid),
                     description=t.get("description", ""), steps=steps,
+                    trigger_scene=json.loads(t.get("trigger_scene") or "[]") if isinstance(t.get("trigger_scene"), str) else (t.get("trigger_scene") or []),
+                    allowed_initiators=json.loads(t.get("allowed_initiators") or "[]") if isinstance(t.get("allowed_initiators"), str) else (t.get("allowed_initiators") or []),
+                    allowed_executors=json.loads(t.get("allowed_executors") or "[]") if isinstance(t.get("allowed_executors"), str) else (t.get("allowed_executors") or []),
+                    max_duration_hours=t.get("max_duration_hours", 24),
+                    quality_standards=t.get("quality_standards", ""),
                 )
         except Exception as e:
             print(f"  [wf] SQLite 模板加载失败: {e}")
@@ -194,7 +221,12 @@ class WorkflowEngine:
                 for s in wf.steps
             ]
             self._lifecycle.upsert_template(
-                name, wf.title, wf.description, steps
+                name, wf.title, wf.description, steps,
+                trigger_scene=wf.trigger_scene,
+                allowed_initiators=wf.allowed_initiators,
+                allowed_executors=wf.allowed_executors,
+                max_duration_hours=wf.max_duration_hours,
+                quality_standards=wf.quality_standards,
             )
         except Exception as e:
             print(f"  [wf] upsert template 失败: {e}", flush=True)
@@ -539,7 +571,7 @@ class WorkflowEngine:
         """检查角色的 CCS 是否存活（tmux 会话），不存活则拉起。存活则确保进 /loop。"""
         alive = _sp.run(
             ["tmux", "has-session", "-t", f"ccs-{role}"],
-            capture_output=True, timeout=3,
+            capture_output=True, timeout=5,
         ).returncode == 0
         if alive:
             # 注入 /loop 确保角色进入工作循环（防止 standby 卡死）
@@ -560,7 +592,7 @@ class WorkflowEngine:
             for _ in range(15):
                 time.sleep(1)
                 if _sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
-                           capture_output=True, timeout=3).returncode == 0:
+                           capture_output=True, timeout=5).returncode == 0:
                     return True
         except Exception:
             pass
