@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from paths import WORKFLOWS_DB as DB_PATH
+from paths import WORKFLOWS_DB as DB_PATH, SESSION_ROLES_PERSONAS
 
 # ── 有效角色列表（从 persona JSON 动态加载） ──────
 _ROLE_REGISTRY: list[str] = []
@@ -23,7 +23,7 @@ _ROLE_REGISTRY: list[str] = []
 def _load_role_registry() -> list[str]:
     if _ROLE_REGISTRY:
         return _ROLE_REGISTRY
-    persona_dir = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+    persona_dir = SESSION_ROLES_PERSONAS
     if not persona_dir.exists():
         return []
     roles = set()

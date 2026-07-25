@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from paths import WORKFLOWS_DB as DB_PATH
+from paths import WORKFLOWS_DB as DB_PATH, SESSION_ROLES_PERSONAS
 ROLE_REGISTRY: list[str] = []
 
 
@@ -20,7 +20,7 @@ def _load_role_registry() -> list[str]:
     """从 persona JSON 加载有效角色列表。"""
     if ROLE_REGISTRY:
         return ROLE_REGISTRY
-    persona_dir = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+    persona_dir = SESSION_ROLES_PERSONAS
     if not persona_dir.exists():
         return []
     roles = set()
