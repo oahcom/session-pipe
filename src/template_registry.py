@@ -262,7 +262,7 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
             report.add_error(f"steps[{index}] contains boilerplate section: {bp[:20]}...")
 
     # failure_patterns 无泛化占位符
-    for fp in step.get("failure_patterns", []):
+    for fp in (step.get("failure_patterns") or []):
         for bp in ["产出物为空或仅模板占位符", "产出物非预期格式", "步骤执行后未写对应"]:
             if bp in fp:
                 report.add_error(f"steps[{index}] generic failure_pattern: {fp[:40]}")
@@ -276,7 +276,7 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
         report.add_error(f"steps[{index}] prompt too short ({len(pt)}B), should be >= 150B")
 
     # 每步必须包含 ## 完成 标头（告诉 CCS 完成后写哪条 bus）
-    if "## 完成" not in pt:
+    if not pt or "## 完成" not in pt:
         report.add_error(f"steps[{index}] missing '## 完成' section header")
 
     # ## 完成 中的 bus_category 与 exit_condition 一致

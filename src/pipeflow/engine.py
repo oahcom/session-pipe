@@ -90,13 +90,6 @@ class WorkflowEngine:
         self._load_workflows()
 
     @property
-    def composite_runner(self):
-        if self._composite_runner is None:
-            from pipeflow.composite import CompositeRunner
-            self._composite_runner = CompositeRunner()
-        return self._composite_runner
-
-    @property
     def _lifecycle(self):
         if self._lm is None:
             from lifecycle.manager import LifecycleManager
@@ -260,7 +253,8 @@ class WorkflowEngine:
         return True
 
     def tick(self) -> int:
-        return self.composite_runner.tick()
+        self.run_once()
+        return 0
 
     def run_once(self):
         # 确保工作流涉及的角色存活
@@ -338,7 +332,7 @@ class WorkflowEngine:
             import logging as _lg
             _lg.getLogger("engine.sqlite_block").warning("生产工作流扫描异常: %s", _sqle)
 
-        self.composite_runner.tick()
+
         self._scan_tasks()
 
     def _advance_production_wf(self, wf_id: str, lm, wf_name: str, step_id: str,
