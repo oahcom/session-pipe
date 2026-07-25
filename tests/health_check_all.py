@@ -237,10 +237,10 @@ def test_launcher_imports_from_roles():
 def test_pipeline_imports_from_launcher():
     """验证 session-pipeline 能引用 launcher 的路由。"""
     try:
-        from launcher import is_ccs_running
-        ok("pipeline → launcher 导入正常 (is_ccs_running)")
+        from core import _is_alive
+        ok("pipeline → launcher 导入正常 (_is_alive)")
     except ImportError:
-        fail("pipeline 无法导入 launcher")
+        fail("pipeline 无法导入 launcher.core")
 
 
 @check("cross-project")

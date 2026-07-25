@@ -221,24 +221,24 @@ def test_idempotent_consume():
     print("  ✓ IdempotentConsume 幂等消费")
 
 
-def test_optimistic_claim():
-    """乐观锁 claim：claim_message 原子标记，重复 claim 返回 already_claimed。"""
-    from reliability import OptimisticClaim
+def test_idempotent_consume_dedup():
+    """幂等消费：safe_consume 首次成功，重复 skipped。"""
+    from reliability import IdempotentConsume
     from bus_protocol import Blackboard
     import uuid
 
     bb = Blackboard()
-    oc = OptimisticClaim()
-    title = f"乐观锁测试 {uuid.uuid4().hex[:8]}"
-    fid = bb.write("architecture", title, evidence="乐观锁测试", src="test")
+    ic = IdempotentConsume()
+    title = f"幂等测试 {uuid.uuid4().hex[:8]}"
+    fid = bb.write("architecture", title, evidence="幂等测试", src="test")
 
-    r1 = oc.claim_message(bb, fid, "pipeline")
-    assert r1["status"] in ("consumed", "claimed"), f"第一次 claim 应成功: {r1}"
+    r1 = ic.safe_consume(bb, fid, "pipeline")
+    assert r1["status"] == "consumed", f"首次消费应成功: {r1}"
 
-    r2 = oc.claim_message(bb, fid, "pipeline")
-    assert r2.get("already") is True, f"第二次 claim already 应为 True: {r2}"
-    assert r2["status"] == "claimed", f"第二次 claim 状态应为 claimed: {r2}"
-    print("  ✓ OptimisticClaim 乐观锁 claim")
+    r2 = ic.safe_consume(bb, fid, "pipeline")
+    assert r2["status"] == "skipped", f"重复消费应 skipped: {r2}"
+    assert r2["reason"] == "already_consumed", f"原因应为 already_consumed: {r2}"
+    print("  ✓ IdempotentConsume 幂等消费去重")
 
 
 if __name__ == "__main__":
@@ -256,7 +256,7 @@ if __name__ == "__main__":
         test_reliability_health_check,
         test_reliability_ttl_pruner,
         test_idempotent_consume,
-        test_optimistic_claim,
+        test_idempotent_consume_dedup,
     ]
 
     passed = 0

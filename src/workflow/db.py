@@ -13,7 +13,13 @@ SCHEMA_SQL = """
         description TEXT,
         steps_json TEXT NOT NULL,
         steps_mermaid TEXT,
-        created_at REAL NOT NULL
+        created_at REAL NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        trigger_scene TEXT,
+        allowed_initiators TEXT,
+        allowed_executors TEXT,
+        max_duration_hours INTEGER DEFAULT 24,
+        quality_standards TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS workflow_instances (
         instance_id TEXT PRIMARY KEY,

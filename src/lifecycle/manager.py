@@ -884,7 +884,7 @@ class LifecycleManager:
         return True
 
     def _ensure_schema(self):
-        """初始化数据库 schema（如不存在）。"""
+        """初始化数据库 schema（如不存在）+ 迁移已有表。"""
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS workflow_templates (
                 template_id TEXT PRIMARY KEY, name TEXT, description TEXT, steps_json TEXT,
@@ -895,7 +895,7 @@ class LifecycleManager:
             CREATE TABLE IF NOT EXISTS workflow_instances (
                 instance_id TEXT PRIMARY KEY, template_id TEXT, task_id TEXT,
                 assigner TEXT, assignee TEXT, status TEXT DEFAULT 'pending',
-                current_step_id TEXT DEFAULT 's1', step_results TEXT, created_at REAL,
+                current_step_id TEXT DEFAULT 's1', step_results TEXT, context TEXT, created_at REAL,
                 completed_at REAL, parent_wf_id TEXT, subflow_source_step_id TEXT
             );
             CREATE TABLE IF NOT EXISTS workflow_logs (
@@ -905,9 +905,31 @@ class LifecycleManager:
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY, title TEXT, description TEXT,
                 assigner TEXT, assignee TEXT, priority INTEGER DEFAULT 0, status TEXT,
-                created_at REAL, updated_at REAL, parent_task_id TEXT
+                current_workflow_id TEXT,
+                progress TEXT DEFAULT '{}',
+                created_at REAL, updated_at REAL, completed_at REAL,
+                tags TEXT DEFAULT '[]',
+                context TEXT DEFAULT '{}',
+                parent_task_id TEXT
             );
         """)
+        # 迁移：为已有表添加缺失列
+        for table, col, col_def in [
+            ("workflow_templates", "is_active", "INTEGER DEFAULT 1"),
+            ("workflow_templates", "trigger_scene", "TEXT"),
+            ("workflow_templates", "allowed_initiators", "TEXT"),
+            ("workflow_templates", "allowed_executors", "TEXT"),
+            ("workflow_templates", "max_duration_hours", "INTEGER DEFAULT 24"),
+            ("workflow_templates", "quality_standards", "TEXT DEFAULT ''"),
+            ("workflow_instances", "context", "TEXT DEFAULT '{}'"),
+            ("workflow_instances", "parent_wf_id", "TEXT"),
+            ("workflow_instances", "subflow_source_step_id", "TEXT"),
+            ("tasks", "parent_task_id", "TEXT"),
+        ]:
+            existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+        self._conn.commit()
 
     def close(self):
         self._conn.close()

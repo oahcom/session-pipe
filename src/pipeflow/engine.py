@@ -11,7 +11,8 @@ import json
 import time
 import uuid
 import logging
-import shlex, subprocess as _sp
+import shlex as _shlex
+import subprocess as _sp
 from dataclasses import dataclass
 from pathlib import Path
 LOGGER = logging.getLogger("workflow.engine")
@@ -436,8 +437,8 @@ class WorkflowEngine:
                 vcmd = step.verify
                 for k, val in ctx.items():
                     vcmd = vcmd.replace(f"{{{k}}}", str(val))
-                _sp_args = shlex.split(vcmd) if vcmd else []
-                ver = _sp.run(_sp_args, capture_output=True, timeout=30)
+                # ponytail: verify 使用 shlex.split 防注入；若需 pipes/redirects 改为白名单模式
+                ver = _sp.run(_shlex.split(vcmd), capture_output=True, timeout=30)
                 if ver.returncode != 0:
                     err = ver.stderr.decode()[:200] or "verify failed"
                     self._bb.write("blocker",
@@ -579,7 +580,7 @@ class WorkflowEngine:
         try:
             _sp.run(
                 ["python3", str(_ccs_cli), "start", role, "--no-attach",
-                 "--drive", "loop"],
+                 "--drive", "ondemand"],
                 capture_output=True, timeout=30,
             )
             for _ in range(15):
