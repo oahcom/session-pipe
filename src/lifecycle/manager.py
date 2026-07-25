@@ -904,7 +904,7 @@ class LifecycleManager:
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY, title TEXT, description TEXT,
-                assigner TEXT, assignee TEXT, status TEXT,
+                assigner TEXT, assignee TEXT, priority INTEGER DEFAULT 0, status TEXT,
                 created_at REAL, updated_at REAL, parent_task_id TEXT
             );
         """)

@@ -344,7 +344,7 @@ class P0Exemption:
             r = dict(row)
             # 幂等：检查 30min 内是否已发过 warning
             _recent = self._conn.execute(
-                "SELECT 1 FROM workflow_audit_log WHERE task_id=? AND action='p0_warning_sent' AND (? - ts) < 1800",
+                "SELECT 1 FROM workflow_logs WHERE task_id=? AND action='p0_warning_sent' AND (? - ts) < 1800",
                 (r['task_id'], now)
             ).fetchone()
             if _recent:
