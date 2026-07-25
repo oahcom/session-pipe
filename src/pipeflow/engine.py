@@ -235,22 +235,7 @@ class WorkflowEngine:
         for _wf_row in self._lifecycle._conn.execute("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')").fetchall():
             self._ensure_role_alive(_wf_row["assignee"])
 
-        # JSON 文件工作流
-        for run_file in self.runs_dir.glob("*.json"):
-            try:
-                run = self._load_run_data(run_file.read_text())
-                if not run or run.status != "running":
-                    continue
-                wf = self._workflows.get(run.workflow_name)
-                if not wf:
-                    continue
-                current = next((s for s in wf.steps if s.id == run.current_step), None)
-                if not current:
-                    continue
-                self._tick(run, current)
-            except Exception:
-                pass
-
+        # JSON 工作流路径已删除
         # SQLite production 工作流 — 复用 _lifecycle 连接避免泄漏
         try:
             lm = self._lifecycle
@@ -292,7 +277,7 @@ class WorkflowEngine:
                     prompt = prompt.replace("{title}", task_title)
                     prompt = prompt.replace("{description}", task_desc)
                     prompt = prompt.replace("{assignee}", step.target_role)
-                    self._send_to_role(step.target_role, prompt)
+                    self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 标记已通知
                     results[step_id] = {"status": "notified", "notified_at": time.time()}
                     lm._conn.execute(
@@ -586,6 +571,9 @@ class WorkflowEngine:
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
         self._ensure_role_alive(role)
         prompt = "/goal " + prompt
+        # 工作习惯提示：仅独立消息显示（非工作流步骤）
+        if not wf_id:
+            prompt = "/goal\n\n## 工作习惯\n用 `wf create <title> --assignee <role>` 创建工作流（自动匹配模板），或 `wf suggest <title>` 预览推荐。\n\n" + prompt.removeprefix("/goal ")
         # task_spec 携带完整提示词（角色 loop 读 bus 拿到全部上下文）
         title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
         self._bb.write("task_spec", title, evidence=prompt, src="workflow_engine")
