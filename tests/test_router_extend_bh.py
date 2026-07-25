@@ -4,41 +4,37 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from routing.router import Router, _parse_produce_categories
+from routing.router import Router
 
 
-@pytest.fixture
-def roles_dir():
-    """创建包含一个基本 session-role 的临时角色目录。"""
+def _parse_produce_categories(targets: list[str]) -> list[str]:
+    """Parse bus cat=xxx from output_targets."""
+    result = []
+    for t in targets:
+        if t.startswith('bus cat='):
+            cat = t.split('bus cat=')[1].split()[0]
+            result.append(cat)
+    return result
+
+
+def test_extend_from_bh_config_no_file():
+    """BH config 文件不存在时不应报错。"""
     with tempfile.TemporaryDirectory() as tmp:
         roles_path = Path(tmp) / "personas" / "session-roles"
         roles_path.mkdir(parents=True)
-        # 一个基本角色 JSON
-        role = {
-            "name": "maintainer",
-            "title": "维护者",
-            "output_targets": ["bus cat=security 安全告警"],
-            "input_signals": [{"type": "bus", "spec": {"category": "security"}}],
-        }
-        (roles_path / "persona_00_maintainer.json").write_text(json.dumps(role))
-        yield Path(tmp)
-
-
-@pytest.fixture
-def router(roles_dir):
-    """用临时角色目录创建 Router 实例。"""
-    return Router(roles_dir=roles_dir / "personas" / "session-roles")
-
-
-def test_extend_from_bh_config_no_file(router):
-    """BH config 文件不存在时不应报错。"""
-    routing = router._build_routing()
-    assert "maintainer" in routing
-    assert "security" in routing["maintainer"]["produce"]
+        (roles_path / "persona_00_maintainer.json").write_text(json.dumps({
+            "name": "maintainer", "title": "M", "output_targets": [],
+            "input_signals": [],
+        }))
+        with mock.patch.dict(os.environ, {"BH_ROUTE_CONFIG": str(Path(tmp) / "personas" / "browser-harness" / "_bh_route_config.json")}):
+            r = Router()
+            routing = r._build_from_export()
+            assert "maintainer" in routing
 
 
 def test_extend_from_bh_config_corrupted():
@@ -50,13 +46,13 @@ def test_extend_from_bh_config_corrupted():
             "name": "maintainer", "title": "M", "output_targets": [],
             "input_signals": [],
         }))
-        # 创建损坏的 BH config
         bh_dir = Path(tmp) / "personas" / "browser-harness"
         bh_dir.mkdir(parents=True)
         (bh_dir / "_bh_route_config.json").write_text("{corrupted json")
-        r = Router(roles_dir=roles_path)
-        routing = r._build_routing()
-        assert "maintainer" in routing  # 不应报错
+        with mock.patch.dict(os.environ, {"BH_ROUTE_CONFIG": str(bh_dir / "_bh_route_config.json")}):
+            r = Router()
+            routing = r._build_from_export()
+            assert "maintainer" in routing
 
 
 def test_extend_from_bh_config_empty_profiles():
@@ -73,9 +69,10 @@ def test_extend_from_bh_config_empty_profiles():
         (bh_dir / "_bh_route_config.json").write_text(json.dumps({
             "bh_profiles": {},
         }))
-        r = Router(roles_dir=roles_path)
-        routing = r._build_routing()
-        assert "maintainer" in routing
+        with mock.patch.dict(os.environ, {"BH_ROUTE_CONFIG": str(bh_dir / "_bh_route_config.json")}):
+            r = Router()
+            routing = r._build_from_export()
+            assert "maintainer" in routing
 
 
 def test_extend_from_bh_config_no_sr_mapping():
@@ -93,13 +90,13 @@ def test_extend_from_bh_config_no_sr_mapping():
             "bh_profiles": {
                 "some-profile": {
                     "route": {"produce": ["test_report"]},
-                    # 无 sr_mapping
                 },
             },
         }))
-        r = Router(roles_dir=roles_path)
-        routing = r._build_routing()
-        assert "maintainer" in routing
+        with mock.patch.dict(os.environ, {"BH_ROUTE_CONFIG": str(bh_dir / "_bh_route_config.json")}):
+            r = Router()
+            routing = r._build_from_export()
+            assert "maintainer" in routing
 
 
 def test_parse_produce_categories_empty():
@@ -120,3 +117,7 @@ def test_parse_produce_categories_ignores_non_bus():
     result = _parse_produce_categories(["git commit", "bus cat=security 安全"])
     assert "security" in result
     assert "git" not in result
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -12,26 +12,12 @@ import time
 import uuid
 from pathlib import Path
 
-# 确保 src 目录在 hermes_scripts 之前（防止 hermes_core 遮蔽本地 config_loader）
-_SRC_DIR = str(Path(__file__).resolve().parent)
-if _SRC_DIR in sys.path:
-    sys.path.remove(_SRC_DIR)
-sys.path.insert(0, _SRC_DIR)
-
-# 加入 hermes scripts 路径（环境变量优先）
-_HERMES_SCRIPTS = Path(os.environ.get(
-    "HERMES_SCRIPTS_DIR",
-    str(Path.home() / ".hermes" / "scripts")
-))
-if str(_HERMES_SCRIPTS) not in sys.path:
-    sys.path.insert(1, str(_HERMES_SCRIPTS))
-
-# 确保 session-launcher/src 路径可用（for sentinel/routine import）
+# sys.path 由 paths.py 集中管理。list_sentinels 延迟注入 launcher 路径为例外。
 
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
     with_retry, health_check, start_background_services, stop_background_services,
-    reconfigure, reload_config, IDEMPOTENT_CONSUME, OPTIMISTIC_CLAIM, ACK_TRACKER,
+    reconfigure, reload_config, IDEMPOTENT_CONSUME, ACK_TRACKER,
     DEFAULT_RETRY, get_last_cursor, set_last_cursor, setup_logging,
 )
 
@@ -64,73 +50,16 @@ def list_sentinels():
     return _list_sentinels()
 
 
-@with_retry(DEFAULT_RETRY)
 def poll_unconsumed(category: str | None = None, consumer: str | None = None, instance_id: str = "", limit: int = 100) -> list[dict]:
-    """拉取未消费消息，按优先级排序。
-
-    使用 Blackboard.unconsumed() 直接获取，
-    不再 subprocess + 字符串解析。
-    集成重试、熔断、心跳、指标。
-    使用 config.yaml 中的 max_messages_per_poll（Fix 2）。
-    若指定 consumer，跳过 cursor 之前的消息（Fix 6 防重启重复处理）。
-    instance_id 区分不同 pipeline 实例的 cursor（Fix 7：多实例隔离）。
-    """
-    from bus_protocol import Blackboard
-    from config_loader import get_config
-
-    bb = Blackboard()
-    router = _rt_mod.get_router()
-    max_per_poll = get_config().nested_get("bus", "max_messages_per_poll", default=100)
-    # 读取持久化 cursor，跳过已处理消息
-    since_id = get_last_cursor(consumer, "", instance_id) if consumer else 0
-
-    # 熔断器调用
-    def _do_poll():
-        return [f for f in bb.unconsumed() if f.id > since_id][:max_per_poll]
-
-    try:
-        facts = CIRCUIT_BREAKER.call(_do_poll)
-    except Exception as e:
-        METRICS.inc("poll_errors_total")
-        LOGGER.error(f"poll_unconsumed failed: {e}", extra={"trace_id": str(uuid.uuid4())[:8]})
-        return [{"error": str(e)}]
-
-    HEARTBEAT.beat("pipeline")
-    messages: list[dict] = []
-    for f in facts:
-        if category and f.cat != category:
-            continue
-        messages.append({
-            "id": f.id,
-            "category": f.cat,
-            "text": f.t[:100],
-            "evidence": f.e[:120] if f.e else "",
-            "priority": _rt_mod.priority(f.cat),
-            "consumers": router.get_consumers_prioritized(f.cat),
-        })
-    # 按优先级升序排列（高优先级在前）
-    messages.sort(key=lambda m: m["priority"])
-
-    METRICS.inc("poll_count")
-    METRICS.observe("backlog_size", len(messages))
-    return messages
+    """拉取未消费消息（re-export from routing.polling）。"""
+    from routing.polling import poll_unconsumed as _p
+    return _p(category=category, consumer=consumer, instance_id=instance_id, limit=limit)
 
 
 def notify_consumers(messages: list[dict]) -> None:
-    """按优先级通知消费者。"""
-    consumer_map: dict[str, list[dict]] = {}
-    for msg in messages:
-        for c in msg.get("consumers", []):
-            consumer_map.setdefault(c, []).append(msg)
-
-    for role, msgs in sorted(consumer_map.items()):
-        # 该角色的消息按优先级排序
-        msgs.sort(key=lambda m: m.get("priority", 99))
-        print(f"  {role}: {len(msgs)} 条待消费")
-        for m in msgs:
-            print(f"    [P{m['priority']}] [{m['category']}] {m['text']}")
-            if m.get("evidence"):
-                print(f"      → {m['evidence']}")
+    """通知消费者（re-export from routing.polling）。"""
+    from routing.polling import notify_consumers as _n
+    return _n(messages)
 
 
 def status() -> dict:
@@ -222,7 +151,7 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
 
 
 
-# ── 路由分发（从 auto_route_routing 导入）──
+# ── 路由分发（从 routes 导入）──
 from routing.routes import route_all, route_to_ccs, route_all_to_ccs, dispatch_investigator
 
 
@@ -236,49 +165,7 @@ def _output_json(data, has_json):
         print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def _run_daemon():
-    """守护模式入口：单实例锁 → 持续轮询。"""
-    import signal
-    _PID_DIR = Path("/tmp")
-    _PID_FILE = _PID_DIR / "session-pipeline-daemon.pid"
-
-    if _PID_FILE.exists():
-        try:
-            old_pid = int(_PID_FILE.read_text())
-            os.kill(old_pid, 0)
-            print(f"Daemon already running (PID={old_pid}). Exiting.")
-            sys.exit(1)
-        except (OSError, ValueError):
-            pass
-    _PID_FILE.write_text(str(os.getpid()))
-
-    from config_loader import get_config
-    cfg = get_config()
-    poll_interval = cfg.nested_get("bus", "poll_interval", default=60)
-    log_level = getattr(logging, cfg.nested_get("logging", "level", default="INFO"))
-    log_json = cfg.nested_get("logging", "json_output", default=True)
-    setup_logging(level=log_level, json_output=log_json)
-
-    start_background_services()
-    _rt_mod.get_router().load_from_db()
-    _daemon_instance_id = f"pipeline_{uuid.uuid4().hex[:8]}"
-    LOGGER.info(f"Daemon started, poll_interval={poll_interval}s, instance_id={_daemon_instance_id}")
-    try:
-        while not _get_shutdown()._shutdown:
-            reload_config()
-            result = route_all(consumer="pipeline", instance_id=_daemon_instance_id)
-            delivery = route_all_to_ccs()
-            if delivery["total"] > 0:
-                LOGGER.info(f"Delivered {delivery["routed"]} to CCS", extra={"trace_id": "-"})
-            if result["routed"] > 0:
-                LOGGER.info(f"Routed {result['routed']} messages", extra={"trace_id": "-"})
-            time.sleep(poll_interval)
-    except KeyboardInterrupt:
-        LOGGER.info("Shutting down...")
-    finally:
-        stop_background_services()
-        _PID_FILE.unlink(missing_ok=True)
-        LOGGER.info("Daemon stopped")
+    sys.exit(1)
 
 
 def _cli_route_all(argv, flags, has_json):
@@ -369,8 +256,8 @@ if __name__ == "__main__":
 
     # ── dispatch ──
     if _daemon_flag:
-        _run_daemon()
-    elif _status_flag:
+        print("Use pipeflow/daemon.py for the unified daemon.")
+        sys.exit(1)
         _output_json(status(), has_json)
     elif _health_flag:
         _output_json(health_check(), has_json)

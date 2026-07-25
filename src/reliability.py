@@ -297,43 +297,8 @@ class IdempotentConsume:
                     "consumer": consumer,
                     "error": str(e),
                 }
-
-
-class OptimisticClaim:
-    """乐观锁 claim：在 route-all 时防止多实例抢同一消息。
-
-    策略：用 SQLite 事务包裹 check + consume，
-    如果 check 到已消费（并发竞争）则跳过。
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._idempotent = IdempotentConsume()
-
-    def claim_message(self, bb, fact_id: int, consumer: str) -> dict:
-        """原子 claim：检查未消费 → consume。返回 claim 结果。"""
-        with self._lock:
-            # 乐观检查
-            if self._idempotent.is_consumed(bb, fact_id, consumer):
-                return {"status": "claimed", "fact_id": fact_id, "consumer": consumer, "already": True}
-
-            # 执行 consume
-            result = self._idempotent.safe_consume(bb, fact_id, consumer)
-            result["already"] = False
-            return result
-
-    def claim_batch(self, bb, messages: list[dict], consumer: str) -> list[dict]:
-        """批量 claim：对每条消息原子 claim，返回所有结果。"""
-        results = []
-        for msg in messages:
-            result = self.claim_message(bb, msg["id"], consumer)
-            results.append(result)
-        return results
-
-
 # 全局实例
 IDEMPOTENT_CONSUME = IdempotentConsume()
-OPTIMISTIC_CLAIM = OptimisticClaim()
 
 
 # ── ACK 确认机制 ────────────────────────────────────────────────────

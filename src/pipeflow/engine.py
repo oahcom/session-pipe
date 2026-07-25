@@ -85,7 +85,6 @@ class WorkflowEngine:
         self.runs_dir = self.workflows_dir / "runs"
         self._bb = Blackboard()
         self._workflows: dict[str, WorkflowDef] = {}
-        self._composite_runner = None
         self._lm = None
         self._load_workflows()
 
@@ -196,9 +195,6 @@ class WorkflowEngine:
                 print(f"  [wf] LM start_wf 失败: {e}", flush=True)
             self._write_step_prompt(run, wf.steps[0])
             return run.id
-
-        if name in self.composite_runner.list_chains():
-            return self.composite_runner.start(name, context)
 
         raise ValueError(f"未知工作流: {name}")
 
