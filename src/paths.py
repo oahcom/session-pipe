@@ -25,8 +25,6 @@ WORKFLOWS_DB = HERMES_STATE / "workflows.db"
 CURSOR_DB = HERMES_STATE / "pipeline_cursor.db"
 ROUTING_DB = HERMES_STATE / "routing.db"
 ACK_TRACKER_DB = HERMES_STATE / "ack_tracker.db"
-COMPOSITE_RUNS_DB = HERMES_STATE / "composite_runs.db"
-
 # ── 模板与配置 ──
 HERMES_TEMPLATES = _HOME / ".hermes" / "templates"
 HERMES_BACKUPS = _HOME / ".hermes" / "backups"
@@ -36,6 +34,9 @@ WORKFLOW_GUIDE = HERMES_TEMPLATES / "WORKFLOW_GUIDE.md"
 HERMES_SCRIPTS = Path(_HOME / ".hermes" / "scripts")
 SESSION_LAUNCHER_SRC = Path(_SESSION_LAUNCHER_SRC)
 SESSION_PIPELINE_SRC = Path(__file__).resolve().parent
+
+# ── CCS CLI（统一入口，消除 4 处硬编码） ──
+CCS_CLI = SESSION_LAUNCHER_SRC / "ccs.py"
 
 # ── 哨兵目录 ──
 CCS_SENTINEL_DIR = Path("/tmp/ccs-sentinels")
@@ -65,6 +66,11 @@ def ensure_paths() -> None:
     # 加父目录（src），这样 import lifecycle 能找到 lifecycle/__init__.py
     _psrc = str(SESSION_PIPELINE_SRC.resolve())
     sys.path.insert(0, _psrc)
-    # 如果 launcher 的 lifecycle 已被缓存，清除缓存
+    # 清除 launcher 缓存并预加载 pipeline 版本
+    import importlib
     if "lifecycle" in sys.modules:
         del sys.modules["lifecycle"]
+    try:
+        importlib.import_module("lifecycle")
+    except Exception as _e:
+        print(f"[paths] lifecycle 预加载失败: {_e}")

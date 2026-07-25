@@ -66,14 +66,27 @@ class LifecycleManager:
     # ── 状态查询 ─────────────────────────────────
 
     def upsert_template(self, template_id: str, name: str,
-                         description: str, steps: list[dict]) -> None:
-        """写入或更新工作流模板定义。"""
+                         description: str, steps: list[dict],
+                         trigger_scene: list[str] = None,
+                         allowed_initiators: list[str] = None,
+                         allowed_executors: list[str] = None,
+                         max_duration_hours: int = 24,
+                         quality_standards: str = "") -> None:
+        """写入或更新工作流模板定义（含角色适配元数据）。"""
         self._conn.execute("""
             INSERT OR REPLACE INTO workflow_templates
-            (template_id, name, description, steps_json, created_at, is_active)
-            VALUES (?, ?, ?, ?, ?, 1)
+            (template_id, name, description, steps_json, created_at, is_active,
+             trigger_scene, allowed_initiators, allowed_executors,
+             max_duration_hours, quality_standards)
+            VALUES (?, ?, ?, ?, ?, 1,
+                    ?, ?, ?,
+                    ?, ?)
         """, (template_id, name, description,
-              json.dumps(steps, ensure_ascii=False), time.time()))
+              json.dumps(steps, ensure_ascii=False), time.time(),
+              json.dumps(trigger_scene or [], ensure_ascii=False),
+              json.dumps(allowed_initiators or [], ensure_ascii=False),
+              json.dumps(allowed_executors or [], ensure_ascii=False),
+              max_duration_hours, quality_standards))
         self._conn.commit()
 
     def get_wf(self, wf_id: str) -> Optional[dict]:
@@ -181,6 +194,7 @@ class LifecycleManager:
                     "review": self._complete_review_unsafe,
                     "gate": self._complete_gate_unsafe,
                     "notify": self._complete_notify_unsafe,
+                    "subflow": self._complete_subflow_unsafe,
                 }
                 fn = handler.get(step_type)
                 if not fn:
@@ -202,7 +216,7 @@ class LifecycleManager:
         st = step.get("type", "")
         if st == "review":
             return step.get("target_role", "")
-        if st == "handoff":
+        if st in ("handoff", "subflow"):
             template = self._get_template(wf.get("template_id"))
             if not template:
                 return ""
@@ -257,6 +271,21 @@ class LifecycleManager:
                         if assigner and self.role != assigner:
                             raise PermissionError(
                                 f"only assigner can confirm: {self.role} != {assigner}")
+
+                # ── subflow 步骤: 确认前检查子工作流是否完成 ──
+                step_def = self.get_step(wf_id, step_id)
+                if step_def and step_def.get("type") == "subflow":
+                    sub_wf_id = current.get("sub_wf_id") or current.get("subflow_id", "")
+                    if sub_wf_id:
+                        child = self._get_wf_unsafe(sub_wf_id)
+                        if not child:
+                            raise ValueError(f"子工作流 {sub_wf_id} 不存在")
+                        if child["status"] == "failed":
+                            raise ValueError(
+                                f"子工作流 {sub_wf_id} 已失败，无法审批父步骤")
+                        if child["status"] != "completed":
+                            raise ValueError(
+                                f"子工作流 {sub_wf_id} 未完成 (status={child['status']})")
 
                 completed_by = current.get("completed_by", "")
                 task_id = wf.get("task_id")
@@ -358,6 +387,8 @@ class LifecycleManager:
                         "UPDATE workflow_instances SET status='failed', completed_at=? "
                         "WHERE instance_id=?", (time.time(), wf_id)
                     )
+                    # 级联取消子工作流
+                    self._cascade_cancel_unsafe(wf_id, reason)
                     self._sync_task_unsafe(task_id)
                     self._log_unsafe(wf_id, task_id, "wf_failed", detail=f"step {step_id}: {reason}")
                     self._conn.commit()
@@ -425,6 +456,39 @@ class LifecycleManager:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    # ── 子工作流级联操作 ───────────────────────────
+
+    def _cascade_cancel_unsafe(self, wf_id: str, reason: str = ""):
+        """级联取消所有子工作流（迭代实现，避免递归栈溢出）。"""
+        _stack = [wf_id]
+        while _stack:
+            _current = _stack.pop()
+            _children = self._conn.execute(
+                "SELECT instance_id, task_id FROM workflow_instances "
+                "WHERE parent_wf_id=? AND status NOT IN ('completed', 'cancelled', 'failed')",
+                (_current,)
+            ).fetchall()
+            for _child in _children:
+                _cid = _child["instance_id"]
+                _ctid = _child["task_id"]
+                self._conn.execute(
+                    "UPDATE workflow_instances SET status='cancelled', completed_at=? "
+                    "WHERE instance_id=?", (time.time(), _cid))
+                self._conn.execute(
+                    "UPDATE tasks SET status='cancelled' WHERE task_id=?", (_ctid,))
+                self._log_unsafe(_cid, _ctid, "wf_cancelled",
+                                 detail=f"cascade from parent {_current}: {reason}")
+                _stack.append(_cid)
+
+    def _count_pending_subflows(self, wf_id: str, step_id: str) -> int:
+        """统计指定步骤创建的子工作流中未完成的个数。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM workflow_instances "
+            "WHERE parent_wf_id=? AND subflow_source_step_id=? AND status NOT IN ('completed')",
+            (wf_id, step_id)
+        ).fetchone()
+        return row[0] if row else 0
 
     # ── 内部 unsafe 方法（在已开启的事务中调用） ──
 
@@ -553,6 +617,65 @@ class LifecycleManager:
                                result.stderr.decode()[:200])
         except Exception as e:
             logger.warning("approval token CCS send error: %s", e)
+
+    def _complete_subflow_unsafe(self, wf_id, step_id, step, task_id, results):
+        """创建子工作流 + 启动，返回 step_done_ready（等 confirm 时检查子状态）。"""
+        sub_tpl_id = step.get("subflow_template_id", "")
+        sub_assignee = step.get("subflow_assignee", "")
+        if not sub_tpl_id or not sub_assignee:
+            self._set_step_result_unsafe(wf_id, step_id, "failed", results)
+            self._log_unsafe(wf_id, task_id, "subflow_failed",
+                             detail=f"missing subflow_template_id or subflow_assignee")
+            return "failed"
+
+        # 构建子任务描述：父 prompt + 步骤上下文
+        step_prompt = step.get("prompt_template", "")
+        parent_wf = self._get_wf_unsafe(wf_id)
+        parent_task_id = parent_wf.get("task_id", "") if parent_wf else ""
+        sub_title = f"[subflow] {step.get('title', sub_tpl_id)}"
+        sub_desc = f"Parent: {wf_id} / {task_id}\nStep: {step_id}\nTemplate: {sub_tpl_id}\nPrompt:\n{step_prompt}"
+
+        # 创建子 workflow_instance（通过 raw SQL，避免触发 Gate 递归）
+        sub_wf_id = f"wf_{int(time.time()*1000) % 100000000}"
+        child_instance_id = f"task_{__import__('uuid').uuid4().hex[:8]}"
+        now = time.time()
+        self._conn.execute("""
+            INSERT INTO tasks (task_id, title, description, assigner, assignee,
+                               status, created_at, updated_at, parent_task_id)
+            VALUES (?, ?, ?, ?, ?, 'created', ?, ?, ?)
+        """, (child_instance_id, sub_title, sub_desc, self.role, sub_assignee,
+              now, now, parent_task_id))
+        self._conn.execute("""
+            INSERT INTO workflow_instances
+                (instance_id, template_id, task_id, assigner, assignee,
+                 status, current_step_id, created_at,
+                 parent_wf_id, subflow_source_step_id)
+            VALUES (?, ?, ?, ?, ?, 'pending', 's1', ?, ?, ?)
+        """, (sub_wf_id, sub_tpl_id, child_instance_id, self.role, sub_assignee,
+              now, wf_id, step_id))
+
+        # 启动子工作流
+        self._conn.execute(
+            "UPDATE workflow_instances SET status='running' WHERE instance_id=?",
+            (sub_wf_id,))
+        self._conn.commit()
+
+        # 记录到 step_results
+        results[step_id] = {
+            "status": "step_done_ready",
+            "sub_wf_id": sub_wf_id,
+            "sub_task_id": child_instance_id,
+            "sub_template_id": sub_tpl_id,
+            "completed_at": now,
+            "completed_by": self.role,
+        }
+        self._conn.execute(
+            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+            (json.dumps(results, ensure_ascii=False), wf_id))
+        self._log_unsafe(wf_id, task_id, "subflow_created",
+                         detail=f"→ {sub_wf_id} ({sub_tpl_id})")
+        self._issue_approval_token(wf_id, step_id, step, task_id, results)
+        return "step_done_ready"
 
     def _complete_gate_unsafe(self, wf_id, step_id, step, task_id, results):
         check = step.get("completion_check", {})

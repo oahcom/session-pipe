@@ -15,7 +15,8 @@ if str(_HERMES_SCRIPTS) not in sys.path:
 
 from config_loader import get_config
 from routing import router as _rt_mod
-from pipeflow.composite import CompositeRunner
+from paths import CCS_CLI as _CCS_CLI
+from workflow.client import WorkflowClient
 
 from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, GRACEFUL_SHUTDOWN
 from reliability import with_retry, DEFAULT_RETRY, get_last_cursor, set_last_cursor
@@ -42,7 +43,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     from bus_protocol import Blackboard
 
     if not instance_id:
-        instance_id = f"pipeline_{uuid.uuid4().hex[:8]}"
+        instance_id = f"pipeline_{uuid.uuid4().hex[:8]}_{os.getpid()}_{int(time.time())}"
 
     # 延迟导入规避循环依赖（poll_unconsumed 定义在 auto_route.py）
     from routing.auto import poll_unconsumed as _poll
@@ -63,8 +64,8 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 continue
             consumers = msg.get("consumers", [])
             ordered = (
-                [c for c in consumers if "*" not in router._routing.get(c, {}).get("consume", [])]
-                + [c for c in consumers if "*" in router._routing.get(c, {}).get("consume", [])]
+                [c for c in consumers if "*" not in router.routing.get(c, {}).get("consume", [])]
+                + [c for c in consumers if "*" in router.routing.get(c, {}).get("consume", [])]
             )
             if not ordered:
                 METRICS.inc("route_orphan_count")
@@ -104,6 +105,20 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                         # ACK 记录
                         ACK_TRACKER.record_ack(fid, role, ack_status, category=cat,
                                                error=r.get("error", "") if ack_status == "error" else "")
+                        # 消费成功后创建对应角色的工作流（自动推荐模板）
+                        if ack_status == "consumed":
+                            try:
+                                _wc = WorkflowClient(role)
+                                _wc.create_task_v2(assignment.get("title","")[:80],
+                                                   assignee=role, initiator_role="pipeline",
+                                                   bus_category=cat)
+                                _wc.close()
+                            except Exception as _e:
+                                LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
+                        try:
+                            set_last_cursor(consumer, "", fid, instance_id)
+                        except Exception:
+                            pass
                     except Exception as e:
                         LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
                                      extra={"trace_id": str(fid)})
@@ -164,12 +179,11 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         return {"role": role_name, "routed": 0, "total": 0, "dry_run": dry_run, "details": []}
 
     # 子进程调 ccs.py 发消息，规避 routing 包名冲突
-    _ccs_cli = str(Path.home() / "session-launcher" / "src" / "ccs.py")
-    _launcher_env = {**os.environ, "PYTHONPATH": str(Path.home() / "session-launcher" / "src")}
+    _launcher_env = {**os.environ, "PYTHONPATH": str(_CCS_CLI.parent)}
 
     def _send(role, msg):
         import subprocess as _sp, json as _json
-        r = _sp.run([sys.executable, _ccs_cli, "send", "--from", "pipeline", role, msg],
+        r = _sp.run([sys.executable, str(_CCS_CLI), "send", "--from", "pipeline", role, msg],
                      capture_output=True, text=True, timeout=15, env=_launcher_env)
         err = ""
         if r.returncode != 0:
@@ -179,7 +193,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
 
     def _is_running(role):
         import subprocess as _sp
-        r = _sp.run([sys.executable, _ccs_cli, "status-role", role],
+        r = _sp.run([sys.executable, str(_CCS_CLI), "status-role", role],
                      capture_output=True, text=True, timeout=10, env=_launcher_env)
         return "未运行" not in r.stdout
 
@@ -210,6 +224,16 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         if result.get("success"):
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "routed", "sent_chars": result.get("sent_chars", 0)})
+            # 创建对应角色的工作流实例（按 bus 分类推荐模板）
+            try:
+                _title = msg.get("text", "")[:80]
+                _cat = msg.get("category", "")
+                _wf = WorkflowClient(role_name)
+                _wf.create_task_v2(_title, assignee=role_name, initiator_role="pipeline",
+                                   bus_category=_cat)
+                _wf.close()
+            except Exception as _e:
+                LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)
         else:
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "failed", "error": result.get("error", "unknown")})

@@ -1,5 +1,7 @@
 # Session Pipeline — Technical Deep Dive
 
+> 更新: 2026-07-24 | 受众: 高级开发者 | 相关: [DOCS.md](DOCS.md)
+
 ## 1. 项目定位
 
 Session 生态的**路由层**。自动感知 bus 新消息，按优先级分发给对应 CCS 消费。无需人在中间传话，不靠 AI 自主决定该听谁的消息。
@@ -15,65 +17,71 @@ roles (定义层 JSON) → launcher (执行层) → pipeline (路由层)
 
 ```
 session-pipeline/
-├── router.py               # → routing/router.py（主体）
-├── auto_route.py            # → routing/auto.py（主体）
-├── reliability.py           # 可靠性基础设施实例化
-├── reliability_core.py      # 可靠性核心（重试/熔断/心跳/TTL/Metrics）
-├── config_loader.py         # YAML 配置加载 + 热重载
-├── paths.py                 # 统一路径管理
-│
-├── routing/                 # 路由系统
-│   ├── router.py            # 路由映射（从角色 JSON 推导 produce/consume）
-│   ├── rdb.py               # SQLite 持久化路由表 + 审计日志
-│   ├── auto.py              # 自动消息分发 + daemon 模式
-│   ├── routes.py            # 路由分发逻辑
+├── src/
+│   ├── routing/                 # 路由系统
+│   │   ├── router.py            # 路由映射（从角色 JSON 推导 produce/consume）
+│   │   ├── auto.py              # 自动消息分发 + daemon 模式
+│   │   ├── routes.py            # 路由分发逻辑（route_all, route_to_ccs）
+│   │   ├── rdb.py               # SQLite 持久化路由表 + 审计日志
+│   │   └── __init__.py
+│   │
+│   ├── pipeflow/                # 流水线引擎
+│   │   ├── engine.py            # 对话工作流执行引擎（核心循环）
+│   │   ├── db.py                # SQLite 持久化（Template/Instance/Task）
+│   │   ├── daemon.py            # 工作流守护进程（run_once loop）
+│   │   ├── dsl.py               # 工作流 DSL 解析
+│   │   └── __init__.py
+│   │
+│   ├── lifecycle/               # 生命周期管理
+│   │   ├── manager.py           # 状态机（完成/审批/回滚/升级）
+│   │   └── __init__.py
+│   │
+│   ├── workflow/                # 工作流客户端
+│   │   ├── client.py            # 高层 API（与 DB 交互）
+│   │   ├── db.py                # 工作流 DB 辅助
+│   │   ├── gateway.py           # 工作流网关
+│   │   └── __init__.py
+│   │
+│   ├── reliability.py           # 可靠性基础设施实例化
+│   ├── reliability_core.py      # 可靠性核心（重试/熔断/心跳/TTL/Metrics）
+│   ├── config_loader.py         # YAML 配置加载 + 热重载
+│   ├── paths.py                 # 统一路径管理
+│   ├── template_registry.py     # 模板注册表
+│   ├── wf.py                    # 工作流 CLI 工具
+│   ├── workflow_client.py       # 工作流客户端兼容入口
+│   ├── p0_exemption.py          # P0 豁免机制
 │   └── __init__.py
 │
-├── pipeflow/                # 流水线引擎
-│   ├── engine.py            # 对话工作流执行引擎
-│   ├── models.py            # WorkflowDef / Step / WorkflowRun 模型
-│   ├── db.py                # SQLite 持久化
-│   ├── dsl.py               # 工作流 DSL 解析
-│   ├── composite.py         # 复合工作流
-│   ├── daemon.py            # 工作流守护进程
-│   └── __init__.py
-│
-├── workflow/                # 工作流客户端
-│   ├── client.py            # 工作流客户端
-│   └── __init__.py
-│
-├── lifecycle/               # 生命周期管理
-│   └── manager.py
-│
-├── composite_runner.py      # 复合工作流引擎（subflow/parallel/choice）
-├── composite_models.py      # 复合工作流数据模型
-├── workflow_engine.py       # 工作流引擎（pipeflow 包装）
-├── workflow_daemon.py       # 工作流守护进程（推送 prompt 给 CCS）
-├── workflow_db.py           # 工作流数据库
-│
-├── config/config.yaml       # 所有可配置参数
+├── config/config.yaml           # 所有可配置参数
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── SYSTEM_LANDSCAPE.md
 │   ├── TEST_WORKFLOW.md
-│   └── TECHNICAL_DEEP_DIVE.md  # 本文档
+│   ├── WORKFLOW_TEMPLATE_SPEC.md
+│   └── TECHNICAL_DEEP_DIVE.md   # 本文档
 └── tests/
     ├── test_router.py
     ├── test_workflow_db.py
     ├── test_workflow_engine.py
-    └── test_cross_component.py
+    ├── test_cross_component.py
+    ├── test_engine_e2e.py
+    ├── test_integration.py
+    ├── test_role_interaction.py
+    ├── test_workflow_daemon.py
+    └── test_router_extend_bh.py
 ```
 
 ## 3. 核心模块详解
 
-### 3.1 routing/router.py — 路由表
+### 3.1 routing/router.py — 路由表 (448 行)
 
 **核心能力:** 从 hermes-session-roles 的角色 JSON 自动推导 produce/consume 关系。
 
 ```python
-router = Router()
+from routing.router import get_router
+router = get_router()
 router.role_produce_categories("maintainer")   # ["code_fix", "architecture"]
-router.get_consumers("code_fix")               # ["consumer", "engineer", "closer", ...]
+router.get_consumers("code_fix")               # ["engineer", "closer", ...]
 router.get_consumers_prioritized("code_fix")   # 高优先级在前
 ```
 
@@ -84,11 +92,12 @@ router.get_consumers_prioritized("code_fix")   # 高优先级在前
 
 **消费联动:** `consume_linkage()` 返回其他受影响的消费者列表（供 caller 做 ACK 跟踪）。
 
-### 3.2 routing/auto.py — 自动分发
+### 3.2 routing/auto.py — 自动分发 (415 行)
 
 **核心函数:**
 
 ```python
+from routing.auto import poll_unconsumed, route_all, route_to_ccs, route_all_to_ccs
 poll_unconsumed(category, consumer, limit=100)  # 拉取未消费消息
 route_all(consumer, dry_run, parallel)           # 路由所有未消费消息
 route_to_ccs(ccs_role)                           # 为特定角色路由
@@ -98,12 +107,12 @@ route_all_to_ccs()                               # 并行路由所有角色
 **CLI:**
 
 ```bash
-python3 src/auto_route.py                          # 查看队列状态
-python3 src/auto_route.py --route-all              # 路由所有未消费
-python3 src/auto_route.py --route-all --dry-run    # 预览分配方案
-python3 src/auto_route.py --daemon                 # 守护模式（60s 轮询）
-python3 src/auto_route.py --health                 # 健康检查
-python3 src/auto_route.py --metrics                # Prometheus 指标
+python3 src/routing/auto.py                          # 查看队列状态
+python3 src/routing/auto.py --route-all              # 路由所有未消费
+python3 src/routing/auto.py --route-all --dry-run    # 预览分配方案
+python3 src/routing/auto.py --daemon                 # 守护模式（60s 轮询）
+python3 src/routing/auto.py --health                 # 健康检查
+python3 src/routing/auto.py --metrics                # Prometheus 指标
 ```
 
 **优先级路由:**
@@ -119,7 +128,7 @@ python3 src/auto_route.py --metrics                # Prometheus 指标
 | deception | 7 | 欺骗检测 |
 | default | 11 | 其他 |
 
-### 3.3 reliability + reliability_core — 可靠性基础设施
+### 3.3 reliability + reliability_core — 可靠性基础设施 (483 + 456 行)
 
 六层可靠性保障:
 
@@ -171,7 +180,7 @@ CREATE TABLE cursors (
 
 `ack_tracker.db` 记录每条消息的消费确认状态。未 ACK 的消息自动重试。
 
-### 3.4 pipeflow/engine.py — 工作流引擎
+### 3.4 pipeflow/engine.py — 工作流引擎 (871 行)
 
 数据驱动的对话工作流执行引擎，通过 Sister Bus 与 CCS 会话交互。
 
@@ -193,10 +202,13 @@ class Step:
     target_role: str
     prompt_template: str
     exit_condition: dict
+    type: str               # single/handoff/review/gate/notify
     max_retries: int
     verify: str             # shell command, exit 0 = pass
-    failure_patterns: list[str] | None
-    estimated_hours: int
+    completion_check: dict  # gate 步骤的检查条件
+    condition: str          # 条件步骤表达式
+    rollback_to: str        # 回滚目标步骤
+    subflow_template: str   # 子工作流模板名
 
 @dataclass
 class WorkflowRun:
@@ -206,29 +218,36 @@ class WorkflowRun:
     status: str             # running / completed / failed / cancelled
     current_step: str
     step_retries: dict[str, int]
+    step_results: dict[str, Any]
 ```
 
-**25 个可用工作流:**
-architect_adr, architect_full_design, architect_review, closer_close_loop, coordinator_dispatch, coordinator_schedule, coordinator_standup, design_review, dev_implement, devops_deploy_execute, devops_deploy_plan, engineer_feature, engineer_implementation, investigator_analyze, lr_tech_decision, maintainer_health_monitor, pg_implement, pm_requirements, qa_test_execute, qa_test_plan, reviewer_pr_review, scout_research_cycle, security_audit_scan, security_threat_model, writer_document
+**32 个可用工作流模板 + 3 个复合链:**
 
-### 3.5 composite_runner.py — 复合工作流
+- 原子工作流: `~/.hermes/workflows/*.json`
+- 复合链: `~/.hermes/workflows/chains/*.json` (dev_pipeline, security_hotfix, recovery_pipeline)
 
-三种复合模式:
+### 3.5 lifecycle/manager.py — 生命周期状态机 (938 行)
 
-| 模式 | 说明 |
-|------|------|
-| subflow | 顺序执行多个子工作流 |
-| parallel | 并行执行多个子工作流 |
-| choice | 条件分支 |
+5 种步骤类型的完成策略:
 
-### 3.6 routing/rdb.py — 路由表数据库
+| type | 完成策略 | 需要审批 | 自动推进 |
+|------|---------|---------|---------|
+| `single` | 直接完成 | 否 | 是 |
+| `handoff` | 等待分配者确认 | 是 (token) | 否 |
+| `review` | 等待 target_role 确认 | 是 (token) | 否 |
+| `gate` | 检查条件通过/阻塞 | 否 | 条件通过时 |
+| `notify` | 直接完成 | 否 | 是 |
+
+**并发安全:** `threading.RLock` + SQLite WAL + `BEGIN IMMEDIATE`
+
+### 3.6 routing/rdb.py — 路由表数据库 (283 行)
 
 SQLite 持久化路由表，支持:
 - `save_routing(role, produce, consume, changed_by)` — 注册/更新
 - `load_routing()` — 加载全部
 - `audit_log(limit)` — 变更审计历史
 
-### 3.7 config/config.yaml — 集中配置
+### 3.8 config/config.yaml — 集中配置
 
 | 配置块 | 功能 |
 |--------|------|
@@ -282,12 +301,13 @@ SQLite 持久化路由表，支持:
 Bus 协议基于 `bus_protocol.Blackboard` 直接 API（不再 subprocess 解析字符串）:
 
 ```python
+from bus_protocol import Blackboard
 bb = Blackboard()
 facts = bb.unconsumed()              # 拉取未消费消息
 bb.read(cat="security", limit=10)    # 按分类读取
 bb.write("code_fix", "消息", src="pipeline")  # 写入通知
 ```
 
-<pipeline> 依赖的 bus 路径:
+依赖的 bus 路径:
 - `~/.hermes/sister_bus/blackboard.db` — SQLite DB
-- `~/.hermes/scripts/bus_client.py` — subprocess CLI 回退
+- `~/.hermes/scripts/bus_protocol.py` — Python API

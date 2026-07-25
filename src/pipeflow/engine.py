@@ -21,7 +21,6 @@ from paths import HERMES_WORKFLOWS as _WORKFLOWS_DIR
 
 from bus_protocol import Blackboard
 
-_RUNS_DIR = _WORKFLOWS_DIR / "runs"
 _POLL_SLEEP = 5
 _TIMEOUT_GRACE = 10
 _ESCALATED_AFTER = 2
@@ -78,7 +77,6 @@ class WorkflowEngine:
     def __init__(self, workflows_dir: Path = _WORKFLOWS_DIR):
         self.workflows_dir = Path(workflows_dir).expanduser()
         self.runs_dir = self.workflows_dir / "runs"
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._bb = Blackboard()
         self._workflows: dict[str, WorkflowDef] = {}
         self._composite_runner = None
@@ -164,12 +162,12 @@ class WorkflowEngine:
         if wf:
             if not wf.steps:
                 raise ValueError(f"工作流 {name} 无步骤")
+            run_id = f"wf_{uuid.uuid4().hex[:12]}"
             run = WorkflowRun(
-                id=f"wf_{uuid.uuid4().hex[:8]}",
+                id=run_id,
                 workflow_name=name, context=context or {},
                 current_step=wf.steps[0].id,
             )
-            self._save_run(run)
             self._upsert_template(name, wf)
             try:
                 self._lifecycle.start_wf(run.id, current_step_id=wf.steps[0].id,
@@ -202,21 +200,31 @@ class WorkflowEngine:
             print(f"  [wf] upsert template 失败: {e}", flush=True)
 
     def status(self, wid: str) -> dict:
-        run = self._load_run(wid)
-        if not run:
+        try:
+            row = self._lifecycle._conn.execute(
+                "SELECT instance_id, template_id, status, current_step_id, step_results, created_at "
+                "FROM workflow_instances WHERE instance_id=?", (wid,)
+            ).fetchone()
+        except Exception:
+            row = None
+        if not row:
             return {"error": "不存在"}
         return {
-            "id": run.id, "workflow": run.workflow_name,
-            "status": run.status, "current_step": run.current_step,
-            "retries": run.step_retries, "results": run.step_results,
+            "id": row["instance_id"], "workflow": row["template_id"],
+            "status": row["status"], "current_step": row["current_step_id"],
+            "retries": {}, "results": json.loads(row["step_results"] or "{}"),
         }
 
     def cancel(self, wid: str) -> bool:
-        run = self._load_run(wid)
-        if not run or run.status in ("completed", "cancelled"):
+        try:
+            row = self._lifecycle._conn.execute(
+                "SELECT status FROM workflow_instances WHERE instance_id=?", (wid,)
+            ).fetchone()
+        except Exception:
+            row = None
+        if not row or row["status"] in ("completed", "cancelled", "failed"):
             return False
-        run.status = "cancelled"
-        self._save_run(run)
+        self._lifecycle.close_wf(wid)
         return True
 
     def tick(self) -> int:
@@ -433,14 +441,14 @@ class WorkflowEngine:
                 print(f"  [wf] LM complete_step 失败: {e}", flush=True)
 
             run.step_results[step.id] = {"status": "done", "ts": time.time()}
-            self._advance(run)
+            self._sync_step_results(run.id, run.step_results)
             return
 
         run.step_results[step.id] = {
             **run.step_results.get(step.id, {}),
             "poll_since": time.time()
         }
-        self._save_run(run)
+        self._sync_step_results(run.id, run.step_results)
 
         elapsed = time.time() - (run.step_results.get(step.id, {}).get("ts", run.created_at))
         if elapsed < timeout:
@@ -450,7 +458,7 @@ class WorkflowEngine:
                 hint = f"⏰ {step.id}（{step.title}）运行中，剩余约 {remaining} 分钟"
                 self._send_to_role(step.target_role, hint)
                 run.step_results[step.id]["last_reminder"] = time.time()
-                self._save_run(run)
+                self._sync_step_results(run.id, run.step_results)
             return
 
         # 从 step_results 读持久化的超时计数
@@ -474,8 +482,8 @@ class WorkflowEngine:
                 pass
             self._send_to_role("coordinator", warning)
 
-        # 持久化到 SQLite（不只是 JSON 文件）
-        self._save_run(run)
+        # 同步到 SQLite
+        self._sync_step_results(run.id, run.step_results)
         try:
             lm = self._lifecycle
             lm._conn.execute(
@@ -485,6 +493,21 @@ class WorkflowEngine:
             lm._conn.commit()
         except Exception:
             pass
+
+    def _sync_step_results(self, wf_id: str, step_results: dict):
+        try:
+            lm = self._lifecycle
+            lm._conn.execute("BEGIN IMMEDIATE")
+            lm._conn.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(step_results, ensure_ascii=False), wf_id)
+            )
+            lm._conn.commit()
+        except Exception:
+            try:
+                lm._conn.rollback()
+            except Exception:
+                pass
 
     def _check_session_alive(self, role: str, since: float) -> bool:
         try:
@@ -512,31 +535,6 @@ class WorkflowEngine:
                 continue
             return True
         return False
-
-    def _advance(self, run: WorkflowRun):
-        wf = self._workflows.get(run.workflow_name)
-        if not wf:
-            return
-        idx = next((i for i, s in enumerate(wf.steps) if s.id == run.current_step), -1)
-        if idx < 0 or idx + 1 >= len(wf.steps):
-            run.status = "completed"
-            try:
-                self._lifecycle.close_wf(run.id)
-            except Exception as e:
-                print(f"  [wf] LM close_wf 失败: {e}", flush=True)
-            self._save_run(run)
-            elapsed = run.updated_at - run.created_at
-            self._bb.write("workflow",
-                f"[workflow] {run.workflow_name} 完成: {len(wf.steps)} 步, 耗时 {elapsed:.0f}s",
-                src="workflow_engine")
-            return
-        next_step = wf.steps[idx + 1]
-        if next_step.condition and not self._eval_cond(next_step.condition, run):
-            return
-        run.current_step = next_step.id
-        run.step_results[next_step.id] = {"status": "running", "ts": time.time()}
-        self._write_step_prompt(run, next_step)
-        self._save_run(run)
 
     def _eval_cond(self, expr: str, run: WorkflowRun) -> bool:
         try:
@@ -641,30 +639,65 @@ class WorkflowEngine:
                 parts.append(f"[{fname}] {content[:200]}...")
         return "\n".join(parts) if parts else "workspace 为空"
 
-    def _save_run(self, run: WorkflowRun):
-        run.updated_at = time.time()
-        data = json.dumps({
-            "id": run.id, "workflow_name": run.workflow_name,
-            "context": run.context, "current_step": run.current_step,
-            "step_retries": run.step_retries, "status": run.status,
-            "created_at": run.created_at, "updated_at": run.updated_at,
-            "step_results": run.step_results,
-        }, ensure_ascii=False, indent=2)
-        tmp_path = self.runs_dir / f"{run.id}.tmp"
-        final_path = self.runs_dir / f"{run.id}.json"
-        tmp_path.write_text(data)
-        tmp_path.rename(final_path)
-
-    def _load_run(self, wid: str) -> Optional[WorkflowRun]:
-        p = self.runs_dir / f"{wid}.json"
-        return self._load_run_data(p.read_text()) if p.exists() else None
-
-    def _load_run_data(self, text: str) -> Optional[WorkflowRun]:
+    def _check_anomalies(self):
+        """Detect workflows stuck across multiple steps; auto-heal."""
         try:
-            d = json.loads(text)
-            return WorkflowRun(**d)
+            conn = self._lifecycle._conn
+            running = conn.execute(
+                "SELECT instance_id, template_id, current_step_id, step_results, created_at, assignee "
+                "FROM workflow_instances WHERE status='running'"
+            ).fetchall()
+            for row in running:
+                inst = dict(row)
+                results = json.loads(inst.get("step_results") or "{}")
+                wf = self._workflows.get(inst["template_id"])
+                _wf_steps = (wf.steps if wf else [])
+                timed_out_steps = 0
+                _escalated = False
+                for _sid, _sr in results.items():
+                    if not isinstance(_sr, dict):
+                        continue
+                    if _sr.get("escalated"):
+                        _escalated = True
+                    _tc = _sr.get("timeout_count", 0)
+                    if _tc == 0:
+                        continue
+                    _sf = next((s for s in _wf_steps if s.id == _sid), None)
+                    _mr = _sf.max_retries if _sf else 0
+                    if _tc >= _mr + 1:
+                        timed_out_steps += 1
+                if timed_out_steps >= 2 and not _escalated:
+                    self._bb.write("blocker",
+                        f"[anomaly] {inst['instance_id']} has {timed_out_steps} steps exhausted retries",
+                        src="workflow_engine")
+                if timed_out_steps >= 3:
+                    self._bb.write("blocker",
+                        f"[anomaly] {inst['instance_id']} exhausted {timed_out_steps} steps, healing",
+                        src="workflow_engine")
+                    _role = inst.get("assignee", "")
+                    _sid = inst.get("current_step_id", "")
+                    if _role:
+                        self._ensure_role_alive(_role)
+                    if _sid and _role and wf:
+                        _sf = next((s for s in wf.steps if s.id == _sid), None)
+                        if _sf:
+                            _prompt = _sf.prompt_template
+                            self._send_to_role(_role, _prompt, wf_id=inst["instance_id"], step_id=_sid)
+                    if _sid and _sid in results:
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            results[_sid]["last_heal"] = time.time()
+                            conn.execute(
+                                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+            conn.commit()
         except Exception:
-            return None
+            pass
+
 
     def _scan_tasks(self):
         try:
@@ -717,6 +750,9 @@ class WorkflowEngine:
                                 _wf = self._workflows.get(_tmpl["template_id"])
                                 if _wf:
                                     self._advance_production_wf(_sub_row["instance_id"], lm, _tmpl["template_id"], _step_id, _sr)
+
+            conn.commit()
+            self._check_anomalies()
         except Exception:
             pass
 

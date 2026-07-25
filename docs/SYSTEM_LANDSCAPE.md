@@ -1,14 +1,14 @@
 # Session 三项目架构全景图
 
-> 自动生成 · `health_check_all.py` 驱动 · 2026-07-14
+> 更新: 2026-07-24 | 受众: 全栈工程师 | 相关: [DOCS.md](DOCS.md)
 
 ## 三个项目一句话
 
 | 项目 | 类比 | 职责 | 代码量 |
 |------|------|------|--------|
-| **hermes-session-roles** | `/etc/passwd` | 角色定义：25 个角色身份 + 提示词模板 | 1,750 行 |
+| **hermes-session-roles** | `/etc/passwd` | 角色定义：32 个角色身份 + 提示词模板 | 1,750 行 |
 | **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/协作 | 7,737 行 |
-| **session-pipeline** | 消息队列 | 消息路由：优先级/重试/熔断/心跳 | 4,072 行 |
+| **session-pipeline** | 消息队列 | 消息路由 + 工作流引擎 + 可靠性基础设施 | 6,088 行 |
 
 ---
 
@@ -36,7 +36,6 @@
 | ACK 回执 | `~/.hermes/state/ack_tracker.db` | 4.3MB |
 | 路由表 | `~/.hermes/state/routing.db` | 40KB |
 | Pipeline Cursor | `~/.hermes/state/pipeline_cursor.db` | 28KB |
-| 复合运行 | `~/.hermes/state/composite_runs.db` | 32KB |
 
 ## 哨兵文件
 
@@ -66,9 +65,9 @@ Blackboard SQLite 中心总线
 
 ---
 
-## 角色协作矩阵（25 角色 · 自动生成）
+## 角色协作矩阵（32 角色）
 
-> 全部 25 个 session 角色的 produce/consume 路由，来自 `router._build_routing()`。
+> 全部 32 个 session 角色的 produce/consume 路由，来自 `router._build_routing()`。
 
 | 角色 | 产出 → | 消费 ← |
 |------|--------|--------|

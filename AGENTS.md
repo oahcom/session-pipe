@@ -1,5 +1,7 @@
 # Session Pipeline AGENTS.md
 
+> 更新: 2026-07-24 | 受众: AI Agent + 维护者 | 相关: [docs/DOCS.md](docs/DOCS.md)
+
 ## 项目概述
 Session 生态的**路由层**——自动感知 bus 新消息，按优先级分发给对应 CCS 消费。
 
@@ -33,7 +35,7 @@ hermes-session-roles  →  session-launcher  →  session-pipeline
 
 ```bash
 PYTHONPATH=src python3 -c "
-from router import format_pipeline
+from routing.router import format_pipeline
 print(format_pipeline())
 " > /tmp/routing_before.txt
 ```
@@ -43,7 +45,7 @@ print(format_pipeline())
 ```bash
 # 路由表加载正常
 PYTHONPATH=src python3 -c "
-from router import get_router; r = get_router()
+from routing.router import get_router; r = get_router()
 assert len(r._routing) >= 25, f'路由表不完整: {len(r._routing)}'
 print(f'OK: {len(r._routing)} roles')
 "
@@ -82,7 +84,7 @@ python3 src/ccs.py health
 
 ### 5. 每周自进化
 
-- 检查 unconsumed 消息积压（`python3 src/auto_route.py --status`）
+- 检查 unconsumed 消息积压（`python3 src/routing/auto.py --status`）
 - 检查路由命中率：哪些角色从未被路由到？
 - 检查 TTL 清理是否正常运行
 - 检查熔断器触发次数
@@ -96,3 +98,31 @@ python3 src/ccs.py health
 | circuit_breaker.failure_threshold | 5 | 熔断阈值 |
 | heartbeat.stale_threshold | 300s | 消费者超时 |
 | ttl_pruner.max_age_days | 90 | 消息保留天数 |
+
+## 6. 工作流模板治理
+
+### 模板必填元数据
+```bash
+# 每个 ~/.hermes/workflows/*.json 必须包含以下 6 个字段：
+trigger_scene=["编码实现", "bug修复"]   # 至少 1 条触发场景
+allowed_initiators=["coordinator","pm"] # 至少 1 个允许发起角色
+allowed_executors=["engineer"]          # 至少 1 个允许执行角色
+max_duration_hours=24                   # 正整数
+quality_standards="通过 code review..." # ≥8 字符质量标准
+
+# 验证所有模板
+PYTHONPATH=src python3 -m template_registry validate-all
+
+# 验证单个模板
+PYTHONPATH=src python3 -m template_registry validate <template.json>
+```
+
+### 创建模板流程
+1. 认真填写 6 个元数据字段及每步的 `failure_patterns`
+2. 运行 `validate-all` 确保校验通过
+3. 用 `recommend` 验证推荐的场景覆盖符合预期
+
+### 模板元数据缺失的后果
+- 模板仍然可通过 `engine.start("name")` 显式启动
+- 但 **TemplateRegistry.recommend() 不会推荐它**（无 trigger_scene 或角色不匹配时不可见）
+- `_load_workflows()` 加载时会打印警告
