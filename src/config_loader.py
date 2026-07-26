@@ -2,6 +2,7 @@
 """
 配置加载器：读取 config.yaml，提供全局 config 对象。
 """
+import json
 import os
 import sys
 from pathlib import Path

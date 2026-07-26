@@ -66,6 +66,52 @@ class LifecycleManager:
 
     # ── 状态查询 ─────────────────────────────────
 
+    def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        """安全的 DB 查询代理（替代外部直接访问 _conn）。"""
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        """安全的 DB 写入代理（替代外部直接访问 _conn）。"""
+        with self._lock:
+            self._conn.execute(sql, params)
+            self._conn.commit()
+
+    def execute_many(self, sql: str, seq: list[tuple]) -> None:
+        """批量执行代理。"""
+        with self._lock:
+            self._conn.executemany(sql, seq)
+            self._conn.commit()
+
+    def execute_raw(self, sql: str, params: tuple = ()) -> None:
+        """执行 SQL（不自动提交，用于事务内操作）。"""
+        with self._lock:
+            self._conn.execute(sql, params)
+
+    def commit(self) -> None:
+        """提交当前事务。"""
+        with self._lock:
+            self._conn.commit()
+
+    def rollback(self) -> None:
+        """回滚当前事务。"""
+        with self._lock:
+            self._conn.rollback()
+
+    def begin(self) -> None:
+        """开始事务（IMMEDIATE）。"""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+
+    def ping(self) -> bool:
+        """检查连接是否存活。"""
+        try:
+            with self._lock:
+                self._conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
     def upsert_template(self, template_id: str, name: str,
                          description: str, steps: list[dict],
                          trigger_scene: list[str] = None,
@@ -456,6 +502,7 @@ class LifecycleManager:
                 self._sync_task_unsafe(task_id)
                 self._log_unsafe(wf_id, task_id, "wf_closed", detail=f"workflow {status}")
                 self._conn.commit()
+                return True
             except Exception:
                 self._conn.rollback()
                 raise

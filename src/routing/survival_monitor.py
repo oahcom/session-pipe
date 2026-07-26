@@ -8,16 +8,21 @@ L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
 集成方式：routing_daemon 每 120s 调 tick()。
 独立于 CCS 侧代码，纯外部观测。
 """
-import json, logging, subprocess, time, http.client, urllib.parse
+import json, logging, os, subprocess, time, http.client, urllib.parse
 from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 
 SENTINEL_DIR = Path("/tmp/ccs-sentinels")
-PERSONAS_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+try:
+    from paths import SESSION_ROLES_ROOT
+    _ROLES_ROOT = SESSION_ROLES_ROOT
+except ImportError:
+    _ROLES_ROOT = Path.home() / "hermes-session-roles"
+PERSONAS_DIR = _ROLES_ROOT / "personas" / "session-roles"
 BUS_SCRIPT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
-ROUTER_URL = "localhost:20128"
+ROUTER_URL = os.environ.get("ROUTER_URL", "localhost:20128")
 
 # ── 角色 output_targets 缓存 ──
 _ROLE_TARGETS_CACHE: dict[str, list[str]] = {}

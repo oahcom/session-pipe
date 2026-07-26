@@ -14,9 +14,10 @@ import json, logging, os, random, re, subprocess, sys, time
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
+# ponytail: 由 paths.py 统一管理路径；运行时可通过环境变量覆盖
+_DEFAULT_PERSONAS = SRC_DIR.parents[1] / "hermes-session-roles" / "personas" / "session-roles"
 PERSONAS_DIR = Path(os.environ.get(
-    "SESSION_ROLES_DIR",
-    "/home/administrator/hermes-session-roles/personas/session-roles",
+    "SESSION_ROLES_DIR", str(_DEFAULT_PERSONAS),
 ))
 BUS_SCRIPT = Path(os.environ.get(
     "BUS_CLIENT",
@@ -321,3 +322,5 @@ def main():
     s = run_eval_check(role_filter=args.role)
     print(json.dumps(s, ensure_ascii=False))
     return 0 if s["failed"] == 0 else 1
+if __name__ == "__main__":
+    sys.exit(main())

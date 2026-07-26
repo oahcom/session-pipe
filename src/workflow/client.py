@@ -360,23 +360,31 @@ class WorkflowClient:
             cmd.extend(["--evidence", evidence])
         subprocess.run(cmd, capture_output=True, timeout=15)
 
-    # ── 委派方法 ──
+    # ── 委派方法（经 subprocess 调用 launcher partner 模块） ──
 
     def confirm_delivery(self, task_id: str, target_role: str, timeout: int = 300) -> dict:
-        from routing.partner import PartnerClient
-        return PartnerClient(self.role).confirm_delivery(task_id, target_role, timeout)
+        cmd = ["python3", str(CCS_CLI), "partner", "confirm", task_id, target_role, "--as", self.role]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return {"ok": r.returncode == 0, "output": r.stdout}
 
     def check_wake_permission(self, target: str) -> bool:
-        from routing.partner import PartnerClient
-        return PartnerClient(self.role).check_wake_permission(target)
+        cmd = ["python3", str(CCS_CLI), "partner", "check-wake", self.role, target]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
 
     def resolve_partner(self, role: str) -> dict:
-        from routing.partner import PartnerClient
-        return PartnerClient(self.role).resolve(role)
+        cmd = ["python3", str(CCS_CLI), "partner", "resolve", role]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return {"ok": r.returncode == 0, "output": r.stdout}
 
     def wake_partner(self, role: str, context: str = "", force: bool = False) -> dict:
-        from routing.partner import PartnerClient
-        return PartnerClient(self.role).wake(role, context, force)
+        cmd = ["python3", str(CCS_CLI), "partner", "wake", role, "--as", self.role]
+        if context:
+            cmd.extend(["--context", context])
+        if force:
+            cmd.append("--force")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return {"ok": r.returncode == 0, "output": r.stdout}
 
     # ── Kanban ──
 

@@ -151,6 +151,7 @@ def main():
                 LOGGER.info("route_all: %d/%d routed", r.get("routed", 0), r.get("total", 0))
             except Exception as e:
                 LOGGER.error("route_all 异常: %s", e)
+                METRICS.inc("daemon_errors_total")
 
             now = time.time()
 
@@ -161,10 +162,12 @@ def main():
                     LOGGER.info("route_all_to_ccs: %d/%d routed", r.get("routed", 0), r.get("total", 0))
                 except Exception as e:
                     LOGGER.error("route_all_to_ccs 异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
                 try:
                     _check_cron_schedules()
                 except Exception as e:
                     LOGGER.error("cron_schedule 检查异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
                 last_ccs = now
 
             # 定时执行 eval_criteria 检查
@@ -181,6 +184,7 @@ def main():
                                r.get("passed", 0), r.get("failed", 0))
                 except Exception as e:
                     LOGGER.error("eval_check 异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
                 last_eval = now
 
             # 存活检测 tick（L1 进程存活 + 哨兵状态）
@@ -199,6 +203,7 @@ def main():
                     pass  # survival_monitor 可选组件
                 except Exception as e:
                     LOGGER.error("survival_check 异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
                 last_survival = now
 
             time.sleep(INTERVAL)

@@ -136,9 +136,9 @@ class WorkflowEngine:
             return
         try:
             lm = self._lifecycle
-            rows = lm._conn.execute(
+            rows = lm.query(
                 "SELECT template_id, name, description, steps_json FROM workflow_templates"
-            ).fetchall()
+            )
             for row in rows:
                 t = dict(row)
                 tid = t["template_id"]
@@ -226,10 +226,11 @@ class WorkflowEngine:
 
     def status(self, wid: str) -> dict:
         try:
-            row = self._lifecycle._conn.execute(
+            rows = self._lifecycle.query(
                 "SELECT instance_id, template_id, status, current_step_id, step_results, created_at "
                 "FROM workflow_instances WHERE instance_id=?", (wid,)
-            ).fetchone()
+            )
+            row = rows[0] if rows else None
         except Exception:
             row = None
         if not row:
@@ -242,9 +243,10 @@ class WorkflowEngine:
 
     def cancel(self, wid: str) -> bool:
         try:
-            row = self._lifecycle._conn.execute(
+            rows = self._lifecycle.query(
                 "SELECT status FROM workflow_instances WHERE instance_id=?", (wid,)
-            ).fetchone()
+            )
+            row = rows[0] if rows else None
         except Exception:
             row = None
         if not row or row["status"] in ("completed", "cancelled", "failed"):
@@ -258,27 +260,26 @@ class WorkflowEngine:
 
     def run_once(self):
         # 确保工作流涉及的角色存活
-        for _wf_row in self._lifecycle._conn.execute("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')").fetchall():
+        for _wf_row in self._lifecycle.query("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"):
             self._ensure_role_alive(_wf_row["assignee"])
 
         # JSON 工作流路径已删除
         # SQLite production 工作流 — 复用 _lifecycle 连接避免泄漏
         try:
             lm = self._lifecycle
-            lm._conn.execute("SELECT 1").fetchone()
+            lm.ping()
         except Exception:
             pass
         try:
             lm = self._lifecycle
-            rows = lm._conn.execute(
+            rows = lm.query(
                 "SELECT instance_id, template_id, current_step_id, step_results, created_at, status "
                 "FROM workflow_instances WHERE status IN ('pending','running')"
-            ).fetchall()
+            )
             for row in rows:
                 inst = dict(row)
                 if inst.get("status") == "pending":
-                    lm._conn.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
-                    lm._conn.commit()
+                    lm.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
                 inst = dict(row)
                 wf_name = inst.get("template_id") or ""
                 wf = self._workflows.get(wf_name)
@@ -293,10 +294,11 @@ class WorkflowEngine:
 
                 # 步骤尚未开始（首次检测到）→ 发初始提示词给角色
                 if not step_status:
-                    task = lm._conn.execute(
+                    task_rows = lm.query(
                         "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
                         (inst["instance_id"],)
-                    ).fetchone()
+                    )
+                    task = task_rows[0] if task_rows else None
                     task_title = task["title"] if task else wf_name
                     task_desc = task["description"] if task else ""
                     prompt = step.prompt_template
@@ -307,11 +309,10 @@ class WorkflowEngine:
                     self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 标记已通知
                     results[step_id] = {"status": "notified", "notified_at": time.time()}
-                    lm._conn.execute(
+                    lm.execute(
                         "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                         (json.dumps(results, ensure_ascii=False), inst["instance_id"])
                     )
-                    lm._conn.commit()
                     step_status = "notified"  # 更新状态，让后续 exit_condition/超时检查能执行
 
                 # completion_check 步骤已完成 → 自动推进到下一步
@@ -342,7 +343,7 @@ class WorkflowEngine:
                                 results: dict = None):
         """推进生产工作流到下一步，并通知目标角色。"""
         try:
-            conn = lm._conn
+            conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
             wf = self._workflows.get(wf_name)
             if not wf:
                 return
@@ -501,27 +502,26 @@ class WorkflowEngine:
         self._sync_step_results(run.id, run.step_results)
         try:
             lm = self._lifecycle
-            lm._conn.execute(
+            lm.execute(
                 "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                 (json.dumps(run.step_results, ensure_ascii=False), run.id)
             )
-            lm._conn.commit()
         except Exception:
             pass
 
     def _sync_step_results(self, wf_id: str, step_results: dict):
         try:
             lm = self._lifecycle
-            lm._conn.execute("BEGIN IMMEDIATE")
-            lm._conn.execute(
+            lm.begin()
+            lm.execute_raw(
                 "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                 (json.dumps(step_results, ensure_ascii=False), wf_id)
             )
-            lm._conn.commit()
+            lm.commit()
         except Exception as _e:
             LOGGER.exception("_sync_step_results 写入失败")
             try:
-                lm._conn.rollback()
+                lm.rollback()
             except Exception as _e2:
                 LOGGER.exception("_sync_step_results rollback 也失败")
 
@@ -611,8 +611,11 @@ class WorkflowEngine:
             )
         except Exception:
             try:
-                from routing.partner import PartnerClient
-                PartnerClient("workflow_engine").force_send(role, prompt)
+                ccs_cli = Path.home() / "session-launcher" / "src" / "ccs.py"
+                subprocess.run(
+                    ["python3", str(ccs_cli), "send", role, prompt[:2000]],
+                    capture_output=True, timeout=10,
+                )
             except Exception as _e:
                     LOGGER.exception("silenced exception")
 
@@ -625,10 +628,11 @@ class WorkflowEngine:
         if "{title}" in step.prompt_template or "{description}" in step.prompt_template:
             try:
                 lm = self._lifecycle
-                task = lm._conn.execute(
+                task_rows = lm.query(
                     "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
                     (run.id,)
-                ).fetchone()
+                )
+                task = task_rows[0] if task_rows else None
                 if task:
                     ctx["title"] = task["title"]
                     ctx["description"] = task["description"]
@@ -654,7 +658,7 @@ class WorkflowEngine:
     def _check_anomalies(self):
         """Detect workflows stuck across multiple steps; auto-heal."""
         try:
-            conn = self._lifecycle._conn
+            conn = self._lifecycle._conn  # ponytail: 同上一轮重构时统一
             running = conn.execute(
                 "SELECT instance_id, template_id, current_step_id, step_results, created_at, assignee "
                 "FROM workflow_instances WHERE status='running'"
@@ -714,12 +718,12 @@ class WorkflowEngine:
     def _scan_tasks(self):
         try:
             lm = self._lifecycle
-            lm._conn.execute("SELECT 1").fetchone()
+            lm.ping()
         except Exception:
             pass
         try:
             lm = self._lifecycle
-            conn = lm._conn
+            conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
             rows = conn.execute(
                 "SELECT DISTINCT t.task_id, t.status FROM tasks t "
                 "JOIN workflow_instances wi ON t.task_id = wi.task_id "

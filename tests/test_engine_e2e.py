@@ -91,7 +91,6 @@ def test_ccs_keeps_working_extends_timeout():
     import shutil
     shutil.rmtree(d)
     _clean_session(ROLE)
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -126,7 +125,6 @@ def test_ccs_completes_step_advances():
     print(f"  场景2 完成步骤推进: current_step={s['current_step']} {'✅' if ok else '❌'}")
     import shutil
     shutil.rmtree(d)
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -159,7 +157,6 @@ def test_ccs_stuck_escalates_not_fails():
     print(f"  场景3 卡住升级不失败: status={s['status']} retries={r} {'✅' if ok else '❌'}")
     import shutil
     shutil.rmtree(d)
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -198,7 +195,6 @@ def test_ccs_comes_back_resets_timeout():
     import shutil
     shutil.rmtree(d)
     _clean_session(ROLE)
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -235,7 +231,6 @@ def test_multi_step_workflow_completes():
     print(f"  场景5 多步完成: status={s['status']} {'✅' if ok else '❌'}")
     import shutil
     shutil.rmtree(d)
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -270,7 +265,6 @@ def test_reminder_heartbeat(mock_send):
     print(f"  场景6 提醒心跳: called={mock_send.called} text_has_剩余={('剩余' in sent_text) if sent_text else False} {'✅' if ok else '❌'}")
     import shutil
     shutil.rmtree(d)
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════
