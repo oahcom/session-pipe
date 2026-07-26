@@ -25,6 +25,7 @@ from output_validator import validate_output
 
 # 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
 _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker"})
+SYSTEM_CATEGORIES = {"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"}
 
 
 
@@ -114,14 +115,17 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                         # architecture / notice / ccs_health 是路由信号而非任务，
                         # 为它们创建 workflow 会引发 workflow-engine → blocker 循环。
                         if ack_status == "consumed" and cat not in _SYSTEM_CATEGORIES:
-                            try:
-                                _wc = WorkflowClient(role)
-                                _wc.create_task_v2(assignment.get("title","")[:80],
-                                                   assignee=role, initiator_role="pipeline",
-                                                   bus_category=cat)
-                                _wc.close()
-                            except Exception as _e:
-                                LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
+                            if cat in SYSTEM_CATEGORIES:
+                                LOGGER.debug("Skipping workflow creation for system category %s", cat)
+                            else:
+                                try:
+                                    _wc = WorkflowClient(role)
+                                    _wc.create_task_v2(assignment.get("title","")[:80],
+                                                       assignee=role, initiator_role="pipeline",
+                                                       bus_category=cat)
+                                    _wc.close()
+                                except Exception as _e:
+                                    LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
                         try:
                             set_last_cursor(consumer, "", fid, instance_id)
                         except Exception:
@@ -250,15 +254,18 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "routed", "sent_chars": result.get("sent_chars", 0)})
             # 创建对应角色的工作流实例（按 bus 分类推荐模板）
-            try:
-                _title = msg.get("text", "")[:80]
-                _cat = msg.get("category", "")
-                _wf = WorkflowClient(role_name)
-                _wf.create_task_v2(_title, assignee=role_name, initiator_role="pipeline",
-                                   bus_category=_cat)
-                _wf.close()
-            except Exception as _e:
-                LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)
+            _cat = msg.get("category", "")
+            if _cat in SYSTEM_CATEGORIES:
+                LOGGER.debug("Skipping workflow creation for system category %s", _cat)
+            else:
+                try:
+                    _title = msg.get("text", "")[:80]
+                    _wf = WorkflowClient(role_name)
+                    _wf.create_task_v2(_title, assignee=role_name, initiator_role="pipeline",
+                                       bus_category=_cat)
+                    _wf.close()
+                except Exception as _e:
+                    LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)
         else:
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "failed", "error": result.get("error", "unknown")})

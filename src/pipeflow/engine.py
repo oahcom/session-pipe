@@ -303,6 +303,7 @@ class WorkflowEngine:
                     prompt = prompt.replace("{title}", task_title)
                     prompt = prompt.replace("{description}", task_desc)
                     prompt = prompt.replace("{assignee}", step.target_role)
+                    prompt = prompt.replace("{topic}", task_title)
                     self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 标记已通知
                     results[step_id] = {"status": "notified", "notified_at": time.time()}
@@ -386,6 +387,7 @@ class WorkflowEngine:
             prompt = prompt.replace("{title}", task_title)
             prompt = prompt.replace("{description}", task_desc)
             prompt = prompt.replace("{assignee}", next_step.target_role)
+            prompt = prompt.replace("{topic}", task_title)
             self._send_to_role(next_step.target_role, prompt,
                                wf_id=wf_id, step_id=next_step.id)
             # 如果步骤有子工作流模板 → 自动创建子工作流

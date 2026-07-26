@@ -1,20 +1,52 @@
 #!/usr/bin/env python3
-"""survival_monitor.py — L1/L2/L3 三层存活检测（可选组件）。
+"""survival_monitor.py — L1/L2/L3 三层存活检测。
 
 L1: 进程存活（tmux has-session + 哨兵文件）
-L2: 思考存活（pane 最后活动时间 + token 消耗）[预留]
-L3: 产出存活（bus 产出时间戳对比）[预留]
+L2: 思考存活（pane 最后活动时间 + 9Router token 消耗）
+L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
 
 集成方式：routing_daemon 每 120s 调 tick()。
 独立于 CCS 侧代码，纯外部观测。
 """
-import json, logging, subprocess, time
+import json, logging, subprocess, time, http.client, urllib.parse
 from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 
 SENTINEL_DIR = Path("/tmp/ccs-sentinels")
+PERSONAS_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+BUS_SCRIPT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
+ROUTER_URL = "localhost:20128"
+
+# ── 角色 output_targets 缓存 ──
+_ROLE_TARGETS_CACHE: dict[str, list[str]] = {}
+_ROLE_TARGETS_TS: float = 0
+
+def _load_role_targets() -> dict[str, list[str]]:
+    """从 persona JSON 加载每个角色的产出分类列表。"""
+    global _ROLE_TARGETS_CACHE, _ROLE_TARGETS_TS
+    now = time.time()
+    if now - _ROLE_TARGETS_TS < 300 and _ROLE_TARGETS_CACHE:
+        return _ROLE_TARGETS_CACHE
+    cache: dict[str, list[str]] = {}
+    if PERSONAS_DIR.is_dir():
+        for f in sorted(PERSONAS_DIR.glob("persona_*.json")):
+            try:
+                d = json.loads(f.read_text())
+                name = d.get("name", f.stem)
+                cats = set()
+                for t in d.get("output_targets", []):
+                    m = __import__("re").search(r'cat=(\w+)', t)
+                    if m:
+                        cats.add(m.group(1))
+                if cats:
+                    cache[name] = sorted(cats)
+            except Exception:
+                continue
+    _ROLE_TARGETS_CACHE = cache
+    _ROLE_TARGETS_TS = now
+    return cache
 
 
 class SurvivalMonitor:
@@ -22,11 +54,12 @@ class SurvivalMonitor:
 
     def __init__(self):
         self._cache: dict[str, dict[str, Any]] = {}
+        self._role_targets: dict[str, list[str]] = {}
+
+    # ── L1: 进程存活 ──
 
     def _l1_check(self, role: str) -> dict:
-        """L1: 检查 tmux session 和哨兵文件。"""
         tmux_name = f"ccs-{role}"
-        # tmux session 存活
         alive = False
         try:
             r = subprocess.run(
@@ -36,22 +69,26 @@ class SurvivalMonitor:
             alive = r.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-        # 哨兵文件存在
         sentinel = SENTINEL_DIR / f"{role}.json"
         has_sentinel = sentinel.exists()
         if alive and has_sentinel:
             status = "ALIVE"
         elif has_sentinel and not alive:
-            status = "ORPHAN"  # 哨兵残留但进程死
+            status = "ORPHAN"
         elif not has_sentinel:
             status = "UNKNOWN"
         else:
             status = "DEAD"
         return {"status": status, "tmux_alive": alive, "has_sentinel": has_sentinel}
 
+    # ── L2: 思考存活 ──
+
     def _l2_check(self, role: str) -> dict:
-        """L2: 检查 pane 最后活动时间。[预留]"""
+        """L2: pane 最后活动时间 + 9Router token 消耗推断是否在推理。"""
         tmux_name = f"ccs-{role}"
+        now = time.time()
+
+        # 信号 1: tmux pane 最后活动时间
         last_activity = 0.0
         try:
             r = subprocess.run(
@@ -62,47 +99,100 @@ class SurvivalMonitor:
                 last_activity = float(r.stdout.strip().split("\n")[-1])
         except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
             pass
-        now = time.time()
-        age = now - last_activity if last_activity > 0 else -1
+        pane_age = now - last_activity if last_activity > 0 else -1
+
+        # 信号 2: 9Router token 消耗（最近 2 分钟）
+        tokens_2m = 0
+        try:
+            conn = http.client.HTTPConnection(ROUTER_URL, timeout=3)
+            conn.request("GET", f"/v1/token-usage?role={urllib.parse.quote(role)}&since_s=120")
+            resp = conn.getresponse()
+            if resp.status == 200:
+                data = json.loads(resp.read().decode())
+                tokens_2m = int(data.get("total_tokens", 0))
+            conn.close()
+        except Exception:
+            pass  # 9Router API 可选
+
+        # 综合判断
+        pane_active = pane_age >= 0 and pane_age < 300
+        has_token = tokens_2m > 0
+        thinking = has_token or pane_active
+
         return {
             "last_activity_epoch": last_activity,
-            "age_seconds": age,
-            "thinking": age < 300 if age >= 0 else None,
+            "pane_age_seconds": pane_age,
+            "tokens_2m": tokens_2m,
+            "thinking": thinking,
+            "detail": f"pane_age={pane_age:.0f}s tokens_2m={tokens_2m}",
         }
 
-    def _l3_check(self, role: str) -> dict:
-        """L3: 检查角色最近是否有 bus 产出或文件变更。
+    # ── L3: 产出存活 ──
 
-        通过 bus_client 读该角色最近 bus 消息的时间戳，
-        若无产出且 L2 显示活跃则认为角色在空转。
+    def _l3_check(self, role: str) -> dict:
+        """L3: 按角色 output_targets 分类查 bus 最近产出。
+
+        对每个 output_targets 中提取的 bus 分类，
+        查最近 10 分钟是否有该分类的产出消息（src=该角色）。
         """
-        producing = None
-        detail = "L3 未启用 — bus_client 不可用"
+        self._role_targets = _load_role_targets()
+        targets = self._role_targets.get(role, None)
+        now = time.time()
+
+        # 不指定分类逐个查
         try:
+            # 查该角色最近 5 条产出消息
             r = subprocess.run(
-                [sys.executable, str(Path.home() / ".hermes" / "scripts" / "bus_client.py"),
-                 "read", "--cat", "code_fix", "--limit", "1", "--json"],
+                [sys.executable, str(BUS_SCRIPT), "read", "--src", role,
+                 "--limit", "5", "--json"],
                 capture_output=True, text=True, timeout=10,
             )
             if r.returncode == 0 and r.stdout.strip():
-                import json as _json
-                facts = _json.loads(r.stdout)
+                facts = json.loads(r.stdout)
                 if isinstance(facts, list) and facts:
-                    last_ts = facts[0].get("created_at", 0) or facts[0].get("timestamp", 0)
-                    age = time.time() - float(last_ts)
-                    producing = age < 600  # 10 分钟内有过产出
-                    detail = f"最近产出 {age:.0f}s 前" if producing else f"无产出 {age:.0f}s"
-                else:
-                    producing = None
-                    detail = "bus 无匹配消息"
-            else:
-                producing = None
-                detail = "bus_client 返回空"
+                    recent_ts = max(
+                        float(f.get("created_at", 0) or f.get("timestamp", 0))
+                        for f in facts
+                    )
+                    age = now - recent_ts
+                    producing = age < 600
+
+                    # 分类覆盖度
+                    found_cats = set(f.get("cat", "") for f in facts)
+                    if targets:
+                        covered = found_cats & set(targets)
+                        coverage = f"{len(covered)}/{len(targets)}"
+                    else:
+                        coverage = f"{len(found_cats)}/?"
+
+                    return {
+                        "producing": producing,
+                        "age_seconds": age,
+                        "recent_count": len(facts),
+                        "categories_found": sorted(found_cats),
+                        "targets_coverage": coverage,
+                        "detail": f"最近产出 {age:.0f}s 前, {len(facts)} 条, 覆盖 {coverage}",
+                    }
+            return {
+                "producing": False,
+                "age_seconds": None,
+                "recent_count": 0,
+                "categories_found": [],
+                "targets_coverage": "0/?",
+                "detail": "bus 无匹配产出",
+            }
         except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError,
-                OSError, IndexError, ValueError) as _e:
-            producing = None
-            detail = f"L3 检查异常: {_e}"
-        return {"producing": producing, "detail": detail}
+                OSError, IndexError, ValueError) as e:
+            return {
+                "producing": None,
+                "age_seconds": None,
+                "recent_count": 0,
+                "categories_found": [],
+                "targets_coverage": "?",
+                "detail": f"L3 异常: {e}",
+            }
+
+    # ── 汇总 ──
 
     def _overall(self, l1: dict, l2: dict, l3: dict) -> str:
         if l1.get("status") == "DEAD":
@@ -117,8 +207,36 @@ class SurvivalMonitor:
             return "idle"
         return "healthy"
 
+    # ── 写 bus（接轨 eval_checker 模式）──
+
+    def _write_bus(self, cat: str, text: str, *, evidence: str = ""):
+        try:
+            subprocess.run(
+                [sys.executable, str(BUS_SCRIPT), "write", cat, text,
+                 "--evidence", evidence[:500], "--src", "survival_monitor"],
+                capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            LOGGER.warning("bus write fail: %s", e)
+
+    # ── 写哨兵 health（接轨 watchdog/tracker 模式）──
+
+    def _write_health(self, role: str, **kwargs):
+        try:
+            health_dir = Path("/tmp/ccs-health")
+            health_dir.mkdir(parents=True, exist_ok=True)
+            path = health_dir / f"{role}.json"
+            health = {}
+            if path.exists():
+                health.update(json.loads(path.read_text()))
+            health.update(kwargs)
+            path.write_text(json.dumps(health))
+        except Exception as e:
+            LOGGER.warning("health write fail: %s", e)
+
+    # ── 入口 ──
+
     def tick(self) -> dict[str, dict]:
-        """对所有哨兵角色执行一轮存活检测。"""
         if not SENTINEL_DIR.is_dir():
             return {}
         roles = []
@@ -137,14 +255,38 @@ class SurvivalMonitor:
                   and now - prev.get("l2_ts", 0) > 120 else prev.get("l2", {}))
             l3 = (self._l3_check(role) if l2.get("thinking")
                   and now - prev.get("l3_ts", 0) > 300 else prev.get("l3", {}))
+            overall = self._overall(l1, l2, l3)
             result = {
                 "l1": l1, "l1_ts": now,
                 "l2": l2, "l2_ts": now if "thinking" in l2 else prev.get("l2_ts", 0),
                 "l3": l3, "l3_ts": now if "producing" in l3 else prev.get("l3_ts", 0),
-                "overall": self._overall(l1, l2, l3),
+                "overall": overall,
             }
             self._cache[role] = result
             results[role] = result
-        LOGGER.debug("survival tick: %d roles checked, %d stalled",
-                     len(results), sum(1 for r in results.values() if r["overall"] in ("stale", "dead")))
+
+            # 写健康数据到 /tmp/ccs-health/（接轨 sentinel health 系统）
+            self._write_health(role,
+                survival_overall=overall,
+                survival_l2_thinking=l2.get("thinking"),
+                survival_l3_producing=l3.get("producing"),
+                survival_ts=now,
+            )
+
+            # 状态变更或异常时写 bus（接轨 eval_checker notice 模式）
+            prev_overall = prev.get("overall", "unknown")
+            if overall != prev_overall:
+                self._write_bus("architecture",
+                    f"[survival:{overall}] {role} L1={l1['status']} L2={l2.get('thinking')} L3={l3.get('producing')}",
+                    evidence=f"prev={prev_overall} | {l2.get('detail','')} | {l3.get('detail','')}")
+            elif overall in ("stale", "idle"):
+                self._write_bus("notice",
+                    f"@ccs-monitor [survival] {role} 状态异常: {overall}",
+                    evidence=f"{l2.get('detail','')} | {l3.get('detail','')}")
+
+        stalled = [r for r, h in results.items() if h["overall"] in ("stale", "dead")]
+        if stalled:
+            LOGGER.warning("存活告警: %s", stalled)
+        LOGGER.info("survival tick: %d roles, %d stalled",
+                     len(results), len(stalled))
         return results

@@ -1,17 +1,16 @@
-.PHONY: check lint test all clean
+.PHONY: all test lint check clean
 
-check:
-	@echo "=== py_compile ==="
-	@for f in src/**/*.py; do python3 -m py_compile "$$f" && echo "  OK $$f" || exit 1; done
-
-lint: check
+all: test lint check
 
 test:
-	@python3 -m pytest tests/ -v --timeout=60 -x
+	python3 -m pytest tests/ -x -q --tb=short
 
-all: check test
+lint:
+	@failed=0; for f in $$(find . -name '*.py' -not -path './.git/*' -not -path './__pycache__/*' -not -path './venv/*'); do python3 -m py_compile "$$f" 2>&1 || failed=1; done; if [ "$$failed" = 1 ]; then exit 1; fi
+
+check:
+	python3 -c "from routing.auto import route_all; print('import OK')"
 
 clean:
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@find . -name '*.pyc' -delete
-	@echo "cleaned"
