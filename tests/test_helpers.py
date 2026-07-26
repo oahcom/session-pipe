@@ -10,6 +10,7 @@ TE (Test Engineer) 使用本模块提供的工具编写测试场景。
   TE → 使用本文件写测试场景 / 执行探索测试 / 报告 bug
 """
 
+__test__ = False  # 工具库，非测试文件
 import json
 import os
 import sys

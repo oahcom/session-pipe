@@ -4,24 +4,17 @@ import os
 # 1. 阻止 TTL pruner 在模块导入时自动启动（冲突 bus 连接）
 os.environ.setdefault("SESSION_PIPELINE_SKIP_TTL_PRUNER", "1")
 
-# 2. 将 bus 的 Blackboard 默认路径替换为 temp DB（不污染生产 DB）
+# 2. 直接覆写 hermes_bus.config.BLACKBOARD_DB（env var 方案无代码读取）
 _HERMES_HOME = os.path.expanduser("~/.hermes")
-os.environ.setdefault("BLACKBOARD_DB_PATH",
-                       os.path.join(_HERMES_HOME, "sister_bus", "test_blackboard.db"))
+_TEST_DB = os.path.join(_HERMES_HOME, "sister_bus", "test_blackboard.db")
+import hermes_bus.config
+hermes_bus.config.BLACKBOARD_DB = _TEST_DB
 
-# 3. 延迟 import，确保 env var 在 bus_protocol 模块加载前设置
+# 3. 确保测试用 DB 存在
 from pathlib import Path
-import sqlite3
-
-def ensure_test_db():
-    """确保测试 DB 存在（仅表结构，无数据）。"""
-    db = os.environ["BLACKBOARD_DB_PATH"]
-    if Path(db).exists():
-        return
-    Path(db).parent.mkdir(parents=True, exist_ok=True)
-    # 创建空表结构
+if not Path(_TEST_DB).exists():
+    Path(_TEST_DB).parent.mkdir(parents=True, exist_ok=True)
     from bus_protocol import Blackboard
-    bb = Blackboard(db_path=db)
-    # Blackboard 的 __init__ 会执行 _init_schema，这里触发它
-    bb.write("_schema_init", "test schema init", src="test")
-    bb.mark_consumed(1, "test")
+    bb = Blackboard(db_path=_TEST_DB)
+    bb.write("notice", "test schema init", src="conftest")
+    bb.mark_consumed(1, "conftest")
