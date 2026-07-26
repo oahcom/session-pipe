@@ -52,11 +52,44 @@ python3 src/health.py --check
 ## 代码布局
 ```
 src/
-  route_table.py    ── 路由表管理
-  lifecycle.py      ── 状态机
+  router.py         ── 主路由引擎（消息→角色分发）
+  routes.py         ── 路由表定义
+  rdb.py            ── 路由表持久化
+  auto.py           ── 自动路由推导
+  polling.py        ── 轮询调度
+  survival_monitor.py ── 存活监测
+
+  pipeflow/
+    engine.py       ── 工作流执行引擎
+    daemon.py       ── 工作流守护
+    db.py           ── 工作流持久化
+
+  lifecycle/
+    manager.py      ── 工作流状态机
+
+  workflow/
+    client.py       ── CCS 角色使用的工作流客户端
+    gateway.py      ── 工作流网关门禁
+    db.py           ── 工作流数据访问
+
+  p0_exemption.py   ── P0 豁免通道（coordinator/lr/pm）
+  config_loader.py  ── 配置加载
+  eval_checker.py   ── 安全白名单命令执行检查
+  output_validator.py ── 输出格式验证
+  contract_updater.py ── 合约同步
+  cron_scheduler.py ── cron 调度器
+  drift_detector.py ── 架构漂移检测
   reliability.py    ── 熔断/重试
-  pipeflow.py       ── 工作流引擎
-  health.py         ── 健康检查
+  paths.py          ── 路径常量
+```
+
+### P0 豁免快速操作
+```bash
+# 创建 P0 任务（仅 coordinator/lr/pm）
+python3 -c "from p0_exemption import P0Exemption; P0Exemption().create_p0_task('指定角色', 3600, '紧急修复原因（≥15字符）')"
+
+# 审计扫描
+python3 -c "from p0_exemption import P0Exemption; P0Exemption().p0_audit_scan()"
 ```
 
 ## 测试
