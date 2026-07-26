@@ -94,7 +94,8 @@ class Gate:
             # schema 无 allowed_initiators 列 → 跳过权限校验
             return True
         if not row or not row["allowed_initiators"]:
-            return False
+            # no allowed_initiators set → backward compatible, allow all
+            return True
         try:
             initiators = json.loads(row["allowed_initiators"])
         except (json.JSONDecodeError, TypeError):
@@ -112,7 +113,8 @@ class Gate:
             # schema 无 allowed_executors 列 → 跳过权限校验
             return True
         if not row or not row["allowed_executors"]:
-            return False
+            # no allowed_executors set → backward compatible, allow all
+            return True
         try:
             executors = json.loads(row["allowed_executors"])
         except (json.JSONDecodeError, TypeError):

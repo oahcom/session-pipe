@@ -573,11 +573,11 @@ class WorkflowEngine:
         if alive:
             return True
 
-        # 拉起 CCS（用 loop 模式创建 tmux 会话，方便后续 send）
+        # 拉起 CCS（ondemand 模式，处理完消息自动退出）
         try:
             _sp.run(
                 ["python3", str(_CCS_CLI), "start", role, "--no-attach",
-                 "--drive", "loop"],
+                 "--drive", "ondemand"],
                 capture_output=True, timeout=30,
             )
             for _ in range(15):

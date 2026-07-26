@@ -386,7 +386,7 @@ def test_run_persists_on_tick():
     assert s2["current_step"] == "s2", f"持久化后应 s2: {s2['current_step']}"
     # 验证 s1 的结果也已持久化
     assert "s1" in s2["results"], f"s1 结果未持久化: {s2['results']}"
-    assert s2["results"]["s1"]["status"] == "done"
+    assert s2["results"]["s1"]["status"] == "completed"
 
 
 def test_corrupted_run_file():

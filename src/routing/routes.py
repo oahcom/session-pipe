@@ -21,6 +21,7 @@ from workflow.client import WorkflowClient
 from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, GRACEFUL_SHUTDOWN
 from reliability import with_retry, DEFAULT_RETRY, get_last_cursor, set_last_cursor
 from reliability import IDEMPOTENT_CONSUME, ACK_TRACKER
+from output_validator import validate_output
 
 # 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
 _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker"})
@@ -173,6 +174,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
 
     dry_run=True 时只展示分配方案。
     """
+    from bus_protocol import Blackboard as _Blackboard
     from routing.auto import poll_unconsumed as _poll
     from routing.rdb import RoutingDB as _RDB
 
@@ -225,6 +227,23 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "skipped", "reason": f"CCS {role_name} 未启动"})
             continue
+
+        # Output validation: validate structured JSON content before routing
+        try:
+            _content_dict = json.loads(msg.get("text", ""))
+            _v = validate_output(role_name, msg.get("category", ""), _content_dict)
+            if not _v.get("valid") and _v.get("severity") == "error":
+                _bb = _Blackboard()
+                _bb.write("notice",
+                          f"@{role_name} output validation failed: missing fields {_v['missing']}",
+                          evidence=f"msg_id={msg['id']} category={msg['category']}")
+                details.append({"id": msg["id"], "category": msg["category"],
+                                "action": "rejected", "reason": f"validation_error: missing {_v['missing']}"})
+                continue
+            if not _v.get("valid") and _v.get("severity") == "warning":
+                body += "\n(validated: false)"
+        except (json.JSONDecodeError, TypeError):
+            pass  # non-JSON content — skip validation
 
         result = _send(role_name, body)
         if result.get("success"):

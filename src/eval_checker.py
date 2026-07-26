@@ -178,15 +178,16 @@ def _write_bus(cat: str, text: str, *, evidence: str = "", src: str = "eval_chec
         LOGGER.warning("bus write fail: %s", e)
 
 
-def run_eval_check() -> dict:
-    """主入口：加载角色 JSON，随机挑 1-2 个，
-    对每个执行前 3 条 eval_criteria。
-    返回 {checked, passed, failed, skipped, notices}。
-    """
+def _is_critical(criterion: str) -> bool:
+    """检查 criterion 是否为 critical 级别（severity: critical）。"""
+    return bool(re.search(r'severity[:\s=]*critical', criterion, re.IGNORECASE))
+
+
+def _load_roles() -> list | None:
+    """加载所有角色 JSON，返回含 eval_criteria 的角色列表。"""
     if not PERSONAS_DIR.is_dir():
         LOGGER.warning("personas dir not found: %s", PERSONAS_DIR)
-        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0}
-
+        return None
     roles = []
     for f in sorted(PERSONAS_DIR.glob("persona_*.json")):
         try:
@@ -196,22 +197,39 @@ def run_eval_check() -> dict:
                 roles.append({"name": d.get("name", f.stem), "eval_criteria": ec})
         except Exception as e:
             LOGGER.warning("skip %s: %s", f.name, e)
+    return roles
 
+
+def _find_unverified(roles: list) -> list:
+    """返回所有 criterion 均为自然语言（无可执行命令）的角色。"""
+    return [r for r in roles if not any("验证:" in c for c in r["eval_criteria"])]
+
+
+def run_eval_check(role_filter: str | None = None) -> dict:
+    """主入口：加载角色 JSON，按权重轮询挑 1-2 个，
+    对每个执行前 3 条 eval_criteria。
+    权重 = 该角色可执行 eval 数量（含"验证:"的 criterion 数），最少 1。
+    参数 role_filter: 只检查指定角色名。
+    返回 {checked, passed, failed, skipped, notices, blockers}。
+    """
+    roles = _load_roles()
     if not roles:
-        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0}
+        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
 
-    n = min(random.randint(1, 2), len(roles))
-    # 保证至少包含 maintainer（有真实可执行命令）
-    sampled = []
-    maintainer = next((r for r in roles if r["name"] == "maintainer"), None)
-    if maintainer:
-        sampled.append(maintainer)
-        other_candidates = [r for r in roles if r["name"] != "maintainer"]
-        if n > 1 and other_candidates:
-            sampled.append(random.choice(other_candidates))
-    else:
-        sampled = random.sample(roles, n)
-    summary = {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0}
+    # 按角色名过滤
+    if role_filter:
+        filtered = [r for r in roles if r["name"] == role_filter]
+        if not filtered:
+            LOGGER.warning("role %s not found", role_filter)
+            return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
+        roles = filtered
+
+    # 权重 = 可执行 eval 数量（含"验证:"的 criterion 数），最少 1
+    weights = [max(1, sum(1 for c in r["eval_criteria"] if "验证:" in c)) for r in roles]
+    n = min(2, len(roles))
+    sampled = random.choices(roles, weights=weights, k=n)
+
+    summary = {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
 
     for role in sampled:
         name = role["name"]
@@ -234,32 +252,55 @@ def run_eval_check() -> dict:
             else:
                 summary["failed"] += 1
                 evidence = f"role={name} | {detail}"
+                is_crit = _is_critical(c)
+                tag = "blocker" if is_crit else "notice"
                 _write_bus(
                     "verification",
                     f"[eval_checker] FAIL: {name} — {c[:60]}",
                     evidence=evidence,
                 )
                 _write_bus(
-                    "notice",
+                    tag,
                     f"@ccs-monitor [eval_checker] 检查失败: {name} — {c[:60]}",
                     evidence=evidence,
                 )
-                summary["notices"] += 1
+                if is_crit:
+                    summary["blockers"] += 1
+                else:
+                    summary["notices"] += 1
 
     LOGGER.info(
-        "eval_check done: checked=%d passed=%d failed=%d skipped=%d notices=%d",
+        "eval_check done: checked=%d passed=%d failed=%d skipped=%d notices=%d blockers=%d",
         summary["checked"], summary["passed"],
-        summary["failed"], summary["skipped"], summary["notices"],
+        summary["failed"], summary["skipped"],
+        summary["notices"], summary["blockers"],
     )
     return summary
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    s = run_eval_check()
+    import argparse
+    parser = argparse.ArgumentParser(description="eval_criteria checker")
+    parser.add_argument("--report-unverified", action="store_true",
+                        help="输出无可执行 criterion 的角色（全自然语言）")
+    parser.add_argument("--role", type=str, default=None,
+                        help="只检查指定角色")
+    args = parser.parse_args()
+
+    if args.report_unverified:
+        roles = _load_roles()
+        if roles is None:
+            return 1
+        unverified = _find_unverified(roles)
+        if unverified:
+            print("未验证角色（全自然语言，无可执行 criterion）:")
+            for r in unverified:
+                print(f"  - {r['name']}")
+        else:
+            print("所有角色至少有一个可执行 criterion")
+        return 0
+
+    s = run_eval_check(role_filter=args.role)
     print(json.dumps(s, ensure_ascii=False))
     return 0 if s["failed"] == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
