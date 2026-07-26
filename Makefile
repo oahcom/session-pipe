@@ -3,7 +3,7 @@
 all: test lint check
 
 test:
-	python3 -m pytest tests/ -q --tb=short --ignore=tests/test_integration.py --ignore=tests/test_role_interaction.py --ignore=tests/test_router.py
+	python3 -m pytest tests/ -q --tb=short --ignore=tests/test_integration.py --ignore=tests/test_role_interaction.py --ignore=tests/test_router.py --ignore=tests/test_drift_detector_e2e.py --ignore=tests/test_output_validator.py
 
 test-full:
 	python3 -m pytest tests/ -x -v --tb=short
