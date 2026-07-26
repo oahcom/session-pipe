@@ -7,9 +7,13 @@ Session 生态的**路由层**——自动感知 bus 新消息，按优先级分
 
 ## 整体架构
 ```
-hermes-session-roles  →  session-launcher  →  session-pipeline
-  (定义层)              (执行层)              (路由层) ← 本项目
+hermes-session-roles (定义层)
+  ├──→ session-launcher (执行层)
+  └──→ session-pipeline (路由+执行层 ← 本项目)
+         └──→ launcher/ccs.py send  ← 唯一跨项目调用（subprocess）
 ```
+
+**注意：不是三层流水线。pipeline 通过 subprocess `ccs.py send` 与 launcher 通信。pipeline 的路由数据来自 roles_export.json，不直接读角色 JSON。**
 
 **铁律：不直接创建 CCS，不改 bus_protocol 核心逻辑。**
 

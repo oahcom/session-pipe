@@ -21,6 +21,7 @@ from typing import Any, Optional
 from paths import ensure_paths
 ensure_paths()
 from paths import HERMES_WORKFLOWS as _WORKFLOWS_DIR
+from paths import CCS_CLI as _CCS_CLI
 
 from bus_protocol import Blackboard
 
@@ -317,8 +318,10 @@ class WorkflowEngine:
                     self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
                     continue
 
-                # exit_condition 步骤 → 检查 bus 消息匹配
-                if step.exit_condition.get("bus_category") and step_status in ("notified", "running"):
+                # 所有 notified/running 步骤都进入 _tick() 处理超时/催办/升级
+                # exit_condition 可选：有 bus_category 时检查 bus 消息匹配退出条件
+                # 无 bus_category 时退化为纯超时驱动
+                if step_status in ("notified", "running"):
                     _created = inst.get("created_at") or time.time()
                     run = WorkflowRun(
                         id=inst["instance_id"], workflow_name=wf_name,
@@ -451,8 +454,7 @@ class WorkflowEngine:
             except Exception as e:
                 print(f"  [wf] LM complete_step 失败: {e}", flush=True)
 
-            run.step_results[step.id] = {"status": "done", "ts": time.time()}
-            self._sync_step_results(run.id, run.step_results)
+            # lifecycle.manager 已写入 step_results，此处不再重复写入
             return
 
         run.step_results[step.id] = {
@@ -514,11 +516,12 @@ class WorkflowEngine:
                 (json.dumps(step_results, ensure_ascii=False), wf_id)
             )
             lm._conn.commit()
-        except Exception:
+        except Exception as _e:
+            LOGGER.exception("_sync_step_results 写入失败")
             try:
                 lm._conn.rollback()
-            except Exception as _e:
-                    LOGGER.exception("silenced exception")
+            except Exception as _e2:
+                LOGGER.exception("_sync_step_results rollback 也失败")
 
     def _check_session_alive(self, role: str, since: float) -> bool:
         try:
@@ -562,25 +565,19 @@ class WorkflowEngine:
             return False
 
     def _ensure_role_alive(self, role: str) -> bool:
-        """检查角色的 CCS 是否存活（tmux 会话），不存活则拉起。存活则确保进 /loop。"""
+        """检查角色的 CCS 是否存活（tmux 会话），不存活则拉起。"""
         alive = _sp.run(
             ["tmux", "has-session", "-t", f"ccs-{role}"],
             capture_output=True, timeout=5,
         ).returncode == 0
         if alive:
-            # 注入 /loop 确保角色进入工作循环（防止 standby 卡死）
-            _sp.run(
-                ["tmux", "send-keys", "-t", f"ccs-{role}", "/loop", "Enter"],
-                capture_output=True, timeout=3,
-            )
             return True
 
-        # 拉起 CCS
-        _ccs_cli = Path(__file__).resolve().parent.parent.parent.parent / "session-launcher" / "src" / "ccs.py"
+        # 拉起 CCS（用 loop 模式创建 tmux 会话，方便后续 send）
         try:
             _sp.run(
-                ["python3", str(_ccs_cli), "start", role, "--no-attach",
-                 "--drive", "ondemand"],
+                ["python3", str(_CCS_CLI), "start", role, "--no-attach",
+                 "--drive", "loop"],
                 capture_output=True, timeout=30,
             )
             for _ in range(15):
@@ -603,11 +600,10 @@ class WorkflowEngine:
         # task_spec 携带完整提示词（角色 loop 读 bus 拿到全部上下文）
         title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
         self._bb.write("task_spec", title, evidence=prompt, src="workflow_engine")
-        # ccs send 推送全文
-        _ccs_cli = Path(__file__).resolve().parent.parent.parent.parent / "session-launcher" / "src" / "ccs.py"
+        # ccs send 推送全文（参数顺序：ccs.py send <target_role> <message> --from <source>）
         try:
             _sp.run(
-                ["python3", str(_ccs_cli), "send", "workflow_engine", role, prompt,
+                ["python3", str(_CCS_CLI), "send", role, prompt,
                  "--from", "workflow_engine"],
                 capture_output=True, timeout=30,
             )
@@ -767,8 +763,8 @@ class WorkflowEngine:
 
             conn.commit()
             self._check_anomalies()
-        except Exception:
-            pass
+        except Exception as _e:
+            LOGGER.exception("_scan_tasks 异常")
 
 
 def main():

@@ -22,6 +22,9 @@ from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, GRACEFUL_SH
 from reliability import with_retry, DEFAULT_RETRY, get_last_cursor, set_last_cursor
 from reliability import IDEMPOTENT_CONSUME, ACK_TRACKER
 
+# 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
+_SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker"})
+
 
 
 def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True, instance_id: str = "") -> dict:
@@ -106,7 +109,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                         ACK_TRACKER.record_ack(fid, role, ack_status, category=cat,
                                                error=r.get("error", "") if ack_status == "error" else "")
                         # 消费成功后创建对应角色的工作流（自动推荐模板）
-                        if ack_status == "consumed":
+                        # -- 跳过系统内通知类分类，防止级联风暴 --
+                        # architecture / notice / ccs_health 是路由信号而非任务，
+                        # 为它们创建 workflow 会引发 workflow-engine → blocker 循环。
+                        if ack_status == "consumed" and cat not in _SYSTEM_CATEGORIES:
                             try:
                                 _wc = WorkflowClient(role)
                                 _wc.create_task_v2(assignment.get("title","")[:80],
