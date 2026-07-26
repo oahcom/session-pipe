@@ -60,7 +60,7 @@ class P0Exemption:
             wc = WorkflowClient(self.role, db_path=str(self.db_path))
             wc.close()
         except Exception:
-            pass
+            pass  # must-silent: WorkflowClient import is optional feature check
         # 确保 P0 列存在 — DESIGN.md WL-P1-01 DDL 迁移
         existing = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()}
         for col, coltype in {"p0_state": "TEXT DEFAULT NULL", "p0_reason": "TEXT DEFAULT ''",
@@ -457,7 +457,7 @@ class P0Exemption:
                 cmd.extend(["--evidence", evidence])
             subprocess.run(cmd, capture_output=True, timeout=15)
         except Exception:
-            pass  # ponytail: bus unavailable in cron context, skip silently
+            pass  # must-silent: bus unavailable in cron context, skip silently
 
     def close(self):
         self._conn.close()

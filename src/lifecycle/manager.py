@@ -554,7 +554,7 @@ class LifecycleManager:
             try:
                 return json.loads(wf["step_results"])
             except (json.JSONDecodeError, TypeError):
-                pass
+                pass  # must-silent: step_results may not be valid JSON yet
         return {}
 
     def _log_unsafe(self, wf_id: str, task_id: str = None,

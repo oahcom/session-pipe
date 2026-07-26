@@ -172,7 +172,7 @@ def write_suggestions(suggestions: list[dict]) -> int:
     count = 0
     for s in suggestions:
         text = f"[contract_updater] {s['type']}: {s['suggestion'][:80]}"
-        evidence = json.dumps(s, ensure_ascii=False)
+        evidence = "tag=contract_improvement | " + json.dumps(s, ensure_ascii=False)
         try:
             subprocess.run(
                 [sys.executable, str(BUS_SCRIPT), "write", "architecture", text,

@@ -200,7 +200,7 @@ def main():
                     if stalled:
                         LOGGER.warning("存活告警: %s", stalled)
                 except ImportError:
-                    pass  # survival_monitor 可选组件
+                    pass  # must-silent: survival_monitor optional component
                 except Exception as e:
                     LOGGER.error("survival_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
@@ -212,7 +212,7 @@ def main():
             _pid_lock_fd.close()
             _pid_file.unlink(missing_ok=True)
         except Exception:
-            pass
+            pass  # must-silent: PID lock cleanup in finally block
 
 
 if __name__ == "__main__":

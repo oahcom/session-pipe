@@ -526,7 +526,7 @@ class TemplateRegistry:
                 try:
                     d[field] = json.loads(val)
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    pass  # must-silent: field may already be parsed
         # 别名
         if "steps_json" in d:
             d["steps"] = d.pop("steps_json")

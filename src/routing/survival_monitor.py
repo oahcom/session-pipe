@@ -73,7 +73,7 @@ class SurvivalMonitor:
             )
             alive = r.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+            LOGGER.debug("tmux has-session check failed for %s", role)
         sentinel = SENTINEL_DIR / f"{role}.json"
         has_sentinel = sentinel.exists()
         if alive and has_sentinel:
@@ -103,7 +103,7 @@ class SurvivalMonitor:
             if r.returncode == 0 and r.stdout.strip():
                 last_activity = float(r.stdout.strip().split("\n")[-1])
         except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-            pass
+            LOGGER.debug("tmux pane activity check failed for %s", role)
         pane_age = now - last_activity if last_activity > 0 else -1
 
         # 信号 2: 9Router token 消耗（最近 2 分钟）
@@ -117,7 +117,7 @@ class SurvivalMonitor:
                 tokens_2m = int(data.get("total_tokens", 0))
             conn.close()
         except Exception:
-            pass  # 9Router API 可选
+            pass  # must-silent: 9Router token-usage API is optional
 
         # 综合判断
         pane_active = pane_age >= 0 and pane_age < 300

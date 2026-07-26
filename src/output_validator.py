@@ -12,7 +12,10 @@ and nested schemas::
 
 from pathlib import Path
 import json
+import logging
 from typing import Any
+
+LOGGER = logging.getLogger(__name__)
 
 _ROLES_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
 
@@ -21,9 +24,7 @@ def _load_role_schema(role: str, category: str) -> dict[str, Any] | None:
     """Return the output_schema dict for *role* / *category*, or None."""
     if not _ROLES_DIR.is_dir():
         return None
-    for fpath in _ROLES_DIR.iterdir():
-        if fpath.suffix != ".json":
-            continue
+    for fpath in sorted(_ROLES_DIR.glob("persona_*.json")):
         try:
             data = json.loads(fpath.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -32,6 +33,7 @@ def _load_role_schema(role: str, category: str) -> dict[str, Any] | None:
             continue
         schema = data.get("output_schema")
         if not isinstance(schema, dict):
+            LOGGER.debug("role %r found in %s but output_schema missing or not a dict", role, fpath)
             return None
         return schema.get(category)
     return None

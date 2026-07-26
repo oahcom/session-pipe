@@ -129,7 +129,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                         try:
                             set_last_cursor(consumer, "", fid, instance_id)
                         except Exception:
-                            pass
+                            LOGGER.debug("set_last_cursor failed for %s fid=%s", consumer, fid)
                     except Exception as e:
                         LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
                                      extra={"trace_id": str(fid)})
@@ -200,7 +200,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         err = ""
         if r.returncode != 0:
             try: err = _json.loads(r.stdout).get("error", r.stderr[:100])
-            except: err = r.stderr[:100] or "exit=" + str(r.returncode)
+            except Exception: err = r.stderr[:100] or "exit=" + str(r.returncode)
         return {"success": r.returncode == 0, "sent_chars": len(msg), "error": err}
 
     def _is_running(role):
@@ -247,7 +247,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             if not _v.get("valid") and _v.get("severity") == "warning":
                 body += "\n(validated: false)"
         except (json.JSONDecodeError, TypeError):
-            pass  # non-JSON content — skip validation
+            pass  # must-silent: non-JSON content — skip validation
 
         result = _send(role_name, body)
         if result.get("success"):

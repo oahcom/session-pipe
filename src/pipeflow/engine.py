@@ -117,7 +117,7 @@ class WorkflowEngine:
                         for _e in _vr.errors[:4]:
                             print(f"        - {_e}")
                 except Exception:
-                    pass
+                    LOGGER.debug("workflow meta validation failed for %s", f.name)
                 self._workflows[data["name"]] = WorkflowDef(
                     name=data["name"], title=data.get("title", ""),
                     description=data.get("description", ""), steps=steps,
@@ -269,7 +269,7 @@ class WorkflowEngine:
             lm = self._lifecycle
             lm.ping()
         except Exception:
-            pass
+            LOGGER.debug("lifecycle ping failed during run_once")
         try:
             lm = self._lifecycle
             rows = lm.query(
@@ -413,8 +413,8 @@ class WorkflowEngine:
                         conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                             (json.dumps(new_results, ensure_ascii=False), wf_id))
                         conn.commit()
-                except Exception:
-                    pass
+                except Exception as _e:
+                    LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
         except Exception as e:
             # 异常时通知目标角色排查修复
             try:
@@ -507,7 +507,7 @@ class WorkflowEngine:
                 (json.dumps(run.step_results, ensure_ascii=False), run.id)
             )
         except Exception:
-            pass
+            LOGGER.debug("step_results SQLite sync (secondary) failed for %s", run.id)
 
     def _sync_step_results(self, wf_id: str, step_results: dict):
         try:
@@ -588,7 +588,7 @@ class WorkflowEngine:
                            capture_output=True, timeout=5).returncode == 0:
                     return True
         except Exception:
-            pass
+            LOGGER.debug("CCS role alive check failed for %s", role)
         return False
 
     def _send_to_role(self, role: str, prompt: str,
@@ -711,8 +711,8 @@ class WorkflowEngine:
                             conn.rollback()
                             raise
             conn.commit()
-        except Exception:
-            pass
+        except Exception as _e:
+            LOGGER.error("heal_stalled failed for %s: %s", inst.get("instance_id",""), _e)
 
 
     def _scan_tasks(self):
@@ -720,7 +720,7 @@ class WorkflowEngine:
             lm = self._lifecycle
             lm.ping()
         except Exception:
-            pass
+            LOGGER.debug("lifecycle ping failed during _scan_tasks")
         try:
             lm = self._lifecycle
             conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
@@ -808,7 +808,7 @@ def main():
                 print(f"Daemon PID={old} 已在运行")
                 sys.exit(1)
             except (OSError, ValueError):
-                pass
+                LOGGER.debug("PID file stale or missing")
         _PID_FILE.write_text(str(os.getpid()))
         print(f"Workflow Engine daemon PID={os.getpid()}, interval={interval}s")
 

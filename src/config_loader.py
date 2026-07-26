@@ -64,7 +64,7 @@ def load_config(path: Optional[Path] = None) -> Config:
                 with open(config_path, "w", encoding="utf-8") as f:
                     json.dump(_default_config(), f, ensure_ascii=False, indent=2)
         except (OSError, PermissionError):
-            pass  # 写失败不影响功能
+            pass  # must-silent: writing default config, failure is non-fatal
         return cfg
 
     with open(config_path, "r", encoding="utf-8") as f:
@@ -96,7 +96,7 @@ def _resolve_exceptions(names: list) -> tuple:
             cls = getattr(mod, parts[-1])
             classes.append(cls)
         except (ImportError, AttributeError, ValueError):
-            pass
+            pass  # must-silent: resolving exception class names, fallback to broad Exception
     return tuple(classes) if classes else (Exception,)
 
 
