@@ -6,3 +6,6 @@ __pycache__/
 *.swp
 *.swo
 *~
+workflow.db-shm
+workflow.db-wal
+.coverage
