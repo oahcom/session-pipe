@@ -65,6 +65,11 @@ def _extract_cmd(criterion: str) -> str | None:
     if not cmd_raw:
         return None
 
+    # 剥离 bash -c '...' / sh -c '...' 外层，只保留内部命令
+    _inner = re.match(r"^(?:bash|sh)\s+-c\s+'(.+?)'\s*$", cmd_raw, re.DOTALL)
+    if _inner:
+        cmd_raw = _inner.group(1).strip()
+
     # 清理 expected：去掉附加说明（; — | 后的内容），保留比较表达式
     if expected:
         expected = re.sub(r'\s*[;—|]\s.*$', '', expected).strip()
@@ -92,7 +97,7 @@ def _is_shell_cmd(cmd: str) -> bool:
 # ponytail: 白名单仅覆盖常见只读命令，写操作命令（systemctl start 等）不在内
 _ALLOWED_CMDS = frozenset({
     "systemctl", "journalctl", "ps", "df", "free", "grep",
-    "bash", "sh", "curl", "python3", "git", "wc", "find",
+    "curl", "git", "wc", "find",
     "cat", "head", "tail", "ls", "stat", "echo", "test",
     "sort", "uniq", "awk", "sed", "diff", "which", "command",
 })
