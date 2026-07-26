@@ -30,7 +30,10 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
 
     bb = Blackboard()
     router = _rt_mod.get_router()
-    max_per_poll = get_config().nested_get("bus", "max_messages_per_poll", default=100)
+    try:
+        max_per_poll = get_config().nested_get("bus", "max_messages_per_poll", default=100)
+    except Exception:
+        max_per_poll = 100
     since_id = get_last_cursor(consumer, "", instance_id) if consumer else 0
 
     def _do_poll():

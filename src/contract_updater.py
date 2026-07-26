@@ -20,6 +20,91 @@ PERSONAS_DIR = Path(os.environ.get(
 ))
 
 
+def _apply_suggestion(suggestion: dict) -> bool:
+    """应用一条改进建议到角色 JSON。
+
+    目前支持 type=add_verification:
+      - 读取角色 JSON
+      - 在 eval_criteria 中按文本匹配条目
+      - 若条目是纯自然语言字符串且 suggestion 提供了 verification_command:
+        替换为 {"text":, "verifiable":, "expected":}
+      - 写回文件
+    返回 True 表示成功应用。
+    """
+    role = suggestion.get("role")
+    criterion_text = suggestion.get("criterion")
+    stype = suggestion.get("type")
+    if stype != "add_verification" or not role or not criterion_text:
+        return False
+
+    # 找到对应的角色 JSON 文件
+    target: dict | None = None
+    target_path: Path | None = None
+    for f in PERSONAS_DIR.glob("persona_*.json"):
+        try:
+            d = json.loads(f.read_text())
+            if d.get("name") == role:
+                target, target_path = d, f
+                break
+        except Exception:
+            continue
+    if target is None:
+        return False
+
+    # 按文本匹配 eval_criteria 条目
+    criteria = target.get("eval_criteria", [])
+    idx = None
+    for i, entry in enumerate(criteria):
+        if isinstance(entry, str) and criterion_text in entry:
+            idx = i
+            break
+        if isinstance(entry, dict) and criterion_text in entry.get("text", ""):
+            idx = i
+            break
+    if idx is None:
+        return False
+
+    entry = criteria[idx]
+    if not isinstance(entry, str):
+        return False  # 已结构化，跳过
+
+    verification_cmd = suggestion.get("verification_command")
+    if not verification_cmd:
+        return False
+
+    criteria[idx] = {
+        "text": entry,
+        "verifiable": verification_cmd,
+        "expected": suggestion.get("expected", ""),
+    }
+
+    try:
+        target_path.write_text(json.dumps(target, ensure_ascii=False, indent=2) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def apply_all_suggestions(suggestions: list[dict]) -> dict:
+    """批量应用建议。返回 {applied, failed, details}。"""
+    applied = 0
+    failed = 0
+    details: list[dict] = []
+    for s in suggestions:
+        role = s.get("role", "unknown")
+        try:
+            ok = _apply_suggestion(s)
+            if ok:
+                applied += 1
+            else:
+                failed += 1
+            details.append({"role": role, "success": ok, "error": "" if ok else "apply returned False"})
+        except Exception as e:
+            failed += 1
+            details.append({"role": role, "success": False, "error": str(e)})
+    return {"applied": applied, "failed": failed, "details": details}
+
+
 def _has_output_schema(role_name: str) -> bool:
     """检查角色 JSON 是否定义了 output_schema。"""
     for f in PERSONAS_DIR.glob("persona_*.json"):
@@ -109,7 +194,18 @@ def main():
                         help="从 JSON 文件读取检查历史，默认从 stdin 读取")
     parser.add_argument("--no-write", action="store_true",
                         help="仅输出建议到 stdout，不写入 bus")
+    parser.add_argument("--apply", action="store_true",
+                        help="从 stdin 读取 JSON 格式的 suggestion 列表并执行应用")
     args = parser.parse_args()
+
+    if args.apply:
+        suggestions = json.load(sys.stdin)
+        if not isinstance(suggestions, list):
+            LOGGER.error("--apply 输入应为 suggestion 列表 (list[dict])")
+            return 1
+        result = apply_all_suggestions(suggestions)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
 
     if args.from_file:
         with open(args.from_file) as f:

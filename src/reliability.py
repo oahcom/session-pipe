@@ -195,8 +195,11 @@ def health_check() -> dict:
     stale_consumers = HEARTBEAT.get_stale_consumers()
     total_facts = stats.get("total", 0)
     # 使用 config 中的 backlog 阈值（Fix 2）
-    cfg = get_config()
-    warn_thresh = cfg.nested_get("health", "backlog_warning_threshold", default=100)
+    try:
+        cfg = get_config()
+        warn_thresh = cfg.nested_get("health", "backlog_warning_threshold", default=100)
+    except Exception:
+        warn_thresh = 100
     crit_thresh = cfg.nested_get("health", "backlog_critical_threshold", default=500)
     if total_facts >= crit_thresh:
         status = "critical"

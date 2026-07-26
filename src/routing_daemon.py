@@ -13,7 +13,12 @@ routing_daemon.py — 路由分发 daemon，定期轮询 bus 未消费消息并�
 """
 import fcntl, json, os, sys, time
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Ensure pipeline src is first in sys.path (overrides .pth file adding .hermes/scripts)
+_PIPELINE_SRC = str(Path(__file__).resolve().parent)
+if _PIPELINE_SRC not in sys.path or sys.path[0] != _PIPELINE_SRC:
+    sys.path.insert(0, _PIPELINE_SRC)
+# Pre-load pipeline's config_loader before .hermes/scripts shadows it
+import config_loader  # noqa: F401 (caches correct version in sys.modules)
 
 from routing.auto import route_all, route_all_to_ccs, health_check
 from reliability import setup_logging, LOGGER, METRICS

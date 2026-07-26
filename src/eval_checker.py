@@ -102,11 +102,23 @@ _ALLOWED_CMDS = frozenset({
     "sort", "uniq", "awk", "sed", "diff", "which", "command",
 })
 
+_SYSTEMCTL_READONLY = frozenset({"status", "is-active", "is-enabled", "show", "list-units", "list-unit-files"})
+
+def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
+    """白名单通过后二次校验：systemctl 只允许只读子命令。"""
+    if first_word != "systemctl":
+        return True
+    subcmd = cmd.lstrip().split(maxsplit=2)
+    return len(subcmd) >= 2 and subcmd[1] in _SYSTEMCTL_READONLY
+
+
 def _run(cmd: str, timeout: int = 30) -> dict:
     """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
     first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
     if first_word not in _ALLOWED_CMDS:
         return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
+    if not _cmd_is_readonly(first_word, cmd):
+        return {"ok": False, "stdout": "", "stderr": f"写操作被拒绝: {first_word} 不允许非只读子命令", "returncode": -3}
     try:
         r = subprocess.run(
             ["bash", "-c", cmd],
