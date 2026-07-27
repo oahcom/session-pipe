@@ -8,17 +8,17 @@ L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
 集成方式：routing_daemon 每 120s 调 tick()。
 独立于 CCS 侧代码，纯外部观测。
 """
-import json, logging, os, subprocess, time, http.client, urllib.parse
+import json, logging, os, subprocess, sys, time, http.client, urllib.parse
 from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 
-SENTINEL_DIR = Path("/tmp/ccs-sentinels")
 try:
-    from paths import SESSION_ROLES_ROOT
+    from paths import CCS_SENTINEL_DIR as SENTINEL_DIR, SESSION_ROLES_ROOT
     _ROLES_ROOT = SESSION_ROLES_ROOT
 except ImportError:
+    SENTINEL_DIR = Path("/tmp/ccs-sentinels")
     _ROLES_ROOT = Path.home() / "hermes-session-roles"
 PERSONAS_DIR = _ROLES_ROOT / "personas" / "session-roles"
 BUS_SCRIPT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
@@ -47,8 +47,8 @@ def _load_role_targets() -> dict[str, list[str]]:
                         cats.add(m.group(1))
                 if cats:
                     cache[name] = sorted(cats)
-            except Exception:
-                continue
+            except Exception as e:
+                LOGGER.debug("skip malformed persona %s: %s", f.name, e)
     _ROLE_TARGETS_CACHE = cache
     _ROLE_TARGETS_TS = now
     return cache
@@ -116,8 +116,8 @@ class SurvivalMonitor:
                 data = json.loads(resp.read().decode())
                 tokens_2m = int(data.get("total_tokens", 0))
             conn.close()
-        except Exception:
-            pass  # must-silent: 9Router token-usage API is optional
+        except Exception as e:
+            LOGGER.debug("L2 token check failed for %s: %s", role, e)
 
         # 综合判断
         pane_active = pane_age >= 0 and pane_age < 300
@@ -228,7 +228,7 @@ class SurvivalMonitor:
 
     def _write_health(self, role: str, **kwargs):
         try:
-            health_dir = Path("/tmp/ccs-health")
+            health_dir = Path.home() / ".hermes" / "run" / "ccs-health"
             health_dir.mkdir(parents=True, exist_ok=True)
             path = health_dir / f"{role}.json"
             health = {}
@@ -238,6 +238,44 @@ class SurvivalMonitor:
             path.write_text(json.dumps(health))
         except Exception as e:
             LOGGER.warning("health write fail: %s", e)
+
+    # ── 僵尸清理 ──
+
+    def _cleanup_dead(self, role: str, checks_since: int) -> None:
+        """连续 N 次 DEAD → 删除过期哨兵文件，释放状态。"""
+        if checks_since < 2:
+            return
+        sentinel = SENTINEL_DIR / f"{role}.json"
+        try:
+            if sentinel.exists():
+                sentinel.unlink()
+                LOGGER.info("[survival] 清理 DEAD 哨兵: %s (连续 %d 次检测)", role, checks_since)
+                self._write_bus("architecture",
+                    f"[survival:cleanup] {role} 哨兵已删除 (连续 {checks_since} 次 DEAD)",
+                    evidence=f"survival_dead={checks_since}次")
+        except OSError as e:
+            LOGGER.warning("[survival] 清理哨兵失败 %s: %s", role, e)
+
+    def _cleanup_orphan(self, role: str) -> None:
+        """ORPHAN 状态: 哨兵存在但 tmux 无响应 → kill session + 删除哨兵。"""
+        tmux_name = f"ccs-{role}"
+        sentinel = SENTINEL_DIR / f"{role}.json"
+        try:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", tmux_name],
+                capture_output=True, timeout=5,
+            )
+            LOGGER.info("[survival] 清理 ORPHAN session: %s", role)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            LOGGER.debug("[survival] ORPHAN session 不存在: %s", tmux_name)
+        try:
+            if sentinel.exists():
+                sentinel.unlink()
+        except OSError:
+            pass
+        self._write_bus("architecture",
+            f"[survival:cleanup] {role} ORPHAN session + 哨兵已清理",
+            evidence="orphan_cleanup")
 
     # ── 入口 ──
 
@@ -288,6 +326,17 @@ class SurvivalMonitor:
                 self._write_bus("notice",
                     f"@ccs-monitor [survival] {role} 状态异常: {overall}",
                     evidence=f"{l2.get('detail','')} | {l3.get('detail','')}")
+
+            # 僵尸清理
+            prev_dead_checks = prev.get("dead_checks_since", 0)
+            if overall == "dead" and l1.get("status") != "ORPHAN":
+                dead_checks = prev_dead_checks + 1
+                result["dead_checks_since"] = dead_checks
+                self._cleanup_dead(role, dead_checks)
+            elif l1.get("status") == "ORPHAN":
+                self._cleanup_orphan(role)
+            else:
+                result["dead_checks_since"] = 0
 
         stalled = [r for r, h in results.items() if h["overall"] in ("stale", "dead")]
         if stalled:
