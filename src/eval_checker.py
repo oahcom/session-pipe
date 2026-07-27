@@ -104,13 +104,26 @@ _ALLOWED_CMDS = frozenset({
 })
 
 _SYSTEMCTL_READONLY = frozenset({"status", "is-active", "is-enabled", "show", "list-units", "list-unit-files"})
+_GIT_READONLY = frozenset({"log", "show", "status", "diff", "branch", "tag", "remote", "stash", "rev-parse", "ls-files"})
+_CURL_WRITE_FLAGS = frozenset({"-X", "--data", "-d", "-T", "--upload-file", "-F", "--form", "--request"})
 
 def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
-    """白名单通过后二次校验：systemctl 只允许只读子命令。"""
-    if first_word != "systemctl":
+    """白名单通过后二次校验：systemctl/curl/git 只允许只读操作。"""
+    parts = cmd.lstrip().split()
+    if len(parts) < 2:
         return True
-    subcmd = cmd.lstrip().split(maxsplit=2)
-    return len(subcmd) >= 2 and subcmd[1] in _SYSTEMCTL_READONLY
+
+    if first_word == "systemctl":
+        return parts[1] in _SYSTEMCTL_READONLY
+
+    if first_word == "curl":
+        # -X POST/-d/--data 等写操作标志 → 拒绝
+        return not any(flag in parts or flag.split("=")[0] in parts for flag in _CURL_WRITE_FLAGS)
+
+    if first_word == "git":
+        return parts[1] in _GIT_READONLY
+
+    return True
 
 
 def _run(cmd: str, timeout: int = 30) -> dict:
