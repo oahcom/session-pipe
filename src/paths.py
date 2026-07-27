@@ -39,9 +39,9 @@ SESSION_PIPELINE_SRC = Path(__file__).resolve().parent
 CCS_CLI = SESSION_LAUNCHER_SRC / "ccs.py"
 
 # ── 哨兵目录 ──
-CCS_SENTINEL_DIR = Path("/tmp/ccs-sentinels")
-LIFECYCLE_SENTINEL_DIR = Path("/tmp/ccs-lifecycle-sentinels")
-CODEX_SENTINEL_DIR = Path("/tmp/cdx-sentinels")
+CCS_SENTINEL_DIR = Path.home() / ".hermes" / "run" / "ccs-sentinels"
+LIFECYCLE_SENTINEL_DIR = Path.home() / ".hermes" / "run" / "ccs-lifecycle-sentinels"
+CODEX_SENTINEL_DIR = Path.home() / ".hermes" / "run" / "cdx-sentinels"
 
 # ── 角色目录 ──
 SESSION_ROLES_PERSONAS = SESSION_ROLES_ROOT / "personas" / "session-roles"
