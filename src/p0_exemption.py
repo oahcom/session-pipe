@@ -293,9 +293,9 @@ class P0Exemption:
         )
         self._conn.commit()
         self._log_audit(task_id, role,
-                        json.dumps({"action": "extended", "minutes": actual,
-                                    "remaining_budget": remaining - actual},
-                                   ensure_ascii=False))
+                        {"action": "extended", "minutes": actual,
+                         "remaining_budget": remaining - actual},
+                        action="p0_extended")
         self._notify_bus("architecture", f"P0_draft deadline extended: {task_id}",
                          evidence=f"by={role}, +{actual}min")
         return {"task_id": task_id, "extended_minutes": actual,
@@ -433,14 +433,15 @@ class P0Exemption:
         except Exception:
             return None
 
-    def _log_audit(self, task_id: str, actor: str, detail: str):
-        """写审计日志到 workflow_logs。"""
+    def _log_audit(self, task_id: str, actor: str, detail: str | dict, action: str = "p0_exemption"):
+        """写审计日志到 workflow_logs。action 参数允许调用者覆盖默认操作名。
+        detail 为 dict 时直接存储（供 extend_deadline 等结构化记录使用）。
+        """
+        payload = json.dumps(detail, ensure_ascii=False) if isinstance(detail, dict) else json.dumps({"detail": detail}, ensure_ascii=False)
         self._conn.execute(
             "INSERT INTO workflow_logs (workflow_instance_id, task_id, "
             "action, actor, detail, ts) VALUES (?, ?, ?, ?, ?, ?)",
-            (None, task_id, "p0_exemption", actor,
-             json.dumps({"detail": detail}, ensure_ascii=False),
-             time.time())
+            (None, task_id, action, actor, payload, time.time())
         )
         self._conn.commit()
 
