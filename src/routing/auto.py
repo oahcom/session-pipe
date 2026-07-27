@@ -120,7 +120,8 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
         for linked_role in linked:
             try:
                 bb.mark_consumed(fact_id, linked_role)
-            except Exception:
+            except Exception as exc:
+                LOGGER.warning("auto-link consume failed for fact=%s linked_role=%s: %s", fact_id, linked_role, exc)
                 METRICS.inc("consume_errors_total", labels={"consumer": linked_role})
     except Exception as e:
         LOGGER.error(f"consume #{tid} failed: {e}", extra={"trace_id": str(tid)})
@@ -163,9 +164,6 @@ def _output_json(data, has_json):
         print(json.dumps(data, ensure_ascii=False))
     else:
         print(json.dumps(data, ensure_ascii=False, indent=2))
-
-
-    sys.exit(1)
 
 
 def _cli_route_all(argv, flags, has_json):
@@ -256,9 +254,8 @@ if __name__ == "__main__":
 
     # ── dispatch ──
     if _daemon_flag:
-        print("Use pipeflow/daemon.py for the unified daemon.")
-        sys.exit(1)
         _output_json(status(), has_json)
+        sys.exit(1)
     elif _health_flag:
         _output_json(health_check(), has_json)
     elif _metrics_flag:
