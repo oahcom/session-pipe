@@ -44,6 +44,7 @@ class Step:
     verify: str = ""
     failure_patterns: list[str] = None
     subflow_template: str = ""  # 该步骤对应的子工作流模板名
+    exit_schema: dict = None  # 退出校验 schema（文件校验/内容校验/自定义校验）
 
 
 @dataclass
@@ -429,6 +430,16 @@ class WorkflowEngine:
 
         last_ts = run.step_results.get(step.id, {}).get("poll_since", run.created_at)
 
+        # exit_schema 校验（文件/内容约束）
+        if step.exit_schema:
+            ok, errs = self._validate_exit_schema(step, run)
+            if not ok:
+                err_msg = "; ".join(errs)
+                self._bb.write("blocker",
+                    f"[workflow] {run.workflow_name} {step.id} 不符合 schema: {err_msg}",
+                    src="workflow_engine")
+                return
+
         if self._check_exit(cat, src_filter, text_filter, created_after=last_ts):
             if step.verify:
                 ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
@@ -528,6 +539,88 @@ class WorkflowEngine:
                                 evidence=f"write_err={_e}, rollback_err={_e2}", src="pipeflow")
                 except Exception:
                     pass
+
+    def _validate_exit_schema(self, step: Step, run: WorkflowRun) -> tuple[bool, list[str]]:
+        """校验 exit_schema 定义的文件约束。返回 (ok, error_list)。"""
+        schema = step.exit_schema
+        if not schema:
+            return (True, [])
+        ws = Path.home() / "ccs-workspaces" / step.target_role
+        errs: list[str] = []
+
+        for req in schema.get("required", []):
+            fpath = ws / req
+            # 支持通配符: mc_*/ * → 检查 glob 匹配
+            if "*" in req:
+                matches = sorted(fpath.parent.glob(fpath.name))
+                if not matches:
+                    errs.append(f"缺少产出: {req} 无 glob 匹配")
+            elif not fpath.exists():
+                errs.append(f"缺少产出: {req}")
+
+        for fname, props in schema.get("properties", {}).items():
+            fpath = ws / fname
+
+            if "minLength" in props:
+                if fpath.exists():
+                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                    if len(content) < props["minLength"]:
+                        errs.append(f"{fname} 内容不足 ({len(content)}<{props['minLength']})")
+                else:
+                    errs.append(f"缺少产出: {fname}")
+
+            if "mustContain" in props:
+                if fpath.exists():
+                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                    missing = [kw for kw in props["mustContain"] if kw not in content]
+                    if missing:
+                        errs.append(f"{fname} 缺少必需内容: {missing}")
+                else:
+                    errs.append(f"缺少产出: {fname}")
+
+            if "checksum" in props:
+                import hashlib as _hl
+                if fpath.exists():
+                    content = fpath.read_text(encoding="utf-8", errors="replace").encode()
+                    actual = _hl.md5(content).hexdigest()
+                    if actual != props["checksum"]:
+                        errs.append(f"{fname} checksum mismatch: {actual[:8]}≠{props['checksum'][:8]}")
+                else:
+                    errs.append(f"缺少产出: {fname}")
+
+            if "minFiles" in props:
+                if fpath.is_dir():
+                    ext = props.get("extension", "")
+                    files = [f for f in fpath.iterdir() if f.is_file() and (not ext or f.name.endswith(ext))]
+                    if len(files) < props["minFiles"]:
+                        ext_label = ext or "文件"
+                        errs.append(f"{fname} {ext_label} 文件不足 ({len(files)}<{props['minFiles']})")
+                else:
+                    errs.append(f"缺少产出: {fname}")
+
+            if "minCount" in props:
+                if "*" in fname:
+                    import glob as _gl
+                    matches = _gl.glob(str(fpath))
+                    if len(matches) < props["minCount"]:
+                        errs.append(f"{fname} glob 匹配不足 ({len(matches)}<{props['minCount']})")
+                elif fpath.exists():
+                    pass  # file exists but no glob → ok
+
+        return (len(errs) == 0, errs)
+
+    def _eval_cond(self, expr: str, run: WorkflowRun) -> bool:
+        """简朴条件求值: s1.status == 'done' 格式。"""
+        import re as _re
+        m = _re.match(r"s(\d+)\.status\s*==\s*'(\w+)'", expr.strip())
+        if not m:
+            return False
+        step_id = f"s{m.group(1)}"
+        expected = m.group(2)
+        sr = run.step_results.get(step_id)
+        if not sr:
+            return False
+        return sr.get("status") == expected
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> bool:
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
