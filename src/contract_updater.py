@@ -16,7 +16,7 @@ BUS_SCRIPT = Path(os.environ.get(
 LOGGER = logging.getLogger("session-pipeline.contract_updater")
 PERSONAS_DIR = Path(os.environ.get(
     "SESSION_ROLES_DIR",
-    "/home/administrator/hermes-session-roles/personas/session-roles",
+    str(Path(__file__).resolve().parent.parent.parent / "hermes-session-roles" / "personas" / "session-roles"),
 ))
 
 
