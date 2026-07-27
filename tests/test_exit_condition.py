@@ -382,7 +382,8 @@ class TestTickCompletedRunSkipped(unittest.TestCase):
 
 
 class TestTickNoMatchUpdatesPollSince(unittest.TestCase):
-    def test_poll_since_updated_when_no_match(self):
+    def test_poll_since_not_updated_when_no_match(self):
+        """退出条件未匹配时不推 poll_since，下次 tick 重查同一时间窗。"""
         eng = _mocked_eng()
         eng._check_exit = MagicMock(return_value=False)
         eng._sync_step_results = MagicMock()
@@ -392,10 +393,9 @@ class TestTickNoMatchUpdatesPollSince(unittest.TestCase):
         run.step_results = {"s1": {}}
         eng._tick(run, step)
 
-        eng._sync_step_results.assert_called()
+        eng._sync_step_results.assert_not_called()
         sr = run.step_results["s1"]
-        self.assertIn("poll_since", sr)
-        self.assertIsInstance(sr["poll_since"], float)
+        self.assertNotIn("poll_since", sr)
 
 
 if __name__ == "__main__":
