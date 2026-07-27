@@ -315,8 +315,9 @@ class WorkflowEngine:
                     )
                     step_status = "notified"  # 更新状态，让后续 exit_condition/超时检查能执行
 
-                # completion_check 步骤已完成 → 自动推进到下一步
-                if step.completion_check and step_status in ("step_done_ready", "completed"):
+                # 步骤已完成 → 自动推进到下一步
+                # step_done_ready/completed 由角色或外部系统标记，无需额外的 completion_check
+                if step_status in ("step_done_ready", "completed"):
                     self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
                     continue
 
@@ -456,6 +457,12 @@ class WorkflowEngine:
                 self._lifecycle.complete_step(run.id, step.id)
             except Exception as e:
                 print(f"  [wf] LM complete_step 失败: {e}", flush=True)
+                # ponytail: 角色已自行推进步骤 → 推进 poll_since 避免下一轮重复匹配同一条 exit 消息
+                run.step_results[step.id] = {
+                    **run.step_results.get(step.id, {}),
+                    "poll_since": time.time()
+                }
+                self._sync_step_results(run.id, run.step_results)
 
             # lifecycle.manager 已写入 step_results，此处不再重复写入
             return
