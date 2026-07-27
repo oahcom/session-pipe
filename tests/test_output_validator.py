@@ -1,84 +1,120 @@
-#!/usr/bin/env python3
-"""Unit tests for output_validator.py.
-
-Use a temporary directory with mock role JSON files to avoid
-depending on the real ~/hermes-session-roles tree.
-"""
+"""test_output_validator.py — output_schema 校验测试覆盖。"""
 import json
-import tempfile
+import sys
 from pathlib import Path
-from unittest import mock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src import output_validator
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-_REVIEWER = "reviewer"
-_CATEGORY = "code_review"
-_SCHEMA = {
-    "code_review": {
-        "fields": {
-            "file_path": "string",
-            "issues": "list",
-            "summary": "string",
-        }
-    }
-}
-_SCHEMA_FILE = {"name": _REVIEWER, "output_schema": _SCHEMA}
-
-_NO_SCHEMA_FILE = {"name": "no_schema_role"}
+from output_validator import _load_role_schema, validate_output
 
 
-@pytest.fixture
-def roles_dir():
-    """Patch _ROLES_DIR with a temp directory containing test persona files."""
-    d = tempfile.mkdtemp()
-    (Path(d) / f"{_REVIEWER}.json").write_text(json.dumps(_SCHEMA_FILE), encoding="utf-8")
-    (Path(d) / "no_schema_role.json").write_text(
-        json.dumps(_NO_SCHEMA_FILE), encoding="utf-8"
-    )
-    # A corrupted file that isn't valid JSON
-    (Path(d) / "corrupted.json").write_text("this is not json", encoding="utf-8")
-    with mock.patch.object(output_validator, "_ROLES_DIR", Path(d)):
-        yield
-
-
-class TestValidateOutput:
-    def test_validate_no_schema(self, roles_dir):
-        """Role with no output_schema → valid=True, severity='unknown'."""
-        result = output_validator.validate_output(
-            "no_schema_role", _CATEGORY, {"a": 1}
-        )
-        assert result == {"valid": True, "missing": [], "severity": "unknown"}
-
-    def test_validate_complete(self, roles_dir):
-        """Content matches every required field → valid=True."""
-        content = {"file_path": "main.py", "issues": ["bug"], "summary": "ok"}
-        result = output_validator.validate_output(_REVIEWER, _CATEGORY, content)
-        assert result == {"valid": True, "missing": [], "severity": "ok"}
-
-    def test_validate_missing_fields(self, roles_dir):
-        """Missing required fields → valid=False with the missing keys."""
-        content = {"file_path": "main.py"}
-        result = output_validator.validate_output(_REVIEWER, _CATEGORY, content)
-        assert result["valid"] is False
-        assert result["severity"] == "error"
-        assert "issues" in result["missing"]
-        assert "summary" in result["missing"]
-
-    def test_validate_non_json(self, roles_dir):
-        """Corrupted / nonexistent role file silently skips validation."""
-        result = output_validator.validate_output("undefined", _CATEGORY, {"x": 1})
-        assert result == {"valid": True, "missing": [], "severity": "unknown"}
+def _persona_mock(name: str, data: dict) -> MagicMock:
+    """Build a mock Path with read_text returning persona JSON."""
+    f = MagicMock(spec=Path)
+    f.name = f"persona_{name}.json"
+    f.read_text.return_value = json.dumps(data)
+    f.__lt__ = lambda self, other: self.name < other.name
+    return f
 
 
 class TestLoadRoleSchema:
-    def test_load_role_schema_exists(self, roles_dir):
-        """Return the category schema dict for a known role."""
-        schema = output_validator._load_role_schema(_REVIEWER, _CATEGORY)
-        assert schema == _SCHEMA[_CATEGORY]
+    @patch("output_validator._ROLES_DIR")
+    def test_not_a_dir(self, mock_dir):
+        mock_dir.is_dir.return_value = False
+        assert _load_role_schema("engineer", "code_fix") is None
 
-    def test_load_role_schema_none(self, roles_dir):
-        """Return None for a role that doesn't exist."""
-        schema = output_validator._load_role_schema("nonexistent", _CATEGORY)
-        assert schema is None
+    @patch("output_validator._ROLES_DIR")
+    def test_role_not_found(self, mock_dir):
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = []
+        assert _load_role_schema("nonexistent", "x") is None
+
+    @patch("output_validator._ROLES_DIR")
+    def test_role_no_schema(self, mock_dir):
+        f = _persona_mock("engineer", {"name": "engineer"})
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = [f]
+        assert _load_role_schema("engineer", "code_fix") is None
+
+    @patch("output_validator._ROLES_DIR")
+    def test_role_has_schema(self, mock_dir):
+        f = _persona_mock("engineer", {
+            "name": "engineer",
+            "output_schema": {"code_fix": {"title": "str", "evidence": "str"}}
+        })
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = [f]
+        schema = _load_role_schema("engineer", "code_fix")
+        assert schema == {"title": "str", "evidence": "str"}
+
+
+class TestValidateOutput:
+    @patch("output_validator._ROLES_DIR")
+    def test_no_schema_returns_unknown(self, mock_dir):
+        mock_dir.is_dir.return_value = False
+        result = validate_output("engineer", "code_fix", {"title": "x"})
+        assert result == {"valid": True, "missing": [], "severity": "unknown"}
+
+    @patch("output_validator._ROLES_DIR")
+    def test_all_fields_present(self, mock_dir):
+        f = _persona_mock("engineer", {
+            "name": "engineer",
+            "output_schema": {"code_fix": {"title": "str", "evidence": "str"}}
+        })
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = [f]
+        result = validate_output("engineer", "code_fix", {"title": "a", "evidence": "b"})
+        assert result["valid"] is True
+        assert result["missing"] == []
+        assert result["severity"] == "ok"
+
+    @patch("output_validator._ROLES_DIR")
+    def test_missing_fields(self, mock_dir):
+        f = _persona_mock("engineer", {
+            "name": "engineer",
+            "output_schema": {"code_fix": {"title": "str", "evidence": "str"}}
+        })
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = [f]
+        result = validate_output("engineer", "code_fix", {"title": "a"})
+        assert result["valid"] is False
+        assert "evidence" in result["missing"]
+        assert result["severity"] == "error"
+
+    @patch("output_validator._ROLES_DIR")
+    def test_nested_schema_fields(self, mock_dir):
+        f = _persona_mock("architect", {
+            "name": "architect",
+            "output_schema": {
+                "architecture": {
+                    "description": "arch insight",
+                    "fields": {"title": "str", "rationale": "str"}
+                }
+            }
+        })
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = [f]
+        assert validate_output("architect", "architecture", {"title": "a", "rationale": "b"})["valid"] is True
+        assert validate_output("architect", "architecture", {"title": "a"})["valid"] is False
+
+    @patch("output_validator._ROLES_DIR")
+    def test_nested_schema_without_fields_treats_description_as_required(self, mock_dir):
+        """嵌套 schema 但无 fields 键时，description 被视为必填字段。"""
+        f = _persona_mock("minimalist", {
+            "name": "minimalist",
+            "output_schema": {"x": {"description": "no fields here"}}
+        })
+        mock_dir.is_dir.return_value = True
+        mock_dir.glob.return_value = [f]
+        # content 必须包含 "description" 才通过
+        assert validate_output("minimalist", "x", {"description": "y"})["valid"] is True
+        assert validate_output("minimalist", "x", {})["valid"] is False
+
+
+if __name__ == "__main__":
+    import pytest as _p
+    import sys as _s
+    _s.exit(_p.main([__file__, "-v"]))
