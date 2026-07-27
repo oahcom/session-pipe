@@ -26,9 +26,6 @@ from paths import CCS_CLI as _CCS_CLI
 from bus_protocol import Blackboard
 
 _POLL_SLEEP = 5
-_TIMEOUT_GRACE = 10
-_ESCALATED_AFTER = 2
-_FAIL_AFTER = 3
 _REMINDER_INTERVAL = 120
 
 
@@ -417,13 +414,7 @@ class WorkflowEngine:
                 except Exception as _e:
                     LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
         except Exception as e:
-            # 异常时通知目标角色排查修复
-            try:
-                _target_role = wf_name if 'wf_name' in dir() else step_id
-            except Exception:
-                _target_role = ""
-            import logging as _lg
-            _lg.getLogger("engine.advance").warning("推进生产工作流失败 %s: %s", wf_id, e)
+            LOGGER.warning("_advance_production_wf failed %s: %s", wf_id, e)
     
     def _tick(self, run: WorkflowRun, step: Step):
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
@@ -502,7 +493,7 @@ class WorkflowEngine:
             try:
                 self._lifecycle.escalate_step(run.id, step.id, reason=warning)
             except Exception as _e:
-                    LOGGER.exception("silenced exception")
+                LOGGER.exception("escalate_step failed for %s/%s", run.id, step.id)
             self._send_to_role("coordinator", warning)
 
         # 同步到 SQLite
@@ -531,21 +522,12 @@ class WorkflowEngine:
                 lm.rollback()
             except Exception as _e2:
                 LOGGER.exception("_sync_step_results rollback 也失败")
-
-    def _check_session_alive(self, role: str, since: float) -> bool:
-        try:
-            session_dir = Path.home() / ".claude" / "projects" \
-                / f"-home-administrator-ccs-workspaces/{role}"
-            if not session_dir.exists():
-                return False
-            latest = max(session_dir.glob("*.jsonl"),
-                         key=lambda f: f.stat().st_mtime) if list(session_dir.glob("*.jsonl")) else None
-            if not latest:
-                return False
-            age = time.time() - latest.stat().st_mtime
-            return age < 300
-        except Exception:
-            return False
+                try:
+                    from bus_protocol import Blackboard as _BB
+                    _BB().write("code_fix", f"pipeflow: DB write+rollback 双重失败 wf={wf_id}",
+                                evidence=f"write_err={_e}, rollback_err={_e2}", src="pipeflow")
+                except Exception:
+                    pass
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> bool:
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
@@ -558,20 +540,6 @@ class WorkflowEngine:
                 continue
             return True
         return False
-
-    def _eval_cond(self, expr: str, run: WorkflowRun) -> bool:
-        try:
-            import re
-            m = re.search(r"s(\d+)\.status\s*==\s*'([^']+)'", expr)
-            if m:
-                step_num = int(m.group(1))
-                expected_status = m.group(2)
-                step_key = f"s{step_num}"
-                actual = run.step_results.get(step_key, {}).get("status", "")
-                return actual == expected_status
-            return False
-        except Exception:
-            return False
 
     def _ensure_role_alive(self, role: str) -> bool:
         """检查角色的 CCS 是否存活（tmux 会话），不存活则拉起。"""
@@ -619,12 +587,17 @@ class WorkflowEngine:
         except Exception:
             try:
                 ccs_cli = Path.home() / "session-launcher" / "src" / "ccs.py"
-                subprocess.run(
+                _sp.run(
                     ["python3", str(ccs_cli), "send", role, prompt[:2000]],
                     capture_output=True, timeout=10,
                 )
             except Exception as _e:
-                    LOGGER.exception("silenced exception")
+                LOGGER.exception("fallback CCS send failed for %s", role)
+                try:
+                    from bus_protocol import Blackboard as _BB
+                    _BB().write("code_fix", "pipeflow: fallback CCS send failed role=" + role, evidence=str(_e)[:200], src="pipeflow")
+                except Exception:
+                    pass
 
     def _write_step_prompt(self, run: WorkflowRun, step: Step, extra_prompt: str = ""):
         ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
@@ -645,7 +618,7 @@ class WorkflowEngine:
                     ctx["description"] = task["description"]
                     ctx["assignee"] = step.target_role
             except Exception as _e:
-                    LOGGER.exception("silenced exception")
+                LOGGER.exception("_write_step_prompt task context fetch failed for %s", run.id)
         prompt = step.prompt_template + "\n" + extra_prompt if extra_prompt else step.prompt_template
         for k, v in ctx.items():
             prompt = prompt.replace(f"{{{k}}}", str(v))
@@ -778,6 +751,12 @@ class WorkflowEngine:
             self._check_anomalies()
         except Exception as _e:
             LOGGER.exception("_scan_tasks 异常")
+            try:
+                from bus_protocol import Blackboard as _BB
+                _BB().write("code_fix", f"pipeflow: _scan_tasks 异常",
+                            evidence=str(_e), src="pipeflow")
+            except Exception:
+                pass
 
 
 def main():
