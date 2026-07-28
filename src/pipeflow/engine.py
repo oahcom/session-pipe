@@ -375,7 +375,7 @@ class WorkflowEngine:
                         "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
                         (inst["instance_id"],)
                     )
-                    task = task_rows[0] if task_rows else None
+                    task = task_rows[0] if task_rows and len(task_rows) > 0 else None
                     task_title = task["title"] if task else wf_name
                     task_desc = task["description"] if task else ""
                     # 任务上下文注入：把 title/desc 放到 prompt 头部，角色立刻知道干什么
@@ -445,7 +445,7 @@ class WorkflowEngine:
     def _kick_stalled_roles(self):
         """检测有 running workflow 但 steps 停滞超时的角色，重推任务。
 
-        条件: step 处于 notified 状态超过 10 分钟，且无 timeout_count 递增
+        条件: step 处于 notified 状态超过 3 分钟，且无 timeout_count 递增
         (timeout_count 由 tick 处理，这里补 tick 照顾不到的冷启动停滞)
         """
         lm = self._lifecycle
@@ -466,7 +466,7 @@ class WorkflowEngine:
                 if _status != "notified":
                     continue
                 _notified_at = _sr.get("notified_at", 0)
-                if not _notified_at or now - _notified_at < 600:
+                if not _notified_at or now - _notified_at < 180:
                     continue
                 # 停滞超过 10 分钟 + 无 timeout_count → 重推
                 _tc = _sr.get("timeout_count", 0)
@@ -718,10 +718,15 @@ class WorkflowEngine:
         if not schema:
             return (True, [])
         ws = _CCS_WORKSPACES / step.target_role
+        ws_real = os.path.realpath(ws)
         errs: list[str] = []
 
         for req in schema.get("required", []):
             fpath = ws / req
+            fpath_real = os.path.realpath(fpath)
+            if not fpath_real.startswith(ws_real):
+                errs.append(f"路径越权: {req}")
+                continue
             # 支持通配符: mc_*/ * → 检查 glob 匹配
             if "*" in req:
                 matches = sorted(fpath.parent.glob(fpath.name))

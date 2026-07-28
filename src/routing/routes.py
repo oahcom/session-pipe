@@ -128,8 +128,8 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                     LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
                         try:
                             set_last_cursor(consumer, "", fid, instance_id)
-                        except Exception:
-                            LOGGER.debug("set_last_cursor failed for %s fid=%s", consumer, fid)
+                        except Exception as _sc_e:
+                            LOGGER.debug("set_last_cursor failed for %s fid=%s: %s", consumer, fid, _sc_e)
                     except Exception as e:
                         LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
                                      extra={"trace_id": str(fid)})
@@ -259,7 +259,13 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                 LOGGER.debug("Skipping workflow creation for system category %s", _cat)
             else:
                 try:
-                    _title = msg.get("text", "")[:80]
+                    _raw = msg.get("text", "")
+                    # 从消息文本提取有意义的标题：取第一段或前 60 字符
+                    _title = _raw.split("\n")[0] if _raw else ""
+                    _title = _title[:80]
+                    if len(_title) < 8:
+                        # 消息太短不足以当标题时，构造描述性标题
+                        _title = f"[{_cat}] 处理角色 {role_name} 的 {_cat} 任务"
                     _wf = WorkflowClient(role_name)
                     _wf.create_task_v2(_title, assignee=role_name, initiator_role="pipeline",
                                        bus_category=_cat)
