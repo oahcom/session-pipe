@@ -250,7 +250,7 @@ class Router:
 
         return "\n".join(lines)
 
-    def consume_linkage(self, fact_id: int, category: str) -> list[str]:
+    def consume_linkage(self, category: str) -> list[str]:
         """消费一条消息后，返回其他受影响的消费者列表。
 
         消费联动逻辑：

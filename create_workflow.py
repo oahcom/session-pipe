@@ -4,10 +4,11 @@ import sys, json, os
 sys.path.insert(0, 'src')
 
 from template_registry import TemplateRegistry
-from migration.scripts import run_migration
+# FIXME: migration 模块不存在，暂注释
+# 
 
 db = "/home/administrator/.hermes/state/workflows.db"
-run_migration(db_path=db, dry_run=False)
+    # run_migration(db_path=db, dry_run=False)  # migration 模块不存在
 
 reg = TemplateRegistry(db_path=db)
 

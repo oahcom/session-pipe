@@ -42,9 +42,9 @@ def check_resource_constraints(role: str) -> dict:
         mem = subprocess.run(["free","-m"], capture_output=True, text=True, timeout=5)
         for line in mem.stdout.split("\n"):
             if line.startswith("Mem:"):
-                usage["memory_mb"] = int(line.split()[3])
+                usage["memory_mb"] = int(line.split()[6])
                 if usage["memory_mb"] < budget["max_memory_mb"]:
-                    violations.append(f"mem {usage['memory_mb']} < {budget['max_memory_mb']}MB")
+                    violations.append(f"mem {usage["memory_mb"]} > {budget["max_memory_mb"]}MB exceed")
     except Exception: usage["memory_mb"] = -1
     return {"ok": len(violations)==0, "violations": violations, "usage": usage}
 
@@ -55,9 +55,10 @@ class LifecycleManager:
     STEP_STATUSES = {"pending", "running", "step_done_ready", "completed", "failed"}
     STEP_TYPES = {"handoff", "review", "single", "gate", "notify"}
 
-    def __init__(self, role: str, db_path: str = None):
+    def __init__(self, role: str, db_path: str = None, on_advance: callable = None):
         self.role = role
         self.db_path = Path(db_path) if db_path else DB_PATH
+        self._on_advance = on_advance  # callback(next_role) → 拉起下一棒角色，不等 daemon tick
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), timeout=10)
         self._conn.row_factory = sqlite3.Row
@@ -99,9 +100,12 @@ class LifecycleManager:
             self._conn.rollback()
 
     def begin(self) -> None:
-        """开始事务（IMMEDIATE）。"""
+        """开始事务（IMMEDIATE），已在事务中时跳过。"""
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass  # ponytail: 已在事务中时静默 RLock 已保证线程安全
 
     def ping(self) -> bool:
         """检查连接是否存活。"""
@@ -481,7 +485,7 @@ class LifecycleManager:
                     "UPDATE workflow_instances SET current_step_id=?, step_results=?, status='running' "
                     "WHERE instance_id=?", (step_id, json.dumps(results, ensure_ascii=False), wf_id)
                 )
-                self._log_unsafe(wf.get("task_id"), wf.get("task_id"), "step_rolled_back",
+                self._log_unsafe(wf.get("instance_id"), wf.get("task_id"), "step_rolled_back",
                                  detail=f"{step_id} rolled back by {self.role}")
                 self._conn.commit()
                 return True
@@ -783,6 +787,13 @@ class LifecycleManager:
             "UPDATE workflow_instances SET current_step_id=? WHERE instance_id=?",
             (next_step["step_id"], wf_id)
         )
+        # ── advance 时同步拉起下一棒角色，不等 daemon tick 轮询 ──
+        _next_role = next_step.get("target_role", "")
+        if _next_role and _next_role != wf.get("assignee", "") and self._on_advance:
+            try:
+                self._on_advance(_next_role)
+            except Exception:
+                pass  # 拉起失败不阻塞 advance
         return True
 
     def _sync_task_unsafe(self, task_id: Optional[str]):
@@ -931,35 +942,41 @@ class LifecycleManager:
         return True
 
     def _ensure_schema(self):
-        """初始化数据库 schema（如不存在）+ 迁移已有表。"""
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS workflow_templates (
-                template_id TEXT PRIMARY KEY, name TEXT, description TEXT, steps_json TEXT,
-                created_at REAL, is_active INTEGER DEFAULT 1,
-                trigger_scene TEXT, allowed_initiators TEXT, allowed_executors TEXT,
-                max_duration_hours INTEGER DEFAULT 24, quality_standards TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS workflow_instances (
-                instance_id TEXT PRIMARY KEY, template_id TEXT, task_id TEXT,
-                assigner TEXT, assignee TEXT, status TEXT DEFAULT 'pending',
-                current_step_id TEXT DEFAULT 's1', step_results TEXT, context TEXT, created_at REAL,
-                completed_at REAL, parent_wf_id TEXT, subflow_source_step_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS workflow_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_instance_id TEXT, task_id TEXT,
-                action TEXT, actor TEXT, detail TEXT, ts REAL
-            );
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY, title TEXT, description TEXT,
-                assigner TEXT, assignee TEXT, priority INTEGER DEFAULT 0, status TEXT,
-                current_workflow_id TEXT,
-                progress TEXT DEFAULT '{}',
-                created_at REAL, updated_at REAL, completed_at REAL,
-                tags TEXT DEFAULT '[]',
-                context TEXT DEFAULT '{}',
-                parent_task_id TEXT
-            );
-        """)
+        """初始化数据库 schema（如不存在）+ 迁移已有表。
+
+        从 workflow/db.py 导入核心 schema 避免重复定义。"""
+        try:
+            from workflow.db import SCHEMA_SQL as _SCHEMA_SQL
+            self._conn.executescript(_SCHEMA_SQL)
+        except ImportError:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS workflow_templates (
+                    template_id TEXT PRIMARY KEY, name TEXT, description TEXT, steps_json TEXT,
+                    created_at REAL, is_active INTEGER DEFAULT 1,
+                    trigger_scene TEXT, allowed_initiators TEXT, allowed_executors TEXT,
+                    max_duration_hours INTEGER DEFAULT 24, quality_standards TEXT DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS workflow_instances (
+                    instance_id TEXT PRIMARY KEY, template_id TEXT, task_id TEXT,
+                    assigner TEXT, assignee TEXT, status TEXT DEFAULT 'pending',
+                    current_step_id TEXT DEFAULT 's1', step_results TEXT, context TEXT, created_at REAL,
+                    completed_at REAL, parent_wf_id TEXT, subflow_source_step_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS workflow_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_instance_id TEXT, task_id TEXT,
+                    action TEXT, actor TEXT, detail TEXT, ts REAL
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id TEXT PRIMARY KEY, title TEXT, description TEXT,
+                    assigner TEXT, assignee TEXT, priority INTEGER DEFAULT 0, status TEXT,
+                    current_workflow_id TEXT,
+                    progress TEXT DEFAULT '{}',
+                    created_at REAL, updated_at REAL, completed_at REAL,
+                    tags TEXT DEFAULT '[]',
+                    context TEXT DEFAULT '{}',
+                    parent_task_id TEXT
+                );
+            """)
         # 迁移：为已有表添加缺失列
         for table, col, col_def in [
             ("workflow_templates", "is_active", "INTEGER DEFAULT 1"),
