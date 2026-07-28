@@ -37,6 +37,7 @@ class RoutingDB:
     """路由表 SQLite 数据库。"""
 
     def __init__(self, db_path: str | Path = DB_PATH):
+        self._lock = threading.RLock()
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), timeout=10)

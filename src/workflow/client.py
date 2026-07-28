@@ -1,7 +1,9 @@
 """workflow/client.py — CCS 角色使用的工作流客户端。"""
 
 import json
+import logging
 import os
+import re
 import time
 import warnings
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Optional
 from paths import BUS_CLIENT, SESSION_LAUNCHER_SRC
 from workflow.db import create_connection
 
+LOGGER = logging.getLogger("workflow.client")
 CCS_CLI = SESSION_LAUNCHER_SRC / "ccs.py"
 
 
@@ -19,6 +22,7 @@ class WorkflowClient:
     def __init__(self, role: str, db_path: str = None):
         self.role = role
         self.db_path = db_path
+        self._lock = threading.RLock()
         self._conn = create_connection(db_path)
 
     def __enter__(self):
@@ -57,10 +61,36 @@ class WorkflowClient:
             )
         return self._create_task_impl(title, description, assignee, priority, template_id)
 
+    _TITLE_PATTERNS_BLOCKED = frozenset({
+        "task #", "task#", "任务#", "任务 #", "reviewer task", "qa task",
+        "engineer task", "writer task", "maintainer task",
+    })
+
+    @classmethod
+    def _title_is_placeholder(cls, title: str) -> bool:
+        """检查标题是否为占位符（纯编号/角色+编号），拒绝创建空转任务。"""
+        t = title.strip().lower()
+        if not t or len(t) < 8:
+            return True
+        import re
+        if re.match(r'^(reviewer|qa|engineer|writer|maintainer|scout)\s*task\s*#?\d*$', t):
+            return True
+        if re.match(r'^task\s*#?\d*$', t):
+            return True
+        return False
+
     def create_task_v2(self, title: str, assignee: str,
                        template_id: str = "", initiator_role: str = "",
                        description: str = "", parent_task_id: str = "",
                        bus_category: str = "") -> tuple:
+        # 标题质量门禁：拒绝占位符标题
+        if self._title_is_placeholder(title):
+            LOGGER.warning("标题占位符拒绝: assignee=%s title=%s bus_category=%s",
+                          assignee, title, bus_category)
+            raise ValueError(
+                f"标题 '{title[:40]}' 是占位符，不会产生实际收益。"
+                f"请提供有描述性的任务标题（≥8字符，描述具体做什么）"
+            )
         # 自动选择模板: 未指定时按任务标题 + 发起角色 + bus 分类匹配
         if not template_id:
             from template_registry import TemplateRegistry
