@@ -293,12 +293,19 @@ class WorkflowEngine:
 
                 _auto_cancel_at = 6
                 reason = ""
+                # 条件1: 超时重试耗尽
                 if max_tc >= _auto_cancel_at:
                     reason = f"timeout_count={max_tc}（已达自动回收阈值{_auto_cancel_at}）"
+                # 条件2: 测试/开发模板超2小时
                 elif tpl in _ZOMBIE_TEMPLATES and age_h > 2:
                     reason = f"测试模板 {tpl} 运行{age_h:.0f}h > 2h阈值"
+                # 条件3: 全局24小时
                 elif age_h > 24:
                     reason = f"运行{age_h:.0f}h > 24h全局阈值"
+                # 条件4: running 但 step_results 为空且 >1h（从未推进）
+                elif age_h > 1 and not sr:
+                    _step = d.get("current_step_id", "")
+                    reason = f"running 状态 {_step} 无推进记录 {age_h:.1f}h"
 
                 if reason:
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)
@@ -423,7 +430,9 @@ class WorkflowEngine:
                     self._tick(run, step)
         except Exception as _sqle:
             import logging as _lg
+            import traceback as _tb
             _lg.getLogger("engine.sqlite_block").warning("生产工作流扫描异常: %s", _sqle)
+            _tb.print_exc()
 
 
         self._scan_tasks()
@@ -510,7 +519,8 @@ class WorkflowEngine:
             conn.execute("UPDATE workflow_instances SET current_step_id=? WHERE instance_id=? AND current_step_id=?",
                         (next_step.id, wf_id, step_id))
             new_results = dict(results or {})
-            new_results[next_step.id] = {"status": "notified", "ts": time.time(), "notified_at": time.time()}
+            new_results[next_step.id] = {"status": "notified", "ts": time.time(), "notified_at": time.time(),
+                                          "poll_since": time.time(), "bus_anchor": time.time()}
             conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                         (json.dumps(new_results, ensure_ascii=False), wf_id))
             conn.commit()
@@ -584,12 +594,13 @@ class WorkflowEngine:
         # 超时后自动升级到 coordinator，不会被 schema 失败 return 阻断。
         # 超限阈值: max(max_retries+2, 3) 次超时后自动 cancel，防止无限重试堆积。
         elapsed = time.time() - (run.step_results.get(step.id, {}).get("ts", run.created_at))
-        _auto_cancel_at = max(max_retries + 2, 3)
+        _auto_cancel_at = max(max_retries + 3, 4)
         if elapsed >= timeout:
             timeout_count = run.step_results.get(step.id, {}).get("timeout_count", 0) + 1
             run.step_results[step.id] = {
                 **run.step_results.get(step.id, {}),
                 "timeout_count": timeout_count,
+                "ts": time.time(),  # 重置计时器，给角色响应窗口
             }
             self._sync_step_results(run.id, run.step_results)
             # 超限 → 自动 cancel，阻止死循环升级
@@ -603,9 +614,13 @@ class WorkflowEngine:
                     f"(timeout_count={timeout_count} >= {_auto_cancel_at})",
                     src="workflow_engine")
                 return
-            # 每 3 次超时通知 coordinator（但不再写新的 task_spec）
+            # 每次超时都重新推送任务（之前只通知 coordinator，角色从未收到重推）
+            self._send_to_role(step.target_role, step.prompt_template,
+                               wf_id=run.id, step_id=step.id)
+            # 每 3 次超时额外通知 coordinator
             if timeout_count % 3 == 0:
-                warning = f"[workflow] {run.workflow_name}/{run.current_step} 持续超时 ({timeout_count}×, 还差{_auto_cancel_at - timeout_count}次自动回收)"
+                warning = (f"[workflow] {run.workflow_name}/{run.current_step} 持续超时 "
+                           f"({timeout_count}×, 还差{_auto_cancel_at - timeout_count}次自动回收)")
                 self._send_to_role("coordinator", warning, wf_id=run.id, step_id=run.current_step)
             return
 
@@ -783,9 +798,8 @@ class WorkflowEngine:
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         earliest = 0.0
         for f in facts:
-            # src 匹配：允许 claude（默认值）匹配任何角色名
-            # ponytail: 角色通过 bus_client 默认 src=claude，但 exit_condition 用角色名匹配
-            if src_filter and f.src != src_filter and f.src != "claude":
+            # src 匹配：严格匹配——不再允许 claude 通配豁免
+            if src_filter and f.src != src_filter:
                 continue
             if text_filter and text_filter not in f.t:
                 continue
@@ -795,39 +809,105 @@ class WorkflowEngine:
                 earliest = f.ts
         return earliest
 
+    @staticmethod
+    def _is_agent_alive(role: str) -> bool:
+        """检查 CCS tmux pane 内是否有 claude agent 进程在运行。"""
+        try:
+            r = _sp.run(
+                ["tmux", "list-panes", "-t", f"ccs-{role}",
+                 "-F", "#{pane_current_command}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return False
+            cmd = r.stdout.strip().split("\n")[0]
+            return cmd in ("claude", "claude-code", "python3", "python")
+        except Exception:
+            return False
+
     def _ensure_role_alive(self, role: str) -> bool:
-        """检查角色的 CCS 是否存活（tmux 会话），不存活则拉起。"""
+        """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。"""
         alive = _sp.run(
             ["tmux", "has-session", "-t", f"ccs-{role}"],
             capture_output=True, timeout=5,
         ).returncode == 0
+        if alive and not self._is_agent_alive(role):
+            # tmux 会话存活但无 claude 进程 → 重启
+            LOGGER.info("CCS %s: tmux alive but no claude, restarting", role)
+            _sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
+                    capture_output=True, timeout=5)
+            alive = False
         if alive:
+            # 代码变更检测：检测到 workspace/launcher 代码变化时标记需重启
+            if self._detect_code_change(role):
+                LOGGER.info("code-change detected for %s, scheduling restart", role)
+                self._bb.write("code_fix",
+                    f"[code-hotswap] {role} 代码变更，重启旧实例",
+                    src="workflow_engine")
+                _sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
+                        capture_output=True, timeout=5)
+                self._clean_role_code_checksum(role)
             return True
 
-        # 拉起 CCS（ondemand 模式，处理完消息自动退出）
+        # 拉起 CCS（infinite 模式，agent 常驻执行任务）
+        # ponytail: ondemand 模式只写哨兵不创建 tmux 会话，必须用 infinite 让 agent 持续运行
         try:
             _sp.run(
                 ["python3", str(_CCS_CLI), "start", role, "--no-attach",
-                 "--drive", "ondemand"],
+                 "--drive", "infinite"],
                 capture_output=True, timeout=30,
             )
-            for _ in range(15):
+            for _ in range(30):
                 time.sleep(1)
                 if _sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
                            capture_output=True, timeout=5).returncode == 0:
-                    return True
+                    time.sleep(3)  # 等 agent 进程启动
+                    if self._is_agent_alive(role):
+                        return True
         except Exception:
             LOGGER.debug("CCS role alive check failed for %s", role)
         return False
+
+    _CODE_CS_DIR = Path.home() / ".hermes" / "run"
+
+    def _detect_code_change(self, role: str) -> bool:
+        """检查角色 workspace 或 launcher 代码是否有变更。返回 True 表示需重启。"""
+        import hashlib
+        ws = _CCS_WORKSPACES / role
+        launcher = _CCS_CLI
+        cs_path = self._CODE_CS_DIR / f"code-checksum-{role}"
+        try:
+            sources = sorted(ws.rglob("*.py")) + [launcher]
+            h = hashlib.md5()
+            for f in sources:
+                if f.exists():
+                    h.update(f.read_bytes())
+            digest = h.hexdigest()
+            if cs_path.exists():
+                prev = cs_path.read_text().strip()
+                if prev != digest:
+                    return True
+            cs_path.write_text(digest)
+        except Exception:
+            pass
+        return False
+
+    def _clean_role_code_checksum(self, role: str):
+        """重启后清除 checksum 标记。"""
+        cs_path = self._CODE_CS_DIR / f"code-checksum-{role}"
+        try:
+            if cs_path.exists():
+                cs_path.unlink()
+        except Exception:
+            pass
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = ""):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
         self._ensure_role_alive(role)
-        prompt = "/goal " + prompt
-        # 工作习惯提示：仅独立消息显示（非工作流步骤）
-        if not wf_id:
-            prompt = "/goal\n\n## 工作习惯\n用 `wf create <title> --assignee <role>` 创建工作流（自动匹配模板），或 `wf suggest <title>` 预览推荐。\n\n" + prompt.removeprefix("/goal ")
+        # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
+        if not prompt.startswith("/goal"):
+            prompt = "/goal " + prompt
         # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
         if wf_id:
             try:
@@ -988,7 +1068,24 @@ class WorkflowEngine:
                         except Exception:
                             conn.rollback()
                             raise
-            conn.commit()
+                conn.commit()
+            # ── 指标持久化（JSONL）──
+            try:
+                _st_rows = conn.execute("SELECT status, COUNT(*) as c FROM workflow_instances GROUP BY status").fetchall()
+                _metrics = {
+                    "ts": time.time(),
+                    "total": total,
+                    "completed": (_completed["c"] if _completed else 0),
+                    "rate": round((_completed["c"] or 0) / max(total, 1) * 100, 1),
+                    "running": len(running) if running else _running["c"] if _running else 0,
+                    "by_status": {r["status"]: r["c"] for r in _st_rows},
+                }
+                _mf = Path.home() / ".hermes" / "state" / "workflow-metrics.jsonl"
+                _mf.parent.mkdir(parents=True, exist_ok=True)
+                with _mf.open("a") as f:
+                    f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
         except Exception as _e:
             LOGGER.error("heal_stalled failed: %s", _e)
 
