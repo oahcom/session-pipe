@@ -12,6 +12,7 @@ Workflow Daemon — 驱动工作流引擎，主动推进工作流步骤。
 sys.path 由 paths.py 集中管理，本文件不修改 sys.path。
 """
 
+import fcntl
 import os
 import signal
 import sys
@@ -31,26 +32,31 @@ from pipeflow.engine import WorkflowEngine
 
 INTERVAL = 10  # 秒
 
-_PID_FILE = Path("/tmp/workflow-daemon.pid")
+_LOCK_FILE = Path.home() / ".hermes" / "run" / "workflow-daemon.lock"
+_LOCK_FD = None
 
 
-def _acquire_pid_lock() -> bool:
-    """获取 PID 锁，防止双进程竞争。"""
-    if _PID_FILE.exists():
-        try:
-            old_pid = int(_PID_FILE.read_text())
-            os.kill(old_pid, 0)
-            print(f"[daemon] 已有实例 PID={old_pid} 在运行")
-            return False
-        except (OSError, ValueError):
-            _PID_FILE.unlink(missing_ok=True)
-    _PID_FILE.write_text(str(os.getpid()))
-    return True
+def _acquire_flock() -> bool:
+    """fcntl.flock 互斥锁，防止双进程竞争（不依赖 PID，兼容 WSL2）。"""
+    global _LOCK_FD
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = _LOCK_FILE.open("w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd.write(str(os.getpid()))
+        fd.flush()
+        _LOCK_FD = fd
+        return True
+    except (IOError, OSError):
+        fd.close()
+        old_pid = _LOCK_FILE.read_text().strip() if _LOCK_FILE.exists() else "?"
+        print(f"[daemon] 已有实例在运行 (lock held by pid={old_pid})")
+        return False
 
 
 def daemon_loop(interval: int):
     """守护进程主循环：驱动 engine.run_once 推进所有工作流。"""
-    if not _acquire_pid_lock():
+    if not _acquire_flock():
         sys.exit(1)
 
     eng = WorkflowEngine()
@@ -74,7 +80,10 @@ def daemon_loop(interval: int):
             # NOTE: engine.tick() 是 run_once() 的别名，不再重复调用
             time.sleep(interval)
     finally:
-        _PID_FILE.unlink(missing_ok=True)
+        if _LOCK_FD is not None:
+            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+            _LOCK_FD.close()
+            _LOCK_FILE.unlink(missing_ok=True)
         print("[daemon] 已停止")
 
 
