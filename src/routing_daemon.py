@@ -159,7 +159,7 @@ def main():
                                         d.get("title", "")[:50], ",".join(roles))
                     LOGGER.info("route_all: %d/%d routed", routed_n, total_n)
                 elif total_n:
-                    LOGGER.info("route_all: 0/%d 消费失败或无消费者", total_n)
+                    LOGGER.debug("route_all: 0/%d 无可消费消息或无匹配消费者", total_n)
                 error_backoff = 0
             except Exception as e:
                 LOGGER.error("route_all 异常 (backoff=%ds): %s", error_backoff, e)
