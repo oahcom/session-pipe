@@ -13,12 +13,20 @@ sys.path 由 paths.py 集中管理，本文件不修改 sys.path。
 """
 
 import fcntl
+import logging
 import os
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+LOGGER = logging.getLogger("pipeline.daemon")
 
 # 自愈 sys.path: 从文件位置推导 src/ 路径，支持从任意目录直接执行
 _src = Path(__file__).resolve().parent.parent
@@ -50,7 +58,7 @@ def _acquire_flock() -> bool:
     except (IOError, OSError):
         fd.close()
         old_pid = _LOCK_FILE.read_text().strip() if _LOCK_FILE.exists() else "?"
-        print(f"[daemon] 已有实例在运行 (lock held by pid={old_pid})")
+        LOGGER.warning("已有实例在运行 (lock held by pid=%s)", old_pid)
         return False
 
 
@@ -69,14 +77,14 @@ def daemon_loop(interval: int):
         signal.signal(signal.SIGTERM, _handler)
         signal.signal(signal.SIGINT, _handler)
 
-    print(f"[daemon] Workflow Daemon 启动 PID={os.getpid()}, 间隔 {interval}s")
+    LOGGER.info("Workflow Daemon 启动 PID=%d, 间隔 %ds", os.getpid(), interval)
 
     try:
         while not shutdown:
             try:
                 eng.run_once()
             except Exception as e:
-                print(f"[daemon] run_once 异常: {e}")
+                LOGGER.error("run_once 异常: %s", e, exc_info=True)
             # NOTE: engine.tick() 是 run_once() 的别名，不再重复调用
             time.sleep(interval)
     finally:
@@ -84,7 +92,7 @@ def daemon_loop(interval: int):
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
             _LOCK_FD.close()
             _LOCK_FILE.unlink(missing_ok=True)
-        print("[daemon] 已停止")
+        LOGGER.info("Workflow Daemon 已停止")
 
 
 if __name__ == "__main__":
