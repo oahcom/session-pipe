@@ -123,7 +123,7 @@ class WorkflowEngine:
                         print(f"  [wf] 警告: {f.name} 质量检查不通过:")
                         for _e in _vr.errors[:4]:
                             print(f"        - {_e}")
-                except Exception:
+                except (ValueError, KeyError, TypeError):
                     LOGGER.debug("workflow meta validation failed for %s", f.name)
                 self._workflows[data["name"]] = WorkflowDef(
                     name=data["name"], title=data.get("title", ""),
@@ -168,7 +168,7 @@ class WorkflowEngine:
                         continue
                     try:
                         steps.append(Step(**s_clean))
-                    except Exception:
+                    except (ValueError, KeyError, TypeError):
                         continue
                 if not steps:
                     continue
@@ -238,7 +238,7 @@ class WorkflowEngine:
                 "FROM workflow_instances WHERE instance_id=?", (wid,)
             )
             row = rows[0] if rows else None
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             row = None
         if not row:
             return {"error": "不存在"}
@@ -254,7 +254,7 @@ class WorkflowEngine:
                 "SELECT status FROM workflow_instances WHERE instance_id=?", (wid,)
             )
             row = rows[0] if rows else None
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             row = None
         if not row or row["status"] in ("completed", "cancelled", "failed"):
             return False
@@ -339,7 +339,7 @@ class WorkflowEngine:
         lm = self._lifecycle
         try:
             lm.ping()
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             LOGGER.debug("lifecycle ping failed during run_once")
         try:
             rows = lm.query(
@@ -398,8 +398,7 @@ class WorkflowEngine:
                     ws_dir = Path.home() / "ccs-workspaces" / step.target_role
                     ws_dir.mkdir(parents=True, exist_ok=True)
                     tasks_file = ws_dir / "TASKS.md"
-                    if not tasks_file.exists():
-                        tasks_file.write_text(f"# 当前任务\n\n## 标题\n{task_title}\n\n## 描述\n{task_desc or task_title}\n\n## 工作流\n{wf_name} — 步骤 {step.id}: {step.title}\n", encoding="utf-8")
+                    tasks_file.write_text(f"# 当前任务\n\n## 标题\n{task_title}\n\n## 描述\n{task_desc or task_title}\n\n## 工作流\n{wf_name} — 步骤 {step.id}: {step.title}\n", encoding="utf-8")
                     prompt = prompt.replace("{workspace_summary}", self._collect_workspace_summary(Path.home() / "ccs-workspaces" / step.target_role) if hasattr(self,'_collect_workspace_summary') else "")
                     self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 标记已通知
@@ -436,6 +435,31 @@ class WorkflowEngine:
 
 
         self._scan_tasks()
+
+        # 报告当前工作流概况（仅活跃时）
+        try:
+            lm = self._lifecycle
+            summary = lm.query(
+                "SELECT status, COUNT(*) as cnt FROM workflow_instances GROUP BY status"
+            )
+            active_statuses = {"pending", "running", "step_done_ready"}
+            active_rows = [r for r in summary if r["status"] in active_statuses]
+            if active_rows:
+                parts = [f"{r['status']}={r['cnt']}" for r in active_rows]
+                LOGGER.info("workflow 概况: %s", ", ".join(parts))
+                # 逐条列出运行中的 workflow 进度
+                runs = lm.query(
+                    "SELECT instance_id, template_id, current_step_id, assignee, created_at "
+                    "FROM workflow_instances WHERE status IN ('running','pending','step_done_ready')"
+                )
+                for wf in runs:
+                    LOGGER.info("wf %s [%s] → %s step=%s (创建于 %s)",
+                                wf["instance_id"][:8], wf["template_id"][:30],
+                                wf["assignee"] or "?", wf["current_step_id"],
+                                wf["created_at"][:16] if wf.get("created_at") else "?")
+        except Exception:
+            pass
+
         # 角色停滞保护：检测有积压 task 但无 progress 的角色
         try:
             self._kick_stalled_roles()
@@ -504,11 +528,11 @@ class WorkflowEngine:
                     _sf = _sdata.get("subflow_id", "")
                     if _sf:
                         _st = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
-                        if not _st or _st["status"] != "completed":
+                        if not _st or _st['status'] not in ('completed', 'step_done_ready'):
                             _all_subs_done = False
                             break
                 if _all_subs_done:
-                    conn.execute("UPDATE workflow_instances SET status='completed' WHERE instance_id=?", (wf_id,))
+                    self.lifecycle.close_wf(wf_id, status='completed')  # ponytail: lifecycle integration point
                     conn.commit()
                     self._bb.write("workflow",
                         f"[workflow] {wf_name} 完成: {len(steps)} 步",
@@ -569,7 +593,7 @@ class WorkflowEngine:
     
     def _tick(self, run: WorkflowRun, step: Step):
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
-        if run.status in ("completed", "cancelled"):
+        if run.status in ('completed', 'cancelled', 'step_done_ready'):
             return
         ec = step.exit_condition
         cat = ec.get("bus_category", "")
@@ -709,7 +733,7 @@ class WorkflowEngine:
                 try:
                     self._bb.write("code_fix", f"pipeflow: DB write+rollback 双重失败 wf={wf_id}",
                                    evidence=f"write_err={_e}, rollback_err={_e2}", src="pipeflow")
-                except Exception:
+                except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail in _sync_step_results fallback")
 
     def _validate_exit_schema(self, step: Step, run: WorkflowRun) -> tuple[bool, list[str]]:
@@ -827,7 +851,7 @@ class WorkflowEngine:
                 return False
             cmd = r.stdout.strip().split("\n")[0]
             return cmd in ("claude", "claude-code", "python3", "python")
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             return False
 
     def _ensure_role_alive(self, role: str) -> bool:
@@ -869,7 +893,7 @@ class WorkflowEngine:
                     time.sleep(3)  # 等 agent 进程启动
                     if self._is_agent_alive(role):
                         return True
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             LOGGER.debug("CCS role alive check failed for %s", role)
         return False
 
@@ -893,7 +917,7 @@ class WorkflowEngine:
                 if prev != digest:
                     return True
             cs_path.write_text(digest)
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             pass
         return False
 
@@ -903,7 +927,7 @@ class WorkflowEngine:
         try:
             if cs_path.exists():
                 cs_path.unlink()
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             pass
 
     def _send_to_role(self, role: str, prompt: str,
@@ -911,7 +935,7 @@ class WorkflowEngine:
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
         self._ensure_role_alive(role)
         # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
-        if not prompt.startswith("/goal"):
+        if not prompt.startswith(("/goal", "/GOAL", "/Goal")):
             prompt = "/goal " + prompt
         # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
         if wf_id:
@@ -929,7 +953,7 @@ class WorkflowEngine:
                         f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
                         f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n",
                         encoding="utf-8")
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 pass
         # 超时/告警通知走 blocker 而非 task_spec，防止 coordinator 误认为新任务
         _is_warning = any(kw in prompt for kw in ["持续超时", "异常", "超时自动回收"])
@@ -946,7 +970,7 @@ class WorkflowEngine:
                  "--from", "workflow_engine"],
                 capture_output=True, timeout=30,
             )
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             try:
                 ccs_cli = Path.home() / "session-launcher" / "src" / "ccs.py"
                 _sp.run(
@@ -958,7 +982,7 @@ class WorkflowEngine:
                 try:
                     self._bb.write("code_fix", "pipeflow: fallback CCS send failed role=" + role,
                                    evidence=str(_e)[:200], src="pipeflow")
-                except Exception:
+                except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail after fallback CCS send")
 
     def _write_step_prompt(self, run: WorkflowRun, step: Step, extra_prompt: str = ""):
@@ -1089,7 +1113,7 @@ class WorkflowEngine:
                 _mf.parent.mkdir(parents=True, exist_ok=True)
                 with _mf.open("a") as f:
                     f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 pass
         except Exception as _e:
             LOGGER.error("heal_stalled failed: %s", _e)
@@ -1099,14 +1123,14 @@ class WorkflowEngine:
         lm = self._lifecycle
         try:
             lm.ping()
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             LOGGER.debug("lifecycle ping failed during _scan_tasks")
         try:
             conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
             rows = conn.execute(
                 "SELECT DISTINCT t.task_id, t.status FROM tasks t "
                 "JOIN workflow_instances wi ON t.task_id = wi.task_id "
-                "WHERE t.status NOT IN ('completed', 'failed', 'cancelled')"
+                "WHERE t.status NOT IN ('completed', 'failed', 'cancelled', 'step_done_ready')"
             ).fetchall()
             for row in rows:
                 task_id = row["task_id"]
@@ -1133,7 +1157,7 @@ class WorkflowEngine:
                     _sf = _sdata.get("subflow_id", "")
                     if _sf:
                         _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
-                        if _sub_status and _sub_status["status"] == "completed":
+                        if _sub_status and _sub_status['status'] in ('completed', 'step_done_ready'):
                             _sdata["status"] = "completed"
                             _sdata["completed_at"] = time.time()
                             conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
@@ -1153,7 +1177,7 @@ class WorkflowEngine:
             try:
                 self._bb.write("code_fix", f"pipeflow: _scan_tasks 异常",
                                evidence=str(_e), src="pipeflow")
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 LOGGER.debug("bus write fail in _scan_tasks error handler")
 
 
