@@ -436,22 +436,22 @@ class WorkflowEngine:
 
         self._scan_tasks()
 
-        # 报告当前工作流概况（仅活跃时）
+        # 报告当前工作流概况（仅在有活跃 workflow 时）
         try:
             lm = self._lifecycle
-            summary = lm.query(
-                "SELECT status, COUNT(*) as cnt FROM workflow_instances GROUP BY status"
+            runs = lm.query(
+                "SELECT instance_id, template_id, current_step_id, assignee, created_at "
+                "FROM workflow_instances WHERE status IN ('running','pending','step_done_ready')"
             )
-            active_statuses = {"pending", "running", "step_done_ready"}
-            active_rows = [r for r in summary if r["status"] in active_statuses]
-            if active_rows:
-                parts = [f"{r['status']}={r['cnt']}" for r in active_rows]
-                LOGGER.info("workflow 概况: %s", ", ".join(parts))
-                # 逐条列出运行中的 workflow 进度
-                runs = lm.query(
-                    "SELECT instance_id, template_id, current_step_id, assignee, created_at "
-                    "FROM workflow_instances WHERE status IN ('running','pending','step_done_ready')"
+            if runs:
+                # 先输出总数摘要
+                summary = lm.query(
+                    "SELECT status, COUNT(*) as cnt FROM workflow_instances GROUP BY status"
                 )
+                total = sum(r["cnt"] for r in summary)
+                parts = [f"{r['status']}={r['cnt']}" for r in summary]
+                LOGGER.info("workflow 概况: %d 个 — %s", total, ", ".join(parts))
+                # 逐条列出活跃 workflow 进度
                 for wf in runs:
                     LOGGER.info("wf %s [%s] → %s step=%s (创建于 %s)",
                                 wf["instance_id"][:8], wf["template_id"][:30],
