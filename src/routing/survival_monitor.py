@@ -284,7 +284,7 @@ class SurvivalMonitor:
                 ["tmux", "kill-session", "-t", tmux_name],
                 capture_output=True, timeout=5,
             )
-            LOGGER.info("[survival] 清理 ORPHAN session: %s", role)
+            LOGGER.debug("[survival] 清理 ORPHAN session: %s", role)
         except (subprocess.TimeoutExpired, FileNotFoundError):
             LOGGER.debug("[survival] ORPHAN session 不存在: %s", tmux_name)
         try:
