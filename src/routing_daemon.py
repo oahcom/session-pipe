@@ -22,13 +22,13 @@ import config_loader  # noqa: F401 (caches correct version in sys.modules)
 
 from routing.auto import route_all, route_all_to_ccs, health_check
 from reliability import setup_logging, LOGGER, METRICS
+from paths import CCS_SENTINEL_DIR as SENTINEL_DIR
 
-SENTINEL_DIR = Path("/tmp/ccs-sentinels")
 INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔
 EVAL_INTERVAL = 600 # eval_criteria 检查间隔（每 10 分钟）
 SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
-CRON_SCHEDULE_TRACKER = Path("/tmp/cron_schedule_triggered.json")  # 去重跟踪
+CRON_SCHEDULE_TRACKER = Path.home() / ".hermes" / "run" / "cron_schedule_triggered.json"  # 去重跟踪
 
 
 def _any_live_targets() -> bool:
@@ -126,7 +126,7 @@ def main():
     last_survival = 0
 
     # ── 单实例 PID 锁 ──
-    _pid_file = Path(f"/tmp/routing_daemon.pid")
+    _pid_file = Path.home() / ".hermes" / "run" / "routing_daemon.pid"
     _pid_lock_fd = open(_pid_file.with_suffix(".lock"), "w")
     try:
         fcntl.flock(_pid_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -140,6 +140,7 @@ def main():
     _run_eval = None
 
     try:
+        error_backoff = 0
         while True:
             if not _any_live_targets():
                 LOGGER.warning("无存活 CCS 目标，休眠 300s")
@@ -148,10 +149,22 @@ def main():
 
             try:
                 r = route_all()
-                LOGGER.info("route_all: %d/%d routed", r.get("routed", 0), r.get("total", 0))
+                routed_n, total_n = r.get("routed", 0), r.get("total", 0)
+                if routed_n:
+                    for d in r.get("details", []):
+                        roles = [a["role"] for a in d.get("assigned", []) if a.get("status") == "consumed"]
+                        if roles:
+                            LOGGER.info("route → [%s] #%d %s → %s",
+                                        d.get("category", "?"), d.get("id", 0),
+                                        d.get("title", "")[:50], ",".join(roles))
+                    LOGGER.info("route_all: %d/%d routed", routed_n, total_n)
+                elif total_n:
+                    LOGGER.info("route_all: 0/%d 消费失败或无消费者", total_n)
+                error_backoff = 0
             except Exception as e:
-                LOGGER.error("route_all 异常: %s", e)
+                LOGGER.error("route_all 异常 (backoff=%ds): %s", error_backoff, e)
                 METRICS.inc("daemon_errors_total")
+                error_backoff = min(error_backoff + 5, 120)
 
             now = time.time()
 
@@ -159,10 +172,19 @@ def main():
             if now - last_ccs >= CCS_INTERVAL:
                 try:
                     r = route_all_to_ccs()
-                    LOGGER.info("route_all_to_ccs: %d/%d routed", r.get("routed", 0), r.get("total", 0))
+                    ccs_routed = r.get("routed", 0)
+                    ccs_total = r.get("total", 0)
+                    if ccs_routed:
+                        for d in r.get("details", []):
+                            LOGGER.info("ccs-route [%s] #%d → %s",
+                                        d.get("category", "?"), d.get("id", 0),
+                                        ",".join(d.get("assigned", [])))
+                    LOGGER.info("route_all_to_ccs: %d/%d routed", ccs_routed, ccs_total)
+                    error_backoff = 0
                 except Exception as e:
-                    LOGGER.error("route_all_to_ccs 异常: %s", e)
+                    LOGGER.error("route_all_to_ccs 异常 (backoff=%ds): %s", error_backoff, e)
                     METRICS.inc("daemon_errors_total")
+                    error_backoff = min(error_backoff + 5, 120)
                 try:
                     _check_cron_schedules()
                 except Exception as e:
@@ -180,8 +202,11 @@ def main():
                         _run_eval = lambda: {"checked": 0}
                 try:
                     r = _run_eval()
-                    LOGGER.info("eval_check: %d 条通过 / %d 条失败",
-                               r.get("passed", 0), r.get("failed", 0))
+                    if r.get("failed", 0):
+                        LOGGER.warning("eval_check 失败: %d/%d 未通过 (blockers=%d, notices=%d)",
+                                      r["failed"], r["checked"], r.get("blockers", 0), r.get("notices", 0))
+                    elif r.get("passed", 0):
+                        LOGGER.info("eval_check: %d/%d 通过 ✓", r["passed"], r["checked"])
                 except Exception as e:
                     LOGGER.error("eval_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
@@ -206,7 +231,7 @@ def main():
                     METRICS.inc("daemon_errors_total")
                 last_survival = now
 
-            time.sleep(INTERVAL)
+            time.sleep(INTERVAL + error_backoff)
     finally:
         try:
             _pid_lock_fd.close()

@@ -18,10 +18,13 @@ try:
     from paths import CCS_SENTINEL_DIR as SENTINEL_DIR, SESSION_ROLES_ROOT
     _ROLES_ROOT = SESSION_ROLES_ROOT
 except ImportError:
-    SENTINEL_DIR = Path("/tmp/ccs-sentinels")
+    SENTINEL_DIR = Path("~/.hermes/run/ccs-sentinels")
     _ROLES_ROOT = Path.home() / "hermes-session-roles"
 PERSONAS_DIR = _ROLES_ROOT / "personas" / "session-roles"
-BUS_SCRIPT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
+BUS_SCRIPT = Path(os.environ.get(
+    "BUS_CLIENT",
+    str(Path.home() / ".hermes" / "scripts" / "bus_client.py"),
+))
 ROUTER_URL = os.environ.get("ROUTER_URL", "localhost:20128")
 
 # ── 角色 output_targets 缓存 ──
@@ -42,7 +45,7 @@ def _load_role_targets() -> dict[str, list[str]]:
                 name = d.get("name", f.stem)
                 cats = set()
                 for t in d.get("output_targets", []):
-                    m = __import__("re").search(r'cat=(\w+)', t)
+                    m = re.search(r'cat=(\w+)', t)
                     if m:
                         cats.add(m.group(1))
                 if cats:
@@ -94,6 +97,7 @@ class SurvivalMonitor:
         now = time.time()
 
         # 信号 1: tmux pane 最后活动时间
+        # pane_activity = 0 表示 pane 从未活跃（tmux 返回 0），等同于无数据
         last_activity = 0.0
         try:
             r = subprocess.run(
@@ -101,9 +105,12 @@ class SurvivalMonitor:
                 capture_output=True, text=True, timeout=3,
             )
             if r.returncode == 0 and r.stdout.strip():
-                last_activity = float(r.stdout.strip().split("\n")[-1])
+                val = r.stdout.strip().split("\n")[0]
+                if val and val != "0":
+                    last_activity = float(val)
         except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
             LOGGER.debug("tmux pane activity check failed for %s", role)
+        # last_activity == 0 表示无数据（非 epoch 0），标记为 unknown(-1)
         pane_age = now - last_activity if last_activity > 0 else -1
 
         # 信号 2: 9Router token 消耗（最近 2 分钟）
@@ -120,9 +127,13 @@ class SurvivalMonitor:
             LOGGER.debug("L2 token check failed for %s: %s", role, e)
 
         # 综合判断
+        # pane_age == -1 时仅依赖 token；两项均未知时退化为 unknown 而非 stale
         pane_active = pane_age >= 0 and pane_age < 300
         has_token = tokens_2m > 0
-        thinking = has_token or pane_active
+        if pane_age < 0 and not has_token:
+            thinking = None  # 两项均未知，让调用方用 L3 fallback
+        else:
+            thinking = has_token or pane_active
 
         return {
             "last_activity_epoch": last_activity,
@@ -206,8 +217,16 @@ class SurvivalMonitor:
             return "orphan"
         if l1.get("status") != "ALIVE":
             return "unknown"
+        # thinking=None（两项信号均未知）→ 跳过 L2，让 L3 bus 产出定结论
         if l2.get("thinking") is False:
             return "stale"
+        # L2 不确定时看 L3——如果最近有 bus 产出，仍算 healthy
+        if l2.get("thinking") is None:
+            if l3.get("producing") is True:
+                return "healthy"
+            if l3.get("producing") is False:
+                return "idle"
+            return "unknown"  # 两项信号均无数据
         if l3.get("producing") is False:
             return "idle"
         return "healthy"
@@ -296,7 +315,7 @@ class SurvivalMonitor:
             l1 = self._l1_check(role)
             l2 = (self._l2_check(role) if l1["status"] == "ALIVE"
                   and now - prev.get("l2_ts", 0) > 120 else prev.get("l2", {}))
-            l3 = (self._l3_check(role) if l2.get("thinking")
+            l3 = (self._l3_check(role) if l2.get("thinking") is not False
                   and now - prev.get("l3_ts", 0) > 300 else prev.get("l3", {}))
             overall = self._overall(l1, l2, l3)
             result = {
@@ -339,8 +358,11 @@ class SurvivalMonitor:
                 result["dead_checks_since"] = 0
 
         stalled = [r for r, h in results.items() if h["overall"] in ("stale", "dead")]
+        orphaned = [r for r, h in results.items() if h.get("overall") == "orphan"]
         if stalled:
-            LOGGER.warning("存活告警: %s", stalled)
-        LOGGER.info("survival tick: %d roles, %d stalled",
-                     len(results), len(stalled))
+            LOGGER.warning("存活告警 stale/dead: %s", stalled)
+        if orphaned and len(orphaned) <= 3:
+            LOGGER.debug("orphan sessions (已清理): %s", orphaned)
+        LOGGER.debug("survival tick: %d roles, %d stale/dead, %d orphan",
+                     len(results), len(stalled), len(orphaned))
         return results

@@ -79,13 +79,17 @@ def daemon_loop(interval: int):
 
     LOGGER.info("Workflow Daemon 启动 PID=%d, 间隔 %ds", os.getpid(), interval)
 
+    idled = 0
     try:
         while not shutdown:
             try:
                 eng.run_once()
+                idled = 0
             except Exception as e:
                 LOGGER.error("run_once 异常: %s", e, exc_info=True)
-            # NOTE: engine.tick() 是 run_once() 的别名，不再重复调用
+                idled += 1
+                if idled % 10 == 0:
+                    LOGGER.error("连续失败 %d 轮，最后异常: %s", idled, e)
             time.sleep(interval)
     finally:
         if _LOCK_FD is not None:
