@@ -33,6 +33,16 @@ class WorkflowClient:
         self.close()
         return False
 
+    _TASK_COLUMNS_CACHE: dict[str, set[str]] = {}
+
+    def _get_task_columns(self) -> set[str]:
+        db_key = str(self.db_path) if self.db_path else ""
+        if db_key not in self._TASK_COLUMNS_CACHE:
+            self._TASK_COLUMNS_CACHE[db_key] = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+        return self._TASK_COLUMNS_CACHE[db_key]
+
     def _log(self, wf_id: str = None, task_id: str = None,
              action: str = "", detail: str = ""):
         self._conn.execute(
@@ -92,6 +102,13 @@ class WorkflowClient:
                 f"标题 '{title[:40]}' 是占位符，不会产生实际收益。"
                 f"请提供有描述性的任务标题（≥8字符，描述具体做什么）"
             )
+        # 去重防御：同一角色同一标题 5 分钟内不重复创建
+        dup = self._conn.execute(
+            "SELECT 1 FROM tasks WHERE assignee=? AND title=? AND created_at > ? LIMIT 1",
+            (assignee, title, time.time() - 300)
+        ).fetchone()
+        if dup:
+            raise ValueError(f"重复任务: assignee={assignee} title='{title[:40]}' 已在 5 分钟内创建过")
         # 自动选择模板: 未指定时按任务标题 + 发起角色 + bus 分类匹配
         if not template_id:
             from template_registry import TemplateRegistry
@@ -123,7 +140,7 @@ class WorkflowClient:
         import subprocess
         task_id = f"task_{uuid.uuid4().hex[:8]}"
         now = time.time()
-        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        cols = self._get_task_columns()
         if template_id and "template_id" in cols:
             self._conn.execute("""
                 INSERT OR IGNORE INTO tasks (task_id, title, description, assigner, assignee,
@@ -226,9 +243,7 @@ class WorkflowClient:
         task = self.get_task(task_id)
         if not task:
             return False
-        if task['assigner'] == self.role:
-            return False
-        if task.get('assignee') and task['assignee'] != self.role:
+        if task['assigner'] != self.role and self.role != 'system':
             return False
         self._log(task_id=task_id, action="deleted")
         self._conn.execute("DELETE FROM workflow_instances WHERE task_id=?", (task_id,))
