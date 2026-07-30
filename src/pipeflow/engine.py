@@ -314,9 +314,9 @@ class WorkflowEngine:
                             "UPDATE workflow_instances SET status='cancelled' WHERE instance_id=?",
                             (wf_id,)
                         )
-                        self._bb.write("blocker",
-                            f"[workflow] 自动回收僵尸: {tpl}/{wf_id} — {reason}",
-                            src="pipeflow_daemon")
+                        self._notify_role("maintainer",
+                            f"僵尸工作流自动回收: {tpl}/{wf_id}",
+                            f"原因: {reason}\n请排查该工作流为何没有正常完成。")
                     except Exception as e:
                         LOGGER.debug("stale cleanup write failed: %s", e)
             LOGGER.info("stale cleanup done")
@@ -634,10 +634,9 @@ class WorkflowEngine:
                     self._lifecycle.close_wf(run.id, status="cancelled")
                 except Exception as _e:
                     LOGGER.warning("auto-cancel close_wf failed: %s", _e)
-                self._bb.write("blocker",
-                    f"[workflow] 超时自动回收: {run.workflow_name}/{run.id} "
-                    f"(timeout_count={timeout_count} >= {_auto_cancel_at})",
-                    src="workflow_engine")
+                self._notify_role("maintainer",
+                    f"工作流超时自动回收: {run.workflow_name}/{run.id}",
+                    f"step={run.current_step} timeout_count={timeout_count} >= {_auto_cancel_at}\n请排查该步骤为何持续超时。")
                 return
             # 每次超时都重新推送任务（之前只通知 coordinator，角色从未收到重推）
             self._send_to_role(step.target_role, step.prompt_template,
@@ -931,9 +930,49 @@ class WorkflowEngine:
         except (ValueError, KeyError, TypeError):
             pass
 
+    def _is_role_busy(self, role: str, exclude_wf_id: str = "") -> bool:
+        """检查角色是否已有其他 workflow 的活跃步骤（notified/running，超时<3次）。"""
+        try:
+            rows = self._lifecycle.query(
+                "SELECT instance_id, step_results FROM workflow_instances "
+                "WHERE assignee=? AND status='running' AND instance_id!=?",
+                (role, exclude_wf_id)
+            )
+            for r in rows:
+                sr = json.loads(r["step_results"] or "{}")
+                for _sid, sdata in sr.items():
+                    if not isinstance(sdata, dict):
+                        continue
+                    if sdata.get("status") in ("notified", "running"):
+                        if sdata.get("timeout_count", 0) < 3:
+                            LOGGER.info("skip: %s busy with %s/%s (step=%s)",
+                                        role, r["instance_id"][:8], _sid, sdata.get("status"))
+                            return True
+            return False
+        except Exception:
+            return False
+
+    def _notify_role(self, role: str, title: str, evidence: str):
+        """告警通知：写 blocker bus + ccs send 唤醒角色（绕过并发检查）。"""
+        self._bb.write("blocker", title, evidence=evidence, src="workflow_engine")
+        try:
+            _sp.run(
+                ["python3", str(_CCS_CLI), "send", role,
+                 f"[workflow 告警] {title}\n\n{evidence}",
+                 "--from", "workflow_engine"],
+                capture_output=True, timeout=15,
+            )
+        except Exception:
+            pass
+
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = ""):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
+        # 并发保护：角色已有一个不同 workflow 的活跃步骤时，跳过推送
+        if wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
+            LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
+                        role, wf_id[:12], step_id)
+            return
         self._ensure_role_alive(role)
         # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
         if not prompt.startswith(("/goal", "/GOAL", "/Goal")):
@@ -1071,13 +1110,13 @@ class WorkflowEngine:
                     if _tc >= _mr + 1:
                         timed_out_steps += 1
                 if timed_out_steps >= 2 and not _escalated:
-                    self._bb.write("blocker",
-                        f"[anomaly] {inst['instance_id']} has {timed_out_steps} steps exhausted retries",
-                        src="workflow_engine")
+                    self._notify_role("maintainer",
+                        f"工作流多步骤超时: {inst['instance_id'][:12]}",
+                        f"{timed_out_steps} 个步骤已耗尽重试次数，当前步骤={inst.get('current_step_id','?')} 角色={inst.get('assignee','?')}")
                 if timed_out_steps >= 3:
-                    self._bb.write("blocker",
-                        f"[anomaly] {inst['instance_id']} exhausted {timed_out_steps} steps, healing",
-                        src="workflow_engine")
+                    self._notify_role("maintainer",
+                        f"工作流多步骤超限自愈: {inst['instance_id'][:12]}",
+                        f"{timed_out_steps} 个步骤全部超限，正在强制重推，检查是否需人工介入。")
                     _role = inst.get("assignee", "")
                     _sid = inst.get("current_step_id", "")
                     if _role:
@@ -1173,6 +1212,16 @@ class WorkflowEngine:
 
             conn.commit()
             self._check_anomalies()
+            # ponytail: 动态任务生成——每轮 run_once 检查一次每个角色是否需要新任务
+            self._generate_tasks_from_state()
+            # ponytail: 任务质量反馈闭环——每轮 run_once 评估最近完成的任务并写入 bus
+            try:
+                from task_evidence import evaluate_and_feedback
+                _feed = evaluate_and_feedback()
+                if _feed.get("evaluated", 0):
+                    LOGGER.info("task-evidence: evaluated %d completed tasks", _feed["evaluated"])
+            except Exception as _e:
+                LOGGER.debug("task_evidence feedback failed: %s", _e)
         except Exception as _e:
             LOGGER.exception("_scan_tasks 异常")
             try:
@@ -1180,6 +1229,93 @@ class WorkflowEngine:
                                evidence=str(_e), src="pipeflow")
             except (ValueError, KeyError, TypeError):
                 LOGGER.debug("bus write fail in _scan_tasks error handler")
+
+    _TASK_GEN_COOLDOWN: dict[str, float] = {}  # role → last gen ts
+
+    def _generate_tasks_from_state(self):
+        """从工作流模板为空闲角色自动生成任务。
+
+        每轮 run_once 末尾运行，检测当前 DB 中无 running/pending 任务的角色，
+        从加载的模板中选择最匹配的生成一个 task_spec 写入 bus。
+
+        # 防重复机制
+        - 每个角色每 600s 最多生成 1 个任务
+        - 已有 running/pending workflow 的角色跳过
+        - 生成标题描述性（≥12字符），非占位符
+        """
+        _lock = getattr(self, '_TASK_GEN_COOLDOWN', {})
+        _now = time.time()
+        _COOLDOWN_S = 600  # 10 min
+
+        # 1) 哪些角色已有 running/pending 任务
+        try:
+            _busy_roles = set()
+            for _r in self._lifecycle.query(
+                "SELECT DISTINCT assignee FROM workflow_instances "
+                "WHERE status IN ('running','pending','step_done_ready')"
+            ):
+                _busy_roles.add(_r['assignee'])
+        except Exception:
+            return
+
+        # 2) 遍历模板，为每个有模板但空闲的角色生成任务
+        _tasks_added = 0
+        for _wf_name, _wf in self._workflows.items():
+            if not _wf.steps or not _wf.allowed_executors:
+                continue
+            # 取第一个 executor 作为目标角色
+            _role = _wf.allowed_executors[0]
+            if _role in _busy_roles:
+                continue
+            if not self._can_assign_role(_role):
+                continue
+            # cooldown 检测
+            _last = _TASK_GEN_COOLDOWN.get(_role, 0)
+            if _now - _last < _COOLDOWN_S:
+                continue
+
+            # 3) 组装有描述性的任务标题
+            _title = f"[auto] {_wf.title or _wf_name}: {_wf.description[:40]}" if _wf.description else f"[auto] 执行 {_wf_name} 工作流"
+            if len(_title) < 12:
+                continue  # 跳过标题过短
+            _prompt = (
+                f"/goal\n\n"
+                f"## 任务\n执行工作流模板 {_wf_name}\n\n"
+                f"## 描述\n{_wf.description}\n\n"
+                f"## 步骤\n"
+            )
+            for _s in _wf.steps:
+                _prompt += f"  {_s.id}: {_s.title}\n"
+            if _wf.quality_standards:
+                _prompt += f"\n## 质量标准\n{_wf.quality_standards}\n"
+
+            # 4) 写 bus task_spec（路由 daemon 自动消费 → 创建 workflow）
+            try:
+                self._bb.write("task_spec",
+                    f"needs_implementation @{_role} {_title[:80]}",
+                    evidence=_prompt, src="workflow_engine")
+                LOGGER.info("auto-task: %s → %s (%s)", _role, _title[:60], _wf_name)
+                _TASK_GEN_COOLDOWN[_role] = _now
+                _tasks_added += 1
+                if _tasks_added >= 3:
+                    break  # 每轮最多创建 3 个任务，防止 flood
+            except Exception as _e:
+                LOGGER.debug("auto-task gen failed for %s: %s", _role, _e)
+
+        if _tasks_added:
+            LOGGER.info("auto-task: 本轮生成 %d 个新任务", _tasks_added)
+
+    def _can_assign_role(self, role: str) -> bool:
+        """检查角色是否可分配任务（排除系统角色和已停止的）。"""
+        _skip = {"coordinator", "pipeline", "claude", "workflow_engine", ""}
+        if role in _skip:
+            return False
+        try:
+            _r = _sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
+                         capture_output=True, timeout=5)
+            return _r.returncode == 0
+        except Exception:
+            return False
 
 
 def main():
