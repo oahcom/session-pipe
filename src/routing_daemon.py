@@ -11,18 +11,24 @@ routing_daemon.py — 路由分发 daemon，定期轮询 bus 未消费消息并�
   本 daemon = 消息路由分发（bus → 角色）
   workflow daemon = 工作流步骤推进（engine.run_once）
 """
-import fcntl, json, os, sys, time
+import fcntl, importlib, importlib.util, json, os, sys, time
 from pathlib import Path
-# Ensure pipeline src is first in sys.path (overrides .pth file adding .hermes/scripts)
+# Ensure pipeline src is first in sys.path
 _PIPELINE_SRC = str(Path(__file__).resolve().parent)
 if _PIPELINE_SRC not in sys.path or sys.path[0] != _PIPELINE_SRC:
     sys.path.insert(0, _PIPELINE_SRC)
 # Pre-load pipeline's config_loader before .hermes/scripts shadows it
 import config_loader  # noqa: F401 (caches correct version in sys.modules)
 
+# 使用绝对导入确保读到 pipeline 的 paths（避免被 launcher 的 paths 遮蔽）
+_paths_spec = importlib.util.spec_from_file_location(
+    "pipeline_paths", str(Path(_PIPELINE_SRC) / "paths.py"))
+_paths_mod = importlib.util.module_from_spec(_paths_spec)
+_paths_spec.loader.exec_module(_paths_mod)
+SENTINEL_DIR = _paths_mod.CCS_SENTINEL_DIR
+
 from routing.auto import route_all, route_all_to_ccs, health_check
 from reliability import setup_logging, LOGGER, METRICS
-from paths import CCS_SENTINEL_DIR as SENTINEL_DIR
 
 INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔

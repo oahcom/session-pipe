@@ -13,19 +13,20 @@ _HERMES_SCRIPTS = Path(os.environ.get("HERMES_SCRIPTS_DIR", str(Path.home() / ".
 if str(_HERMES_SCRIPTS) not in sys.path:
     sys.path.insert(1, str(_HERMES_SCRIPTS))
 
-from config_loader import get_config
 from routing import router as _rt_mod
 from paths import CCS_CLI as _CCS_CLI
 from workflow.client import WorkflowClient
 
-from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, GRACEFUL_SHUTDOWN
-from reliability import with_retry, DEFAULT_RETRY, get_last_cursor, set_last_cursor
+from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, set_last_cursor
 from reliability import IDEMPOTENT_CONSUME, ACK_TRACKER
 from output_validator import validate_output
 
 # 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
+# _SYSTEM_CATEGORIES: 跳过 workflow 创建的分类（路由信号）
+# _NON_TASK_CATEGORIES: 跳过路由分发的分类（纯通知/心跳，无任务语义）
 _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker"})
-SYSTEM_CATEGORIES = {"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"}
+_NON_TASK_CATEGORIES = frozenset({"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"})
+SYSTEM_CATEGORIES = _NON_TASK_CATEGORIES  # 向后兼容别名
 
 
 
@@ -121,7 +122,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                 try:
                                     _wc = WorkflowClient(role)
                                     _wc.create_task_v2(assignment.get("title","")[:80],
-                                                       assignee=role, initiator_role="pipeline",
+                                                       assignee=role, initiator_role="",
                                                        bus_category=cat)
                                     _wc.close()
                                 except Exception as _e:
@@ -255,7 +256,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                             "action": "routed", "sent_chars": result.get("sent_chars", 0)})
             # 创建对应角色的工作流实例（按 bus 分类推荐模板）
             _cat = msg.get("category", "")
-            if _cat in SYSTEM_CATEGORIES:
+            if _cat in _NON_TASK_CATEGORIES:
                 LOGGER.debug("Skipping workflow creation for system category %s", _cat)
             else:
                 try:
@@ -267,7 +268,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                         # 消息太短不足以当标题时，构造描述性标题
                         _title = f"[{_cat}] 处理角色 {role_name} 的 {_cat} 任务"
                     _wf = WorkflowClient(role_name)
-                    _wf.create_task_v2(_title, assignee=role_name, initiator_role="pipeline",
+                    _wf.create_task_v2(_title, assignee=role_name, initiator_role="",
                                        bus_category=_cat)
                     _wf.close()
                 except Exception as _e:

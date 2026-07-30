@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """drift_detector.py — 检测角色输出偏离其 output_targets 范围"""
 
+import importlib.util
 import json
 import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# 直接加载 pipeline 的 paths.py，不依赖 sys.path 顺序
+_pipeline_paths = importlib.util.spec_from_file_location(
+    "pipeline_paths", str(Path(__file__).resolve().parent / "paths.py"))
+_pipeline_paths_mod = importlib.util.module_from_spec(_pipeline_paths)
+_pipeline_paths.loader.exec_module(_pipeline_paths_mod)
+CCS_SENTINEL_DIR = _pipeline_paths_mod.CCS_SENTINEL_DIR
+SESSION_ROLES_PERSONAS = _pipeline_paths_mod.SESSION_ROLES_PERSONAS
+
 from bus_protocol import Blackboard
-from paths import CCS_SENTINEL_DIR, SESSION_ROLES_PERSONAS
 
 log = logging.getLogger("drift-detector")
 
