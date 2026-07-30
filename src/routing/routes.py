@@ -24,7 +24,7 @@ from output_validator import validate_output
 # 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
 # _SYSTEM_CATEGORIES: 跳过 workflow 创建的分类（路由信号）
 # _NON_TASK_CATEGORIES: 跳过路由分发的分类（纯通知/心跳，无任务语义）
-_SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker"})
+_SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker", "task_spec"})
 _NON_TASK_CATEGORIES = frozenset({"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"})
 SYSTEM_CATEGORIES = _NON_TASK_CATEGORIES  # 向后兼容别名
 
@@ -119,14 +119,17 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                             if cat in SYSTEM_CATEGORIES:
                                 LOGGER.debug("Skipping workflow creation for system category %s", cat)
                             else:
-                                try:
-                                    _wc = WorkflowClient(role)
-                                    _wc.create_task_v2(assignment.get("title","")[:80],
-                                                       assignee=role, initiator_role="",
-                                                       bus_category=cat)
-                                    _wc.close()
-                                except Exception as _e:
-                                    LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
+                                _t = assignment.get("title", "")
+                                if len(_t) < 80:
+                                    LOGGER.debug("Skipping workflow create: title too short (%d chars) role=%s", len(_t), role)
+                                else:
+                                    try:
+                                        _wc = WorkflowClient(role)
+                                        _wc.create_task_v2(_t[:80], assignee=role,
+                                                           initiator_role="", bus_category=cat)
+                                        _wc.close()
+                                    except Exception as _e:
+                                        LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
                         try:
                             set_last_cursor(consumer, "", fid, instance_id)
                         except Exception as _sc_e:
@@ -264,13 +267,13 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     # 从消息文本提取有意义的标题：取第一段或前 60 字符
                     _title = _raw.split("\n")[0] if _raw else ""
                     _title = _title[:80]
-                    if len(_title) < 8:
-                        # 消息太短不足以当标题时，构造描述性标题
-                        _title = f"[{_cat}] 处理角色 {role_name} 的 {_cat} 任务"
-                    _wf = WorkflowClient(role_name)
-                    _wf.create_task_v2(_title, assignee=role_name, initiator_role="",
-                                       bus_category=_cat)
-                    _wf.close()
+                    if len(_title) < 80:
+                        LOGGER.debug("Skipping workflow create: title too short (%d chars) role=%s", len(_title), role_name)
+                    else:
+                        _wf = WorkflowClient(role_name)
+                        _wf.create_task_v2(_title, assignee=role_name, initiator_role="",
+                                           bus_category=_cat)
+                        _wf.close()
                 except Exception as _e:
                     LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)
         else:
