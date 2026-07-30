@@ -70,6 +70,7 @@ class WorkflowDef:
     max_duration_hours: int = 24
     quality_standards: str = ""
     loop: Optional[dict] = None
+    is_subflow: bool = False  # True = 仅限子工作流调用，不能独立 start
 
 
 @dataclass
@@ -136,6 +137,7 @@ class WorkflowEngine:
                     max_duration_hours=data.get("max_duration_hours", 24),
                     quality_standards=data.get("quality_standards", ""),
                     loop=data.get("loop"),
+                    is_subflow=data.get("is_subflow", False),
                 )
             except Exception as e:
                 print(f"  [wf] 加载 {f.name} 失败: {e}")
@@ -181,16 +183,19 @@ class WorkflowEngine:
                     allowed_executors=json.loads(t.get("allowed_executors") or "[]") if isinstance(t.get("allowed_executors"), str) else (t.get("allowed_executors") or []),
                     max_duration_hours=t.get("max_duration_hours", 24),
                     quality_standards=t.get("quality_standards", ""),
+                    is_subflow=t.get("is_subflow", False),
                 )
         except Exception as e:
             print(f"  [wf] SQLite 模板加载失败: {e}")
 
     def list_workflows(self) -> list[str]:
-        return sorted(self._workflows.keys())
+        return sorted(name for name, wf in self._workflows.items() if not wf.is_subflow)
 
     def start(self, name: str, context: dict = None) -> str:
         wf = self._workflows.get(name)
         if wf:
+            if wf.is_subflow:
+                raise ValueError(f"工作流 {name} 是子工作流模板，不能直接启动")
             if not wf.steps:
                 raise ValueError(f"工作流 {name} 无步骤")
             run_id = f"wf_{uuid.uuid4().hex[:12]}"
@@ -467,6 +472,100 @@ class WorkflowEngine:
         except Exception as _e:
             LOGGER.debug("kick_stalled_roles failed: %s", _e)
 
+        # 上下文溢出检测 → 自动发 /compact
+        try:
+            self._check_context_overflow()
+        except Exception:
+            LOGGER.debug("context overflow check failed")
+
+    # ── 上下文溢出检测 ─────────────────────────────────────────
+    _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
+    _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
+    _last_compact: dict[str, float] = {}
+
+    def _check_context_overflow(self):
+        """检测角色 tmux pane 中 Claude 的上下文溢出信号，自动发 /compact。
+
+        检测两个信号：
+        - "Context limit reached"（Claude 阻塞等待 /compact）
+        - "Context low"（Claude 提示上下文不足）
+
+        覆盖两个来源：
+        - DB 中 running/pending workflow 的角色
+        - 所有实际存在的 ccs-* tmux session（覆盖非 workflow 启动的角色）
+        """
+        roles = set()
+        # 来源1: DB
+        try:
+            for row in self._lifecycle.query(
+                "SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"
+            ):
+                if row["assignee"]:
+                    roles.add(row["assignee"])
+        except Exception:
+            pass
+
+        # 来源2: 实际 tmux 会话（兜底：覆盖手动启动或 DB 查不到的角色）
+        try:
+            r = _sp.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                for name in r.stdout.strip().split("\n"):
+                    name = name.strip()
+                    if name.startswith("ccs-"):
+                        role_name = name[4:]
+                        if role_name:
+                            roles.add(role_name)
+        except Exception:
+            pass
+
+        if not roles:
+            return
+
+        now = time.time()
+        for role in roles:
+            tmux_name = f"ccs-{role}"
+            last = self._last_compact.get(role, 0.0)
+            if now - last < self._OVERFLOW_COOLDOWN:
+                continue
+
+            # 抓最近 500 行输出，搜索 Claude 的上下文溢出信号
+            try:
+                r = _sp.run(
+                    ["tmux", "capture-pane", "-p", "-t", f"{tmux_name}:0.0", "-S", "-500"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except Exception:
+                continue
+            if r.returncode != 0:
+                continue
+            output = r.stdout or ""
+
+            # 信号匹配：Context limit reached / Context low / Context (数字% remaining)
+            has_overflow = (
+                "Context limit reached" in output
+                or "Context low" in output
+                or ("Context" in output and "remaining" in output and "compact" in output.lower())
+            )
+
+            if not has_overflow:
+                continue
+
+            LOGGER.info("上下文溢出: %s 检测到溢出信号，发送 /compact", role)
+            try:
+                _sp.run(
+                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "/compact", "Enter"],
+                    capture_output=True, timeout=5,
+                )
+                self._last_compact[role] = now
+                self._bb.write("architecture",
+                    f"[context_overflow] {role} → /compact",
+                    src="workflow_engine")
+            except Exception as e:
+                LOGGER.warning("compact send failed for %s: %s", role, e)
+
     def _kick_stalled_roles(self):
         """检测有 running workflow 但 steps 停滞超时的角色，重推任务。
 
@@ -483,6 +582,9 @@ class WorkflowEngine:
             for row in rows:
                 _role = row["assignee"]
                 if not _role or _role in ("coordinator",):
+                    continue
+                # 角色已有挂起的任务 → 不打扰
+                if self._role_has_pending_assignment(_role):
                     continue
                 _results = json.loads(row["step_results"] or "{}")
                 _sid = row["current_step_id"]
@@ -648,7 +750,7 @@ class WorkflowEngine:
                     wf_id=run.id, step_id=run.current_step)
             return
 
-        _match_ts = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
+        _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
             run.step_results[step.id] = {
@@ -823,20 +925,22 @@ class WorkflowEngine:
             return False
         return sr.get("status") == expected
 
-    def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> float:
+    def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> tuple:
+        """检查 bus 是否有匹配 exit_condition 的消息。返回 (timestamp, matched_msgs)"""
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         earliest = 0.0
+        matched = []
         for f in facts:
-            # src 匹配：严格匹配——不再允许 claude 通配豁免
             if src_filter and f.src != src_filter:
                 continue
             if text_filter and text_filter not in f.t:
                 continue
             if created_after and f.ts < created_after:
                 continue
+            matched.append({"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src})
             if earliest == 0 or f.ts < earliest:
                 earliest = f.ts
-        return earliest
+        return (earliest, matched)
 
     @staticmethod
     def _is_agent_alive(role: str) -> bool:
@@ -931,6 +1035,35 @@ class WorkflowEngine:
             pass
 
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
+    _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
+
+    def _role_has_pending_assignment(self, role: str) -> bool:
+        """角色是否已被分派过任务且正在执行中。
+
+        查 DB：该角色有 running workflow 的当前步骤是 notified/running 状态
+        且 timeout_count < 3 → 已在工作，不应再发新任务。
+        """
+        try:
+            rows = self._lifecycle.query(
+                "SELECT instance_id, current_step_id, step_results "
+                "FROM workflow_instances "
+                "WHERE assignee=? AND status='running'",
+                (role,)
+            )
+            for r in rows:
+                sr = json.loads(r["step_results"] or "{}")
+                step_id = r["current_step_id"]
+                step_sr = sr.get(step_id, {})
+                status = step_sr.get("status", "")
+                if status in ("notified", "running"):
+                    tc = step_sr.get("timeout_count", 0)
+                    if tc < 3:  # 超时 < 3次 → 角色真的还在工作
+                        LOGGER.debug("skip: %s 已有 pending assignment %s/%s",
+                                     role, r["instance_id"][:8], step_id)
+                        return True
+        except Exception:
+            pass
+        return False
 
     def _is_role_busy(self, role: str, exclude_wf_id: str = "") -> bool:
         """检查角色是否真的在工作。
@@ -939,6 +1072,7 @@ class WorkflowEngine:
           - stale/idle/unknown → 角色不忙，跳过数据库检查直接返回 False
         信号2: workflow_instances 表中是否有该角色的其他活跃步骤（兜底）
         """
+        # 信号1: survival health 文件（直接读，不重跑检测）
         # 信号1: survival health 文件（直接读，不重跑检测）
         try:
             hp = self._HEALTH_DIR / f"{role}.json"
@@ -991,6 +1125,11 @@ class WorkflowEngine:
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = ""):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
+        # 角色已有挂起的任务 / 正在工作中 → 不打扰
+        if self._role_has_pending_assignment(role):
+            LOGGER.info("send-to-role %s 跳过: 已有 pending assignment (wf=%s step=%s)",
+                        role, wf_id[:12] if wf_id else "?", step_id)
+            return
         # 并发保护：角色已有一个不同 workflow 的活跃步骤时，跳过推送
         if wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
@@ -1286,11 +1425,16 @@ class WorkflowEngine:
         for _wf_name, _wf in self._workflows.items():
             if not _wf.steps or not _wf.allowed_executors:
                 continue
+            if _wf.is_subflow:
+                continue
             # 取第一个 executor 作为目标角色
             _role = _wf.allowed_executors[0]
             if _role in _busy_roles:
                 continue
             if not self._can_assign_role(_role):
+                continue
+            # 跳过空模板描述（task_spec needs_implementation → 理解 → 编码 是占位符）
+            if not _wf.description or len(_wf.description.strip()) < 20 or "needs_implementation" in (_wf.description or ""):
                 continue
             # cooldown 检测
             _last = self._TASK_GEN_COOLDOWN.get(_role, 0)
