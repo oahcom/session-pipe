@@ -930,8 +930,31 @@ class WorkflowEngine:
         except (ValueError, KeyError, TypeError):
             pass
 
+    _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
+
     def _is_role_busy(self, role: str, exclude_wf_id: str = "") -> bool:
-        """检查角色是否已有其他 workflow 的活跃步骤（notified/running，超时<3次）。"""
+        """检查角色是否真的在工作。
+
+        信号1: survival monitor 健康文件（survival_monitor.py 每 120s 更新）
+          - stale/idle/unknown → 角色不忙，跳过数据库检查直接返回 False
+        信号2: workflow_instances 表中是否有该角色的其他活跃步骤（兜底）
+        """
+        # 信号1: survival health 文件（直接读，不重跑检测）
+        try:
+            hp = self._HEALTH_DIR / f"{role}.json"
+            if hp.exists():
+                h = json.loads(hp.read_text())
+                overall = h.get("survival_overall", "unknown")
+                # thinking=None（两信号均未知）也算不忙，放行
+                if overall in ("idle", "stale", "dead", "orphan", "unknown"):
+                    return False
+                # healthy: 角色可能在工作，继续信号2确认
+                # stale/l2=false: 角色空闲，放行
+                if h.get("survival_l2_thinking") is False:
+                    return False
+        except Exception:
+            pass  # 健康文件损坏，退化到信号2
+        # 信号2: DB 兜底——角色健康但 workflow 层面已有别的活跃步骤
         try:
             rows = self._lifecycle.query(
                 "SELECT instance_id, step_results FROM workflow_instances "
@@ -1270,7 +1293,7 @@ class WorkflowEngine:
             if not self._can_assign_role(_role):
                 continue
             # cooldown 检测
-            _last = _TASK_GEN_COOLDOWN.get(_role, 0)
+            _last = self._TASK_GEN_COOLDOWN.get(_role, 0)
             if _now - _last < _COOLDOWN_S:
                 continue
 
@@ -1295,7 +1318,7 @@ class WorkflowEngine:
                     f"needs_implementation @{_role} {_title[:80]}",
                     evidence=_prompt, src="workflow_engine")
                 LOGGER.info("auto-task: %s → %s (%s)", _role, _title[:60], _wf_name)
-                _TASK_GEN_COOLDOWN[_role] = _now
+                self._TASK_GEN_COOLDOWN[_role] = _now
                 _tasks_added += 1
                 if _tasks_added >= 3:
                     break  # 每轮最多创建 3 个任务，防止 flood
