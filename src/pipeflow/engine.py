@@ -435,30 +435,30 @@ class WorkflowEngine:
 
 
         self._scan_tasks()
+        LOGGER.debug("run_once: _scan_tasks done, querying workflow status...")
 
-        # 报告当前工作流概况（仅在有活跃 workflow 时）
+        # 报告当前工作流概况
         try:
             lm = self._lifecycle
+            # 总数摘要 — 始终打印，含零
+            summary = lm.query(
+                "SELECT status, COUNT(*) as cnt FROM workflow_instances GROUP BY status"
+            )
+            total = sum(r["cnt"] for r in summary)
+            parts = [f"{r['status']}={r['cnt']}" for r in summary]
+            LOGGER.info("workflow 概况: %d 个 — %s", total, ", ".join(parts))
+            # 逐条列出活跃 workflow 进度
             runs = lm.query(
                 "SELECT instance_id, template_id, current_step_id, assignee, created_at "
                 "FROM workflow_instances WHERE status IN ('running','pending','step_done_ready')"
             )
-            if runs:
-                # 先输出总数摘要
-                summary = lm.query(
-                    "SELECT status, COUNT(*) as cnt FROM workflow_instances GROUP BY status"
-                )
-                total = sum(r["cnt"] for r in summary)
-                parts = [f"{r['status']}={r['cnt']}" for r in summary]
-                LOGGER.info("workflow 概况: %d 个 — %s", total, ", ".join(parts))
-                # 逐条列出活跃 workflow 进度
-                for wf in runs:
-                    LOGGER.info("wf %s [%s] → %s step=%s (创建于 %s)",
-                                wf["instance_id"][:8], wf["template_id"][:30],
-                                wf["assignee"] or "?", wf["current_step_id"],
-                                wf["created_at"][:16] if wf.get("created_at") else "?")
-        except Exception:
-            pass
+            for wf in runs:
+                LOGGER.info("wf %s [%s] → %s step=%s (创建于 %s)",
+                            wf["instance_id"][:8], wf["template_id"][:30],
+                            wf["assignee"] or "?", wf["current_step_id"],
+                            wf["created_at"][:16] if wf.get("created_at") else "?")
+        except Exception as e:
+            LOGGER.warning("workflow 概况查询异常: %s", e, exc_info=True)
 
         # 角色停滞保护：检测有积压 task 但无 progress 的角色
         try:
@@ -532,7 +532,8 @@ class WorkflowEngine:
                             _all_subs_done = False
                             break
                 if _all_subs_done:
-                    self.lifecycle.close_wf(wf_id, status='completed')  # ponytail: lifecycle integration point
+                    LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
+                    self.lifecycle.close_wf(wf_id, status='completed')
                     conn.commit()
                     self._bb.write("workflow",
                         f"[workflow] {wf_name} 完成: {len(steps)} 步",
