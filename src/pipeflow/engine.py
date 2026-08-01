@@ -1013,6 +1013,25 @@ class WorkflowEngine:
                 except Exception as _relax_err:
                     LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
 
+            # 无 bus_category 的步骤不走 exit 匹配（纯超时 + 角色 wf complete 驱动），
+            # 否则空 cat 匹配所有 bus 消息，导致 engine 自产告警被当作角色产出完成步骤。
+            if not cat:
+                return
+            # exit 匹配必须在 timeout 检查之后、return 之前执行，
+            # 否则 notified/running 步骤永远无法通过 exit 条件推进（bus #162804）。
+            _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
+            if _match_ts:
+                run.step_results[step.id] = {
+                    **run.step_results.get(step.id, {}),
+                    "bus_anchor": _match_ts,
+                    "exit_messages": _match_msgs,
+                }
+                self._sync_step_results(run.id, run.step_results)
+                try:
+                    self._lifecycle.complete_step(run.id, step.id)
+                except Exception as _e:
+                    LOGGER.debug("exit-match complete_step 失败: %s", _e)
+                return
             return
 
         # 无 bus_category 的步骤不走 exit 匹配（纯超时 + 角色 wf complete 驱动），
@@ -1151,41 +1170,49 @@ class WorkflowEngine:
 
         for fname, props in schema.get("properties", {}).items():
             fpath = ws / fname
+            # 通配符一次解析：所有检查器共享匹配列表
+            if "*" in fname:
+                import glob as _gl
+                matched = [Path(m) for m in _gl.glob(str(fpath))]
+            else:
+                matched = [fpath] if fpath.exists() else []
+
+            if not matched and fpath.is_dir():
+                matched = []  # minFiles 走单独检查，不混入内容检查
+            elif not matched:
+                # 无匹配且非目录：所有内容检查均失败
+                for prop_key in ("minLength", "mustContain", "mustContainUrl", "checksum", "maxAgeMinutes"):
+                    if prop_key in props:
+                        errs.append(f"缺少产出: {fname}")
+                        break
+                continue
 
             if "minLength" in props:
-                if fpath.exists():
-                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                for mf in matched:
+                    content = mf.read_text(encoding="utf-8", errors="replace")
                     if len(content) < props["minLength"]:
-                        errs.append(f"{fname} 内容不足 ({len(content)}<{props['minLength']})")
-                else:
-                    errs.append(f"缺少产出: {fname}")
+                        errs.append(f"{mf.name} 内容不足 ({len(content)}<{props['minLength']})")
 
             if "mustContain" in props:
-                if fpath.exists():
-                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                for mf in matched:
+                    content = mf.read_text(encoding="utf-8", errors="replace")
                     missing = [kw for kw in props["mustContain"] if kw not in content]
                     if missing:
-                        errs.append(f"{fname} 缺少必需内容: {missing}")
-                else:
-                    errs.append(f"缺少产出: {fname}")
+                        errs.append(f"{mf.name} 缺少必需内容: {missing}")
 
             if "mustContainUrl" in props and props["mustContainUrl"]:
-                if fpath.exists():
-                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                for mf in matched:
+                    content = mf.read_text(encoding="utf-8", errors="replace")
                     if not re.search(r'https?://', content):
-                        errs.append(f"{fname} 缺少 URL 链接 (mustContainUrl)")
-                else:
-                    errs.append(f"缺少产出: {fname}")
+                        errs.append(f"{mf.name} 缺少 URL 链接 (mustContainUrl)")
 
             if "checksum" in props:
                 import hashlib as _hl
-                if fpath.exists():
-                    content = fpath.read_text(encoding="utf-8", errors="replace").encode()
+                for mf in matched:
+                    content = mf.read_text(encoding="utf-8", errors="replace").encode()
                     actual = _hl.md5(content).hexdigest()
                     if actual != props["checksum"]:
-                        errs.append(f"{fname} checksum mismatch: {actual[:8]}≠{props['checksum'][:8]}")
-                else:
-                    errs.append(f"缺少产出: {fname}")
+                        errs.append(f"{mf.name} checksum mismatch: {actual[:8]}≠{props['checksum'][:8]}")
 
             if "minFiles" in props:
                 if fpath.is_dir():
@@ -1205,6 +1232,19 @@ class WorkflowEngine:
                         errs.append(f"{fname} glob 匹配不足 ({len(matches)}<{props['minCount']})")
                 elif fpath.exists():
                     pass  # file exists but no glob → ok
+
+            if "maxAgeMinutes" in props:
+                if fpath.exists():
+                    age_min = (time.time() - fpath.stat().st_mtime) / 60
+                    if age_min > props["maxAgeMinutes"]:
+                        errs.append(f"{fname} 文件过旧 ({age_min:.0f}min > {props['maxAgeMinutes']}min)，疑似非本任务产出")
+                elif "*" in fname:
+                    import glob as _gl
+                    matches = _gl.glob(str(fpath))
+                    for m in matches:
+                        age_min = (time.time() - os.path.getmtime(m)) / 60
+                        if age_min > props["maxAgeMinutes"]:
+                            errs.append(f"{m} 文件过旧 ({age_min:.0f}min > {props['maxAgeMinutes']}min)，疑似非本任务产出")
 
         return (len(errs) == 0, errs)
 
