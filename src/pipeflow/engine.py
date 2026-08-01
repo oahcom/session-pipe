@@ -682,6 +682,9 @@ class WorkflowEngine:
                     LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
                     self._lifecycle.close_wf(wf_id, status='completed')
                     conn.commit()
+                    # 部署自动闭环：把产出 cli/*.py 安装到 ~/.hermes/bin/，让工具可被
+                    # cron/daemon/角色直接调用（"有实际收益"的最后一环——部署）。
+                    self._deploy_production_outputs(wf_id)
                     self._bb.write("workflow",
                         f"[workflow] {wf_name} 完成: {len(steps)} 步",
                         src="workflow_engine")
@@ -738,7 +741,36 @@ class WorkflowEngine:
                     LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
         except Exception as e:
             LOGGER.warning("_advance_production_wf failed %s: %s", wf_id, e)
-    
+
+    def _deploy_production_outputs(self, wf_id: str):
+        """全链路完成后自动部署产出物到 ~/.hermes/bin/。
+
+        扫描 engineer workspace 下的 cli/*.py，复制到生产路径。
+        部署后写 bus cat=code_fix 通知维护者。
+        """
+        try:
+            eng_ws = _CCS_WORKSPACES / "engineer" / "cli"
+            if not eng_ws.exists():
+                return
+            deploy_dir = Path.home() / ".hermes" / "bin"
+            deploy_dir.mkdir(parents=True, exist_ok=True)
+            deployed = []
+            for f in eng_ws.glob("*.py"):
+                if f.name.startswith("_") or f.name.startswith("test_"):
+                    continue
+                import shutil
+                dest = deploy_dir / f.name
+                shutil.copy2(str(f), str(dest))
+                deployed.append(f.name)
+            if deployed:
+                self._bb.write("code_fix",
+                    f"[deploy] {wf_id[:12]} 产出已部署: {', '.join(deployed)}",
+                    evidence=f"路径: ~/.hermes/bin/{'/'.join(deployed)}",
+                    src="workflow_engine")
+                LOGGER.info("deployed %d outputs from %s", len(deployed), wf_id[:12])
+        except Exception as e:
+            LOGGER.debug("deploy_production_outputs failed: %s", e)
+
     def _tick(self, run: WorkflowRun, step: Step):
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
         if run.status in ('completed', 'cancelled', 'step_done_ready'):
@@ -752,7 +784,10 @@ class WorkflowEngine:
 
         # ── 双锚点：persisted.poll_since 与 bus_anchor，避免 tick 内消息被跳 ──
         # bus_anchor：永久记录已匹配消息的时间戳，只增不减；poll_since：轮询游标，仅在 exit_condition 匹配后同步
-        _persisted = run.step_results.get(step.id, {}).get("poll_since", run.created_at)
+        # ponytail: fallback 用 time.time() 而非 run.created_at——当 wf complete 全量覆写
+        # step_results 擦除 poll_since/bus_anchor 时，fall back 到 workflow 创建时间
+        # 会导致 created_after 过滤器跳过所有近期 bus 消息，流水线永久卡死。
+        _persisted = run.step_results.get(step.id, {}).get("poll_since", time.time())
         _bus_anchor = run.step_results.get(step.id, {}).get("bus_anchor")
         # 初始化时用 poll_since，但一旦设置后永远只增不减
         if _bus_anchor is None:
