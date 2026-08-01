@@ -1093,19 +1093,25 @@ class WorkflowEngine:
 
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
 
-    def _role_has_pending_assignment(self, role: str) -> bool:
+    def _role_has_pending_assignment(self, role: str, exclude_wf_id: str = "") -> bool:
         """角色是否已被分派过任务且正在执行中。
 
         查 DB：该角色有 running workflow 的当前步骤（按 target_role 而非 assignee
         匹配——assignee 是创建时的派发角色，多步工作流后续步骤的执行者
         是各步骤的 target_role）是 notified/running 状态且 timeout_count < 3
         → 已在工作，不应再发新任务。
+
+        ponytail: exclude_wf_id 让同一角色可以并行处理多个不同 workflow，
+        仅排除调用者自身 workflow，避免自阻塞。并行 workflow 的上限由
+        _is_role_busy（survival monitor 信号）控制，此处只做 DB 级兜底。
         """
         try:
             rows = self._lifecycle.query(
                 "SELECT instance_id, template_id, current_step_id, step_results "
                 "FROM workflow_instances "
                 "WHERE status='running'"
+                + (" AND instance_id!=?" if exclude_wf_id else ""),
+                (exclude_wf_id,) if exclude_wf_id else ()
             )
             for r in rows:
                 _wf = self._workflows.get(r["template_id"])
@@ -1195,7 +1201,8 @@ class WorkflowEngine:
                        wf_id: str = "", step_id: str = ""):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
         # 角色已有挂起的任务 / 正在工作中 → 不打扰
-        if self._role_has_pending_assignment(role):
+        # ponytail: 排除自身 wf_id——同一角色可并行处理不同 workflow 的步骤
+        if self._role_has_pending_assignment(role, exclude_wf_id=wf_id):
             LOGGER.info("send-to-role %s 跳过: 已有 pending assignment (wf=%s step=%s)",
                         role, wf_id[:12] if wf_id else "?", step_id)
             return
