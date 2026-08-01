@@ -13,7 +13,6 @@ import re
 import time
 import uuid
 import logging
-import shlex as _shlex
 import subprocess as _sp
 from dataclasses import dataclass
 from pathlib import Path
@@ -821,6 +820,15 @@ class WorkflowEngine:
             # 如果步骤有子工作流模板 → 自动创建子工作流
             if next_step.subflow_template:
                 try:
+                    # 防重：DB 中该步骤已有 subflow_id → 不重复创建
+                    # （否则每 tick 推进同一历史步骤都会新建 subflow，垃圾任务堆积）
+                    _db_sr = conn.execute(
+                        "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                        (wf_id,)).fetchone()
+                    _db_sdata = (json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"]
+                                 else {}).get(next_step.id, {})
+                    if isinstance(_db_sdata, dict) and _db_sdata.get("subflow_id"):
+                        return
                     _sub_wf = self._workflows.get(next_step.subflow_template)
                     if _sub_wf and _sub_wf.steps and _sub_wf.steps[0].target_role == next_step.target_role:
                         _prev_done = ""
@@ -1062,7 +1070,10 @@ class WorkflowEngine:
                 vcmd = step.verify
                 for k, val in ctx.items():
                     vcmd = vcmd.replace(f"{{{k}}}", str(val))
-                ver = _sp.run(_shlex.split(vcmd), capture_output=True, timeout=30)
+                # verify 命令可能含 && / 管道等 shell 语法，shlex.split 会把 && 当
+                # 参数传给第一个命令导致 "extra argument" 报错 → 用 shell=True 执行。
+                # verify 命令来自模板注册表（可信内部源），非外部输入，无注入面。
+                ver = _sp.run(vcmd, shell=True, capture_output=True, timeout=30)
                 if ver.returncode != 0:
                     self._bb.write("blocker",
                         f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}",
@@ -1694,7 +1705,7 @@ class WorkflowEngine:
                     conn.commit()
             # 子工作流完成 → 推进父工作流
             for _sub_row in conn.execute(
-                "SELECT wi.instance_id, wi.step_results FROM workflow_instances wi "
+                "SELECT wi.instance_id, wi.current_step_id, wi.step_results FROM workflow_instances wi "
                 "WHERE wi.status='running' AND wi.template_id IN (SELECT template_id FROM workflow_templates)"
             ).fetchall():
                 _sr = json.loads(_sub_row["step_results"] or "{}")
@@ -1703,6 +1714,11 @@ class WorkflowEngine:
                         continue  # 简写值（如 "done"）没有 subflow_id
                     _sf = _sdata.get("subflow_id", "")
                     if _sf:
+                        # 只处理当前步骤的 subflow：历史步骤的 subflow 已完成会重复
+                        # 触发 _advance_production_wf，而 advance 又为带 subflow_template
+                        # 的下一步创建新 subflow → 每 tick 新建 → 垃圾任务堆积
+                        if _step_id != _sub_row["current_step_id"]:
+                            continue
                         _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
                         if _sub_status and _sub_status['status'] in ('completed', 'step_done_ready'):
                             _sdata["status"] = "completed"
