@@ -17,7 +17,8 @@ SRC_DIR = Path(__file__).resolve().parent
 # ponytail: 由 paths.py 统一管理路径；运行时可通过环境变量覆盖
 _DEFAULT_PERSONAS = SRC_DIR.parents[1] / "hermes-session-roles" / "personas" / "session-roles"
 PERSONAS_DIR = Path(os.environ.get(
-    "SESSION_ROLES_DIR", str(_DEFAULT_PERSONAS),
+    "SESSION_ROLES_DIR",
+    str(_DEFAULT_PERSONAS),
 ))
 BUS_SCRIPT = Path(os.environ.get(
     "BUS_CLIENT",
@@ -101,6 +102,8 @@ _ALLOWED_CMDS = frozenset({
     "curl", "git", "wc", "find",
     "cat", "head", "tail", "ls", "stat", "echo", "test",
     "sort", "uniq", "awk", "sed", "diff", "which", "command",
+    "python3",  # 只读验证脚本（bus_client unread 等），非写操作
+    "cut",  # 管道过滤常见工具，只读
 })
 
 _SYSTEMCTL_READONLY = frozenset({"status", "is-active", "is-enabled", "show", "list-units", "list-unit-files"})
@@ -129,6 +132,16 @@ def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
 def _run(cmd: str, timeout: int = 30) -> dict:
     """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
     first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
+    # 禁止管道符/分号/命令替换——防止 curl|bash 类绕过白名单
+    # 管道（|）只读过滤（cat | cut）放行；分号/命令替换仍禁（可拼接写操作）
+    for _pat in (";", "`", "$("):
+        if _pat in cmd:
+            return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
+    # 管道仅允许左右两侧都是白名单只读命令
+    for _seg in cmd.split("|"):
+        _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
+        if _seg_cmd not in _ALLOWED_CMDS:
+            return {"ok": False, "stdout": "", "stderr": f"管道段命令不在白名单: {_seg_cmd}", "returncode": -3}
     if first_word not in _ALLOWED_CMDS:
         return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
     if not _cmd_is_readonly(first_word, cmd):
