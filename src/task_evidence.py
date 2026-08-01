@@ -161,13 +161,22 @@ def evaluate_and_feedback():
         _out = _output_files(_role)
         _has_bus_evidence = bool(_bus_facts)
         # 收益判定规则（子 agent 独立评估的规则化实现）：
-        #   1. 有实际产出文件（>0 非系统文件）→ 有收益
-        #   2. 标题描述性（>20 字）且有关联 bus 证据 → 有收益
-        #   3. 仅标题长但无产出 → 中性（可能是模板空转）
+        #   1. 有部署到生产路径的产出（~/.hermes/bin/）→ 有收益
+        #   2. workspace 有产出文件但未部署 → neutral（模板执行中/未交付）
+        #   3. 无产出但有 bus 证据+描述性标题 → neutral（进行中）
         #   4. 其余 → 无收益（纯模板任务）
-        if _out:
+        _deployed = False
+        for _f in _out:
+            _fp = Path.home() / ".hermes" / "bin" / _f
+            if _fp.exists():
+                _deployed = True
+                break
+        if _deployed:
             _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — {len(_out)} 个产出文件"
+            _detail = f"task《{_title[:40]}》by {_role} — 已部署: {len(_out)} 个产出文件"
+        elif _out:
+            _quality = "neutral"
+            _detail = f"task《{_title[:40]}》by {_role} — {len(_out)} 个产出文件，未部署（模板执行中/未交付）"
         elif _has_bus_evidence and len(_title) > 20:
             _quality = "positive"
             _detail = f"task《{_title[:40]}》by {_role} — bus 证据存在"
