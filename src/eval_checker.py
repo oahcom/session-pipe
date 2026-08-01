@@ -134,12 +134,29 @@ _CONTROL_WORDS = frozenset({"for", "while", "if", "then", "do", "done", "fi", "e
 _SHELL_BUILTINS_READONLY = frozenset({"for", "while", "do", "done", "if", "then", "fi", "else", "elif", "in", "exit", "return", "break", "continue", "true", "false"})
 
 
+def _split_pipe_segments(cmd: str) -> list[str]:
+    """按 '|' 分割命令,但忽略引号内的 '|' (grep 模式等)。"""
+    segments, buf = [], []
+    in_sq = in_dq = False
+    for ch in cmd:
+        if ch == "'" and not in_dq: in_sq = not in_sq
+        elif ch == '"' and not in_sq: in_dq = not in_dq
+        if ch == "|" and not in_sq and not in_dq:
+            segments.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        segments.append("".join(buf).strip())
+    return [s for s in segments if s]
+
+
 def _inner_cmd_ok(cmd: str) -> bool:
     """递归检查 bash -c '...' / for 循环体内部的命令是否都在白名单。
 
     允许 for/while 循环骨架（只读系统巡检的常见写法），但循环体命令仍须在白名单。
     """
-    for _seg in cmd.split("|"):
+    for _seg in _split_pipe_segments(cmd):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
         if _seg_cmd not in _ALLOWED_CMDS and _seg_cmd not in _SHELL_BUILTINS_READONLY:
             return False
@@ -175,8 +192,8 @@ def _run(cmd: str, timeout: int = 30) -> dict:
             return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
     if not _is_loop_skeleton and not _is_py_inline and ";" in cmd:
         return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
-    # 管道仅允许左右两侧都是白名单只读命令
-    for _seg in cmd.split("|"):
+    # 管道仅允许左右两侧都是白名单只读命令（引号感知分割: grep 模式内的 '|' 不算管道）
+    for _seg in _split_pipe_segments(cmd):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
         if _seg_cmd not in _ALLOWED_CMDS and _seg_cmd not in _SHELL_BUILTINS_READONLY:
             return {"ok": False, "stdout": "", "stderr": f"管道段命令不在白名单: {_seg_cmd}", "returncode": -3}
