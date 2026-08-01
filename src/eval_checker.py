@@ -124,7 +124,14 @@ def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
         return not any(flag in parts or flag.split("=")[0] in parts for flag in _CURL_WRITE_FLAGS)
 
     if first_word == "git":
-        return parts[1] in _GIT_READONLY
+        # 跳过 git 全局选项（-C <dir> / --git-dir=path 等），定位真实子命令
+        i = 1
+        while i < len(parts) and parts[i].startswith("-"):
+            if "=" in parts[i]:
+                i += 1
+            else:
+                i += 2
+        return i < len(parts) and parts[i] in _GIT_READONLY
 
     return True
 
@@ -343,6 +350,10 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                 continue
 
             result = _run(cmd_raw)
+            # 白名单拒绝（-3）是检查器能力边界，非系统故障 → 记 skipped 不写 FAIL
+            if result["returncode"] == -3:
+                summary["skipped"] += 1
+                continue
             passed, detail = _check_passed(result, cmd_raw, expected)
             summary["checked"] += 1
 

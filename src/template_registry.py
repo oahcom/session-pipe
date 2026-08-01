@@ -280,7 +280,9 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
         report.add_error(f"steps[{index}] missing '## 完成' section header")
 
     # ## 完成 中的 bus_category 与 exit_condition 一致
-    _wc = __import__("re").search(r'写 bus cat=(\w+)', pt)
+    # 只检查 '## 完成' 段之后的 bus 写入（步骤中途的中间产出不算 exit）
+    _done_pt = pt.partition("## 完成")[2] or pt
+    _wc = __import__("re").search(r'写 bus cat=(\w+)', _done_pt)
     _ec = step.get("exit_condition", {}).get("bus_category", "")
     if _wc and _ec and _wc.group(1) != _ec:
         report.add_error(f"steps[{index}] ## 完成 writes bus cat='{_wc.group(1)}' but exit_condition expects '{_ec}'")
@@ -379,6 +381,7 @@ class TemplateRegistry:
         # 迁移：添加新列（V2 schema 扩展）
         _migrate_cols = [
             ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+            ("is_subflow", "INTEGER NOT NULL DEFAULT 0"),
             ("trigger_scene", "TEXT"),
             ("allowed_initiators", "TEXT"),
             ("allowed_executors", "TEXT"),
@@ -427,8 +430,8 @@ class TemplateRegistry:
             INSERT OR REPLACE INTO workflow_templates
                 (template_id, name, description, steps_json,
                  trigger_scene, allowed_initiators, allowed_executors,
-                 max_duration_hours, quality_standards, created_at, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 max_duration_hours, quality_standards, created_at, is_active, is_subflow)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """, (
             template_id,
             template["name"],
@@ -440,6 +443,7 @@ class TemplateRegistry:
             template.get("max_duration_hours", 24),
             template.get("quality_standards", ""),
             now,
+            1 if template.get("is_subflow", False) else 0,
         ))
         self._conn.commit()
         return template_id
@@ -533,6 +537,8 @@ class TemplateRegistry:
         # SQLite 布尔值转 Python bool
         if "is_active" in d:
             d["is_active"] = bool(d["is_active"])
+        if "is_subflow" in d:
+            d["is_subflow"] = bool(d["is_subflow"])
         return d
 
     def close(self):
