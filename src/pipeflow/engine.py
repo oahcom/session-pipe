@@ -262,17 +262,18 @@ class WorkflowEngine:
     def cancel(self, wid: str) -> bool:
         try:
             rows = self._lifecycle.query(
-                "SELECT status FROM workflow_instances WHERE instance_id=?", (wid,)
+                "SELECT status, created_at FROM workflow_instances WHERE instance_id=?",
+                (wid,),
             )
             row = rows[0] if rows else None
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, IndexError):
             row = None
         if not row or row["status"] in ("completed", "cancelled", "failed"):
             return False
         # 最小存活时间保护：创建不足 5 分钟的工作流禁止 cancel。
         # 防止"通知角色后 32 秒即被取消"的误杀（bus #158145：s1 响应窗口仅 32s）。
         # ponytail: 5 分钟是保守值，正式角色多数 5 分钟内会响应；超时取消不受此限制（走 _tick 路径）。
-        _created = row.get("created_at") or 0
+        _created = row["created_at"] or 0
         if time.time() - _created < 300:
             LOGGER.warning("cancel rejected: %s 创建不足 5 分钟 (age=%.0fs)，拒绝取消", wid, time.time() - _created)
             return False
