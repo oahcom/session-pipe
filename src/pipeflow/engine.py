@@ -9,6 +9,7 @@ Workflow Engine --- 数据驱动的对话工作流执行引擎。
 
 import json
 import os
+import re
 import time
 import uuid
 import logging
@@ -37,6 +38,10 @@ _ZOMBIE_TEMPLATES = frozenset({
 
 _POLL_SLEEP = 5
 _REMINDER_INTERVAL = 120
+
+# 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用它作
+# StopHook 条件时 bool([]) 为 False → 死循环
+_UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
 
 
 @dataclass
@@ -716,6 +721,12 @@ class WorkflowEngine:
             prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
             prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
             prompt = prompt.replace("{topic}", task_title)
+            # 未替换变量检测：advance 层提前拦截，跳过通知但不中断推进（步骤状态已更新）
+            if _UNMATCHED_VAR_RE.search(prompt):
+                unmatched = _UNMATCHED_VAR_RE.findall(prompt)
+                LOGGER.warning("advance skip notify: %s/%s step=%s 含未替换变量 %s",
+                              wf_id[:8], wf_name, next_step.id, unmatched)
+                return
             self._send_to_role(next_step.target_role, prompt,
                                wf_id=wf_id, step_id=next_step.id)
             # 如果步骤有子工作流模板 → 自动创建子工作流
@@ -1205,6 +1216,16 @@ class WorkflowEngine:
         if wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
+            return
+        # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用
+        # 这些内容作 StopHook 条件时 bool([]) 为 False → 死循环
+        if _UNMATCHED_VAR_RE.search(prompt):
+            unmatched = _UNMATCHED_VAR_RE.findall(prompt)
+            LOGGER.warning("send-to-role %s 跳过: prompt 含未替换变量 %s (wf=%s step=%s)",
+                          role, unmatched, wf_id[:12] if wf_id else "?", step_id)
+            self._bb.write("blocker",
+                f"[workflow] {role} prompt 含未替换变量: {unmatched}",
+                evidence=prompt[:500], src="workflow_engine")
             return
         self._ensure_role_alive(role)
         # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
