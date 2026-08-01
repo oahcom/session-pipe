@@ -872,12 +872,13 @@ class WorkflowEngine:
                     f"step={run.current_step} timeout_count={timeout_count} >= {_auto_cancel_at}\n请排查该步骤为何持续超时。")
                 return
             # 重推任务（最多重推 1 次，不自动完成）
+            # force=True 跳过 pending 检查——超时重推的目的恰恰是角色"卡住没响应"
             if timeout_count == 1:
                 self._send_to_role(step.target_role, step.prompt_template,
-                                   wf_id=run.id, step_id=step.id)
+                                   wf_id=run.id, step_id=step.id, force=True)
                 self._send_to_role("coordinator",
                     f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
-                    wf_id=run.id, step_id=run.current_step)
+                    wf_id=run.id, step_id=run.current_step, force=True)
             return
 
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
@@ -1232,15 +1233,15 @@ class WorkflowEngine:
             pass
 
     def _send_to_role(self, role: str, prompt: str,
-                       wf_id: str = "", step_id: str = ""):
-        """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。"""
-        # 角色已有挂起的任务 / 正在工作中 → 不打扰
-        if self._role_has_pending_assignment(role):
+                       wf_id: str = "", step_id: str = "", force: bool = False):
+        """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。
+        force=True 时跳过 pending/busy 检查，用于超时重推。"""
+        if not force and self._role_has_pending_assignment(role):
             LOGGER.info("send-to-role %s 跳过: 已有 pending assignment (wf=%s step=%s)",
                         role, wf_id[:12] if wf_id else "?", step_id)
             return
         # 并发保护：角色已有一个不同 workflow 的活跃步骤时，跳过推送
-        if wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
+        if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
             return
