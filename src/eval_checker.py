@@ -129,20 +129,58 @@ def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
     return True
 
 
+_CONTROL_WORDS = frozenset({"for", "while", "if", "then", "do", "done", "fi", "else", "elif", "in"})
+# 白名单检查通过后仍需排除的 bash 控制结构（非命令，但需在 for/while 体内递归检查）
+_SHELL_BUILTINS_READONLY = frozenset({"for", "while", "do", "done", "if", "then", "fi", "else", "elif", "in", "exit", "return", "break", "continue", "true", "false"})
+
+
+def _inner_cmd_ok(cmd: str) -> bool:
+    """递归检查 bash -c '...' / for 循环体内部的命令是否都在白名单。
+
+    允许 for/while 循环骨架（只读系统巡检的常见写法），但循环体命令仍须在白名单。
+    """
+    for _seg in cmd.split("|"):
+        _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
+        if _seg_cmd not in _ALLOWED_CMDS and _seg_cmd not in _SHELL_BUILTINS_READONLY:
+            return False
+        # for 循环体: "for s in ...; do systemctl ...; done" → 检查 do 之后的命令
+        if _seg_cmd == "for":
+            _body = _seg[_seg.find("do") + 2:].strip() if "do" in _seg else ""
+            if _body and not _inner_cmd_ok(_body):
+                return False
+    return True
+
+
 def _run(cmd: str, timeout: int = 30) -> dict:
     """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
     first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
+    # bash -c '...' 解包: 递归校验内部命令（for 循环巡检是白名单内命令的组合）
+    if first_word == "bash":
+        _m = re.match(r"^bash\s+-c\s+['\"](.+)['\"]\s*$", cmd, re.DOTALL)
+        if _m:
+            inner = _m.group(1)
+            if not _inner_cmd_ok(inner):
+                return {"ok": False, "stdout": "", "stderr": "bash -c 内部命令不在白名单", "returncode": -3}
+            # 递归校验通过后, 重新从内部命令开始白名单检查
+            return _run(inner, timeout)
+        return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
     # 禁止管道符/分号/命令替换——防止 curl|bash 类绕过白名单
     # 管道（|）只读过滤（cat | cut）放行；分号/命令替换仍禁（可拼接写操作）
-    for _pat in (";", "`", "$("):
+    # 例外1: for/while 循环骨架中的 ';'（'for s in a b; do' 是安全语法）
+    # 例外2: python3 -c '...' 内部的 ';' 是 python 代码分隔符，非 shell 命令分隔符
+    _is_loop_skeleton = first_word in ("for", "while")
+    _is_py_inline = first_word == "python3" and "-c" in cmd.split()[1:3]
+    for _pat in ("`", "$("):
         if _pat in cmd:
             return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
+    if not _is_loop_skeleton and not _is_py_inline and ";" in cmd:
+        return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
     # 管道仅允许左右两侧都是白名单只读命令
     for _seg in cmd.split("|"):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
-        if _seg_cmd not in _ALLOWED_CMDS:
+        if _seg_cmd not in _ALLOWED_CMDS and _seg_cmd not in _SHELL_BUILTINS_READONLY:
             return {"ok": False, "stdout": "", "stderr": f"管道段命令不在白名单: {_seg_cmd}", "returncode": -3}
-    if first_word not in _ALLOWED_CMDS:
+    if first_word not in _ALLOWED_CMDS and first_word not in _SHELL_BUILTINS_READONLY:
         return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
     if not _cmd_is_readonly(first_word, cmd):
         return {"ok": False, "stdout": "", "stderr": f"写操作被拒绝: {first_word} 不允许非只读子命令", "returncode": -3}
