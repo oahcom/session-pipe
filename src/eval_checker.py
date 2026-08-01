@@ -210,7 +210,20 @@ def _run(cmd: str, timeout: int = 30) -> dict:
         if _pat in cmd and not _is_var_assign:
             return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
     if not _is_loop_skeleton and not _is_py_inline and not _is_var_assign and ";" in cmd:
-        return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
+        # 仅允许 python3 -c '...' 引号内的 ';'（python 代码分隔符）
+        # 以及 for/while 循环骨架（'for s in a b; do'）。用管道段递归校验：
+        # 若 ; 出现在段间（df ... ; free ...），逐段校验全部只读才放行
+        _all_segments = _split_pipe_segments(cmd.replace(";", "|"))
+        if len(_all_segments) > 1:
+            _ok = all(
+                s.strip().split(maxsplit=1)[0] in _ALLOWED_CMDS
+                or s.strip().split(maxsplit=1)[0] in _SHELL_BUILTINS_READONLY
+                for s in _all_segments if s.strip()
+            )
+            if not _ok:
+                return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ; 且段含非白名单命令", "returncode": -3}
+        else:
+            return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
     # 管道仅允许左右两侧都是白名单只读命令（引号感知分割: grep 模式内的 '|' 不算管道）
     for _seg in _split_pipe_segments(cmd):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
@@ -275,6 +288,13 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
 
     if expected is None:
         return (result["ok"], f"exit={rc}")
+
+    # grep 类命令无匹配返回 exit=1，但"无 XXX"语义下这是健康信号
+    # 例: journalctl ... | grep -ciE 'ERROR' 无匹配 → exit=1 → 应判 PASS
+    _is_neg_check = any(k in expected for k in ("无", "没有", "不含", "none", "no "))
+    _is_grep_cmd = "grep" in cmd_raw and "wc" not in cmd_raw
+    if _is_neg_check and _is_grep_cmd and rc == 1 and not stdout.strip():
+        return (True, f"无匹配=健康 (grep exit=1, expected={expected[:40]})")
 
     if "全部返回" in cmd_raw:
         # 检查 stdout 包含关键字
@@ -450,7 +470,12 @@ def precheck_all_personas() -> dict:
             else:
                 r = _run(cmd_raw, timeout=5)
                 is_tool_err = _is_tool_error(r)
-                run_ok = r["ok"]
+                # 用 _check_passed 做完整判断（grep 无匹配 exit=1 + expected=0 → PASS）
+                if expected and not is_tool_err and r["returncode"] in (0, 1):
+                    passed, _detail = _check_passed(r, cmd_raw, expected)
+                    run_ok = passed
+                else:
+                    run_ok = r["ok"]
                 if not run_ok and not is_tool_err:
                     error = f"exit={r['returncode']} stderr={r['stderr'][:60]}"
             items.append({"criterion": c[:80], "cmd": cmd_raw,
