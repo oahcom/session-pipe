@@ -95,6 +95,23 @@ def evaluate_and_feedback():
         except Exception:
             return False
 
+    # 预查: 每个任务关联的 workflow_instances 中 exit_messages 写入情况
+    _wf_exit = {}
+    _task_ids = [t["task_id"] for t in completed]
+    if _task_ids:
+        _placeholders = ",".join("?" for _ in _task_ids)
+        for wf in db.execute(
+            f"SELECT task_id, step_results FROM workflow_instances WHERE task_id IN ({_placeholders})",
+            _task_ids
+        ).fetchall():
+            _sr = json.loads(wf["step_results"] or "{}")
+            _has_exit = any(
+                isinstance(v, dict) and v.get("exit_messages")
+                for v in _sr.values()
+            )
+            if _has_exit:
+                _wf_exit[wf["task_id"]] = True
+
     assessments = []
     for t in completed:
         _tid = t["task_id"]
@@ -104,15 +121,20 @@ def evaluate_and_feedback():
         _files = _output_files(_role, t["created_at"], t["updated_at"])
         _n, _size, _names = _output_summary(_files)
         _bus = _bus_evidence(_tid)
+        _exit = _wf_exit.get(_tid, False)
 
         # 收益判定规则（子 agent 独立评估的规则化实现）：
-        #   1. 有真实产出文件（≥1KB）且已部署 → 有收益
-        #   2. 有真实产出文件（≥1KB）未部署 → 有产出但可能未交付（文档类留 workspace 即为交付）
-        #   3. 无产出但有该任务的 bus 证据 → 进行中（有交流痕迹）
-        #   4. 无产出、无证据 → 纯模板任务（无收益）
-        if _n >= 3 or (_n >= 1 and _size > 2048):
+        #   1. 有 exit_messages 证据（角色实际产出被引擎记录）→ 有收益
+        #   2. 有真实产出文件（≥1KB，≥3 个或 ≥2KB）→ 有实质产出
+        #   3. 有产出文件但量小 → 疑似模板残留
+        #   4. 无产出但有 bus 证据 → 进行中
+        #   5. 无产出、无证据 → 纯模板任务（无收益）
+        if _exit:
             _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），质量: 有实质产出"
+            _detail = f"task《{_title[:40]}》by {_role} — exit_messages 证据存在，有实际产出"
+        elif _n >= 3 or (_n >= 1 and _size > 2048):
+            _quality = "positive"
+            _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），有实质产出"
         elif _n >= 1:
             _quality = "neutral"
             _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），疑似模板残留"
@@ -130,6 +152,7 @@ def evaluate_and_feedback():
             "output_count": _n,
             "output_size": _size,
             "has_bus_evidence": _bus,
+            "has_exit_messages": _exit,
         })
 
     # 汇总写 bus
