@@ -962,6 +962,19 @@ class WorkflowEngine:
                 self._sync_step_results(run.id, run.step_results)
                 return
 
+            # ── 空转检测: exit_messages 命中空报告模式 → 角色冷却 ──
+            try:
+                from cron_scheduler import _IDLE_PATTERNS
+                from cron_scheduler import CronScheduler
+                _msgs_text = " ".join(
+                    m.get("text", "") for m in _match_msgs if isinstance(m, dict)
+                ).lower()
+                if any(pat in _msgs_text for pat in _IDLE_PATTERNS):
+                    _cs = CronScheduler()
+                    _cs.report_idle(step.target_role)
+            except Exception as _idle_err:
+                LOGGER.debug("idle detection skipped: %s", _idle_err)
+
             # ── 自动确认 handoff 步骤，推进到下一棒 ──
             # daemon 替代人工 approve，用 step 角色名作为密钥
             try:

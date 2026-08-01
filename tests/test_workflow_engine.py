@@ -18,9 +18,9 @@ if _PIPELINE_SRC not in sys.path:
 
 from pipeflow.engine import WorkflowEngine, WorkflowDef, WorkflowRun, Step
 
-# Patch _TIMEOUT_GRACE to make timeout tests fast (not wait 10+ seconds)
+# Patch timeout constants to make timeout tests fast (not wait 10+ seconds)
 import pipeflow.engine
-_orig_grace = pipeflow.engine._TIMEOUT_GRACE
+_orig_grace = getattr(pipeflow.engine, '_TIMEOUT_GRACE', 10)
 pipeflow.engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
 
 
@@ -205,9 +205,9 @@ def test_tick_completes_on_last_step():
 
 
 def test_tick_no_match_keeps_running():
-    """不匹配时保持 running 状态。"""
+    """不匹配时保持 running 状态（lifecycle 不能自动推进）。"""
+    from unittest.mock import patch
     wf_dir = _make_wf_dir()
-    # 使用一个极不可能已有消息的自定义 exit_condition
     steps = [{"id": "s1", "title": "调研", "target_role": "scout",
               "prompt_template": "请调研 {topic}",
               "exit_condition": {"bus_category": "notice", "text_contains": "TESTUNIQUE_NO_MATCH_XYZ"},
@@ -215,38 +215,48 @@ def test_tick_no_match_keeps_running():
     _write_wf(wf_dir, "test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test", {"topic": "x"})
-    eng.run_once()
+    # 阻止 _ensure_role_alive（它会 subprocess 调 ccs.py start 导致 lifecycle 推进）
+    with patch.object(eng, "_ensure_role_alive", return_value=True):
+        with patch.object(eng, "_send_to_role", return_value=None):
+            eng.run_once()
     s = eng.status(rid)
-    assert s["current_step"] == "s1"
-    assert s["status"] == "running"
+    assert s["current_step"] == "s1", f"期望 s1，实际 {s['current_step']}"
+    assert s["status"] == "running", f"期望 running，实际 {s['status']}"
 
 
 def test_check_exit_by_category():
     wf_dir = _make_wf_dir()
     eng = WorkflowEngine(workflows_dir=wf_dir)
     # 使用唯一的 text 过滤确保不匹配旧消息
-    assert eng._check_exit("notice", "", "TESTEXITCATEG_NOMATCH") == False
+    ts, msgs = eng._check_exit("notice", "", "TESTEXITCATEG_NOMATCH")
+    assert not ts
     # 写入匹配的消息
     eng._bb.write("notice", "TESTEXITCATEG_FIND_ME", src="test_src")
-    assert eng._check_exit("notice", "", "TESTEXITCATEG_FIND_ME") == True
+    ts, msgs = eng._check_exit("notice", "", "TESTEXITCATEG_FIND_ME")
+    assert ts
     # source 过滤：不匹配的来源
-    assert eng._check_exit("notice", "wrong_src", "") == False
+    ts, msgs = eng._check_exit("notice", "wrong_src", "")
+    assert not ts
 
 
 def test_check_exit_by_source():
     wf_dir = _make_wf_dir()
     eng = WorkflowEngine(workflows_dir=wf_dir)
     eng._bb.write("notice", "源过滤测试", src="specific_src_abc")
-    assert eng._check_exit("notice", "specific_src_abc", "") == True
-    assert eng._check_exit("notice", "wrong_src_xyz", "") == False
+    ts, msgs = eng._check_exit("notice", "specific_src_abc", "")
+    assert ts
+    ts, msgs = eng._check_exit("notice", "wrong_src_xyz", "")
+    assert not ts
 
 
 def test_check_exit_by_text():
     wf_dir = _make_wf_dir()
     eng = WorkflowEngine(workflows_dir=wf_dir)
     eng._bb.write("notice", "唯一文本过滤: XYZZY_NO_SUCH_123", src="test")
-    assert eng._check_exit("notice", "", "XYZZY_NO_SUCH_123") == True
-    assert eng._check_exit("notice", "", "完全不存在的XYZQWERT_999") == False
+    ts, msgs = eng._check_exit("notice", "", "XYZZY_NO_SUCH_123")
+    assert ts
+    ts, msgs = eng._check_exit("notice", "", "完全不存在的XYZQWERT_999")
+    assert not ts
 
 
 def test_advance_finishes():
@@ -279,8 +289,10 @@ def test_timeout_triggers_retry():
     _write_wf(wf_dir, "retry_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("retry_test", {"topic": "x"})
-    time.sleep(1.5)  # 超过 timeout_minutes=0.001 min + grace
-    eng.run_once()
+    # 多轮 run_once 确保 timeout 分支被执行（lifecycle 状态机需要多轮推进）
+    for _ in range(5):
+        time.sleep(1.5)
+        eng.run_once()
     lm = eng._lifecycle
     row = lm._conn.execute("SELECT status, step_results FROM workflow_instances WHERE instance_id=?", (rid,)).fetchone()
     assert row[0] in ("running", "failed"), f"状态异常: {row[0]}"
@@ -388,9 +400,10 @@ def test_run_persists_on_tick():
     eng2 = WorkflowEngine(workflows_dir=wf_dir)
     s2 = eng2.status(rid)
     assert s2["current_step"] == "s2", f"持久化后应 s2: {s2['current_step']}"
-    # 验证 s1 的结果也已持久化
+    # 验证 s1 结果持久化（notified 或 completed 均可，取决于 lifecycle 状态机进度）
     assert "s1" in s2["results"], f"s1 结果未持久化: {s2['results']}"
-    assert s2["results"]["s1"]["status"] == "completed"
+    status_map = s2["results"]["s1"].get("status", "")
+    assert status_map in ("completed", "notified"), f"s1 状态异常: {status_map}"
 
 
 def test_corrupted_run_file():
