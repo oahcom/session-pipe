@@ -1040,8 +1040,17 @@ class WorkflowEngine:
                 return
             # exit 匹配必须在 timeout 检查之后、return 之前执行，
             # 否则 notified/running 步骤永远无法通过 exit 条件推进（bus #162804）。
+            # 消息去重：同一消息不应被多个工作流同时消费（bus #162146 QA 4任务共享测试结果）
+            if not hasattr(self, '_consumed_exit_ids'):
+                self._consumed_exit_ids = set()
             _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
             if _match_ts:
+                # 过滤已被其他工作流消费的消息
+                _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
+                _match_ts = _match_msgs[0]["ts"] if _match_msgs else 0.0
+            if _match_ts:
+                # 标记消息已消费，防止其他工作流重复匹配（bus #162146）
+                self._consumed_exit_ids.update(m["id"] for m in _match_msgs)
                 run.step_results[step.id] = {
                     **run.step_results.get(step.id, {}),
                     "bus_anchor": _match_ts,
