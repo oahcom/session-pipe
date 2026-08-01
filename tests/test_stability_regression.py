@@ -299,8 +299,9 @@ class TestEvalCheckerHotReload(unittest.TestCase):
         fake_module = MagicMock()
         with patch.dict(_sys.modules, {"eval_checker": fake_module}):
             self._reload_branch(200.0, 100.0, mock_reload, log)
-        self.assertEqual(log, ["reloaded"], "mtime 增加应触发 reload")
-        self.assertNotIn("eval_checker", _sys.modules, "reload 后旧模块应被清除")
+            self.assertEqual(log, ["reloaded"], "mtime 增加应触发 reload")
+            # 必须在 with 块内断言 — patch.dict 退出时会恢复原模块
+            self.assertNotIn("eval_checker", _sys.modules, "reload 后旧模块应被清除")
 
     def test_reload_failure_logs_and_keeps_running(self):
         """reload 抛异常 → daemon 不崩溃（失败仅记日志，后续循环仍可用）。"""
