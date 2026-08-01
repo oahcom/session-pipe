@@ -239,6 +239,17 @@ def _run(cmd: str, timeout: int = 30) -> dict:
         if _inner_body and not _inner_cmd_ok(_inner_body):
             return {"ok": False, "stdout": "", "stderr": f"$() 内部命令不在白名单: {_inner_body[:60]}", "returncode": -3}
     try:
+        # 引号规范化: python3 -c "..." 内层同引号 → 转义为 \"
+        # persona eval_criteria 常见笔误: python3 -c "import sys; print("PASS")"
+        if first_word == "python3" and "-c" in cmd and cmd.count('"') >= 4:
+            _parts = cmd.split('"')
+            # 奇数索引是引号内内容，把内层未转义的 " 替换为 '（Python 字符串字面量兼容）
+            _fixed = []
+            for i, p in enumerate(_parts):
+                if i % 2 == 1 and '"' in p:
+                    p = p.replace('"', "'")
+                _fixed.append(p)
+            cmd = '"'.join(_fixed)
         r = subprocess.run(
             ["bash", "-c", cmd],
             capture_output=True, text=True, timeout=timeout,
