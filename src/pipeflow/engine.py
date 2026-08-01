@@ -436,6 +436,10 @@ class WorkflowEngine:
                     # 补充替换：12个JSON模板使用{task_definition}/{acceptance_criteria}
                     prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
                     prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
+                    # 首步无上一步产出，用任务标题作变量的语义默认值，避免空变量
+                    for var in ("{focus_area}", "{target}", "{findings}",
+                                "{results}", "{backlog}", "{exception_info}"):
+                        prompt = prompt.replace(var, task_title or task_desc or step.title or wf_name)
                     # 写 TASKS.md 到 workspace，让模板中"读 TASKS.json"指令能找到任务
                     ws_dir = Path.home() / "ccs-workspaces" / step.target_role
                     ws_dir.mkdir(parents=True, exist_ok=True)
@@ -721,6 +725,18 @@ class WorkflowEngine:
             prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
             prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
             prompt = prompt.replace("{topic}", task_title)
+            # 步骤间数据传递：上一步骤的 exit_messages（角色实际产出的 bus 消息）
+            # 提取内容文本填充 {target}/{findings}/{results}/{backlog} 等后续步骤变量
+            prev_sr = (results or {}).get(step_id, {})
+            prev_msgs = prev_sr.get("exit_messages", [])
+            if prev_msgs:
+                if isinstance(prev_msgs, list):
+                    prev_text = "\n".join(str(m) for m in prev_msgs)[:3000]
+                else:
+                    prev_text = str(prev_msgs)[:3000]
+                for var in ("{target}", "{findings}", "{results}", "{backlog}",
+                            "{exception_info}", "{focus_area}"):
+                    prompt = prompt.replace(var, prev_text)
             # 未替换变量检测：advance 层提前拦截，跳过通知但不中断推进（步骤状态已更新）
             if _UNMATCHED_VAR_RE.search(prompt):
                 unmatched = _UNMATCHED_VAR_RE.findall(prompt)
