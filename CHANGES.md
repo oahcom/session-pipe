@@ -14,3 +14,6 @@
 ### 未改动
 - DB schema 无变更（无 migration）
 - 不影响正常 tick 推进路径
+
+## 2026-08-01 — 测试漂移清理
+3. `tests/test_tick_paths.py`: 删除已废弃的 `test_tick_reminder_sent`（last_reminder 催办逻辑已于 252cbcf 移除，测试未同步）。清理 `_REMINDER_INTERVAL` 引用。14/14 测试通过。
