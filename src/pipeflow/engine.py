@@ -437,9 +437,12 @@ class WorkflowEngine:
                     prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
                     prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
                     # 首步无上一步产出，用任务标题作变量的语义默认值，避免空变量
-                    for var in ("{focus_area}", "{target}", "{findings}",
-                                "{results}", "{backlog}", "{exception_info}"):
-                        prompt = prompt.replace(var, task_title or task_desc or step.title or wf_name)
+                    fallback = task_title or task_desc or step.title or wf_name
+                    # focus_area 语义是"聚焦范围"，step.title 比 task_title 更精确
+                    prompt = prompt.replace("{focus_area}", step.title or fallback)
+                    for var in ("{target}", "{findings}", "{results}",
+                                "{backlog}", "{exception_info}"):
+                        prompt = prompt.replace(var, fallback)
                     # 写 TASKS.md 到 workspace，让模板中"读 TASKS.json"指令能找到任务
                     ws_dir = Path.home() / "ccs-workspaces" / step.target_role
                     ws_dir.mkdir(parents=True, exist_ok=True)
@@ -737,6 +740,14 @@ class WorkflowEngine:
                 for var in ("{target}", "{findings}", "{results}", "{backlog}",
                             "{exception_info}", "{focus_area}"):
                     prompt = prompt.replace(var, prev_text)
+            else:
+                # 角色未写 bus（exit_messages 空）→ fallback 到任务描述，保证后续
+                # 步骤变量不为空；task_desc 也空时再退到标题（与首步兜底一致）
+                fallback = task_desc or task_title or wf_name
+                for var in ("{target}", "{findings}", "{results}", "{backlog}",
+                            "{exception_info}", "{focus_area}"):
+                    if var in prompt:
+                        prompt = prompt.replace(var, fallback)
             # 未替换变量检测：advance 层提前拦截，跳过通知但不中断推进（步骤状态已更新）
             if _UNMATCHED_VAR_RE.search(prompt):
                 unmatched = _UNMATCHED_VAR_RE.findall(prompt)
@@ -1318,6 +1329,14 @@ class WorkflowEngine:
         prompt = step.prompt_template + "\n" + extra_prompt if extra_prompt else step.prompt_template
         for k, v in ctx.items():
             prompt = prompt.replace(f"{{{k}}}", str(v))
+        # 语义兜底（与生产扫描块一致）：context 缺失时防止未替换变量导致发送跳过
+        fallback = ctx.get("title") or ctx.get("task_title") or run.workflow_name or step.title or ""
+        prompt = prompt.replace("{focus_area}", step.title or fallback)
+        for var in ("{target}", "{findings}", "{results}", "{backlog}",
+                    "{exception_info}", "{title}", "{description}", "{topic}",
+                    "{task_definition}", "{acceptance_criteria}"):
+            if var in prompt:
+                prompt = prompt.replace(var, fallback)
         self._send_to_role(step.target_role, prompt)
 
     def _collect_workspace_summary(self, ws_dir: Path) -> str:
