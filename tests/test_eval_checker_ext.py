@@ -95,3 +95,35 @@ def test_weights_sampling():
     # 正常角色:  2 条 → 2
     # 维护者:  1 条 → 1
     assert kwargs["weights"] == [1, 2, 1]
+
+
+def test_is_tool_error():
+    """命令自身执行错误（检查器盲区）判定：grep 语法错/文件不存在/选项错误。"""
+    assert ec._is_tool_error({"returncode": 2, "stderr": "grep: unrecognized option", "stdout": ""})
+    assert ec._is_tool_error({"returncode": 2, "stderr": "grep: foo: No such file or directory", "stdout": ""})
+    assert ec._is_tool_error({"returncode": 2, "stderr": "usage: grep", "stdout": ""})
+    # 真实故障不是工具错误
+    assert not ec._is_tool_error({"returncode": 1, "stderr": "", "stdout": ""})
+    assert not ec._is_tool_error({"returncode": 0, "stderr": "", "stdout": "ok"})
+    assert not ec._is_tool_error({"returncode": -3, "stderr": "命令不在白名单", "stdout": ""})
+
+
+def test_tool_error_skipped_not_failed():
+    """工具错误归 skipped，不写 FAIL bus。"""
+    captured = []
+    orig = ec._write_bus
+    def spy(cat, text, *, evidence="", src=""):
+        captured.append((cat, text))
+    ec._write_bus = spy
+    try:
+        with (
+            patch.object(ec, "_load_roles", return_value=_ALL_ROLES),
+            patch.object(ec, "_run",
+                         return_value={"ok": False, "stdout": "", "stderr": "grep: bad pattern", "returncode": 2}),
+        ):
+            s = ec.run_eval_check()
+    finally:
+        ec._write_bus = orig
+    assert s["failed"] == 0
+    assert s["skipped"] >= 1
+    assert captured == []

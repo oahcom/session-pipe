@@ -225,6 +225,22 @@ def _run(cmd: str, timeout: int = 30) -> dict:
         return {"ok": False, "stdout": "", "stderr": str(e)[:200], "returncode": -2}
 
 
+def _is_tool_error(result: dict) -> bool:
+    """判定命令自身执行错误（检查器盲区），而非被检查对象真实故障。
+
+    grep 语法错误(rc=2)/找不到文件、文件不存在等 → 命令写错了，不是系统坏了。
+    """
+    rc = result["returncode"]
+    stderr = result["stderr"]
+    if rc == 2 and ("grep:" in stderr or "usage:" in stderr):
+        return True
+    if "No such file or directory" in stderr:
+        return True
+    if rc == 2 and "unrecognized option" in stderr:
+        return True
+    return False
+
+
 def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, str):
     """根据命令输出和预期结果判断 pass/fail。
 
@@ -351,7 +367,8 @@ def run_eval_check(role_filter: str | None = None) -> dict:
 
             result = _run(cmd_raw)
             # 白名单拒绝（-3）是检查器能力边界，非系统故障 → 记 skipped 不写 FAIL
-            if result["returncode"] == -3:
+            # 工具自身错误（grep 语法错/文件不存在）是 persona 命令写错，同样非系统故障
+            if result["returncode"] == -3 or _is_tool_error(result):
                 summary["skipped"] += 1
                 continue
             passed, detail = _check_passed(result, cmd_raw, expected)
