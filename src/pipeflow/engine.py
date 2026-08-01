@@ -440,8 +440,9 @@ class WorkflowEngine:
                     fallback = task_title or task_desc or step.title or wf_name
                     # focus_area 语义是"聚焦范围"，step.title 比 task_title 更精确
                     prompt = prompt.replace("{focus_area}", step.title or fallback)
-                    for var in ("{target}", "{findings}", "{results}",
-                                "{backlog}", "{exception_info}"):
+                    for var in ("{target}", "{findings}", "{results}", "{backlog}",
+                                "{exception_info}", "{project}", "{changes}",
+                                "{task_list}", "{assignments}"):
                         prompt = prompt.replace(var, fallback)
                     # 写 TASKS.md 到 workspace，让模板中"读 TASKS.json"指令能找到任务
                     ws_dir = Path.home() / "ccs-workspaces" / step.target_role
@@ -745,7 +746,8 @@ class WorkflowEngine:
                 # 步骤变量不为空；task_desc 也空时再退到标题（与首步兜底一致）
                 fallback = task_desc or task_title or wf_name
                 for var in ("{target}", "{findings}", "{results}", "{backlog}",
-                            "{exception_info}", "{focus_area}"):
+                            "{exception_info}", "{focus_area}", "{changes}",
+                            "{task_list}", "{assignments}"):
                     if var in prompt:
                         prompt = prompt.replace(var, fallback)
             # 未替换变量检测：advance 层提前拦截，跳过通知但不中断推进（步骤状态已更新）
@@ -1335,7 +1337,8 @@ class WorkflowEngine:
         prompt = prompt.replace("{focus_area}", step.title or fallback)
         for var in ("{target}", "{findings}", "{results}", "{backlog}",
                     "{exception_info}", "{title}", "{description}", "{topic}",
-                    "{task_definition}", "{acceptance_criteria}"):
+                    "{task_definition}", "{acceptance_criteria}", "{project}",
+                    "{changes}", "{task_list}", "{assignments}"):
             if var in prompt:
                 prompt = prompt.replace(var, fallback)
         self._send_to_role(step.target_role, prompt)
