@@ -1266,12 +1266,13 @@ class WorkflowEngine:
 
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
 
-    def _is_role_busy(self, role: str, exclude_wf_id: str = "") -> bool:
+    def _is_role_busy(self, role: str, exclude_wf_id: str = "", pane_fallback: bool = True) -> bool:
         """检查角色是否真的在工作。
 
         信号1: survival monitor 健康文件（survival_monitor.py 每 120s 更新）
           - stale/idle/unknown → 角色不忙，跳过数据库检查直接返回 False
         信号2: workflow_instances 表中是否有该角色的其他活跃步骤（兜底）
+        pane_fallback: True=tmux pane 存活即视为 busy（超时保护），False=仅 DB 检查（首次投递）
         """
         # 信号1: survival health 文件（直接读，不重跑检测）
         # 信号1: survival health 文件（直接读，不重跑检测）
@@ -1283,14 +1284,14 @@ class WorkflowEngine:
                 # idle/unknown → 查 tmux pane 兜底：tmux 3.4 的 pane_activity 恒为空，
                 # survival L2 信号失效，忙任务被误判 idle → 超时误回收。pane 存活即视为 busy。
                 if overall in ("idle", "stale", "dead", "orphan", "unknown"):
-                    if self._tmux_pane_alive(role):
+                    if pane_fallback and self._tmux_pane_alive(role):
                         LOGGER.info("health=%s 但 tmux pane 存活 → 视为 busy (survival L2 兜底)", overall)
                         return True
                     return False
                 # healthy: 角色可能在工作，继续信号2确认
                 # stale/l2=false: 角色空闲，放行
                 if h.get("survival_l2_thinking") is False:
-                    if self._tmux_pane_alive(role):
+                    if pane_fallback and self._tmux_pane_alive(role):
                         LOGGER.info("l2_thinking=false 但 tmux pane 存活 → 视为 busy (survival L2 兜底)")
                         return True
                     return False
@@ -1361,9 +1362,9 @@ class WorkflowEngine:
                        wf_id: str = "", step_id: str = "", force: bool = False):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。
         force=True 时跳过 pending/busy 检查，用于超时重推。"""
-        # 并发保护：角色已有一个不同 workflow 的活跃步骤时，跳过推送
-        # （统一走 _is_role_busy 并排除自身 wf，避免"自己的 pending 挡住重推"）
-        if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
+        # 并发保护：角色已有另一个 workflow 的活跃步骤时，跳过推送
+        # pane_fallback=False：首次投递仅查 DB，不因 tmux 存活而阻塞
+        if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=False):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
             return
