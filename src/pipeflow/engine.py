@@ -98,9 +98,16 @@ class WorkflowRun:
 
 
 class WorkflowEngine:
-    def __init__(self, workflows_dir: Path = _WORKFLOWS_DIR):
+    def __init__(self, workflows_dir: Path = _WORKFLOWS_DIR, db_path: str = None):
         self.workflows_dir = Path(workflows_dir).expanduser()
         self.runs_dir = self.workflows_dir / "runs"
+        # 非默认目录（测试/沙箱）→ 使用目录内独立 DB，避免污染生产 workflows.db
+        # ponytail: 测试仍共享生产 bus；若要完全隔离需注入 Blackboard
+        self._db_path = db_path or (
+            str(self.workflows_dir / "test_workflows.db")
+            if self.workflows_dir != Path(_WORKFLOWS_DIR)
+            else None
+        )
         self._bb = Blackboard()
         self._workflows: dict[str, WorkflowDef] = {}
         self._lm = None
@@ -110,7 +117,8 @@ class WorkflowEngine:
     def _lifecycle(self):
         if self._lm is None:
             from lifecycle.manager import LifecycleManager
-            self._lm = LifecycleManager("workflow_engine", on_advance=self._ensure_role_alive)
+            self._lm = LifecycleManager("workflow_engine", db_path=self._db_path,
+                                        on_advance=self._ensure_role_alive)
         return self._lm
 
     def _load_workflows(self):
