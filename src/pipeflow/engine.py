@@ -848,14 +848,14 @@ class WorkflowEngine:
             return
 
         # 退出条件未匹配（无 bus 消息，timeout 已在顶部检查）
-        # poll_since 语义 = 已知最新 bus 消息时间戳（游标），而非 now。
-        # 用 now-15s 安全窗口，覆盖 tick 间隔内角色写 bus 的消息，防止永久漏检。
+        # poll_since 推进 = now - 30s 安全窗口，覆盖慢角色写 bus 的延迟（qa 写消息可达数分钟）。
+        # bus_anchor 保持不动——它是"已匹配消息"的锚点，只在匹配时更新。
+        # 修复：之前 no-match 也推进 bus_anchor，导致 tick 间消息被永久跳过。
         _now = time.time()
-        _new_poll = _now - 15
+        _new_poll = _now - 30
         run.step_results[step.id] = {
             **run.step_results.get(step.id, {}),
             "poll_since": _new_poll,
-            "bus_anchor": max(run.step_results.get(step.id, {}).get("bus_anchor", 0), _new_poll),
         }
         self._sync_step_results(run.id, run.step_results)
         return
@@ -1014,20 +1014,9 @@ class WorkflowEngine:
                     capture_output=True, timeout=5)
             alive = False
         if alive:
-            # 代码变更检测：检测到 workspace/launcher 代码变化时标记需重启
-            # 有 running workflow 时延迟重启，防止杀死正在工作的角色
-            if self._detect_code_change(role):
-                if self._role_has_pending_assignment(role):
-                    LOGGER.info("code-change detected for %s but has running workflow, deferring restart", role)
-                    # 保留 checksum，下次 tick 再检测
-                else:
-                    LOGGER.info("code-change detected for %s, scheduling restart", role)
-                    self._bb.write("code_fix",
-                        f"[code-hotswap] {role} 代码变更，重启旧实例",
-                        src="workflow_engine")
-                    _sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
-                            capture_output=True, timeout=5)
-                    self._clean_role_code_checksum(role)
+            # 代码变更检测已禁用：workspace 的 .py 是角色自己的产出（正常开发），
+            # 全量 md5 扫描会误判"代码变更"→ 杀死正在工作的角色（2026-08-01 观测 8 次误杀）。
+            # 如需热替换 launcher 代码，由运维手动 ccs restart 完成。
             return True
 
         # 拉起 CCS（infinite 模式，agent 常驻执行任务）
@@ -1049,39 +1038,6 @@ class WorkflowEngine:
             LOGGER.debug("CCS role alive check failed for %s", role)
         return False
 
-    _CODE_CS_DIR = Path.home() / ".hermes" / "run"
-
-    def _detect_code_change(self, role: str) -> bool:
-        """检查角色 workspace 代码是否有变更（不含 launcher，launcher 变更不应触发单角色重启）。"""
-        import hashlib
-        ws = _CCS_WORKSPACES / role
-        cs_path = self._CODE_CS_DIR / f"code-checksum-{role}"
-        try:
-            sources = sorted(ws.rglob("*.py"))
-            h = hashlib.md5()
-            for f in sources:
-                if f.exists():
-                    h.update(f.read_bytes())
-            digest = h.hexdigest()
-            if cs_path.exists():
-                prev = cs_path.read_text().strip()
-                if prev != digest:
-                    return True
-            cs_path.write_text(digest)
-        except (ValueError, KeyError, TypeError):
-            pass
-        return False
-
-    def _clean_role_code_checksum(self, role: str):
-        """重启后清除 checksum 标记。"""
-        cs_path = self._CODE_CS_DIR / f"code-checksum-{role}"
-        try:
-            if cs_path.exists():
-                cs_path.unlink()
-        except (ValueError, KeyError, TypeError):
-            pass
-
-    _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
 
     def _role_has_pending_assignment(self, role: str) -> bool:
