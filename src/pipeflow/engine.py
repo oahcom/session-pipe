@@ -973,6 +973,7 @@ class WorkflowEngine:
                         {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
                         for f in _role_msgs
                         if f.src == step.target_role
+                        and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                         and f.ts > _notified_ts
                         and f.ts < time.time() + 60  # 防未来时间戳
                     ]
@@ -1005,6 +1006,10 @@ class WorkflowEngine:
 
             return
 
+        # 无 bus_category 的步骤不走 exit 匹配（纯超时 + 角色 wf complete 驱动），
+        # 否则空 cat 匹配所有 bus 消息，导致 engine 自产告警被当作角色产出完成步骤。
+        if not cat:
+            return
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
