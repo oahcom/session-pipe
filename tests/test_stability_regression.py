@@ -27,6 +27,13 @@ def _eng(**overrides) -> WorkflowEngine:
         eng = WorkflowEngine()
     eng._HEALTH_DIR = _HEALTH
     eng._lm = MagicMock()
+    # _lifecycle 是懒加载 property（内部 new LifecycleManager），直接 mock 掉
+    eng._lm.close_wf = MagicMock()
+    eng._lm.query = MagicMock(return_value=[])
+    eng._lm.complete_step = MagicMock()
+    eng._lm.start_wf = MagicMock()
+    eng._lm.upsert_template = MagicMock()
+    type(eng)._lifecycle = PropertyMock(return_value=eng._lm)
     eng._bb = MagicMock()
     eng._workflows = {}
     eng._tmux_pane_alive = MagicMock(return_value=False)
