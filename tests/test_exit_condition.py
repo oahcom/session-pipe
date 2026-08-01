@@ -65,43 +65,49 @@ def _run(step_results=None, status="running", current_step="s1"):
 class TestCheckExitEmpty(unittest.TestCase):
     def test_empty_bus(self):
         eng = _make_eng()
-        # 使用一个几乎不可能已有事实的分类
-        self.assertFalse(eng._check_exit(f"__ec_empty_{_UNIQUE}", "", ""))
+        ts, msgs = eng._check_exit(f"__ec_empty_{_UNIQUE}", "", "")
+        self.assertFalse(ts)
 
 
 class TestCheckExitFilters(unittest.TestCase):
     def test_text_mismatch(self):
         eng = _make_eng()
         eng._bb.write("notice", f"no match {_UNIQUE}", src="test_src")
-        self.assertFalse(eng._check_exit("notice", "", "XYZZY_NOMATCH"))
+        ts, msgs = eng._check_exit("notice", "", "XYZZY_NOMATCH")
+        self.assertFalse(ts)
 
     def test_combined_src_and_text(self):
         eng = _make_eng()
         marker = f"COMBO_{_UNIQUE}"
         eng._bb.write("notice", marker, src="combo_src")
-        self.assertTrue(eng._check_exit("notice", "combo_src", marker))
-        self.assertFalse(eng._check_exit("notice", "wrong_src", marker))
-        self.assertFalse(eng._check_exit("notice", "combo_src", "WRONG"))
+        ts, msgs = eng._check_exit("notice", "combo_src", marker)
+        self.assertTrue(ts)
+        ts, msgs = eng._check_exit("notice", "wrong_src", marker)
+        self.assertFalse(ts)
+        ts, msgs = eng._check_exit("notice", "combo_src", "WRONG")
+        self.assertFalse(ts)
 
 
 class TestCheckExitTimestamp(unittest.TestCase):
     def test_created_after_filters_old(self):
         eng = _make_eng()
         eng._bb.write("notice", f"old msg {_UNIQUE}", src="ts_src")
-        # created_after=future => 过滤掉所有现有 fact
         future = time.time() + 3600
-        self.assertFalse(eng._check_exit("notice", "ts_src", "", created_after=future))
+        ts, msgs = eng._check_exit("notice", "ts_src", "", created_after=future)
+        self.assertFalse(ts)
 
     def test_created_after_allows_recent(self):
         eng = _make_eng()
         marker = f"NEW_{_UNIQUE}"
         eng._bb.write("notice", marker, src="ts_src2")
         past = time.time() - 3600
-        self.assertTrue(eng._check_exit("notice", "ts_src2", marker, created_after=past))
+        ts, msgs = eng._check_exit("notice", "ts_src2", marker, created_after=past)
+        self.assertTrue(ts)
 
     def test_created_after_no_facts(self):
         eng = _make_eng()
-        self.assertFalse(eng._check_exit("notice", "", "", created_after=time.time()))
+        ts, msgs = eng._check_exit("notice", "", "", created_after=time.time())
+        self.assertFalse(ts)
 
 
 class TestCheckExitNoCat(unittest.TestCase):
@@ -109,7 +115,8 @@ class TestCheckExitNoCat(unittest.TestCase):
         eng = _make_eng()
         marker = f"NOCAT_{_UNIQUE}"
         eng._bb.write("architecture", marker, src="nocat_src")
-        self.assertTrue(eng._check_exit("", "nocat_src", marker))
+        ts, msgs = eng._check_exit("", "nocat_src", marker)
+        self.assertTrue(ts)
 
 
 class TestValidateExitSchema(unittest.TestCase):
@@ -189,6 +196,39 @@ class TestValidateExitSchema(unittest.TestCase):
             ok, errs = eng._validate_exit_schema(step, _run())
             self.assertFalse(ok)
             self.assertTrue(any("缺少必需内容" in e for e in errs))
+        finally:
+            fpath.unlink(missing_ok=True)
+
+    def test_must_contain_url_pass(self):
+        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws.mkdir(parents=True, exist_ok=True)
+        fpath = ws / f"urlok_{_UNIQUE}.md"
+        fpath.write_text(f"参考: https://github.com/example/proj\n")
+        try:
+            eng = _make_eng()
+            step = _step(exit_schema={
+                "required": [f"urlok_{_UNIQUE}.md"],
+                "properties": {f"urlok_{_UNIQUE}.md": {"mustContainUrl": True}},
+            })
+            ok, errs = eng._validate_exit_schema(step, _run())
+            self.assertTrue(ok)
+        finally:
+            fpath.unlink(missing_ok=True)
+
+    def test_must_contain_url_fail(self):
+        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws.mkdir(parents=True, exist_ok=True)
+        fpath = ws / f"nourl_{_UNIQUE}.md"
+        fpath.write_text("本地调研结论，无外部链接")
+        try:
+            eng = _make_eng()
+            step = _step(exit_schema={
+                "required": [f"nourl_{_UNIQUE}.md"],
+                "properties": {f"nourl_{_UNIQUE}.md": {"mustContainUrl": True}},
+            })
+            ok, errs = eng._validate_exit_schema(step, _run())
+            self.assertFalse(ok)
+            self.assertTrue(any("URL" in e for e in errs))
         finally:
             fpath.unlink(missing_ok=True)
 
@@ -337,7 +377,7 @@ class TestEvalCond(unittest.TestCase):
 class TestTickExitSchemaBlocked(unittest.TestCase):
     def test_exit_schema_fail_blocks_advance(self):
         eng = _mocked_eng()
-        eng._check_exit = MagicMock(return_value=True)
+        eng._check_exit = MagicMock(return_value=(time.time(), [{"id": 1, "text": "match", "ts": time.time(), "src": "test"}]))
         eng._validate_exit_schema = MagicMock(return_value=(False, ["schema error"]))
         eng._send_to_role = MagicMock()
 
@@ -347,14 +387,14 @@ class TestTickExitSchemaBlocked(unittest.TestCase):
 
         eng._bb.write.assert_called_once()
         call_args = eng._bb.write.call_args
-        self.assertIn("不符合 schema", call_args[0][1])
+        self.assertIn("schema", call_args[0][1])
 
 
 class TestTickVerifyBlocked(unittest.TestCase):
     @patch("pipeflow.engine._sp")
     def test_verify_fail_blocks_advance(self, mock_sp):
         eng = _mocked_eng()
-        eng._check_exit = MagicMock(return_value=True)
+        eng._check_exit = MagicMock(return_value=(time.time(), [{"id": 1, "text": "match", "ts": time.time(), "src": "test"}]))
         eng._validate_exit_schema = MagicMock(return_value=(True, []))
 
         failed_proc = MagicMock()
@@ -368,7 +408,7 @@ class TestTickVerifyBlocked(unittest.TestCase):
 
         eng._bb.write.assert_called_once()
         call_args = eng._bb.write.call_args
-        self.assertIn("验证不通过", call_args[0][1])
+        self.assertIn("verify", call_args[0][1])
 
 
 class TestTickCompletedRunSkipped(unittest.TestCase):
@@ -382,10 +422,10 @@ class TestTickCompletedRunSkipped(unittest.TestCase):
 
 
 class TestTickNoMatchUpdatesPollSince(unittest.TestCase):
-    def test_poll_since_not_updated_when_no_match(self):
-        """退出条件未匹配时不推 poll_since，下次 tick 重查同一时间窗。"""
+    def test_poll_since_updated_when_no_match(self):
+        """退出条件未匹配时引擎推 poll_since，防止重复匹配旧消息。"""
         eng = _mocked_eng()
-        eng._check_exit = MagicMock(return_value=False)
+        eng._check_exit = MagicMock(return_value=(0.0, []))
         eng._sync_step_results = MagicMock()
 
         step = _step()
@@ -393,9 +433,9 @@ class TestTickNoMatchUpdatesPollSince(unittest.TestCase):
         run.step_results = {"s1": {}}
         eng._tick(run, step)
 
-        eng._sync_step_results.assert_not_called()
+        eng._sync_step_results.assert_called_once()
         sr = run.step_results["s1"]
-        self.assertNotIn("poll_since", sr)
+        self.assertIn("poll_since", sr)
 
 
 if __name__ == "__main__":

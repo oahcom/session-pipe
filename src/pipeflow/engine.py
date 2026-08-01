@@ -634,6 +634,13 @@ class WorkflowEngine:
         prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
         prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
         prompt = prompt.replace("{topic}", task_title)
+        # workspace 摘要：给角色上下文（首步生产扫描在调用前已替换，这里统一兜底）
+        try:
+            _ws_dir = Path.home() / "ccs-workspaces" / step.target_role
+            prompt = prompt.replace("{workspace_summary}",
+                                    self._collect_workspace_summary(_ws_dir))
+        except Exception:
+            pass
         # 步骤间数据传递：上一步骤的 exit_messages 填充后续步骤变量
         prev_sr = (results or {}).get(prev_step_id, {}) if prev_step_id else {}
         prev_msgs = prev_sr.get("exit_messages", []) if isinstance(prev_sr, dict) else []
@@ -646,7 +653,7 @@ class WorkflowEngine:
             fallback = task_desc or task_title or wf_name
             for var in ("{target}", "{findings}", "{results}", "{backlog}",
                         "{exception_info}", "{focus_area}", "{changes}",
-                        "{task_list}", "{assignments}"):
+                        "{task_list}", "{assignments}", "{workspace_summary}"):
                 if var in prompt:
                     prompt = prompt.replace(var, fallback)
         return prompt
@@ -1132,6 +1139,14 @@ class WorkflowEngine:
                     missing = [kw for kw in props["mustContain"] if kw not in content]
                     if missing:
                         errs.append(f"{fname} 缺少必需内容: {missing}")
+                else:
+                    errs.append(f"缺少产出: {fname}")
+
+            if "mustContainUrl" in props and props["mustContainUrl"]:
+                if fpath.exists():
+                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                    if not re.search(r'https?://', content):
+                        errs.append(f"{fname} 缺少 URL 链接 (mustContainUrl)")
                 else:
                     errs.append(f"缺少产出: {fname}")
 
@@ -1657,6 +1672,8 @@ class WorkflowEngine:
                 _demand = self._bb.read(cat="task_spec", limit=10)
                 _has_demand = any(
                     _f.src not in ("workflow_engine", "survival_monitor")
+                    # closer 周期性 backlog 扫描是模板循环产物，不是真实需求
+                    and "backlog_scan" not in (_f.t or "")
                     and _f.ts > _now - 3600
                     for _f in _demand
                 )
