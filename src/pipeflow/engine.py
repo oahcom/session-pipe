@@ -863,6 +863,25 @@ class WorkflowEngine:
         elapsed = time.time() - (run.step_results.get(step.id, {}).get("ts", run.created_at))
         _auto_cancel_at = max(max_retries + 3, 4)
         if elapsed >= timeout:
+            # 角色忙（有其他任务执行中）→ 排队语义：不递增 timeout_count，
+            # 仅延长响应窗口（避免"忙时被塞任务→未响应→超时回收"的假阳性）
+            if self._role_has_pending_assignment(step.target_role):
+                _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
+                # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
+                # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
+                if _queued >= 6:
+                    self._send_to_role("coordinator",
+                        f"[workflow] {run.workflow_name}/{run.current_step} "
+                        f"排队 {_queued} 次仍未响应（角色 {step.target_role} 活跃但可能卡死），请介入",
+                        wf_id=run.id, step_id=run.current_step, force=True)
+                run.step_results[step.id] = {
+                    **run.step_results.get(step.id, {}),
+                    "ts": time.time(),  # 重置计时器，等待角色空闲
+                    "queued": _queued,
+                }
+                self._sync_step_results(run.id, run.step_results)
+                return
+
             timeout_count = run.step_results.get(step.id, {}).get("timeout_count", 0) + 1
             run.step_results[step.id] = {
                 **run.step_results.get(step.id, {}),
@@ -881,13 +900,20 @@ class WorkflowEngine:
                     f"step={run.current_step} timeout_count={timeout_count} >= {_auto_cancel_at}\n请排查该步骤为何持续超时。")
                 return
             # 重推任务（最多重推 1 次，不自动完成）
-            # force=True 跳过 pending 检查——超时重推的目的恰恰是角色"卡住没响应"
+            # 角色忙（有其他任务在跑）→ 不强制重推，通知 coordinator 排队
             if timeout_count == 1:
-                self._send_to_role(step.target_role, step.prompt_template,
-                                   wf_id=run.id, step_id=step.id, force=True)
-                self._send_to_role("coordinator",
-                    f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
-                    wf_id=run.id, step_id=run.current_step, force=True)
+                if self._role_has_pending_assignment(step.target_role):
+                    # 角色在忙，延长超时窗口：通知 coordinator 而非重推
+                    self._send_to_role("coordinator",
+                        f"[workflow] {run.workflow_name}/{run.current_step} "
+                        f"超时1次但{step.target_role}忙碌（有其他任务执行中），自动排队等待",
+                        wf_id=run.id, step_id=run.current_step, force=True)
+                else:
+                    self._send_to_role(step.target_role, step.prompt_template,
+                                       wf_id=run.id, step_id=step.id, force=True)
+                    self._send_to_role("coordinator",
+                        f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
+                        wf_id=run.id, step_id=run.current_step, force=True)
             return
 
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
@@ -1170,6 +1196,12 @@ class WorkflowEngine:
                 status = step_sr.get("status", "")
                 if status in ("notified", "running"):
                     tc = step_sr.get("timeout_count", 0)
+                    _queued = step_sr.get("queued", 0)
+                    # 排队上限（约 3 小时未响应）→ 不再视为"在工作"，
+                    # 允许 _kick_stalled_roles 重推 / tick 走超时升级链
+                    if _queued >= 6:
+                        LOGGER.info("%s queued=%d >= 6 → 不再视为 pending", role, _queued)
+                        continue
                     if tc < 3:  # 超时 < 3次 → 角色真的还在工作
                         LOGGER.debug("skip: %s 已有 pending assignment %s/%s",
                                      role, r["instance_id"][:8], step_id)
@@ -1220,6 +1252,10 @@ class WorkflowEngine:
                 sr = json.loads(r["step_results"] or "{}")
                 sdata = sr.get(r["current_step_id"], {})
                 if isinstance(sdata, dict) and sdata.get("status") in ("notified", "running"):
+                    _q = sdata.get("queued", 0)
+                    if _q >= 6:
+                        LOGGER.info("%s queued=%d >= 6 → 不再视为 busy", role, _q)
+                        continue
                     if sdata.get("timeout_count", 0) < 3:
                         LOGGER.info("skip: %s busy with %s/%s (step=%s)",
                                     role, r["instance_id"][:8], r["current_step_id"], sdata.get("status"))
