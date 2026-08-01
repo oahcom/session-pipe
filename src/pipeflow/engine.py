@@ -863,9 +863,9 @@ class WorkflowEngine:
         # 会导致 created_after 过滤器跳过所有近期 bus 消息，流水线永久卡死。
         _persisted = run.step_results.get(step.id, {}).get("poll_since", time.time())
         _bus_anchor = run.step_results.get(step.id, {}).get("bus_anchor")
-        # 初始化时用 poll_since，但一旦设置后永远只增不减
+        # 初始化时用 notified_at（步骤首次通知时间），确保不跳过消息
         if _bus_anchor is None:
-            _bus_anchor = _persisted
+            _bus_anchor = run.step_results.get(step.id, {}).get("notified_at", _persisted)
         last_ts = _bus_anchor
         _skip_before = run.step_results.get(step.id, {}).get("bus_skip_before", 0)
 
