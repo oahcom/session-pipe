@@ -768,8 +768,13 @@ class WorkflowEngine:
                 return
             # 最后一步 → 检查所有子工作流是否全部完成
             if idx + 1 >= len(steps):
+                # 从 DB 实时读取 step_results（不依赖传入的 results 快照，避免
+                # 主循环与 _scan_tasks 双路径传入不同副本导致竞态误判）
+                _db_res = conn.execute(
+                    "SELECT step_results FROM workflow_instances WHERE instance_id=?", (wf_id,)
+                ).fetchone()
                 _all_subs_done = True
-                for _sid, _sdata in (results or {}).items():
+                for _sid, _sdata in (json.loads(_db_res["step_results"]) if _db_res and _db_res["step_results"] else {}).items():
                     if not isinstance(_sdata, dict):
                         continue
                     _sf = _sdata.get("subflow_id", "")
@@ -791,8 +796,16 @@ class WorkflowEngine:
                 return
             # 推进到下一步
             next_step = steps[idx + 1]
-            conn.execute("UPDATE workflow_instances SET current_step_id=? WHERE instance_id=? AND current_step_id=?",
+            # 条件更新：仅当当前步骤仍是 step_id 时才推进（并发防重）
+            _adv = conn.execute("UPDATE workflow_instances SET current_step_id=? WHERE instance_id=? AND current_step_id=?",
                         (next_step.id, wf_id, step_id))
+            if _adv.rowcount == 0:
+                LOGGER.debug("advance skipped: %s/%s 已被其他路径推进", wf_id[:12], step_id)
+                return
+            # 推进后行 status 归位 running，避免 _scan_tasks 路径推进后
+            # 主循环看到旧 step_done_ready 再次触发 advance
+            conn.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?",
+                        (wf_id,))
             new_results = dict(results or {})
             new_results[next_step.id] = {"status": "notified", "ts": time.time(), "notified_at": time.time(),
                                           "poll_since": time.time(), "bus_anchor": time.time()}
@@ -1184,7 +1197,14 @@ class WorkflowEngine:
             # 通配符一次解析：所有检查器共享匹配列表
             if "*" in fname:
                 import glob as _gl
-                matched = [Path(m) for m in _gl.glob(str(fpath))]
+                all_matches = [Path(m) for m in _gl.glob(str(fpath))]
+                # 过滤：只检查工作流创建后被修改/新建的文件（本次任务产出），
+                # 排除 workspace 历史遗留文件导致的 minLength/mustContain 误报
+                _wf_created = getattr(run, 'created_at', 0) or 0
+                matched = [m for m in all_matches if m.stat().st_mtime >= _wf_created] if _wf_created else all_matches
+                if not matched and all_matches:
+                    # 所有匹配文件均在工作流创建前，跳过内容检查（无本次产出可校验）
+                    continue
             else:
                 matched = [fpath] if fpath.exists() else []
 
