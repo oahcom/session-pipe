@@ -164,8 +164,7 @@ class WorkflowEngine:
             for row in rows:
                 t = dict(row)
                 tid = t["template_id"]
-                if tid in self._workflows:
-                    continue
+                # 模板热加载：去除缓存跳过，每次 tick 从 DB 重载
                 raw = json.loads(t.get("steps_json") or "[]")
                 if not raw or not isinstance(raw, list) or not isinstance(raw[0], dict):
                     continue
@@ -793,6 +792,11 @@ class WorkflowEngine:
                     self._bb.write("workflow",
                         f"[workflow] {wf_name} 完成: {len(steps)} 步",
                         src="workflow_engine")
+                    # 食物链循环：loop 配置存在 → 检查是否继续下一轮
+                    # 子 agent 价值审计文件存在且标记 FAIL → 停止循环（收益不足）
+                    # 否则重启生产者角色（思路干净）并启动新迭代
+                    if wf.loop:
+                        self._handle_wf_loop(wf, wf_id, conn)
                 return
             # 推进到下一步
             next_step = steps[idx + 1]
@@ -894,6 +898,98 @@ class WorkflowEngine:
                 LOGGER.info("deployed %d outputs from %s", len(deployed), wf_id[:12])
         except Exception as e:
             LOGGER.debug("deploy_production_outputs failed: %s", e)
+
+    def _handle_wf_loop(self, wf: WorkflowDef, wf_id: str, conn):
+        """食物链循环处理：检查价值门禁 → 重启生产者 → 创建新迭代。
+
+        loop 配置格式：
+          {
+            "enabled": true,
+            "max_iterations": 3,          # 0=无限
+            "producer_roles": ["scout"],   # 每轮重启的角色（思路干净）
+            "value_gate": {
+              "file": "VALUE_AUDIT.md",     # 审计角色产出物
+              "workspace": "lr"             # 审计角色 workspace
+            }
+          }
+        """
+        loop_cfg = wf.loop or {}
+        if not loop_cfg.get("enabled", True):
+            return
+        try:
+            # 从实例 context 读取当前迭代数
+            _ctx_row = conn.execute(
+                "SELECT context FROM workflow_instances WHERE instance_id=?", (wf_id,)
+            ).fetchone()
+            _ctx = json.loads(_ctx_row["context"]) if _ctx_row and _ctx_row["context"] else {}
+            _iteration = int(_ctx.get("loop_iteration", 0) or 0)
+            _max_iter = int(loop_cfg.get("max_iterations", 0) or 0)
+            if _max_iter > 0 and _iteration >= _max_iter:
+                LOGGER.info("wf %s loop: 达到最大迭代 %d，停止", wf_id[:8], _max_iter)
+                self._bb.write("workflow",
+                    f"[workflow] {wf.name} 循环结束: 达到最大迭代 {_max_iter}",
+                    src="workflow_engine")
+                return
+
+            # 价值门禁：审计角色产出文件标记 FAIL → 停止循环
+            _vg = loop_cfg.get("value_gate") or {}
+            _vg_file = _vg.get("file", "")
+            _vg_ws = _vg.get("workspace", "")
+            if _vg_file and _vg_ws:
+                _audit_path = Path.home() / "ccs-workspaces" / _vg_ws / _vg_file
+                if _audit_path.exists():
+                    _text = _audit_path.read_text(encoding="utf-8", errors="ignore")
+                    if "FAIL" in _text.upper() or "REJECT" in _text.upper():
+                        LOGGER.info("wf %s loop: 价值审计 FAIL，停止循环", wf_id[:8])
+                        self._bb.write("workflow",
+                            f"[workflow] {wf.name} 循环停止: 价值审计未达标",
+                            src="workflow_engine")
+                        return
+
+            # 重启生产者角色（tmux kill + ccs start）——保证思路干净
+            _producers = loop_cfg.get("producer_roles") or []
+            for _role in _producers:
+                try:
+                    _sp.run(["python3", str(_CCS_CLI), "stop", _role],
+                            capture_output=True, timeout=30)
+                    _sp.run(["python3", str(_CCS_CLI), "start", _role, "--no-attach",
+                             "--drive", "infinite"],
+                            capture_output=True, timeout=30)
+                    LOGGER.info("wf %s loop: 生产者 %s 已重启 (iteration %d)",
+                                wf_id[:8], _role, _iteration + 1)
+                except (ValueError, KeyError, TypeError) as _e:
+                    LOGGER.warning("loop producer restart failed %s: %s", _role, _e)
+
+            # 创建新迭代：新任务 + 新工作流实例（同一模板）
+            _task_id = f"task_loop_{uuid.uuid4().hex[:8]}"
+            _new_wf_id = f"wf_{uuid.uuid4().hex[:12]}"
+            _task_title = f"{wf.title} — 迭代 {_iteration + 1}"
+            _task_desc = f"{wf.description}\n[loop] 迭代 {_iteration + 1}/{_max_iter or '∞'}"
+            _now = time.time()
+            try:
+                conn.execute(
+                    "INSERT INTO tasks (task_id, title, description, assigner, assignee, "
+                    "priority, status, created_at, updated_at) VALUES (?,?,?,?,?,0,'in_progress',?,?)",
+                    (_task_id, _task_title, _task_desc, "workflow_engine",
+                     wf.allowed_executors[0] if wf.allowed_executors else "", _now, _now))
+                conn.execute(
+                    "INSERT INTO workflow_instances (instance_id, template_id, task_id, assigner, "
+                    "assignee, status, current_step_id, step_results, context, created_at) "
+                    "VALUES (?,?,?,?,?,'pending','s1',?,?,?)",
+                    (_new_wf_id, wf.name, _task_id, "workflow_engine",
+                     wf.allowed_executors[0] if wf.allowed_executors else "",
+                     json.dumps({}),
+                     json.dumps({"loop_iteration": _iteration + 1, "parent_loop_wf": wf_id}),
+                     _now))
+                conn.commit()
+                self._bb.write("workflow",
+                    f"[workflow] {wf.name} 新一轮迭代 {_iteration + 1} 已启动: {_new_wf_id}",
+                    src="workflow_engine")
+            except Exception as _e:
+                LOGGER.error("loop new iteration failed %s: %s", wf_id, _e)
+                conn.rollback()
+        except Exception as _e:
+            LOGGER.warning("_handle_wf_loop failed %s: %s", wf_id, _e)
 
     def _tick(self, run: WorkflowRun, step: Step):
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
