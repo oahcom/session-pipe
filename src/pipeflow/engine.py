@@ -1714,15 +1714,16 @@ class WorkflowEngine:
             _last = self._TASK_GEN_COOLDOWN.get(_role, 0)
             if _now - _last < _COOLDOWN_S:
                 continue
-            # 同模板 24h 内已完成过 → 跳过（防止循环派发同模板任务）
+            # 同模板同角色：有活跃实例(running/pending) → 跳过（防重复创建）
+            # 24h 内已完成/取消过 → 跳过（防循环派发同模板任务）
             try:
-                _done = conn.execute(
+                _existing = conn.execute(
                     "SELECT COUNT(*) as c FROM workflow_instances "
-                    "WHERE template_id=? AND assignee=? AND status IN ('completed','cancelled') "
-                    "AND created_at > ?",
+                    "WHERE template_id=? AND assignee=? "
+                    "AND (status IN ('running','pending') OR created_at > ?)",
                     (_wf_name, _role, _now - 86400)
                 ).fetchone()["c"]
-                if _done > 0:
+                if _existing > 0:
                     continue
             except Exception:
                 pass
