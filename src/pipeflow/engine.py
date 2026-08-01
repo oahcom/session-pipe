@@ -164,7 +164,11 @@ class WorkflowEngine:
             for row in rows:
                 t = dict(row)
                 tid = t["template_id"]
-                # 模板热加载：去除缓存跳过，每次 tick 从 DB 重载
+                # JSON 定义优先：DB 中已有同名模板（简化版/旧版）→ 跳过，防止
+                # upsert 的简化 steps（无 exit_condition）覆盖完整 JSON 定义
+                # （bus #167084 根因：去掉此检查后 s4 exit_condition 变空 → 工作流卡死）
+                if tid in self._workflows:
+                    continue
                 raw = json.loads(t.get("steps_json") or "[]")
                 if not raw or not isinstance(raw, list) or not isinstance(raw[0], dict):
                     continue
@@ -371,6 +375,9 @@ class WorkflowEngine:
             LOGGER.warning("stale cleanup error: %s", e)
 
     def run_once(self):
+        # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
+        self._load_workflows()
+
         # 先清理僵尸 workflow
         try:
             self._cleanup_stale_workflows(self._lifecycle)
@@ -1036,6 +1043,22 @@ class WorkflowEngine:
             # 角色忙（有其他任务执行中）→ 排队语义：不递增 timeout_count，
             # 仅延长响应窗口（避免"忙时被塞任务→未响应→超时回收"的假阳性）
             if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
+                # 角色忙 ≠ 任务未完成：先做 exit 匹配，产出已存在则直接推进
+                # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
+                if cat:
+                    _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
+                    if _busy_match_ts:
+                        run.step_results[step.id] = {
+                            **run.step_results.get(step.id, {}),
+                            "bus_anchor": _busy_match_ts,
+                            "exit_messages": _busy_match_msgs,
+                        }
+                        self._sync_step_results(run.id, run.step_results)
+                        try:
+                            self._lifecycle.complete_step(run.id, step.id)
+                        except Exception as _e:
+                            LOGGER.debug("busy exit-match complete_step 失败: %s", _e)
+                        return
                 _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
                 # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
                 # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
