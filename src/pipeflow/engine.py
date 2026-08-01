@@ -399,6 +399,13 @@ class WorkflowEngine:
                 step_id = inst.get("current_step_id", "")
                 step = next((s for s in wf.steps if s.id == step_id), None)
                 if not step:
+                    # current_step 不在模板中（模板更新遗留/数据损坏）→ 回收
+                    LOGGER.warning("wf %s/%s current_step=%s 不在模板中，自动回收",
+                                   inst["instance_id"][:12], wf_name, step_id)
+                    try:
+                        self._lifecycle.close_wf(inst["instance_id"], status="cancelled")
+                    except Exception:
+                        pass
                     continue
                 results = json.loads(inst.get("step_results") or "{}")
                 step_status = results.get(step_id, {}).get("status", "")
