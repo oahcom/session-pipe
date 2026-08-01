@@ -322,7 +322,10 @@ class WorkflowClient:
         self._conn.commit()
         wf = self.get(wf_id)
         if wf and wf.get('task_id'):
-            self._sync_task_from_workflows(wf['task_id'])
+            try:
+                self._sync_task_from_workflows(wf['task_id'])
+            except Exception:
+                self._conn.rollback()  # 同步失败不阻断主流程，日志必须落库
         self._log(wf_id=wf_id, action="completed", detail=f"summary={summary}")
 
     def _sync_task_from_workflows(self, task_id: str):
@@ -339,7 +342,10 @@ class WorkflowClient:
         self._conn.commit()
         wf = self.get(wf_id)
         if wf and wf.get('task_id'):
-            self._sync_task_from_workflows(wf['task_id'])
+            try:
+                self._sync_task_from_workflows(wf['task_id'])
+            except Exception:
+                self._conn.rollback()
         self._log(wf_id=wf_id, action="failed", detail=f"reason={reason}")
 
     def cancel(self, wf_id: str, reason: str = ""):
@@ -351,7 +357,10 @@ class WorkflowClient:
         self._conn.commit()
         wf = self.get(wf_id)
         if wf and wf.get('task_id'):
-            self._sync_task_from_workflows(wf['task_id'])
+            try:
+                self._sync_task_from_workflows(wf['task_id'])
+            except Exception:
+                self._conn.rollback()
         self._log(wf_id=wf_id, action="cancelled", detail=f"reason={reason}")
 
     def delete(self, wf_id: str) -> bool:

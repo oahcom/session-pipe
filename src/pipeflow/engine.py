@@ -269,6 +269,13 @@ class WorkflowEngine:
             row = None
         if not row or row["status"] in ("completed", "cancelled", "failed"):
             return False
+        # 最小存活时间保护：创建不足 5 分钟的工作流禁止 cancel。
+        # 防止"通知角色后 32 秒即被取消"的误杀（bus #158145：s1 响应窗口仅 32s）。
+        # ponytail: 5 分钟是保守值，正式角色多数 5 分钟内会响应；超时取消不受此限制（走 _tick 路径）。
+        _created = row.get("created_at") or 0
+        if time.time() - _created < 300:
+            LOGGER.warning("cancel rejected: %s 创建不足 5 分钟 (age=%.0fs)，拒绝取消", wid, time.time() - _created)
+            return False
         self._lifecycle.close_wf(wid, status="cancelled")
         return True
 
@@ -301,6 +308,12 @@ class WorkflowEngine:
                     (v.get("timeout_count", 0) for v in sr.values() if isinstance(v, dict)),
                     default=0,
                 )
+
+                # 最小存活时间保护：创建不足 5 分钟的 workflow 不自动回收。
+                # 防止"刚通知角色就被 stale cleanup 误杀"（bus #158145：32s 被 cancel）。
+                age_s = now - created if created else 0
+                if age_s < 300:
+                    continue
 
                 _auto_cancel_at = 6
                 reason = ""
@@ -1392,6 +1405,19 @@ class WorkflowEngine:
             self._bb.write("blocker",
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
+            return
+        # coordinator 只接收真实任务（task_spec 语义），排队/超时/告警升级消息
+        # 写 blocker 即可，不 ccs send —— 避免 /goal 前缀注入 coordinator 死锁
+        # （bus #141691 根因：q/goal [] 循环。coordinator 是调度者不是目标执行者）
+        _is_scheduler_noise = role == "coordinator" and any(
+            kw in prompt for kw in ["排队", "超时", "持续超时", "请介入", "等待角色响应"]
+        )
+        if _is_scheduler_noise:
+            LOGGER.info("send-to-role coordinator 跳过: 调度噪音消息 (wf=%s step=%s)",
+                        wf_id[:12] if wf_id else "?", step_id)
+            self._bb.write("blocker",
+                f"[workflow] coordinator 调度噪音已拦截: {wf_id}/{step_id}",
+                evidence=prompt[:200], src="workflow_engine")
             return
         # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
         if wf_id:

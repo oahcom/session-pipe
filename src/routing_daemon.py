@@ -212,13 +212,31 @@ def main():
                 eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
                 if _eval_checker_mtime < eval_checker_mtime:
                     try:
+                        # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）
+                        for _key in list(sys.modules):
+                            if _key == "eval_checker" or _key.startswith("eval_checker."):
+                                del sys.modules[_key]
                         import eval_checker
                         importlib.reload(eval_checker)
                         _run_eval = eval_checker.run_eval_check
+                        _old_mtime = _eval_checker_mtime
                         _eval_checker_mtime = eval_checker_mtime
-                        LOGGER.info("eval_checker 热重载成功 (mtime updated)")
+                        LOGGER.info("eval_checker 热重载成功 (mtime %s→%s)",
+                                    _old_mtime, eval_checker_mtime)
                     except Exception as _e:
                         LOGGER.warning("eval_checker 热重载失败: %s", _e)
+                        # 热重载失败：尝试强制重新 import（兜底）
+                        try:
+                            for _key in list(sys.modules):
+                                if _key == "eval_checker" or _key.startswith("eval_checker."):
+                                    del sys.modules[_key]
+                            import importlib as _il
+                            eval_checker = _il.import_module("eval_checker")
+                            _run_eval = eval_checker.run_eval_check
+                            _eval_checker_mtime = eval_checker_mtime
+                            LOGGER.info("eval_checker 强制重新 import 成功")
+                        except Exception as _e2:
+                            LOGGER.error("eval_checker 强制重新 import 也失败: %s", _e2)
                 try:
                     r = _run_eval()
                     if r.get("failed", 0):
