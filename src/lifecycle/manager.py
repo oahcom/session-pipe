@@ -401,8 +401,8 @@ class LifecycleManager:
                 msg += "\n请根据拒绝原因修改后重新提交。"
             _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
-                ["python3", _ccs_cli, "send", "coordinator", executor, msg,
-                 "--from", self.role],
+                ["python3", _ccs_cli, "send", executor, msg,
+                 "--from", "cli"],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
                 logger.warning("notify result failed for %s: %s", executor,
@@ -571,8 +571,14 @@ class LifecycleManager:
 
     def _set_step_result_unsafe(self, wf_id: str, step_id: str,
                                  status: str, results: dict):
-        results[step_id] = {"status": status, "completed_at": time.time(),
-                            "completed_by": self.role}
+        _existing = results.get(step_id, {})
+        if isinstance(_existing, dict):
+            _existing.update({"status": status, "completed_at": time.time(),
+                              "completed_by": self.role})
+            results[step_id] = _existing
+        else:
+            results[step_id] = {"status": status, "completed_at": time.time(),
+                                "completed_by": self.role}
         self._conn.execute(
             "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
             (json.dumps(results, ensure_ascii=False), wf_id)
@@ -663,14 +669,37 @@ class LifecycleManager:
             )
             _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
-                ["python3", _ccs_cli, "send", self.role, assigner, msg,
-                 "--from", self.role],
+                ["python3", _ccs_cli, "send", assigner, msg,
+                 "--from", "cli"],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
                 logger.warning("ccs send failed for %s->%s: %s", self.role, assigner,
                                result.stderr.decode()[:200])
+                # 降级兜底：ccs send 失败时写 bus，确保审批请求不丢失
+                # （WL-P2-03：ccs send 失败 → 自动降级为 bus 消息写入）
+                try:
+                    import json as _json
+                    from workflow.client import _get_ccs_cli  # noqa: F401 复用路径解析
+                    self._bb_write_fallback(wf_id, step_id, token, approval_prompt, assigner)
+                except Exception as _fb_err:
+                    logger.warning("bus fallback failed: %s", _fb_err)
         except Exception as e:
             logger.warning("approval token CCS send error: %s", e)
+
+    def _bb_write_fallback(self, wf_id, step_id, token, approval_prompt, assigner):
+        """ccs send 失败时的 bus 降级写入（WL-P2-03 通知降级）。
+
+        确保审批请求不因 send 失败而丢失：写入 bus cat=workflow，
+        assigner 角色通过 bus 轮询可收到。
+        """
+        from blackboard import Blackboard
+        bb = Blackboard()
+        bb.write(
+            "workflow",
+            f"[审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求（ccs send 失败，经 bus 投递）",
+            evidence=f"审批人: {assigner}\n密钥: {token}\n有效期: 1小时\n提示: {approval_prompt}",
+            src="workflow_engine",
+        )
 
     def _complete_subflow_unsafe(self, wf_id, step_id, step, task_id, results):
         """创建子工作流 + 启动，返回 step_done_ready（等 confirm 时检查子状态）。"""
