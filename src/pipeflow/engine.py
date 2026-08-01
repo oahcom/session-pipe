@@ -1718,12 +1718,12 @@ class WorkflowEngine:
             # 同模板同角色：有活跃实例(running/pending) → 跳过（防重复创建）
             # 24h 内已完成/取消过 → 跳过（防循环派发同模板任务）
             try:
-                _existing = conn.execute(
+                _existing = self._lifecycle.query(
                     "SELECT COUNT(*) as c FROM workflow_instances "
                     "WHERE template_id=? AND assignee=? "
                     "AND (status IN ('running','pending') OR created_at > ?)",
                     (_wf_name, _role, _now - 86400)
-                ).fetchone()["c"]
+                )[0]["c"]
                 if _existing > 0:
                     continue
             except Exception:
