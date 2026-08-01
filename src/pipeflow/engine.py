@@ -653,7 +653,7 @@ class WorkflowEngine:
             fallback = task_desc or task_title or wf_name
             for var in ("{target}", "{findings}", "{results}", "{backlog}",
                         "{exception_info}", "{focus_area}", "{changes}",
-                        "{task_list}", "{assignments}", "{workspace_summary}"):
+                        "{task_list}", "{assignments}", "{workspace_summary}", "{project}"):
                 if var in prompt:
                     prompt = prompt.replace(var, fallback)
         return prompt
@@ -1280,12 +1280,19 @@ class WorkflowEngine:
             if hp.exists():
                 h = json.loads(hp.read_text())
                 overall = h.get("survival_overall", "unknown")
-                # thinking=None（两信号均未知）也算不忙，放行
+                # idle/unknown → 查 tmux pane 兜底：tmux 3.4 的 pane_activity 恒为空，
+                # survival L2 信号失效，忙任务被误判 idle → 超时误回收。pane 存活即视为 busy。
                 if overall in ("idle", "stale", "dead", "orphan", "unknown"):
+                    if self._tmux_pane_alive(role):
+                        LOGGER.info("health=%s 但 tmux pane 存活 → 视为 busy (survival L2 兜底)", overall)
+                        return True
                     return False
                 # healthy: 角色可能在工作，继续信号2确认
                 # stale/l2=false: 角色空闲，放行
                 if h.get("survival_l2_thinking") is False:
+                    if self._tmux_pane_alive(role):
+                        LOGGER.info("l2_thinking=false 但 tmux pane 存活 → 视为 busy (survival L2 兜底)")
+                        return True
                     return False
         except Exception:
             pass  # 健康文件损坏，退化到信号2
@@ -1320,6 +1327,22 @@ class WorkflowEngine:
             return False
         except Exception:
             return False
+
+    def _tmux_pane_alive(self, role: str) -> bool:
+        """tmux pane 兜底信号：pane 存活即视为角色在忙。
+
+        tmux 3.4 的 pane_activity 恒为空导致 survival L2 失效（详见 survival_monitor._l2_check），
+        这里用 pane 存在 + active 作为低误报兜底。"""
+        try:
+            r = _sp.run(
+                ["tmux", "list-panes", "-t", f"ccs-{role}", "-F", "#{pane_active}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0 and "1" in r.stdout:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _notify_role(self, role: str, title: str, evidence: str):
         """告警通知：写 blocker bus + ccs send 唤醒角色（绕过并发检查）。"""
@@ -1670,13 +1693,19 @@ class WorkflowEngine:
             # 无 bus 需求信号（task_spec/blocker/需求类消息）时跳过自动生成。
             try:
                 _demand = self._bb.read(cat="task_spec", limit=10)
-                _has_demand = any(
-                    _f.src not in ("workflow_engine", "survival_monitor")
-                    # closer 周期性 backlog 扫描是模板循环产物，不是真实需求
-                    and "backlog_scan" not in (_f.t or "")
-                    and _f.ts > _now - 3600
-                    for _f in _demand
+                _demand_text = ""
+                for _f in _demand:
+                    if _f.src not in ("workflow_engine", "survival_monitor"):
+                        # closer 周期性 backlog 扫描是模板循环产物，不是真实需求
+                        if "backlog_scan" not in (_f.t or ""):
+                            _demand_text += (_f.t or "") + " " + (_f.e or "") + " "
+                # 需求信号必须与目标角色相关：标题或内容含角色名/其职责关键词才算
+                _role_hits = (
+                    f"@{_role}" in _demand_text
+                    or f"assignee={_role}" in _demand_text
+                    or _role in _demand_text
                 )
+                _has_demand = bool(_demand_text) and _role_hits and _demand_text.strip() != ""
                 if not _has_demand:
                     continue
             except Exception:
