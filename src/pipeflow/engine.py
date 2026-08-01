@@ -616,12 +616,6 @@ class WorkflowEngine:
                 "FROM workflow_instances WHERE status='running'"
             )
             for row in rows:
-                _role = row["assignee"]
-                if not _role or _role in ("coordinator",):
-                    continue
-                # 角色已有挂起的任务 → 不打扰
-                if self._role_has_pending_assignment(_role):
-                    continue
                 _results = json.loads(row["step_results"] or "{}")
                 _sid = row["current_step_id"]
                 _sr = _results.get(_sid, {})
@@ -635,14 +629,23 @@ class WorkflowEngine:
                 _tc = _sr.get("timeout_count", 0)
                 if _tc > 0:
                     continue  # tick 已经在处理
+                _wf = self._workflows.get(row["template_id"])
+                if not _wf:
+                    continue
+                _step = next((s for s in _wf.steps if s.id == _sid), None)
+                if not _step:
+                    continue
+                # 用当前步骤的 target_role（同其他修复一致），不是 assignee
+                _role = _step.target_role
+                if not _role or _role in ("coordinator",):
+                    continue
+                # 角色已有挂起的任务 → 不打扰
+                if self._role_has_pending_assignment(_role):
+                    continue
                 LOGGER.info("kick-stalled: %s/%s role=%s notified=%ds ago",
                             row["template_id"], row["instance_id"], _role, now - _notified_at)
-                _wf = self._workflows.get(row["template_id"])
-                if _wf:
-                    _step = next((s for s in _wf.steps if s.id == _sid), None)
-                    if _step:
-                        self._send_to_role(_role, _step.prompt_template,
-                                           wf_id=row["instance_id"], step_id=_sid)
+                self._send_to_role(_role, _step.prompt_template,
+                                   wf_id=row["instance_id"], step_id=_sid)
         except Exception as _e:
             LOGGER.debug("kick_stalled error: %s", _e)
 
