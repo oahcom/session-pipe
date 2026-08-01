@@ -845,9 +845,11 @@ class WorkflowEngine:
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
+            # 同时保存 exit_messages 作为角色产出证据（task_evidence 依赖此字段判定收益）
             run.step_results[step.id] = {
                 **run.step_results.get(step.id, {}),
                 "bus_anchor": _match_ts,
+                "exit_messages": _match_msgs,
             }
             self._sync_step_results(run.id, run.step_results)
 

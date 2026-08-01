@@ -10,12 +10,142 @@
 
 子 agent 拿到这些数据后自行判断哪些 task 有实际收益。
 """
-import sqlite3, json, sys, subprocess, time
+import sqlite3, json, sys, subprocess, time, os
 from pathlib import Path
 
 DB = Path.home() / ".hermes" / "state" / "workflows.db"
 WORKSPACES = Path.home() / "ccs-workspaces"
 BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
+
+# 系统文件：不是角色产出，不应计入证据
+SYSTEM_FILES = {"TASKS.md", "CLAUDE.md", "test_output.md", "base.md"}
+
+# 产出收益判定不依赖部署路径：文档类产出留在 workspace 即为交付
+
+
+def _output_files(role, t_created=None, t_updated=None):
+    """角色 workspace 下的真实产出文件（排除系统文件、目录、空文件）。
+
+    t_created/t_updated: 任务时间窗口（epoch float），只统计窗口内新增/修改的文件，
+    避免同一角色多个任务共用 workspace 导致文件被重复计数。
+    """
+    ws = WORKSPACES / role
+    if not ws.exists():
+        return []
+    files = []
+    for f in ws.rglob("*"):
+        if not f.is_file() or f.name in SYSTEM_FILES:
+            continue
+        try:
+            st = f.stat()
+            # 排除空文件与 <1KB 的疑似模板残留
+            if st.st_size < 1024:
+                continue
+            # 时间窗口过滤：文件 mtime 必须在任务创建与更新之间
+            # 30min 缓冲覆盖角色创建文件的时差，同时避免跨任务文件重叠
+            if t_created and t_updated:
+                if not (t_created - 1800 <= st.st_mtime <= t_updated + 1800):
+                    continue
+        except OSError:
+            continue
+        files.append(f)
+    return files
+
+
+def _output_summary(files):
+    """产出摘要：文件数 + 总大小 + 样例。"""
+    if not files:
+        return 0, 0, []
+    total = sum(f.stat().st_size for f in files)
+    names = sorted(f.name for f in files)[:5]
+    return len(files), total, names
+
+
+def evaluate_and_feedback():
+    """提取已完成任务证据 → 写质量反馈到 bus，供 coordinator/workflow_engine 消费。
+
+    只评估最近 1 小时完成的 workfow，避免重复。
+    收益判定由规则引擎基于真实产出证据（bus 消息、产出文件、workflow 进度）
+    独立评估，不使用标题长度等表面启发式。
+    """
+    db = sqlite3.connect(str(DB))
+    db.row_factory = sqlite3.Row
+    _now = time.time()
+    _cutoff = _now - 3600
+
+    completed = db.execute(
+        "SELECT task_id, title, assignee, created_at, updated_at FROM tasks "
+        "WHERE status='completed' AND updated_at > ? "
+        "ORDER BY updated_at DESC LIMIT 10",
+        (_cutoff,)
+    ).fetchall()
+    if not completed:
+        return {"evaluated": 0, "assessments": []}
+
+    # 每任务的独立 bus 证据：按 task_id 搜索（不再用全局 'task' 搜索）
+    def _bus_evidence(tid):
+        try:
+            _r = subprocess.run(
+                [str(BUS_CLIENT), "search", tid, "--limit", "20"],
+                capture_output=True, text=True, timeout=15)
+            if not _r.stdout.strip().startswith("{"):
+                return False
+            _data = json.loads(_r.stdout)
+            return bool(_data.get("results") or _data.get("facts") or _data.get("items"))
+        except Exception:
+            return False
+
+    assessments = []
+    for t in completed:
+        _tid = t["task_id"]
+        _role = t["assignee"] or "?"
+        _title = t["title"] or "?"
+        # 时间窗口：任务创建前后 1h ~ 更新后 1h，避免跨任务文件重复计数
+        _files = _output_files(_role, t["created_at"], t["updated_at"])
+        _n, _size, _names = _output_summary(_files)
+        _bus = _bus_evidence(_tid)
+
+        # 收益判定规则（子 agent 独立评估的规则化实现）：
+        #   1. 有真实产出文件（≥1KB）且已部署 → 有收益
+        #   2. 有真实产出文件（≥1KB）未部署 → 有产出但可能未交付（文档类留 workspace 即为交付）
+        #   3. 无产出但有该任务的 bus 证据 → 进行中（有交流痕迹）
+        #   4. 无产出、无证据 → 纯模板任务（无收益）
+        if _n >= 3 or (_n >= 1 and _size > 2048):
+            _quality = "positive"
+            _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），质量: 有实质产出"
+        elif _n >= 1:
+            _quality = "neutral"
+            _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），疑似模板残留"
+        elif _bus:
+            _quality = "neutral"
+            _detail = f"task《{_title[:40]}》by {_role} — 无产出文件但有 bus 证据，进行中"
+        else:
+            _quality = "negative"
+            _detail = f"task《{_title[:40]}》by {_role} — 无产出、无证据，纯模板任务"
+        assessments.append({
+            "task_id": _tid, "role": _role,
+            "title": _title, "quality": _quality,
+            "detail": _detail,
+            "output_files": _names,
+            "output_count": _n,
+            "output_size": _size,
+            "has_bus_evidence": _bus,
+        })
+
+    # 汇总写 bus
+    _bus = BUS_CLIENT
+    for a in assessments:
+        try:
+            subprocess.run(
+                [str(_bus), "write", "feedback",
+                 f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
+                 "--evidence", json.dumps(a),
+                 "--src", "task_evidence"],
+                capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+    return {"evaluated": len(assessments), "assessments": assessments}
 
 
 def extract():
@@ -52,7 +182,7 @@ def extract():
         ws = WORKSPACES / role
         if not ws.exists():
             return 0, []
-        files = [f.name for f in ws.rglob("*") if f.is_file()]
+        files = [f.name for f in ws.rglob("*") if f.is_file() and f.name not in SYSTEM_FILES]
         return len(files), files[:10]
 
     result = []
@@ -112,102 +242,6 @@ def extract():
         stats[r["status"]] = r["c"]
 
     return {"tasks": result, "stats": stats, "total_extracted": len(result)}
-
-
-def evaluate_and_feedback():
-    """提取已完成任务证据 → 写质量反馈到 bus，供 coordinator/workflow_engine 消费。
-
-    只评估最近 1 小时完成的 workfow，避免重复。
-    收益判定由规则引擎基于真实产出证据（bus 消息、产出文件、workflow 进度）
-    独立评估，不使用标题长度等表面启发式。
-    """
-    db = sqlite3.connect(str(DB))
-    db.row_factory = sqlite3.Row
-    _now = time.time()
-    _cutoff = _now - 3600
-
-    completed = db.execute(
-        "SELECT task_id, title, assignee, updated_at FROM tasks "
-        "WHERE status='completed' AND updated_at > ? "
-        "ORDER BY updated_at DESC LIMIT 10",
-        (_cutoff,)
-    ).fetchall()
-    if not completed:
-        return {"evaluated": 0, "assessments": []}
-
-    # 关联 bus 证据：标题/内容含任务关键词的消息
-    _bus_facts = {}
-    try:
-        _r = subprocess.run(
-            [str(BUS_CLIENT), "search", "task", "--limit", "200"],
-            capture_output=True, text=True, timeout=15)
-        _bus_facts = json.loads(_r.stdout) if _r.stdout.strip().startswith("{") else {}
-    except Exception:
-        pass
-
-    # 产出文件证据：角色 workspace 下的文件（排除 TASKS.md/CLAUDE.md 等系统文件）
-    def _output_files(role):
-        ws = WORKSPACES / role
-        if not ws.exists():
-            return []
-        return [f.name for f in ws.rglob("*") if f.is_file()
-                and f.name not in ("TASKS.md", "CLAUDE.md", "test_output.md")]
-
-    assessments = []
-    for t in completed:
-        _tid = t["task_id"]
-        _role = t["assignee"] or "?"
-        _title = t["title"] or "?"
-        _out = _output_files(_role)
-        _has_bus_evidence = bool(_bus_facts)
-        # 收益判定规则（子 agent 独立评估的规则化实现）：
-        #   1. 有部署到生产路径的产出（~/.hermes/bin/）→ 有收益
-        #   2. workspace 有产出文件但未部署 → neutral（模板执行中/未交付）
-        #   3. 无产出但有 bus 证据+描述性标题 → neutral（进行中）
-        #   4. 其余 → 无收益（纯模板任务）
-        _deployed = False
-        for _f in _out:
-            _fp = Path.home() / ".hermes" / "bin" / _f
-            if _fp.exists():
-                _deployed = True
-                break
-        if _deployed:
-            _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — 已部署: {len(_out)} 个产出文件"
-        elif _out:
-            _quality = "neutral"
-            _detail = f"task《{_title[:40]}》by {_role} — {len(_out)} 个产出文件，未部署（模板执行中/未交付）"
-        elif _has_bus_evidence and len(_title) > 20:
-            _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — bus 证据存在"
-        elif len(_title) > 20:
-            _quality = "neutral"
-            _detail = f"task《{_title[:40]}》by {_role} — 无产出文件，疑似模板空转"
-        else:
-            _quality = "negative"
-            _detail = f"task《{_title[:40]}》by {_role} — 无产出、标题泛化，纯模板任务"
-        assessments.append({
-            "task_id": _tid, "role": _role,
-            "title": _title, "quality": _quality,
-            "detail": _detail,
-            "output_files": _out[:5],
-            "has_bus_evidence": _has_bus_evidence,
-        })
-
-    # 汇总写 bus
-    _bus = BUS_CLIENT
-    for a in assessments:
-        try:
-            subprocess.run(
-                [str(_bus), "write", "feedback",
-                 f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
-                 "--evidence", json.dumps(a),
-                 "--src", "task_evidence"],
-                capture_output=True, timeout=10)
-        except Exception:
-            pass
-
-    return {"evaluated": len(assessments), "assessments": assessments}
 
 
 if __name__ == "__main__":
