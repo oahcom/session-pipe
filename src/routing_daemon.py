@@ -144,6 +144,7 @@ def main():
 
     # 延迟导入 eval_checker（避免模块级循环引用）
     _run_eval = None
+    _eval_checker_mtime = 0.0
 
     try:
         error_backoff = 0
@@ -204,8 +205,20 @@ def main():
                     try:
                         from eval_checker import run_eval_check
                         _run_eval = run_eval_check
+                        _eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
                     except Exception:
                         _run_eval = lambda: {"checked": 0}
+                # ponytail: 检测 eval_checker.py 变更，热重载无需重启 daemon
+                eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
+                if _eval_checker_mtime < eval_checker_mtime:
+                    try:
+                        import eval_checker
+                        importlib.reload(eval_checker)
+                        _run_eval = eval_checker.run_eval_check
+                        _eval_checker_mtime = eval_checker_mtime
+                        LOGGER.info("eval_checker 热重载成功 (mtime updated)")
+                    except Exception as _e:
+                        LOGGER.warning("eval_checker 热重载失败: %s", _e)
                 try:
                     r = _run_eval()
                     if r.get("failed", 0):
