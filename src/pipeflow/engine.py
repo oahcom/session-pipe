@@ -1200,7 +1200,8 @@ class WorkflowEngine:
         earliest = 0.0
         matched = []
         for f in facts:
-            if src_filter and f.src != src_filter:
+            # src 精确匹配；src=claude（bus 默认值）视为角色未设 src，不排除
+            if src_filter and f.src != src_filter and f.src != "claude":
                 continue
             if text_filter and text_filter not in f.t:
                 continue
