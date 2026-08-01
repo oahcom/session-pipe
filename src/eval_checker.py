@@ -58,8 +58,11 @@ def _extract_cmd(criterion: str) -> str | None:
     cmd_raw = re.sub(r'[一-鿿　-〿＀-￯]+[<\d]*', '', cmd_raw).strip()
     # 去掉 bash -c '...' 后残留的数字/符号（如 "5 分钟内" → "5" 残留）
     cmd_raw = re.sub(r"^bash -c '(.*)'\s*\d*$", r"bash -c '\1'", cmd_raw).strip()
-    # 去掉残留的 " < N" 比较符
-    cmd_raw = re.sub(r'\s+[<>!]=\s*\d+(?:\.\d+)?\s*', ' ', cmd_raw).strip()
+    # 去掉残留的 " < N" 或 "< N" 比较符（含无等号形式：>48h, <24h）
+    cmd_raw = re.sub(r'\s+[<>!]=?\s*\d+(?:\.\d+)?[a-zA-Z]?\s*', ' ', cmd_raw).strip()
+    # 去掉英文解释性残留（timestamp >48h / staged <24h / unread --all 后的说明词）
+    # 匹配: 裸词(如 timestamp/staged) 可选跟比较符(>/</>=/<=/!=) + 数字(可带字母后缀如 h/m/s)
+    cmd_raw = re.sub(r'\s+[a-zA-Z_][\w.-]*(?:\s*[<>!]=?\s*[\d.]+[a-zA-Z]*)?\s*$', '', cmd_raw).strip()
     cmd_raw = re.sub(r'  +', ' ', cmd_raw)
     cmd_raw = re.sub(r'^\s*\|\s*', '', cmd_raw)
     cmd_raw = re.sub(r';$', '', cmd_raw).strip()
@@ -92,7 +95,11 @@ def _is_shell_cmd(cmd: str) -> bool:
         "sort", "uniq", "awk", "sed", "xargs", "tr",
         "cut", "comm", "diff", "patch", "chmod",
         "rsync", "scp", "ssh", "exit",
+        "sqlite3", "du", "ccs", "python3", "for",
     })
+    # bash 变量赋值: last_fix=$(python3 ...) → 有效 bash 语法
+    if "=" in cmd and cmd.split("=")[0].strip().replace("_", "").replace("-", "").isalnum():
+        return True
     return bool(first) and first in keywords
 
 
@@ -104,6 +111,9 @@ _ALLOWED_CMDS = frozenset({
     "sort", "uniq", "awk", "sed", "diff", "which", "command",
     "python3",  # 只读验证脚本（bus_client unread 等），非写操作
     "cut",  # 管道过滤常见工具，只读
+    "sqlite3",  # 只读查询
+    "du",  # 只读磁盘使用
+    "ccs",  # CCS CLI
 })
 
 _SYSTEMCTL_READONLY = frozenset({"status", "is-active", "is-enabled", "show", "list-units", "list-unit-files"})
@@ -192,22 +202,29 @@ def _run(cmd: str, timeout: int = 30) -> dict:
     # 管道（|）只读过滤（cat | cut）放行；分号/命令替换仍禁（可拼接写操作）
     # 例外1: for/while 循环骨架中的 ';'（'for s in a b; do' 是安全语法）
     # 例外2: python3 -c '...' 内部的 ';' 是 python 代码分隔符，非 shell 命令分隔符
+    # 例外3: bash 变量赋值 + $() 命令替换（如 last_fix=$(python3 ...)）——只读巡检常用
     _is_loop_skeleton = first_word in ("for", "while")
     _is_py_inline = first_word == "python3" and "-c" in cmd.split()[1:3]
+    _is_var_assign = "=" in cmd.split()[0] if cmd.split() else False
     for _pat in ("`", "$("):
-        if _pat in cmd:
+        if _pat in cmd and not _is_var_assign:
             return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
-    if not _is_loop_skeleton and not _is_py_inline and ";" in cmd:
+    if not _is_loop_skeleton and not _is_py_inline and not _is_var_assign and ";" in cmd:
         return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
     # 管道仅允许左右两侧都是白名单只读命令（引号感知分割: grep 模式内的 '|' 不算管道）
     for _seg in _split_pipe_segments(cmd):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
         if _seg_cmd not in _ALLOWED_CMDS and _seg_cmd not in _SHELL_BUILTINS_READONLY:
             return {"ok": False, "stdout": "", "stderr": f"管道段命令不在白名单: {_seg_cmd}", "returncode": -3}
-    if first_word not in _ALLOWED_CMDS and first_word not in _SHELL_BUILTINS_READONLY:
+    if first_word not in _ALLOWED_CMDS and first_word not in _SHELL_BUILTINS_READONLY and not _is_var_assign:
         return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
-    if not _cmd_is_readonly(first_word, cmd):
+    if not _is_var_assign and not _cmd_is_readonly(first_word, cmd):
         return {"ok": False, "stdout": "", "stderr": f"写操作被拒绝: {first_word} 不允许非只读子命令", "returncode": -3}
+    # 变量赋值 + $() 命令替换: 校验替换体内部命令在白名单
+    if _is_var_assign and "$(" in cmd:
+        _inner_body = cmd.split("$(", 1)[1].rsplit(")", 1)[0] if cmd.count("$(") == cmd.count(")") else ""
+        if _inner_body and not _inner_cmd_ok(_inner_body):
+            return {"ok": False, "stdout": "", "stderr": f"$() 内部命令不在白名单: {_inner_body[:60]}", "returncode": -3}
     try:
         r = subprocess.run(
             ["bash", "-c", cmd],
@@ -405,15 +422,63 @@ def run_eval_check(role_filter: str | None = None) -> dict:
     return summary
 
 
+def precheck_all_personas() -> dict:
+    """离线预检: 扫描全部 persona 的 eval_criteria，验证命令提取 + 白名单。
+
+    返回 {roles: [{name, criteria: [{criterion, cmd, extracted_ok, will_run_ok, error}]}], summary: {...}}
+    """
+    roles = _load_roles()
+    if not roles:
+        return {"roles": [], "summary": {"total": 0}}
+    results = []
+    for role in roles:
+        items = []
+        for c in role.get("eval_criteria", []):
+            extracted = _extract_cmd(c)
+            if extracted is None:
+                items.append({"criterion": c[:80], "cmd": None,
+                              "extracted_ok": False, "will_run_ok": False,
+                              "error": "extract_cmd 返回 None"})
+                continue
+            cmd_raw, expected = extracted
+            is_shell = _is_shell_cmd(cmd_raw)
+            is_tool_err = False
+            run_ok = False
+            error = None
+            if not is_shell:
+                error = f"首词不在 _is_shell_cmd 关键字列表: {cmd_raw.split()[0] if cmd_raw else '?'}"
+            else:
+                r = _run(cmd_raw, timeout=5)
+                is_tool_err = _is_tool_error(r)
+                run_ok = r["ok"]
+                if not run_ok and not is_tool_err:
+                    error = f"exit={r['returncode']} stderr={r['stderr'][:60]}"
+            items.append({"criterion": c[:80], "cmd": cmd_raw,
+                          "extracted_ok": True, "will_run_ok": run_ok,
+                          "error": error})
+        results.append({"name": role["name"], "criteria": items})
+    bad_count = sum(1 for r in results for c in r["criteria"]
+                    if not c["extracted_ok"] or (c["extracted_ok"] and c["error"]))
+    return {"roles": results,
+            "summary": {"total": len(results), "bad_criteria": bad_count}}
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     import argparse
     parser = argparse.ArgumentParser(description="eval_criteria checker")
     parser.add_argument("--report-unverified", action="store_true",
                         help="输出无可执行 criterion 的角色（全自然语言）")
+    parser.add_argument("--precheck", action="store_true",
+                        help="离线预检全部 persona 的 eval_criteria 命令")
     parser.add_argument("--role", type=str, default=None,
                         help="只检查指定角色")
     args = parser.parse_args()
+
+    if args.precheck:
+        result = precheck_all_personas()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["summary"]["bad_criteria"] == 0 else 1
 
     if args.report_unverified:
         roles = _load_roles()
