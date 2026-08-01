@@ -1382,6 +1382,16 @@ class WorkflowEngine:
         # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
         if not prompt.startswith(("/goal", "/GOAL", "/Goal")):
             prompt = "/goal " + prompt
+        # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
+        # 用正则剥掉 /goal 前缀（lstrip 字符集会误伤内容开头的 g/o/a/l）
+        _goal_content = re.sub(r"^/goal\s*", "", prompt, flags=re.IGNORECASE).strip()
+        if len(_goal_content) < 10:
+            LOGGER.warning("send-to-role %s 拒绝: goal 内容过短 (len=%d, wf=%s step=%s)",
+                          role, len(_goal_content), wf_id[:12] if wf_id else "?", step_id)
+            self._bb.write("blocker",
+                f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
+                evidence=prompt[:300], src="workflow_engine")
+            return
         # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
         if wf_id:
             try:
