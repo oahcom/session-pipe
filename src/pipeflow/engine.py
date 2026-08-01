@@ -435,6 +435,11 @@ class WorkflowEngine:
                 # step_done_ready/completed 由角色或外部系统标记，无需额外的 completion_check
                 if step_status in ("step_done_ready", "completed"):
                     self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
+                    # 推进后立即把行 status 改为 running（推进到非最后一步时），
+                    # 避免角色重复 wf complete 把行 status 打回 step_done_ready
+                    lm.execute("UPDATE workflow_instances SET status='running' "
+                               "WHERE instance_id=? AND status='step_done_ready'",
+                               (inst["instance_id"],))
                     continue
 
                 # 所有 notified/running 步骤都进入 _tick() 处理超时/催办/升级
@@ -631,6 +636,14 @@ class WorkflowEngine:
         """推进生产工作流到下一步，并通知目标角色。"""
         try:
             conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
+            # 防重闭合守卫：launcher wf complete 全量覆写 step_results 会把已
+            # completed 的工作流打回 step_done_ready，这里拒绝二次推进。
+            _row = conn.execute(
+                "SELECT status FROM workflow_instances WHERE instance_id=?", (wf_id,)
+            ).fetchone()
+            if _row and _row["status"] == "completed":
+                LOGGER.debug("advance skipped: %s already completed", wf_id)
+                return
             wf = self._workflows.get(wf_name)
             if not wf:
                 return
@@ -835,10 +848,14 @@ class WorkflowEngine:
             return
 
         # 退出条件未匹配（无 bus 消息，timeout 已在顶部检查）
-        # 推进 poll_since 让下次 tick 只查更新消息
+        # poll_since 语义 = 已知最新 bus 消息时间戳（游标），而非 now。
+        # 用 now-15s 安全窗口，覆盖 tick 间隔内角色写 bus 的消息，防止永久漏检。
+        _now = time.time()
+        _new_poll = _now - 15
         run.step_results[step.id] = {
             **run.step_results.get(step.id, {}),
-            "poll_since": time.time(),
+            "poll_since": _new_poll,
+            "bus_anchor": max(run.step_results.get(step.id, {}).get("bus_anchor", 0), _new_poll),
         }
         self._sync_step_results(run.id, run.step_results)
         return
@@ -998,14 +1015,19 @@ class WorkflowEngine:
             alive = False
         if alive:
             # 代码变更检测：检测到 workspace/launcher 代码变化时标记需重启
+            # 有 running workflow 时延迟重启，防止杀死正在工作的角色
             if self._detect_code_change(role):
-                LOGGER.info("code-change detected for %s, scheduling restart", role)
-                self._bb.write("code_fix",
-                    f"[code-hotswap] {role} 代码变更，重启旧实例",
-                    src="workflow_engine")
-                _sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
-                        capture_output=True, timeout=5)
-                self._clean_role_code_checksum(role)
+                if self._role_has_pending_assignment(role):
+                    LOGGER.info("code-change detected for %s but has running workflow, deferring restart", role)
+                    # 保留 checksum，下次 tick 再检测
+                else:
+                    LOGGER.info("code-change detected for %s, scheduling restart", role)
+                    self._bb.write("code_fix",
+                        f"[code-hotswap] {role} 代码变更，重启旧实例",
+                        src="workflow_engine")
+                    _sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
+                            capture_output=True, timeout=5)
+                    self._clean_role_code_checksum(role)
             return True
 
         # 拉起 CCS（infinite 模式，agent 常驻执行任务）
@@ -1030,13 +1052,12 @@ class WorkflowEngine:
     _CODE_CS_DIR = Path.home() / ".hermes" / "run"
 
     def _detect_code_change(self, role: str) -> bool:
-        """检查角色 workspace 或 launcher 代码是否有变更。返回 True 表示需重启。"""
+        """检查角色 workspace 代码是否有变更（不含 launcher，launcher 变更不应触发单角色重启）。"""
         import hashlib
         ws = _CCS_WORKSPACES / role
-        launcher = _CCS_CLI
         cs_path = self._CODE_CS_DIR / f"code-checksum-{role}"
         try:
-            sources = sorted(ws.rglob("*.py")) + [launcher]
+            sources = sorted(ws.rglob("*.py"))
             h = hashlib.md5()
             for f in sources:
                 if f.exists():
@@ -1382,6 +1403,8 @@ class WorkflowEngine:
             ).fetchall():
                 _sr = json.loads(_sub_row["step_results"] or "{}")
                 for _step_id, _sdata in _sr.items():
+                    if not isinstance(_sdata, dict):
+                        continue  # 简写值（如 "done"）没有 subflow_id
                     _sf = _sdata.get("subflow_id", "")
                     if _sf:
                         _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
@@ -1462,6 +1485,19 @@ class WorkflowEngine:
             # 跳过空模板描述（task_spec needs_implementation → 理解 → 编码 是占位符）
             if not _wf.description or len(_wf.description.strip()) < 20 or "needs_implementation" in (_wf.description or ""):
                 continue
+            # 价值门槛：自动生成必须有真实需求信号，防止模板空转。
+            # 无 bus 需求信号（task_spec/blocker/需求类消息）时跳过自动生成。
+            try:
+                _demand = self._bb.read(cat="task_spec", limit=10)
+                _has_demand = any(
+                    _f.src not in ("workflow_engine", "survival_monitor")
+                    and _f.ts > _now - 3600
+                    for _f in _demand
+                )
+                if not _has_demand:
+                    continue
+            except Exception:
+                pass
             # cooldown 检测
             _last = self._TASK_GEN_COOLDOWN.get(_role, 0)
             if _now - _last < _COOLDOWN_S:

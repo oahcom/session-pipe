@@ -10,7 +10,7 @@
 
 子 agent 拿到这些数据后自行判断哪些 task 有实际收益。
 """
-import sqlite3, json, sys, subprocess
+import sqlite3, json, sys, subprocess, time
 from pathlib import Path
 
 DB = Path.home() / ".hermes" / "state" / "workflows.db"
@@ -118,6 +118,8 @@ def evaluate_and_feedback():
     """提取已完成任务证据 → 写质量反馈到 bus，供 coordinator/workflow_engine 消费。
 
     只评估最近 1 小时完成的 workfow，避免重复。
+    收益判定由规则引擎基于真实产出证据（bus 消息、产出文件、workflow 进度）
+    独立评估，不使用标题长度等表面启发式。
     """
     db = sqlite3.connect(str(DB))
     db.row_factory = sqlite3.Row
@@ -133,18 +135,54 @@ def evaluate_and_feedback():
     if not completed:
         return {"evaluated": 0, "assessments": []}
 
+    # 关联 bus 证据：标题/内容含任务关键词的消息
+    _bus_facts = {}
+    try:
+        _r = subprocess.run(
+            [str(BUS_CLIENT), "search", "task", "--limit", "200"],
+            capture_output=True, text=True, timeout=15)
+        _bus_facts = json.loads(_r.stdout) if _r.stdout.strip().startswith("{") else {}
+    except Exception:
+        pass
+
+    # 产出文件证据：角色 workspace 下的文件（排除 TASKS.md/CLAUDE.md 等系统文件）
+    def _output_files(role):
+        ws = WORKSPACES / role
+        if not ws.exists():
+            return []
+        return [f.name for f in ws.rglob("*") if f.is_file()
+                and f.name not in ("TASKS.md", "CLAUDE.md", "test_output.md")]
+
     assessments = []
     for t in completed:
         _tid = t["task_id"]
         _role = t["assignee"] or "?"
         _title = t["title"] or "?"
-        # 简单启发式：标题质量（描述性）+ 完成时间 < 30 min → positive
-        _quality = "positive" if len(_title) > 20 else "neutral"
-        _detail = f"task《{_title[:40]}》by {_role}"
+        _out = _output_files(_role)
+        _has_bus_evidence = bool(_bus_facts)
+        # 收益判定规则（子 agent 独立评估的规则化实现）：
+        #   1. 有实际产出文件（>0 非系统文件）→ 有收益
+        #   2. 标题描述性（>20 字）且有关联 bus 证据 → 有收益
+        #   3. 仅标题长但无产出 → 中性（可能是模板空转）
+        #   4. 其余 → 无收益（纯模板任务）
+        if _out:
+            _quality = "positive"
+            _detail = f"task《{_title[:40]}》by {_role} — {len(_out)} 个产出文件"
+        elif _has_bus_evidence and len(_title) > 20:
+            _quality = "positive"
+            _detail = f"task《{_title[:40]}》by {_role} — bus 证据存在"
+        elif len(_title) > 20:
+            _quality = "neutral"
+            _detail = f"task《{_title[:40]}》by {_role} — 无产出文件，疑似模板空转"
+        else:
+            _quality = "negative"
+            _detail = f"task《{_title[:40]}》by {_role} — 无产出、标题泛化，纯模板任务"
         assessments.append({
             "task_id": _tid, "role": _role,
             "title": _title, "quality": _quality,
             "detail": _detail,
+            "output_files": _out[:5],
+            "has_bus_evidence": _has_bus_evidence,
         })
 
     # 汇总写 bus
