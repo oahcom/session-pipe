@@ -95,8 +95,8 @@ def evaluate_and_feedback():
         except Exception:
             return False
 
-    # 预查: 每个任务关联的 workflow_instances 中 exit_messages 写入情况
-    _wf_exit = {}
+    # 预查: 每个任务关联的 workflow_instances 中 exit_messages 或 summary 写入情况
+    _wf_evidence = {}
     _task_ids = [t["task_id"] for t in completed]
     if _task_ids:
         _placeholders = ",".join("?" for _ in _task_ids)
@@ -105,12 +105,17 @@ def evaluate_and_feedback():
             _task_ids
         ).fetchall():
             _sr = json.loads(wf["step_results"] or "{}")
+            # exit_messages 是修复后新增的字段（角色实际 bus 产出）
             _has_exit = any(
                 isinstance(v, dict) and v.get("exit_messages")
                 for v in _sr.values()
             )
+            # summary 是引擎生成的角色完成摘要（历史实例的主要证据源）
+            _has_summary = bool(_sr.get("summary"))
             if _has_exit:
-                _wf_exit[wf["task_id"]] = True
+                _wf_evidence[wf["task_id"]] = "exit_messages"
+            elif _has_summary:
+                _wf_evidence[wf["task_id"]] = "summary"
 
     assessments = []
     for t in completed:
@@ -121,17 +126,21 @@ def evaluate_and_feedback():
         _files = _output_files(_role, t["created_at"], t["updated_at"])
         _n, _size, _names = _output_summary(_files)
         _bus = _bus_evidence(_tid)
-        _exit = _wf_exit.get(_tid, False)
+        _evidence = _wf_evidence.get(_tid, "")
 
         # 收益判定规则（子 agent 独立评估的规则化实现）：
         #   1. 有 exit_messages 证据（角色实际产出被引擎记录）→ 有收益
-        #   2. 有真实产出文件（≥1KB，≥3 个或 ≥2KB）→ 有实质产出
-        #   3. 有产出文件但量小 → 疑似模板残留
-        #   4. 无产出但有 bus 证据 → 进行中
-        #   5. 无产出、无证据 → 纯模板任务（无收益）
-        if _exit:
+        #   2. 有 summary 证据（引擎生成的角色完成摘要）→ 有收益
+        #   3. 有真实产出文件（≥1KB，≥3 个或 ≥2KB）→ 有实质产出
+        #   4. 有产出文件但量小 → 疑似模板残留
+        #   5. 无产出但有 bus 证据 → 进行中
+        #   6. 无产出、无证据 → 纯模板任务（无收益）
+        if _evidence == "exit_messages":
             _quality = "positive"
             _detail = f"task《{_title[:40]}》by {_role} — exit_messages 证据存在，有实际产出"
+        elif _evidence == "summary":
+            _quality = "positive"
+            _detail = f"task《{_title[:40]}》by {_role} — summary 证据存在，有实际产出"
         elif _n >= 3 or (_n >= 1 and _size > 2048):
             _quality = "positive"
             _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），有实质产出"
@@ -152,7 +161,9 @@ def evaluate_and_feedback():
             "output_count": _n,
             "output_size": _size,
             "has_bus_evidence": _bus,
-            "has_exit_messages": _exit,
+            "has_exit_messages": _evidence == "exit_messages",
+            "has_summary": _evidence == "summary",
+            "evidence_type": _evidence,
         })
 
     # 汇总写 bus
