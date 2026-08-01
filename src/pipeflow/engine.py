@@ -622,6 +622,35 @@ class WorkflowEngine:
             except Exception as e:
                 LOGGER.warning("compact send failed for %s: %s", role, e)
 
+    def _fill_prompt_vars(self, prompt: str, step: Step, wf_name: str,
+                          task_title: str, task_desc: str, results: dict,
+                          prev_step_id: str = "") -> str:
+        """填充 prompt 变量：任务上下文 + 步骤间数据传递（上一步 exit_messages）。
+        供 _advance_production_wf / _kick_stalled_roles / run_once 复用，保证
+        重推与首推拿到的 prompt 一致（避免重推丢上下文）。"""
+        prompt = prompt.replace("{title}", task_title)
+        prompt = prompt.replace("{description}", task_desc)
+        prompt = prompt.replace("{assignee}", step.target_role)
+        prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
+        prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
+        prompt = prompt.replace("{topic}", task_title)
+        # 步骤间数据传递：上一步骤的 exit_messages 填充后续步骤变量
+        prev_sr = (results or {}).get(prev_step_id, {}) if prev_step_id else {}
+        prev_msgs = prev_sr.get("exit_messages", []) if isinstance(prev_sr, dict) else []
+        if prev_msgs:
+            prev_text = "\n".join(str(m) for m in prev_msgs)[:3000]
+            for var in ("{target}", "{findings}", "{results}", "{backlog}",
+                        "{exception_info}", "{focus_area}"):
+                prompt = prompt.replace(var, prev_text)
+        else:
+            fallback = task_desc or task_title or wf_name
+            for var in ("{target}", "{findings}", "{results}", "{backlog}",
+                        "{exception_info}", "{focus_area}", "{changes}",
+                        "{task_list}", "{assignments}"):
+                if var in prompt:
+                    prompt = prompt.replace(var, fallback)
+        return prompt
+
     def _kick_stalled_roles(self):
         """检测有 running workflow 但 steps 停滞超时的角色，重推任务。
 
@@ -660,11 +689,31 @@ class WorkflowEngine:
                 if not _role or _role in ("coordinator",):
                     continue
                 # 角色已有挂起的任务 → 不打扰
-                if self._role_has_pending_assignment(_role):
+                if self._is_role_busy(_role):
                     continue
                 LOGGER.info("kick-stalled: %s/%s role=%s notified=%ds ago",
                             row["template_id"], row["instance_id"], _role, now - _notified_at)
-                self._send_to_role(_role, _step.prompt_template,
+                # 重推用统一变量填充（任务上下文 + 上一步产出），与首推一致
+                _task_row = lm.query(
+                    "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
+                    (row["instance_id"],)
+                )
+                _task = _task_row[0] if _task_row else None
+                _tt = _task["title"] if _task else row["template_id"]
+                _td = _task["description"] if _task else ""
+                _prev_sid = ""
+                _wf_steps = _wf.steps
+                _idx = next((i for i, s in enumerate(_wf_steps) if s.id == _sid), -1)
+                if _idx > 0:
+                    _prev_sid = _wf_steps[_idx - 1].id
+                _prompt = self._fill_prompt_vars(
+                    _step.prompt_template, _step, row["template_id"],
+                    _tt, _td, _results, _prev_sid)
+                if _UNMATCHED_VAR_RE.search(_prompt):
+                    LOGGER.warning("kick-stalled 跳过 %s/%s: 含未替换变量 %s",
+                                   row["template_id"], _sid, _UNMATCHED_VAR_RE.findall(_prompt))
+                    continue
+                self._send_to_role(_role, _prompt,
                                    wf_id=row["instance_id"], step_id=_sid)
         except Exception as _e:
             LOGGER.debug("kick_stalled error: %s", _e)
@@ -729,34 +778,9 @@ class WorkflowEngine:
             ).fetchone()
             task_title = task["title"] if task else wf_name
             task_desc = task["description"] if task else ""
-            prompt = next_step.prompt_template
-            prompt = prompt.replace("{title}", task_title)
-            prompt = prompt.replace("{description}", task_desc)
-            prompt = prompt.replace("{assignee}", next_step.target_role)
-            prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
-            prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
-            prompt = prompt.replace("{topic}", task_title)
-            # 步骤间数据传递：上一步骤的 exit_messages（角色实际产出的 bus 消息）
-            # 提取内容文本填充 {target}/{findings}/{results}/{backlog} 等后续步骤变量
-            prev_sr = (results or {}).get(step_id, {})
-            prev_msgs = prev_sr.get("exit_messages", [])
-            if prev_msgs:
-                if isinstance(prev_msgs, list):
-                    prev_text = "\n".join(str(m) for m in prev_msgs)[:3000]
-                else:
-                    prev_text = str(prev_msgs)[:3000]
-                for var in ("{target}", "{findings}", "{results}", "{backlog}",
-                            "{exception_info}", "{focus_area}"):
-                    prompt = prompt.replace(var, prev_text)
-            else:
-                # 角色未写 bus（exit_messages 空）→ fallback 到任务描述，保证后续
-                # 步骤变量不为空；task_desc 也空时再退到标题（与首步兜底一致）
-                fallback = task_desc or task_title or wf_name
-                for var in ("{target}", "{findings}", "{results}", "{backlog}",
-                            "{exception_info}", "{focus_area}", "{changes}",
-                            "{task_list}", "{assignments}"):
-                    if var in prompt:
-                        prompt = prompt.replace(var, fallback)
+            prompt = self._fill_prompt_vars(
+                next_step.prompt_template, next_step, wf_name,
+                task_title, task_desc, results, prev_step_id=step_id)
             # 未替换变量检测：advance 层提前拦截，跳过通知但不中断推进（步骤状态已更新）
             if _UNMATCHED_VAR_RE.search(prompt):
                 unmatched = _UNMATCHED_VAR_RE.findall(prompt)
@@ -865,7 +889,7 @@ class WorkflowEngine:
         if elapsed >= timeout:
             # 角色忙（有其他任务执行中）→ 排队语义：不递增 timeout_count，
             # 仅延长响应窗口（避免"忙时被塞任务→未响应→超时回收"的假阳性）
-            if self._role_has_pending_assignment(step.target_role):
+            if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
                 _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
                 # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
                 # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
@@ -902,7 +926,7 @@ class WorkflowEngine:
             # 重推任务（最多重推 1 次，不自动完成）
             # 角色忙（有其他任务在跑）→ 不强制重推，通知 coordinator 排队
             if timeout_count == 1:
-                if self._role_has_pending_assignment(step.target_role):
+                if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
                     # 角色在忙，延长超时窗口：通知 coordinator 而非重推
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} "
@@ -914,6 +938,51 @@ class WorkflowEngine:
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
                         wf_id=run.id, step_id=run.current_step, force=True)
+
+            # ── 宽松推进：角色已写同工作流 bus 消息但分类不匹配（如 evolution_report
+            #    写成了 architecture）→ 产出存在即推进，避免"产出已存在却死锁"。
+            #    触发条件：步骤已超时 >=1 次（角色确实执行过）且非首步。
+            #    匹配策略：先找引擎发的 task_spec（含 wf 前缀）→ 再匹配该角色在
+            #    task_spec 之后写的任意消息（标题可能不含 wf 前缀，按时间窗匹配）。
+            if timeout_count >= 1:
+                try:
+                    _role_msgs = self._bb.read(limit=100)
+                    _wf_id = run.id
+                    _notified_ts = run.step_results.get(step.id, {}).get("notified_at", 0)
+                    _relaxed = [
+                        {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
+                        for f in _role_msgs
+                        if f.src == step.target_role
+                        and f.ts > _notified_ts
+                        and f.ts < time.time() + 60  # 防未来时间戳
+                    ]
+                    # task_spec 锚点确认确实是本工作流任务
+                    _has_anchor = any(
+                        _wf_id[:8] in str(f.t) and f.cat == "task_spec"
+                        for f in _role_msgs
+                    )
+                    if _relaxed and _has_anchor:
+                        LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
+                                    run.workflow_name, step.id, len(_relaxed))
+                        run.step_results[step.id] = {
+                            **run.step_results.get(step.id, {}),
+                            "bus_anchor": _relaxed[0]["ts"],
+                            "exit_messages": _relaxed,
+                            "relaxed_advance": True,
+                        }
+                        self._sync_step_results(run.id, run.step_results)
+                        self._bb.write("blocker",
+                            f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
+                            f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
+                            src="workflow_engine")
+                        try:
+                            self._lifecycle.complete_step(run.id, step.id)
+                        except Exception as _e:
+                            LOGGER.debug("relaxed-advance complete_step 失败: %s", _e)
+                        return
+                except Exception as _relax_err:
+                    LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
+
             return
 
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
@@ -1182,47 +1251,6 @@ class WorkflowEngine:
 
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
 
-    def _role_has_pending_assignment(self, role: str) -> bool:
-        """角色是否已被分派过任务且正在执行中。
-
-        查 DB：该角色有 running workflow 的当前步骤（按 target_role 而非 assignee
-        匹配——assignee 是创建时的派发角色，多步工作流后续步骤的执行者
-        是各步骤的 target_role）是 notified/running 状态且 timeout_count < 3
-        → 已在工作，不应再发新任务。
-        """
-        try:
-            rows = self._lifecycle.query(
-                "SELECT instance_id, template_id, current_step_id, step_results "
-                "FROM workflow_instances "
-                "WHERE status='running'"
-            )
-            for r in rows:
-                _wf = self._workflows.get(r["template_id"])
-                if not _wf:
-                    continue
-                _step = next((s for s in _wf.steps if s.id == r["current_step_id"]), None)
-                if not _step or _step.target_role != role:
-                    continue
-                sr = json.loads(r["step_results"] or "{}")
-                step_id = r["current_step_id"]
-                step_sr = sr.get(step_id, {})
-                status = step_sr.get("status", "")
-                if status in ("notified", "running"):
-                    tc = step_sr.get("timeout_count", 0)
-                    _queued = step_sr.get("queued", 0)
-                    # 排队上限（约 3 小时未响应）→ 不再视为"在工作"，
-                    # 允许 _kick_stalled_roles 重推 / tick 走超时升级链
-                    if _queued >= 6:
-                        LOGGER.info("%s queued=%d >= 6 → 不再视为 pending", role, _queued)
-                        continue
-                    if tc < 3:  # 超时 < 3次 → 角色真的还在工作
-                        LOGGER.debug("skip: %s 已有 pending assignment %s/%s",
-                                     role, r["instance_id"][:8], step_id)
-                        return True
-        except Exception:
-            pass
-        return False
-
     def _is_role_busy(self, role: str, exclude_wf_id: str = "") -> bool:
         """检查角色是否真的在工作。
 
@@ -1252,10 +1280,11 @@ class WorkflowEngine:
             rows = self._lifecycle.query(
                 "SELECT instance_id, template_id, current_step_id, step_results "
                 "FROM workflow_instances "
-                "WHERE status='running' AND instance_id!=?",
-                (exclude_wf_id,)
+                "WHERE status='running'"
             )
             for r in rows:
+                if exclude_wf_id and r["instance_id"] == exclude_wf_id:
+                    continue
                 _wf = self._workflows.get(r["template_id"])
                 if not _wf:
                     continue
@@ -1294,11 +1323,8 @@ class WorkflowEngine:
                        wf_id: str = "", step_id: str = "", force: bool = False):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。
         force=True 时跳过 pending/busy 检查，用于超时重推。"""
-        if not force and self._role_has_pending_assignment(role):
-            LOGGER.info("send-to-role %s 跳过: 已有 pending assignment (wf=%s step=%s)",
-                        role, wf_id[:12] if wf_id else "?", step_id)
-            return
         # 并发保护：角色已有一个不同 workflow 的活跃步骤时，跳过推送
+        # （统一走 _is_role_busy 并排除自身 wf，避免"自己的 pending 挡住重推"）
         if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
