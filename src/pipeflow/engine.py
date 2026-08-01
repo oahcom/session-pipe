@@ -353,8 +353,23 @@ class WorkflowEngine:
             LOGGER.debug("stale cleanup in run_once failed: %s", e)
 
         # 确保工作流涉及的角色存活
+        # 注意：assignee 可能是 coordinator 创建任务时的派发角色（首步目标角色），
+        # 后续步骤的 target_role 才是真正的执行者。只检查 assignee 会漏拉起
+        # 后续步骤角色，因此同时检查当前步骤的 target_role。
+        _alive_roles = set()
         for _wf_row in self._lifecycle.query("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"):
-            self._ensure_role_alive(_wf_row["assignee"])
+            _alive_roles.add(_wf_row["assignee"])
+        for _wf_row in self._lifecycle.query(
+            "SELECT instance_id, template_id, current_step_id FROM workflow_instances WHERE status IN ('running','pending')"
+        ):
+            _wf = self._workflows.get(_wf_row["template_id"])
+            if not _wf:
+                continue
+            _step = next((s for s in _wf.steps if s.id == _wf_row["current_step_id"]), None)
+            if _step:
+                _alive_roles.add(_step.target_role)
+        for _role in _alive_roles:
+            self._ensure_role_alive(_role)
 
         # JSON 工作流路径已删除
         # SQLite production 工作流 — 复用 _lifecycle 连接避免泄漏
@@ -1043,17 +1058,24 @@ class WorkflowEngine:
     def _role_has_pending_assignment(self, role: str) -> bool:
         """角色是否已被分派过任务且正在执行中。
 
-        查 DB：该角色有 running workflow 的当前步骤是 notified/running 状态
-        且 timeout_count < 3 → 已在工作，不应再发新任务。
+        查 DB：该角色有 running workflow 的当前步骤（按 target_role 而非 assignee
+        匹配——assignee 是创建时的派发角色，多步工作流后续步骤的执行者
+        是各步骤的 target_role）是 notified/running 状态且 timeout_count < 3
+        → 已在工作，不应再发新任务。
         """
         try:
             rows = self._lifecycle.query(
-                "SELECT instance_id, current_step_id, step_results "
+                "SELECT instance_id, template_id, current_step_id, step_results "
                 "FROM workflow_instances "
-                "WHERE assignee=? AND status='running'",
-                (role,)
+                "WHERE status='running'"
             )
             for r in rows:
+                _wf = self._workflows.get(r["template_id"])
+                if not _wf:
+                    continue
+                _step = next((s for s in _wf.steps if s.id == r["current_step_id"]), None)
+                if not _step or _step.target_role != role:
+                    continue
                 sr = json.loads(r["step_results"] or "{}")
                 step_id = r["current_step_id"]
                 step_sr = sr.get(step_id, {})
@@ -1092,22 +1114,28 @@ class WorkflowEngine:
         except Exception:
             pass  # 健康文件损坏，退化到信号2
         # 信号2: DB 兜底——角色健康但 workflow 层面已有别的活跃步骤
+        # 按当前步骤的 target_role 匹配（同 _role_has_pending_assignment 语义）
         try:
             rows = self._lifecycle.query(
-                "SELECT instance_id, step_results FROM workflow_instances "
-                "WHERE assignee=? AND status='running' AND instance_id!=?",
-                (role, exclude_wf_id)
+                "SELECT instance_id, template_id, current_step_id, step_results "
+                "FROM workflow_instances "
+                "WHERE status='running' AND instance_id!=?",
+                (exclude_wf_id,)
             )
             for r in rows:
+                _wf = self._workflows.get(r["template_id"])
+                if not _wf:
+                    continue
+                _step = next((s for s in _wf.steps if s.id == r["current_step_id"]), None)
+                if not _step or _step.target_role != role:
+                    continue
                 sr = json.loads(r["step_results"] or "{}")
-                for _sid, sdata in sr.items():
-                    if not isinstance(sdata, dict):
-                        continue
-                    if sdata.get("status") in ("notified", "running"):
-                        if sdata.get("timeout_count", 0) < 3:
-                            LOGGER.info("skip: %s busy with %s/%s (step=%s)",
-                                        role, r["instance_id"][:8], _sid, sdata.get("status"))
-                            return True
+                sdata = sr.get(r["current_step_id"], {})
+                if isinstance(sdata, dict) and sdata.get("status") in ("notified", "running"):
+                    if sdata.get("timeout_count", 0) < 3:
+                        LOGGER.info("skip: %s busy with %s/%s (step=%s)",
+                                    role, r["instance_id"][:8], r["current_step_id"], sdata.get("status"))
+                        return True
             return False
         except Exception:
             return False
