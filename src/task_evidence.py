@@ -18,7 +18,13 @@ WORKSPACES = Path.home() / "ccs-workspaces"
 BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
 
 # 系统文件：不是角色产出，不应计入证据
-SYSTEM_FILES = {"TASKS.md", "CLAUDE.md", "test_output.md", "base.md"}
+# 前缀匹配覆盖 CLAUDE.md.1/.2 等轮转备份副本（子 agent 审计发现 98% 指标虚增来自此）
+SYSTEM_FILES = ("TASKS.md", "CLAUDE.md", "test_output.md", "base.md")
+SYSTEM_PREFIXES = ("CLAUDE.md.", "TASKS.md.")
+
+
+def _is_system_file(name: str) -> bool:
+    return name in SYSTEM_FILES or any(name.startswith(p) for p in SYSTEM_PREFIXES)
 
 # 产出收益判定不依赖部署路径：文档类产出留在 workspace 即为交付
 
@@ -34,7 +40,7 @@ def _output_files(role, t_created=None, t_updated=None):
         return []
     files = []
     for f in ws.rglob("*"):
-        if not f.is_file() or f.name in SYSTEM_FILES:
+        if not f.is_file() or _is_system_file(f.name):
             continue
         try:
             st = f.stat()
@@ -216,7 +222,7 @@ def extract():
         ws = WORKSPACES / role
         if not ws.exists():
             return 0, []
-        files = [f.name for f in ws.rglob("*") if f.is_file() and f.name not in SYSTEM_FILES]
+        files = [f.name for f in ws.rglob("*") if f.is_file() and not _is_system_file(f.name)]
         return len(files), files[:10]
 
     result = []
