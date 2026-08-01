@@ -315,10 +315,26 @@ class WorkflowEngine:
 
                 if reason:
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)
+                    # ── 回收前抢救: 当前步骤已有 exit_messages(产出证据) → 先尝试闭合 ──
+                    try:
+                        _cur = d.get("current_step_id", "")
+                        _sdata = sr.get(_cur, {}) if isinstance(sr, dict) else {}
+                        if isinstance(_sdata, dict) and _sdata.get("exit_messages"):
+                            self._lifecycle.complete_step(wf_id, _cur)
+                            LOGGER.info("stale rescue: %s step %s exit_messages 已就绪 → 已闭合",
+                                        wf_id, _cur)
+                            continue
+                    except Exception as _re:
+                        LOGGER.debug("stale rescue failed for %s: %s", wf_id, _re)
                     try:
                         lm.execute(
                             "UPDATE workflow_instances SET status='cancelled' WHERE instance_id=?",
                             (wf_id,)
+                        )
+                        lm.execute(
+                            "INSERT INTO workflow_logs (workflow_instance_id, task_id, action, actor, detail, ts) "
+                            "VALUES (?, ?, 'cancelled', 'workflow_engine', ?, ?)",
+                            (wf_id, "", f"僵尸回收: {reason}", time.time())
                         )
                         self._notify_role("maintainer",
                             f"僵尸工作流自动回收: {tpl}/{wf_id}",
@@ -715,6 +731,16 @@ class WorkflowEngine:
             _bus_anchor = _persisted
         last_ts = _bus_anchor
         _skip_before = run.step_results.get(step.id, {}).get("bus_skip_before", 0)
+
+        # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
+        _sdata = run.step_results.get(step.id, {})
+        if isinstance(_sdata, dict) and _sdata.get("exit_messages") and _sdata.get("status") != "completed":
+            try:
+                self._lifecycle.complete_step(run.id, step.id)
+                LOGGER.info("tick rescue: %s/%s exit_messages pre-existing → completed", run.workflow_name, step.id)
+                return
+            except Exception as _e:
+                LOGGER.debug("tick rescue failed for %s/%s: %s", run.workflow_name, step.id, _e)
 
         # exit_schema 校验（文件/内容约束）— 放在退出条件匹配之后，
         # 避免 schema 在步骤完成之前就阻塞推进。
