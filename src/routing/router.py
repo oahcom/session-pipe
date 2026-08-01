@@ -160,11 +160,25 @@ class Router:
         ]
 
     def get_consumers(self, category: str) -> list[str]:
-        """返回某类消息的消费者列表。"""
-        return [
+        """返回某类消息的消费者列表。
+
+        优先从路由表获取；路由表为空时使用默认映射（dashboard 告警→
+        maintainer，verification→investigator）确保告警不被遗弃。
+        """
+        consumers = [
             role for role, r in self._routing.items()
             if "*" in r.get("consume", []) or category in r.get("consume", [])
         ]
+        if consumers:
+            return consumers
+        # 路由表为空时：维护告警始终路由给 maintainer（闭环保证）
+        # ponytail: 路由表填充后移除此 fallback
+        _FALLBACK = {
+            "monitor_dashboard": ["maintainer"],
+            "monitor_wf_health": ["maintainer"],
+            "verification+notice": ["coordinator"],
+        }
+        return _FALLBACK.get(category, [])
 
     def get_consumers_prioritized(self, category: str) -> list[str]:
         """返回按优先级排序的消费者列表。
