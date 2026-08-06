@@ -94,12 +94,8 @@ class RoutingDB:
             }
         return routing
 
-    def save_routing(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
-        """插入或更新单个角色路由，并写入 audit 日志。
-
-        Returns:
-            bool: True if inserted/updated, False if no change.
-        """
+    def _save_routing_impl(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
+        """save_routing 的 SQL 体（不含 commit），供单事务批量复用。"""
         now = time.time()
         produce_json = json.dumps(produce, ensure_ascii=False)
         consume_json = json.dumps(consume, ensure_ascii=False)
@@ -147,11 +143,20 @@ class RoutingDB:
                 VALUES (?, 'consume', '', ?, ?, ?)
             """, (role, consume_json, changed_by, now))
 
-        self._conn.commit()
         return True
 
-    def delete_routing(self, role: str, changed_by: str = "") -> bool:
-        """删除角色路由并记录 audit。"""
+    def save_routing(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
+        """插入或更新单个角色路由，并写入 audit 日志。
+
+        Returns:
+            bool: True if inserted/updated, False if no change.
+        """
+        changed = self._save_routing_impl(role, produce, consume, changed_by)
+        self._conn.commit()
+        return changed
+
+    def _delete_routing_impl(self, role: str, changed_by: str = "") -> bool:
+        """delete_routing 的 SQL 体（不含 commit），供单事务批量复用。"""
         row = self._conn.execute(
             "SELECT produce, consume FROM routing WHERE role=?", (role,)
         ).fetchone()
@@ -169,8 +174,13 @@ class RoutingDB:
         """, (role, row["consume"], changed_by, now))
 
         self._conn.execute("DELETE FROM routing WHERE role=?", (role,))
-        self._conn.commit()
         return True
+
+    def delete_routing(self, role: str, changed_by: str = "") -> bool:
+        """删除角色路由并记录 audit。"""
+        changed = self._delete_routing_impl(role, changed_by)
+        self._conn.commit()
+        return changed
 
     def set_routing_table(self, table: dict, changed_by: str = "") -> int:
         """批量写入整个路由表（替换模式）。
@@ -189,17 +199,20 @@ class RoutingDB:
         existing = set(row["role"] for row in self._conn.execute("SELECT role FROM routing"))
         new_roles = set(table.keys())
 
-        # 删除不在新表中的角色
-        for role in existing - new_roles:
-            self.delete_routing(role, changed_by)
-            changes += 1
-
-        # 插入/更新新表中的角色
-        for role, data in table.items():
-            produce = data.get("produce", [])
-            consume = data.get("consume", [])
-            if self.save_routing(role, produce, consume, changed_by):
-                changes += 1
+        # 单事务批量写入：全部 SQL 体执行完一次 commit，异常时 rollback
+        try:
+            for role in existing - new_roles:
+                if self._delete_routing_impl(role, changed_by):
+                    changes += 1
+            for role, data in table.items():
+                produce = data.get("produce", [])
+                consume = data.get("consume", [])
+                if self._save_routing_impl(role, produce, consume, changed_by):
+                    changes += 1
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
         return changes
 

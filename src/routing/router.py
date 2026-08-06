@@ -69,7 +69,7 @@ def priority(category: str) -> int:
 
 # 完整性阈值：DB 路由角色数低于此值视为被污染（如误清空只剩 test_qa），
 # 回退到 shared_loader 导出，防止"DB 非空即信任"导致 route_all 瘫痪。
-_DB_MIN_ROLES = 5
+_DB_MIN_ROLES = int(os.environ.get("ROUTER_MIN_ROLES", "5"))
 
 
 class Router:

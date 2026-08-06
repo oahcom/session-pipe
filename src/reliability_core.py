@@ -34,40 +34,41 @@ _CURSOR_DB = Path(os.environ.get(
     str(Path.home() / ".hermes" / "state")
 )) / "pipeline_cursor.db"
 
-def _cursor_db_path() -> Path:
-    """返回 cursor DB 路径，确保目录存在。"""
-    _CURSOR_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_CURSOR_DB))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.close()
-    return _CURSOR_DB
+# 模块级持久连接（get/set_last_cursor 高频调用，避免每次 connect+close）
+# check_same_thread=False 供多线程轮询共享；锁防并发写
+_CURSOR_LOCK = threading.Lock()
+_CURSOR_CONN = None
+
+def _get_cursor_conn() -> sqlite3.Connection:
+    """惰性创建 cursor DB 持久连接（模块级，避免高频 connect+close）。"""
+    global _CURSOR_CONN
+    if _CURSOR_CONN is None:
+        _CURSOR_DB.parent.mkdir(parents=True, exist_ok=True)
+        _CURSOR_CONN = sqlite3.connect(str(_CURSOR_DB), check_same_thread=False)
+        _CURSOR_CONN.execute("PRAGMA journal_mode=WAL")
+    return _CURSOR_CONN
 
 def get_last_cursor(consumer: str, category: str = "", instance_id: str = "") -> int:
     """获取消费者在分类下的最后处理 fact_id。"""
     _ensure_cursor_db()
-    conn = sqlite3.connect(str(_cursor_db_path()))
-    try:
-        row = conn.execute(
+    with _CURSOR_LOCK:
+        row = _get_cursor_conn().execute(
             "SELECT last_fact_id FROM cursors WHERE consumer=? AND category=? AND instance_id=?",
             (consumer, category, instance_id)
         ).fetchone()
         return row[0] if row else 0
-    finally:
-        conn.close()
 
 def set_last_cursor(consumer: str, category: str, fact_id: int, instance_id: str = "") -> None:
     """更新消费者在分类下的最后处理 fact_id。"""
     _ensure_cursor_db()
-    conn = sqlite3.connect(str(_cursor_db_path()))
-    try:
+    with _CURSOR_LOCK:
+        conn = _get_cursor_conn()
         conn.execute(
             "INSERT OR REPLACE INTO cursors(consumer, category, instance_id, last_fact_id, updated_at) "
             "VALUES(?,?,?,?,?)",
             (consumer, category, instance_id, fact_id, time.time())
         )
         conn.commit()
-    finally:
-        conn.close()
 
 def init_cursor_db() -> None:
     """初始化 cursor 表。"""

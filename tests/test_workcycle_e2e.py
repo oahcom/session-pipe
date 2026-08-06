@@ -51,7 +51,7 @@ def _step(step_id, **overrides):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_single_step_lifecycle(mock_run):
     """start -> notify -> bus exit -> run_once -> completed."""
     signal.alarm(_TEST_TIMEOUT)
@@ -86,7 +86,7 @@ def test_single_step_lifecycle(mock_run):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_two_step_sequential(mock_run):
     """s1 -> advance -> s2 -> complete."""
     signal.alarm(_TEST_TIMEOUT)
@@ -104,6 +104,9 @@ def test_two_step_sequential(mock_run):
     s = eng.status(rid)
     assert s["current_step"] == "s2", f"expected s2, got {s}"
 
+    # 先 run_once 让 s2 标记 notified（bus_anchor=notified_at），再写 DONE_S2
+    # 否则消息被 s2 的 created_after 过滤，永远无法推进
+    eng.run_once()
     # Exit s2
     eng._bb.write("notice", "DONE_S2 done", src="test_role")
     time.sleep(0.1)
@@ -119,7 +122,7 @@ def test_two_step_sequential(mock_run):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_handoff_approval(mock_run):
     """handoff -> step_done_ready -> confirm -> advance."""
     signal.alarm(_TEST_TIMEOUT)
@@ -152,7 +155,7 @@ def test_handoff_approval(mock_run):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_handoff_rejection(mock_run):
     """handoff -> step_done_ready -> reject -> still running."""
     signal.alarm(_TEST_TIMEOUT)
@@ -182,7 +185,7 @@ def test_handoff_rejection(mock_run):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_cancel_mid_workflow(mock_run):
     """Cancel after s1 complete -> cancelled."""
     signal.alarm(_TEST_TIMEOUT)
@@ -199,6 +202,10 @@ def test_cancel_mid_workflow(mock_run):
     s = eng.status(rid)
     assert s["current_step"] == "s2"
 
+    # cancel 有"创建不足 5 分钟拒绝取消"保护 → 把 created_at 改老再 cancel
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET created_at=? WHERE instance_id=?",
+        (time.time() - 600, rid))
     ok = eng.cancel(rid)
     assert ok
     s = eng.status(rid)
@@ -212,7 +219,7 @@ def test_cancel_mid_workflow(mock_run):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_start_invalid_workflow(mock_run):
     """Start nonexistent -> ValueError."""
     d = _make_env()
@@ -230,7 +237,7 @@ def test_start_invalid_workflow(mock_run):
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
-    returncode=0, stdout=b"", stderr=b""))
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_start_empty_steps(mock_run):
     """Workflow with empty steps -> ValueError."""
     d = _make_env()

@@ -19,12 +19,17 @@ import time
 import threading
 import uuid
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
-# 路径设置 — launcher 在前（workflow_client 需要 workflow.gateway）
+# 消除 client 测试的真 ccs/bus subprocess（ccs send / bus notify 均跳过）
+os.environ.setdefault("SESSION_PIPELINE_TEST", "1")
+
+# 路径设置 — pipeline 在前（workflow.gateway/sync 只在 pipeline 的 workflow 包中，
+# launcher 的 workflow 包无这两个模块，置前会导致 workflow.sync 不可达）
 _launcher_src = str(Path.home() / "session-launcher" / "src")
 _pipeline_src = str(Path(__file__).resolve().parents[1] / "src")
 _hermes_scripts = str(Path.home() / ".hermes" / "scripts")
-for p in reversed([_launcher_src, _pipeline_src, _hermes_scripts]):
+for p in reversed([_pipeline_src, _launcher_src, _hermes_scripts]):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -90,9 +95,10 @@ def test_client_create_task_db_sees():
     tmpl_id = db.create_template("fix", "修复模板", {"steps": [{"id": "s1"}]})
     db.close()
     with WorkflowClient("product_architect", db_path=db_path) as client:
-        tid, _ = client.create_task_v2("设计告警模块", assignee="engineer", template_id=tmpl_id, initiator_role="product_architect")
+        # 标题需 ≥8 字符（pipeline client 的占位符门禁）
+        tid, _ = client.create_task_v2("设计告警模块详细方案", assignee="engineer", template_id=tmpl_id, initiator_role="product_architect")
         task = client.get_task(tid)
-        assert task["title"] == "设计告警模块"
+        assert task["title"] == "设计告警模块详细方案"
         assert task["assigner"] == "product_architect"
         assert task["assignee"] == "engineer"
         assert task["status"] == "in_progress"  # create_task_v2 sets in_progress
@@ -159,20 +165,22 @@ def test_engine_start_then_db_status():
               "exit_condition": {"bus_category": "architecture"},
               "max_retries": 0, "condition": "", "rollback_to": ""}]
     _write_wf_def(wf_dir, "research", steps)
-    eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("research", {"topic": "AI Agent"})
-    s = eng.status(rid)
-    assert s["status"] == "running"
-    assert s["workflow"] == "research"
-    # 验证 SQLite 记录存在
-    lm = eng._lifecycle
-    row = lm._conn.execute(
-        "SELECT current_step_id, status FROM workflow_instances WHERE instance_id=?",
-        (rid,)
-    ).fetchone()
-    assert row is not None, "workflow instance not in SQLite"
-    assert row["current_step_id"] == "s1"
-    assert row["status"] == "running"
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=0, stdout="claude\n")):
+        eng = WorkflowEngine(workflows_dir=wf_dir)
+        rid = eng.start("research", {"topic": "AI Agent"})
+        s = eng.status(rid)
+        assert s["status"] == "running"
+        assert s["workflow"] == "research"
+        # 验证 SQLite 记录存在
+        lm = eng._lifecycle
+        row = lm._conn.execute(
+            "SELECT current_step_id, status FROM workflow_instances WHERE instance_id=?",
+            (rid,)
+        ).fetchone()
+        assert row is not None, "workflow instance not in SQLite"
+        assert row["current_step_id"] == "s1"
+        assert row["status"] == "running"
 
 
 def test_engine_advance_to_completion():
@@ -189,18 +197,24 @@ def test_engine_advance_to_completion():
          "max_retries": 0, "condition": "", "rollback_to": ""},
     ]
     _write_wf_def(wf_dir, "dev", steps)
-    eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("dev", {"topic": "缓存模块"})
-    bb = eng._bb
-    # 推进 s1
-    bb.write("architecture", "设计完成", src="architect")
-    eng.run_once()
-    assert eng.status(rid)["current_step"] == "s2"
-    # 推进 s2
-    bb.write("code_fix", f"test-header: 跨组件s2完成_{int(time.time())&0xffff:04x}", src="engineer")
-    eng.run_once()
-    assert eng.status(rid)["status"] == "completed"
-    # NOTE: engine 完成时不写 reflexion_lesson（设计决定，非测试覆盖范围）
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=0, stdout="claude\n")):
+        eng = WorkflowEngine(workflows_dir=wf_dir)
+        rid = eng.start("dev", {"topic": "缓存模块"})
+        bb = eng._bb
+        # 先 run_once 标记 notified（bus_anchor=notified_at），再写消息才能被 created_after 过滤到
+        eng.run_once()
+        # 推进 s1
+        bb.write("architecture", "设计完成", src="architect")
+        eng.run_once()
+        assert eng.status(rid)["current_step"] == "s2"
+        # 先 run_once 让 s2 标记 notified，再写 code_fix 消息（否则消息被 s2 的 notified_at 过滤）
+        eng.run_once()
+        # 推进 s2
+        bb.write("code_fix", f"test-header: 跨组件s2完成_{int(time.time())&0xffff:04x}", src="engineer")
+        eng.run_once()
+        assert eng.status(rid)["status"] == "completed"
+        # NOTE: engine 完成时不写 reflexion_lesson（设计决定，非测试覆盖范围）
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -346,12 +360,14 @@ def test_engine_writes_step_prompt_to_bus():
                                  "text_contains": "ENGINEPROMPT_TEST"},
               "max_retries": 0, "condition": "", "rollback_to": ""}]
     _write_wf_def(wf_dir, "prompt_test", steps)
-    eng = WorkflowEngine(workflows_dir=wf_dir)
-    eng.start("prompt_test", {"topic": "紧急安全漏洞"})
-    bb = eng._bb
-    facts = bb.read(cat="task_spec", limit=500)
-    matched = [f for f in facts if "紧急安全漏洞" in (f.t or "") or "紧急安全漏洞" in (f.e or "")]
-    assert len(matched) >= 1, "Engine 应将步骤 prompt 写入 bus"
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=0, stdout="claude\n")):
+        eng = WorkflowEngine(workflows_dir=wf_dir)
+        eng.start("prompt_test", {"topic": "紧急安全漏洞"})
+        bb = eng._bb
+        facts = bb.read(cat="task_spec", limit=500)
+        matched = [f for f in facts if "紧急安全漏洞" in (f.t or "") or "紧急安全漏洞" in (f.e or "")]
+        assert len(matched) >= 1, "Engine 应将步骤 prompt 写入 bus"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -448,13 +464,19 @@ def test_engine_cancel_persists():
                                  "text_contains": "CANCELPERS_TEST"},
               "max_retries": 0, "condition": "", "rollback_to": ""}]
     _write_wf_def(wf_dir, "cancel_test", steps)
-    eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("cancel_test", {"topic": "x"})
-    assert eng.cancel(rid)
-    # 重新加载验证持久化
-    eng2 = WorkflowEngine(workflows_dir=wf_dir)
-    s = eng2.status(rid)
-    assert s["status"] == "cancelled"
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=0, stdout="claude\n")):
+        eng = WorkflowEngine(workflows_dir=wf_dir)
+        rid = eng.start("cancel_test", {"topic": "x"})
+        # cancel 有"创建不足 5 分钟拒绝取消"保护 → 把 created_at 改老再 cancel
+        eng._lifecycle.execute(
+            "UPDATE workflow_instances SET created_at=? WHERE instance_id=?",
+            (time.time() - 600, rid))
+        assert eng.cancel(rid)
+        # 重新加载验证持久化
+        eng2 = WorkflowEngine(workflows_dir=wf_dir)
+        s = eng2.status(rid)
+        assert s["status"] == "cancelled"
 
 
 def test_engine_run_once_multiple_runs():
@@ -468,17 +490,19 @@ def test_engine_run_once_multiple_runs():
          "max_retries": 0, "condition": "", "rollback_to": ""},
     ]
     _write_wf_def(wf_dir, "multi", steps)
-    eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid1 = eng.start("multi", {"topic": "A"})
-    rid2 = eng.start("multi", {"topic": "B"})
-    # 写入匹配消息
-    eng._bb.write("notice", "MULTIRUN_TEST 完成", src="test")
-    eng.run_once()
-    s1 = eng.status(rid1)
-    s2 = eng.status(rid2)
-    # 两个都应该推进或完成
-    assert s1["status"] in ("running", "completed")
-    assert s2["status"] in ("running", "completed")
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=0, stdout="claude\n")):
+        eng = WorkflowEngine(workflows_dir=wf_dir)
+        rid1 = eng.start("multi", {"topic": "A"})
+        rid2 = eng.start("multi", {"topic": "B"})
+        # 写入匹配消息
+        eng._bb.write("notice", "MULTIRUN_TEST 完成", src="test")
+        eng.run_once()
+        s1 = eng.status(rid1)
+        s2 = eng.status(rid2)
+        # 两个都应该推进或完成
+        assert s1["status"] in ("running", "completed")
+        assert s2["status"] in ("running", "completed")
 
 
 # ══════════════════════════════════════════════════════════════════

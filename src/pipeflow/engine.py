@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 import logging
+import threading
 import subprocess as _sp
 from dataclasses import dataclass
 from pathlib import Path
@@ -565,6 +566,8 @@ class WorkflowEngine:
     _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
     _last_compact: dict[str, float] = {}
+    # check-then-act 竞态防护：cooldown 检查与写入之间加锁
+    _COMPACT_LOCK = threading.Lock()
 
     def _check_context_overflow(self):
         """检测角色 tmux pane 中 Claude 的上下文溢出信号，自动发 /compact。
@@ -610,9 +613,10 @@ class WorkflowEngine:
         now = time.time()
         for role in roles:
             tmux_name = f"ccs-{role}"
-            last = self._last_compact.get(role, 0.0)
-            if now - last < self._OVERFLOW_COOLDOWN:
-                continue
+            with self._COMPACT_LOCK:
+                last = self._last_compact.get(role, 0.0)
+                if now - last < self._OVERFLOW_COOLDOWN:
+                    continue
 
             # 抓最近 500 行输出，搜索 Claude 的上下文溢出信号
             try:
@@ -642,7 +646,8 @@ class WorkflowEngine:
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "/compact", "Enter"],
                     capture_output=True, timeout=5,
                 )
-                self._last_compact[role] = now
+                with self._COMPACT_LOCK:
+                    self._last_compact[role] = now
                 self._bb.write("architecture",
                     f"[context_overflow] {role} → /compact",
                     src="workflow_engine")
@@ -1902,6 +1907,8 @@ class WorkflowEngine:
                 LOGGER.debug("bus write fail in _scan_tasks error handler")
 
     _TASK_GEN_COOLDOWN: dict[str, float] = {}  # role → last gen ts
+    # check-then-act 竞态防护：cooldown 检查与写入之间加锁（GIL 下结构不损坏，仅语义竞态）
+    _TASK_GEN_LOCK = threading.Lock()
 
     def _generate_tasks_from_state(self):
         """从工作流模板为空闲角色自动生成任务。
@@ -1966,10 +1973,11 @@ class WorkflowEngine:
                     continue
             except Exception:
                 pass
-            # cooldown 检测
-            _last = self._TASK_GEN_COOLDOWN.get(_role, 0)
-            if _now - _last < _COOLDOWN_S:
-                continue
+            # cooldown 检测（加锁消除 check-then-act 竞态：两个线程可能同时通过检查）
+            with self._TASK_GEN_LOCK:
+                _last = self._TASK_GEN_COOLDOWN.get(_role, 0)
+                if _now - _last < _COOLDOWN_S:
+                    continue
             # 同模板同角色：有活跃实例(running/pending) → 跳过（防重复创建）
             # 24h 内已完成/取消过 → 跳过（防循环派发同模板任务）
             try:
@@ -2030,7 +2038,8 @@ class WorkflowEngine:
                 except Exception:
                     pass
                 LOGGER.info("auto-task: %s → %s (wf=%s, task=%s)", _role, _title[:60], _rid[:16], _task_id)
-                self._TASK_GEN_COOLDOWN[_role] = _now
+                with self._TASK_GEN_LOCK:
+                    self._TASK_GEN_COOLDOWN[_role] = _now
                 _tasks_added += 1
                 if _tasks_added >= 5:
                     break  # 每轮最多创建 5 个任务，加速产出

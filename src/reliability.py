@@ -328,35 +328,31 @@ class AckTracker:
 
     def _init_db(self):
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
+        # 持久连接：AckTracker 高频调用，避免每次 connect+close
+        # check_same_thread=False 供多线程共享，_lock 序列化并发访问
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
             "CREATE TABLE IF NOT EXISTS acks("
             "fact_id INT, consumer TEXT, category TEXT, "
             "status TEXT, error TEXT, ts REAL)"
         )
-        conn.close()
 
-    def _conn(self):
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    def _get_conn(self):
+        return self._conn
 
     def record_ack(self, fact_id: int, consumer: str, status: str,
                    category: str = "", error: str = "", ts: float = 0.0) -> dict:
         """记录一条消费 ACK。返回 ACK 记录。"""
         ts_val = ts or time.time()
         with self._lock:
-            conn = self._conn()
-            try:
-                conn.execute(
-                    "INSERT INTO acks(fact_id, consumer, category, status, error, ts) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (fact_id, consumer, category, status, error, ts_val),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO acks(fact_id, consumer, category, status, error, ts) "
+                "VALUES(?,?,?,?,?,?)",
+                (fact_id, consumer, category, status, error, ts_val),
+            )
+            conn.commit()
         return {
             "fact_id": fact_id, "consumer": consumer, "category": category,
             "status": status, "error": error, "ts": ts_val,
@@ -382,11 +378,8 @@ class AckTracker:
         params.append(limit)
 
         with self._lock:
-            conn = self._conn()
-            try:
-                rows = conn.execute(sql, params).fetchall()
-            finally:
-                conn.close()
+            conn = self._get_conn()
+            rows = conn.execute(sql, params).fetchall()
         return [
             {"fact_id": r[0], "consumer": r[1], "category": r[2],
              "status": r[3], "error": r[4], "ts": r[5]}
@@ -400,14 +393,11 @@ class AckTracker:
     def ack_stats(self) -> dict:
         """ACK 状态统计。"""
         with self._lock:
-            conn = self._conn()
-            try:
-                total = conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0]
-                rows = conn.execute(
-                    "SELECT status, COUNT(*) FROM acks GROUP BY status"
-                ).fetchall()
-            finally:
-                conn.close()
+            conn = self._get_conn()
+            total = conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0]
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM acks GROUP BY status"
+            ).fetchall()
         return {"total": total, "by_status": {r[0]: r[1] for r in rows}}
 
     def retry_failed(self, bb) -> int:
@@ -422,16 +412,13 @@ class AckTracker:
             try:
                 bb.mark_consumed(ack["fact_id"], ack["consumer"])
                 with self._lock:
-                    conn = self._conn()
-                    try:
-                        conn.execute(
-                            "UPDATE acks SET status='retried', error='' "
-                            "WHERE fact_id=? AND consumer=? AND status='error'",
-                            (ack["fact_id"], ack["consumer"]),
-                        )
-                        conn.commit()
-                    finally:
-                        conn.close()
+                    conn = self._get_conn()
+                    conn.execute(
+                        "UPDATE acks SET status='retried', error='' "
+                        "WHERE fact_id=? AND consumer=? AND status='error'",
+                        (ack["fact_id"], ack["consumer"]),
+                    )
+                    conn.commit()
                 retried += 1
             except Exception:
                 LOGGER.exception(f"Retry failed for ack #{ack.get('fact_id')}")

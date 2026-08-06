@@ -25,6 +25,15 @@ eng_mod._REMINDER_INTERVAL = 60  # 测试周期长，不干扰
 
 from pipeflow.engine import WorkflowEngine, WorkflowRun, Step, WorkflowDef
 
+# mock engine 全部 subprocess（tmux/ccs），防止真 spawn 挂起 30s。
+# stdout="claude\n"：_ensure_role_alive 的 has-session 返回 0 → alive；
+# _is_agent_alive 读到 "claude" → 命中直接返回 True，不 spawn 不 sleep 30s。
+_sp_mock = patch("pipeflow.engine._sp.run",
+                 lambda *a, **k: MagicMock(returncode=0, stdout="claude\n"))
+_sp_mock.start()
+import atexit
+atexit.register(_sp_mock.stop)
+
 HOME = Path.home()
 ROLE = "e2e_test"
 

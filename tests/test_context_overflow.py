@@ -25,30 +25,28 @@ def _get_test_eng():
 
 
 def test_pane_overflow_triggers_compact():
-    """灌入足够行数到 pane，验证 /compact 被发送。"""
-    role = "lr"
-    tmux = f"ccs-{role}"
-
-    # 确认 tmux session 存在
-    alive = subprocess.run(
-        ["tmux", "has-session", "-t", tmux],
-        capture_output=True, timeout=3
-    )
-    if alive.returncode != 0:
-        print(f"SKIP: {tmux} 不存在，跳过")
-        return
-
-    # 灌入 2500 行空行
-    subprocess.run(["tmux", "send-keys", "-t", f"{tmux}:0.0", "python3", "Enter"], timeout=3)
-    subprocess.run(["tmux", "send-keys", "-t", f"{tmux}:0.0", "-l", "\n" * 2500], timeout=10)
-    subprocess.run(["tmux", "send-keys", "-t", f"{tmux}:0.0", "Enter"], timeout=3)
-    time.sleep(1)
-
+    """捕获到溢出信号 → 发送 /compact 并更新 _last_compact。"""
     eng = _get_test_eng()
-    eng._check_context_overflow()
+    role = "lr"
+    eng._last_compact = {}  # 清掉旧状态，避免类级残留
+    send_keys = []
 
-    r = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"{tmux}:0.0"], capture_output=True, text=True, timeout=5)
-    assert "/compact" in r.stdout, f"expected /compact in pane output, got last 100: {r.stdout[-100:]}"
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="Context limit reached")
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    compact_calls = [c for c in send_keys if "/compact" in c]
+    assert len(compact_calls) == 1, f"应发 1 次 /compact, got {send_keys}"
+    assert eng._last_compact.get(role) is not None, "应记录 _last_compact[lr]"
     print("✅ pane overflow → /compact 已触发")
 
 
@@ -56,11 +54,24 @@ def test_cooldown_prevents_duplicate():
     """同一角色 300s 内不重复发 /compact。"""
     eng = _get_test_eng()
     role = "lr"
-    eng._last_compact[role] = time.time()  # 刚发过
+    eng._last_compact = {role: time.time()}  # 刚发过
+    send_keys = []
 
-    # 不应再次发送
-    eng._check_context_overflow()
-    assert eng._last_compact.get(role) != time.time(), "cooldown 应阻止重发"
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="Context limit reached")
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    compact_calls = [c for c in send_keys if "/compact" in c]
+    assert len(compact_calls) == 0, "cooldown 应阻止重发"
     print("✅ cooldown 300s 防重复 ✓")
 
 

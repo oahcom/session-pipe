@@ -7,11 +7,14 @@ p0_exemption.py — P0 豁免通道 + 审计轨迹
 """
 
 import json
+import logging
 import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
+
+LOGGER = logging.getLogger("p0_exemption")
 
 from paths import WORKFLOWS_DB as DB_PATH, BUS_CLIENT
 
@@ -59,8 +62,8 @@ class P0Exemption:
             from workflow.client import WorkflowClient
             wc = WorkflowClient(self.role, db_path=str(self.db_path))
             wc.close()
-        except Exception:
-            pass  # must-silent: WorkflowClient import is optional feature check
+        except Exception as _e:
+            LOGGER.debug("WorkflowClient init failed (optional feature check): %s", _e)
         # 确保 P0 列存在 — DESIGN.md WL-P1-01 DDL 迁移
         existing = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()}
         for col, coltype in {"p0_state": "TEXT DEFAULT NULL", "p0_reason": "TEXT DEFAULT ''",
@@ -78,15 +81,9 @@ class P0Exemption:
         返回 task_id。
         校验不通过抛出 ValueError 或 PermissionError。
         """
-        if initiator_role in ALLOWED_P0_ROLES:
-            pass  # ok
-        elif initiator_role == "pm":
-            if not self._check_pm_work_hours():
-                raise PermissionError(
-                    f"pm 仅能在 {PM_WORK_START}:00–{PM_WORK_END}:00 标记 P0")
-        else:
-            raise PermissionError(
-                f"only coordinator/lr/pm can mark P0, got: {initiator_role}")
+        deny_reason = self._p0_deny_reason(initiator_role)
+        if deny_reason:
+            raise PermissionError(deny_reason)
 
         if len(p0_reason) < 15:
             raise ValueError(
@@ -182,6 +179,20 @@ class P0Exemption:
         h = time.localtime().tm_hour
         return PM_WORK_START <= h < PM_WORK_END
 
+    def _p0_deny_reason(self, role: str) -> Optional[str]:
+        """返回角色被拒绝标记 P0 的原因，允许则返回 None。
+
+        coordinator/lr: 全天候；pm: 仅工作时间；其余角色拒绝。
+        can_mark_p0 / create_p0_task 共用，保证权限逻辑单一来源。
+        """
+        if role in ALLOWED_P0_ROLES:
+            return None
+        if role == "pm":
+            if not self._check_pm_work_hours():
+                return f"pm 仅能在 {PM_WORK_START}:00–{PM_WORK_END}:00 标记 P0"
+            return None
+        return f"only coordinator/lr/pm can mark P0, got: {role}"
+
     def can_mark_p0(self, role: str = None) -> bool:
         """检查角色是否有权标记 P0 (非 draft)。
 
@@ -190,11 +201,7 @@ class P0Exemption:
         engineer 等角色: 只能 P0_draft
         """
         role = role or self.role
-        if role in ALLOWED_P0_ROLES:
-            return True
-        if role == "pm":
-            return self._check_pm_work_hours()
-        return False
+        return self._p0_deny_reason(role) is None
 
     def can_mark_draft(self, role: str = None) -> bool:
         """检查角色是否有权标记 P0_draft (仅允许定义的工程角色)。"""
@@ -202,7 +209,7 @@ class P0Exemption:
         return role in (ALLOWED_P0_ROLES | ALLOWED_DRAFT_ROLES)
 
     def mark_p0_draft(self, task_id: str, reason: str, role: str) -> dict:
-        """任何角色标记 P0_draft。
+        """标记 P0_draft。仅 ALLOWED_P0_ROLES ∪ ALLOWED_DRAFT_ROLES 有权限。
 
         reason ≥15字符, task 存在且未 completed。
         """

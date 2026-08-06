@@ -44,14 +44,15 @@ class WorkflowDB:
         return False
 
     def _log(self, workflow_instance_id: str = None, task_id: str = None,
-             action: str = "", actor: str = "", detail: str = ""):
-        """写入操作日志。"""
+             action: str = "", actor: str = "", detail: str = "", commit: bool = True):
+        """写入操作日志。commit=False 时由调用方统一提交（批量事务减少写放大）。"""
         self._conn.execute(
             "INSERT INTO workflow_logs (workflow_instance_id, task_id, action, actor, detail, ts) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (workflow_instance_id, task_id, action, actor, detail, time.time())
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     # ── Workflow Template CRUD ──────────────────────────────────
 
@@ -216,13 +217,12 @@ class WorkflowDB:
             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         """, (instance_id, template["template_id"], task_id, assigner, assignee,
               first_step.get("id"), now, json.dumps(context or {}, ensure_ascii=False)))
-        self._conn.commit()
 
         self._conn.execute("UPDATE tasks SET current_workflow_id=?, status='in_progress' WHERE task_id=?",
                            (instance_id, task_id))
-        self._conn.commit()
         self._log(workflow_instance_id=instance_id, task_id=task_id, action="created",
-                  actor=assigner, detail=f"template={template_name}")
+                  actor=assigner, detail=f"template={template_name}", commit=False)
+        self._conn.commit()  # 单次提交合并 INSERT + UPDATE + _log
         return instance_id
 
     def get_workflow(self, instance_id: str) -> Optional[dict]:

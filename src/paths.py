@@ -65,11 +65,17 @@ def ensure_paths() -> None:
             sys.path.insert(0, s)
     # session-pipeline 的 lifecycle 包必须优先于 session-launcher（其 manager.py 已删除）
     # 加父目录（src），这样 import lifecycle 能找到 lifecycle/__init__.py
+    # 必须无条件置顶：若仅做 not-in 检查，test 已插 pipeline 时会跳过，launcher 会跑到最前
     _psrc = str(SESSION_PIPELINE_SRC.resolve())
     sys.path.insert(0, _psrc)
-    # 清除 launcher 缓存并预加载 pipeline 版本
+    # 清除 launcher 缓存并预加载 pipeline 版本。
+    # 若已加载的 lifecycle 本就来自 pipeline（SESSION_PIPELINE_SRC 前缀），跳过重导入，
+    # 避免重复 import 副作用；否则才 del 并重导入。
     import importlib
     if "lifecycle" in sys.modules:
+        _lf_file = getattr(sys.modules["lifecycle"], "__file__", "") or ""
+        if _lf_file.startswith(str(SESSION_PIPELINE_SRC)):
+            return
         del sys.modules["lifecycle"]
     try:
         importlib.import_module("lifecycle")

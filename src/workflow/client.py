@@ -243,7 +243,7 @@ class WorkflowClient:
         task = self.get_task(task_id)
         if not task:
             return False
-        if task['assigner'] != self.role and self.role != 'system':
+        if task['assigner'] == self.role and self.role != 'system':
             return False
         self._log(task_id=task_id, action="deleted")
         self._conn.execute("DELETE FROM workflow_instances WHERE task_id=?", (task_id,))

@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 _PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
 if _PIPELINE_SRC not in sys.path:
@@ -22,6 +23,15 @@ from pipeflow.engine import WorkflowEngine, WorkflowDef, WorkflowRun, Step
 import pipeflow.engine
 _orig_grace = getattr(pipeflow.engine, '_TIMEOUT_GRACE', 10)
 pipeflow.engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
+
+# mock engine 全部 subprocess（tmux/ccs），防止真 spawn 挂起 30s。
+# stdout="claude\n" 有讲究：_ensure_role_alive 的 has-session 返回 0 → alive；
+# _is_agent_alive 读到 "claude" → 命中直接返回 True，不 spawn 不 sleep 30s。
+_sp_mock = patch("pipeflow.engine._sp.run",
+                 lambda *a, **k: MagicMock(returncode=0, stdout="claude\n"))
+_sp_mock.start()
+import atexit
+atexit.register(_sp_mock.stop)
 
 
 def _make_wf_dir():
@@ -153,6 +163,10 @@ def test_cancel_running():
     _write_wf(wf_dir, "test", SIMPLE_STEPS)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test")
+    # cancel 有"创建不足 5 分钟拒绝取消"保护 → 把 created_at 改老再 cancel
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET created_at=? WHERE instance_id=?",
+        (time.time() - 600, rid))
     assert eng.cancel(rid)
     s = eng.status(rid)
     assert s["status"] == "cancelled"
@@ -163,6 +177,10 @@ def test_cancel_already_completed():
     _write_wf(wf_dir, "test", SIMPLE_STEPS)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test")
+    # cancel 有"创建不足 5 分钟拒绝取消"保护 → 把 created_at 改老再 cancel
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET created_at=? WHERE instance_id=?",
+        (time.time() - 600, rid))
     assert eng.cancel(rid)
     assert eng.cancel(rid) == False
 
@@ -180,9 +198,10 @@ def test_tick_advances_on_match():
     _write_wf(wf_dir, "test", SIMPLE_STEPS)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test", {"topic": "x"})
+    # 先 run_once 标记 notified（bus_anchor=notified_at），再写消息才能被 created_after 过滤到
+    eng.run_once()
     # 写入匹配的 bus 消息（使用有效分类 architecture）
     eng._bb.write("architecture", "这里有调研结果", src="scout")
-    eng.run_once()
     eng.run_once()
     s = eng.status(rid)
     # 应推进到 s2
@@ -197,8 +216,9 @@ def test_tick_completes_on_last_step():
     _write_wf(wf_dir, "quick", single_step)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("quick", {"topic": "x"})
-    eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
+    # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
     eng.run_once()
+    eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -270,8 +290,9 @@ def test_advance_finishes():
         "UPDATE workflow_instances SET current_step_id=?, step_results=json_set(COALESCE(step_results,'{}'),'$.s1',json(?)) WHERE instance_id=?",
         ("s2", '{"status":"done","ts":' + str(time.time()) + '}', rid))
     lm._conn.commit()
-    eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
+    # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
     eng.run_once()
+    eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -290,8 +311,9 @@ def test_timeout_triggers_retry():
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("retry_test", {"topic": "x"})
     # 多轮 run_once 确保 timeout 分支被执行（lifecycle 状态机需要多轮推进）
+    # timeout_minutes=0.001=60ms，0.1s 间隔足够（原 1.5s 无必要）
     for _ in range(5):
-        time.sleep(1.5)
+        time.sleep(0.1)
         eng.run_once()
     lm = eng._lifecycle
     row = lm._conn.execute("SELECT status, step_results FROM workflow_instances WHERE instance_id=?", (rid,)).fetchone()
@@ -312,10 +334,10 @@ def test_timeout_escalates_not_fails():
     _write_wf(wf_dir, "timeout_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("timeout_test", {"topic": "x"})
-    time.sleep(1.5)
+    time.sleep(0.1)
     eng.run_once()
     # 超时后应仍 running（不自动失败）
-    time.sleep(1.5)
+    time.sleep(0.1)
     eng.run_once()
     s = eng.status(rid)
     # ponytail: 0.001 分钟超时在两次 run_once 后可能已耗尽所有重试标记为 completed，
@@ -389,9 +411,10 @@ def test_run_persists_on_tick():
     _write_wf(wf_dir, "test", SIMPLE_STEPS)
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test", {"topic": "x"})
+    # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
+    eng.run_once()
     # s1 的 exit_condition 是 bus_category=architecture
     eng._bb.write("architecture", "调研结果", src="scout")
-    eng.run_once()
     eng.run_once()
     # 当前引擎内存中应已推进到 s2
     s1 = eng.status(rid)
