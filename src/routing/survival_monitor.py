@@ -336,15 +336,20 @@ class SurvivalMonitor:
             )
 
             # 状态变更或异常时写 bus（接轨 eval_checker notice 模式）
+            # ponytail: idle/stale 每 600s 最多报一次，避免海量噪声
             prev_overall = prev.get("overall", "unknown")
+            _now_report_ts = time.time()
+            _last_report = prev.get("last_report_ts", 0)
             if overall != prev_overall:
                 self._write_bus("architecture",
                     f"[survival:{overall}] {role} L1={l1['status']} L2={l2.get('thinking')} L3={l3.get('producing')}",
                     evidence=f"prev={prev_overall} | {l2.get('detail','')} | {l3.get('detail','')}")
-            elif overall in ("stale", "idle"):
+                result["last_report_ts"] = _now_report_ts
+            elif overall in ("stale", "idle") and _now_report_ts - _last_report > 600:
                 self._write_bus("notice",
-                    f"@ccs-monitor [survival] {role} 状态异常: {overall}",
+                    f"@ccs-monitor [survival] {role} 状态: {overall}",
                     evidence=f"{l2.get('detail','')} | {l3.get('detail','')}")
+                result["last_report_ts"] = _now_report_ts
 
             # 僵尸清理
             prev_dead_checks = prev.get("dead_checks_since", 0)

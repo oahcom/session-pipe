@@ -17,7 +17,8 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
-_ROLES_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+from paths import SESSION_ROLES_ROOT
+_ROLES_DIR = SESSION_ROLES_ROOT / "personas" / "session-roles"
 
 
 def _load_role_schema(role: str, category: str) -> dict[str, Any] | None:

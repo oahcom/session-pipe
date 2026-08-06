@@ -139,8 +139,9 @@ class GracefulShutdown:
         self._active_ops = 0
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        signal.signal(signal.SIGINT, self._signal_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
         LOGGER.info(f"Received signal {signum}, initiating graceful shutdown...", extra=with_trace_id())
@@ -198,9 +199,10 @@ def health_check() -> dict:
     try:
         cfg = get_config()
         warn_thresh = cfg.nested_get("health", "backlog_warning_threshold", default=100)
+        crit_thresh = cfg.nested_get("health", "backlog_critical_threshold", default=500)
     except Exception:
         warn_thresh = 100
-    crit_thresh = cfg.nested_get("health", "backlog_critical_threshold", default=500)
+        crit_thresh = 500
     if total_facts >= crit_thresh:
         status = "critical"
     elif total_facts >= warn_thresh or stale_consumers:
@@ -255,7 +257,8 @@ class IdempotentConsume:
         self._lock = threading.Lock()
 
     def is_consumed(self, bb, fact_id: int, consumer: str) -> bool:
-        """检查指定 fact 是否已被指定 consumer 消费。"""
+        """检查指定 fact 是否已被指定 consumer 消费。
+        注意：log 表用 cat 列存储 consumer 名称（mark_consumed 写入逻辑）。"""
         with bb._conn() as conn:
             row = conn.execute(
                 "SELECT 1 FROM log WHERE fid = ? AND typ = 'consume' AND cat = ? LIMIT 1",

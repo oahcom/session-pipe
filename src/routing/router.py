@@ -67,17 +67,30 @@ def priority(category: str) -> int:
     return CATEGORY_PRIORITY.get(category, _DEFAULT_PRIORITY)
 
 
+# 完整性阈值：DB 路由角色数低于此值视为被污染（如误清空只剩 test_qa），
+# 回退到 shared_loader 导出，防止"DB 非空即信任"导致 route_all 瘫痪。
+_DB_MIN_ROLES = 5
+
+
 class Router:
     """路由表：优先从 SQLite 加载，fallback 到 shared_loader 导出。"""
 
     def __init__(self):
         self._routing = self._load_from_db_or_build()
 
+    def _db_ok(self, db_routing: dict) -> bool:
+        """DB 路由完整：非空且角色数不低于阈值。"""
+        return bool(db_routing) and len(db_routing) >= _DB_MIN_ROLES
+
     def _load_from_db_or_build(self) -> dict:
-        """优先从 DB 加载路由表，fallback 到 shared_loader 导出。"""
+        """优先从 DB 加载路由表，fallback 到 shared_loader 导出。
+
+        添加完整性检查: DB 路由角色数 < _DB_MIN_ROLES 时回退到导出，
+        防止路由.db 只剩 test_qa 导致 route_all 瘫痪。
+        """
         try:
             db_routing = routing_db.load_routing()
-            if db_routing:
+            if self._db_ok(db_routing):
                 return db_routing
         except Exception as _e:
             print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
@@ -87,7 +100,7 @@ class Router:
         """重新从 DB 加载路由表，更新 self._routing。"""
         try:
             db_routing = routing_db.load_routing()
-            if db_routing:
+            if self._db_ok(db_routing):
                 self._routing = db_routing
         except Exception as _e:
             print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)

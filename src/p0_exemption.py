@@ -197,8 +197,9 @@ class P0Exemption:
         return False
 
     def can_mark_draft(self, role: str = None) -> bool:
-        """检查角色是否有权标记 P0_draft (任何人可标记, 但不同角色有不同后续行为)。"""
-        return True  # ponytail: any role can draft, add restriction when abuse detected
+        """检查角色是否有权标记 P0_draft (仅允许定义的工程角色)。"""
+        role = role or self.role
+        return role in (ALLOWED_P0_ROLES | ALLOWED_DRAFT_ROLES)
 
     def mark_p0_draft(self, task_id: str, reason: str, role: str) -> dict:
         """任何角色标记 P0_draft。
@@ -272,30 +273,40 @@ class P0Exemption:
             raise PermissionError(f"cannot extend deadline: {role}")
         if minutes > 30:
             raise ValueError(f"单次延长 ≤30min, 传入 {minutes}")
-        # 读取当前已延长累计
+        # 读取当前已延长累计（兼容旧 action='p0_exemption' 记录）
         extensions = self._conn.execute(
-            "SELECT detail FROM workflow_logs "
-            "WHERE task_id=? AND action='p0_extended' ORDER BY ts",
+            "SELECT action, detail FROM workflow_logs "
+            "WHERE task_id=? AND action IN ('p0_extended', 'p0_exemption') ORDER BY ts",
             (task_id,)
         ).fetchall()
         total_extended = 0
         for row in extensions:
             d = json.loads(dict(row)["detail"])
-            total_extended += d.get("minutes", 0)
+            # 旧格式: {"detail": {"action": "extended", "minutes": N}}; 新格式: {"action": "extended", "minutes": N}
+            inner = d.get("detail", d)
+            if isinstance(inner, dict) and inner.get("action") == "extended":
+                total_extended += inner.get("minutes", 0)
+            elif isinstance(inner, dict) and inner.get("minutes"):
+                total_extended += inner["minutes"]
+            elif isinstance(d, dict) and d.get("action") == "extended":
+                total_extended += d.get("minutes", 0)
+            elif isinstance(d, dict) and d.get("minutes"):
+                total_extended += d["minutes"]
         remaining = 120 - total_extended  # 累计 ≤2h
         if remaining <= 0:
             raise ValueError(f"已无延长额度 (累计≥2h)")
         actual = min(minutes, remaining)
         # 实际延长: 修改 p0_marked_at 使窗口后移
+        # 先写审计再提交，确保 UPDATE + 审计日志原子性（防止预算绕过）
         self._conn.execute(
             "UPDATE tasks SET p0_marked_at=COALESCE(p0_marked_at, created_at) + ? "
             "WHERE task_id=?", (actual * 60, task_id)  # 转换为秒
         )
-        self._conn.commit()
         self._log_audit(task_id, role,
                         {"action": "extended", "minutes": actual,
                          "remaining_budget": remaining - actual},
                         action="p0_extended")
+        self._conn.commit()
         self._notify_bus("architecture", f"P0_draft deadline extended: {task_id}",
                          evidence=f"by={role}, +{actual}min")
         return {"task_id": task_id, "extended_minutes": actual,

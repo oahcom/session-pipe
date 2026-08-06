@@ -168,6 +168,8 @@ class WorkflowDB:
         if not task:
             return False
         if task['assigner'] == actor and actor != "system":
+            self._log(task_id=task_id, action="delete_denied", actor=actor,
+                      detail="assigner 不能删除自己创建的任务")
             return False
         self._log(task_id=task_id, action="deleted", actor=actor)
         self._conn.execute("DELETE FROM workflow_instances WHERE task_id=?", (task_id,))

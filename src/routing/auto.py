@@ -255,7 +255,7 @@ if __name__ == "__main__":
     # ── dispatch ──
     if _daemon_flag:
         _output_json(status(), has_json)
-        sys.exit(1)
+        sys.exit(0)
     elif _health_flag:
         _output_json(health_check(), has_json)
     elif _metrics_flag:

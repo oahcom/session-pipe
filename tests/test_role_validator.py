@@ -111,4 +111,5 @@ class TestValidateRoleDecorator:
 
 if __name__ == "__main__":
     import pytest as _p
+    import sys as _s
     _s.exit(_p.main([__file__, "-v"]))

@@ -32,12 +32,16 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
     router = _rt_mod.get_router()
     try:
         max_per_poll = get_config().nested_get("bus", "max_messages_per_poll", default=100)
-    except Exception:
+    except Exception as e:
+        LOGGER.warning("poll_unconsumed config read failed, using default: %s", e,
+                        extra={"trace_id": str(uuid.uuid4())[:8]})
+        METRICS.inc("config_errors_total")
         max_per_poll = 100
     since_id = get_last_cursor(consumer, "", instance_id) if consumer else 0
 
     def _do_poll():
         effective_limit = min(limit, max_per_poll) if limit else max_per_poll
+        # ponytail: passing cat filter would reduce overhead; use _consume_cats if available
         return [f for f in bb.unconsumed() if f.id > since_id][:effective_limit]
 
     try:

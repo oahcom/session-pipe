@@ -135,6 +135,10 @@ def setup_logging(level: int = logging.INFO, json_output: bool = True) -> loggin
     """配置根 logger，返回业务 logger。"""
     root = logging.getLogger()
     root.setLevel(level)
+    # 不清除已有 handler（避免覆盖其他模块的日志配置），仅检查是否已有 StreamHandler
+    has_stream = any(isinstance(h, logging.StreamHandler) for h in root.handlers)
+    if has_stream:
+        return logging.getLogger("reliability")
     # 清除已有 handler
     for h in list(root.handlers):
         root.removeHandler(h)
@@ -423,12 +427,13 @@ class MetricsCollector:
         lines = []
         with self._lock:
             for key, value in self._counters.items():
-                lines.append(f"# TYPE {key} counter")
+                # 提取不含标签的基础指标名
+                _base_key = key.split("{")[0] if "{" in key else key
+                lines.append(f"# TYPE {_base_key} counter")
                 lines.append(f"{key} {value}")
             for key, values in self._histograms.items():
-                if not values:
-                    continue
-                lines.append(f"# TYPE {key} histogram")
+                _base_key = key.split("{")[0] if "{" in key else key
+                lines.append(f"# TYPE {_base_key} histogram")
                 # 简单统计：count, sum, buckets (le=0.005,0.01,0.05,0.1,0.5,1,5)
                 buckets = [0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
                 counts = {b: 0 for b in buckets}
