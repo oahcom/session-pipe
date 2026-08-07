@@ -43,7 +43,6 @@ class StepHandlerMixin:
         if _bus_anchor is None:
             _bus_anchor = run.step_results.get(step.id, {}).get("notified_at", _persisted)
         last_ts = _bus_anchor
-        _skip_before = run.step_results.get(step.id, {}).get("bus_skip_before", 0)
 
         # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
         _sdata = run.step_results.get(step.id, {})

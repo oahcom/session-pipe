@@ -13,7 +13,6 @@ Reliability Layer — 可靠性基础设施。
 import json
 import logging
 import os
-import signal
 import sqlite3
 import sys
 import threading
@@ -23,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar
+from typing import Callable, Optional, TypeVar
 
 from paths import ensure_paths
 ensure_paths()
@@ -261,7 +260,7 @@ class CircuitBreaker:
             result = func(*args, **kwargs)
             self._on_success()
             return result
-        except Exception as e:
+        except Exception:
             self._on_failure()
             raise
 

@@ -4,7 +4,6 @@
 """
 
 import uuid
-from typing import Optional
 
 from routing import router as _rt_mod
 from reliability import (

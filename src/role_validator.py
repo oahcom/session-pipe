@@ -16,7 +16,6 @@ _ROLE_REGISTRY: list[str] = []
 
 def _load_role_registry() -> list[str]:
     """从 persona JSON 加载有效角色列表。"""
-    global _ROLE_REGISTRY
     if _ROLE_REGISTRY:
         return _ROLE_REGISTRY
     persona_dir = SESSION_ROLES_PERSONAS

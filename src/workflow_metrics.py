@@ -16,7 +16,6 @@ METRICS = Path.home() / ".hermes" / "state" / "workflow-metrics.jsonl"
 def snapshot():
     db = sqlite3.connect(str(DB))
     db.row_factory = sqlite3.Row
-    now = time.time()
     total = db.execute("SELECT COUNT(*) as c FROM workflow_instances").fetchone()["c"]
     by_status = {
         r["status"]: r["c"]

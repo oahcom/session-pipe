@@ -90,7 +90,7 @@ class TaskGeneratorMixin:
         except Exception as _e:
             LOGGER.exception("_scan_tasks 异常")
             try:
-                self._bb.write("code_fix", f"pipeflow: _scan_tasks 异常",
+                self._bb.write("code_fix", "pipeflow: _scan_tasks 异常",
                                evidence=str(_e), src="pipeflow")
             except (ValueError, KeyError, TypeError):
                 LOGGER.debug("bus write fail in _scan_tasks error handler")
@@ -237,7 +237,7 @@ class TaskGeneratorMixin:
         - 已有 running/pending workflow 的角色跳过
         - 生成标题描述性（≥12字符），非占位符
         """
-        _lock = getattr(self, '_TASK_GEN_COOLDOWN', {})
+        getattr(self, '_TASK_GEN_COOLDOWN', {})
         _now = time.time()
         _COOLDOWN_S = 120  # 2min，平衡速度与稳定性
 

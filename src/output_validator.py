@@ -10,7 +10,6 @@ and nested schemas::
     {"description": "...", "fields": {"field_name": ..., ...}}
 """
 
-from pathlib import Path
 import json
 import logging
 from typing import Any

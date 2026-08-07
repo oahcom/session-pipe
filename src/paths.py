@@ -10,11 +10,9 @@ from pathlib import Path
 _HOME = Path.home()
 
 # ── 从 hermes_bus.config 统一导入 ──
-from hermes_bus.config import (
-    BUS_CLIENT, BUS_PROTOCOL,
-    SISTER_BUS_CCS_SOCK, SISTER_BUS_FEED_SOCK,
-    SISTER_BUS_DKK_SOCK, SISTER_BUS_SSK_SOCK,
-)
+from hermes_bus.config import BUS_CLIENT  # re-exported: p0_exemption.py / workflow/client.py 从本模块导入
+
+__all__ = ["BUS_CLIENT"]
 # ── 路径常量：由本项目自行管理，不依赖 bus config ──
 _SESSION_LAUNCHER_SRC = Path(_HOME / "session-launcher" / "src")
 SESSION_ROLES_ROOT = Path(_HOME / "hermes-session-roles")

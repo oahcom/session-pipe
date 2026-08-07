@@ -5,20 +5,13 @@ Auto Route — 自动感知 bus 新消息并通知下游角色。
 支持优先级路由、消费联动、重试、熔断、心跳、指标。
 """
 import json
-import logging
-import os
 import sys
-import time
-import uuid
-from pathlib import Path
 
 # sys.path 由 paths.py 集中管理。list_sentinels 延迟注入 launcher 路径为例外。
 
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
-    with_retry, health_check, start_background_services, stop_background_services,
-    reconfigure, reload_config, IDEMPOTENT_CONSUME, ACK_TRACKER,
-    DEFAULT_RETRY, get_last_cursor, set_last_cursor, setup_logging,
+    health_check, ACK_TRACKER,
 )
 
 
@@ -31,7 +24,6 @@ def _get_shutdown():
     """Lazy access to GRACEFUL_SHUTDOWN (needs _ensure_initialized first)."""
     import reliability as _rel
     return _rel.GRACEFUL_SHUTDOWN
-from config_loader import get_config
 from routing import router as _rt_mod
 from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
 # 延迟导入 launcher.sentinel（避免模块级循环依赖）
@@ -234,7 +226,6 @@ def _cli_dispatch_investigator(argv, dry_run, has_json):
 
 
 if __name__ == "__main__":
-    import signal
     has_json = "--json" in sys.argv
     argv = [a for a in sys.argv[1:] if a != "--json"]
     flags = set(argv)

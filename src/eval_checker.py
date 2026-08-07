@@ -10,7 +10,7 @@ eval_checker.py — eval_criteria 运行时执行器。
     run_eval_check()  # 每 300s 调一次
 """
 
-import json, logging, os, random, re, subprocess, sys, time
+import json, logging, os, random, re, subprocess, sys
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -221,9 +221,9 @@ def _run(cmd: str, timeout: int = 30) -> dict:
                 for s in _all_segments if s.strip()
             )
             if not _ok:
-                return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ; 且段含非白名单命令", "returncode": -3}
+                return {"ok": False, "stdout": "", "stderr": "管道/分号/命令替换被禁止: 含 ; 且段含非白名单命令", "returncode": -3}
         else:
-            return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
+            return {"ok": False, "stdout": "", "stderr": "管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
     # 管道仅允许左右两侧都是白名单只读命令（引号感知分割: grep 模式内的 '|' 不算管道）
     for _seg in _split_pipe_segments(cmd):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""

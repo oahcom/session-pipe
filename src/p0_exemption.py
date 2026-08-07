@@ -305,7 +305,7 @@ class P0Exemption:
                 total_extended += d["minutes"]
         remaining = 120 - total_extended  # 累计 ≤2h
         if remaining <= 0:
-            raise ValueError(f"已无延长额度 (累计≥2h)")
+            raise ValueError("已无延长额度 (累计≥2h)")
         actual = min(minutes, remaining)
         # 实际延长: 修改 p0_marked_at 使窗口后移
         # 先写审计再提交，确保 UPDATE + 审计日志原子性（防止预算绕过）
@@ -415,7 +415,7 @@ class P0Exemption:
                     f"@everyone P0 任务逾期 12h+: {t['task_id']} ({t.get('title','')})",
                     evidence=f"elapsed={elapsed:.1f}h, state={t['p0_state']}")
                 self._log_audit(t['task_id'], "system",
-                                f"escalation_12h: @everyone notified")
+                                "escalation_12h: @everyone notified")
                 results.append({"task_id": t['task_id'], "action": "escalated_12h"})
             elif elapsed > 6:
                 # 6h+ → supervisor
@@ -423,7 +423,7 @@ class P0Exemption:
                     f"P0 任务逾期 6h+: {t['task_id']} — 需 {SUPERVISOR_ROLE} 介入",
                     evidence=f"elapsed={elapsed:.1f}h, state={t['p0_state']}")
                 self._log_audit(t['task_id'], "system",
-                                f"escalation_6h: supervisor notified")
+                                "escalation_6h: supervisor notified")
                 results.append({"task_id": t['task_id'], "action": "escalated_6h"})
 
         return results

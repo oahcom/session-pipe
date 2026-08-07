@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Optional
 
 _CAT_REF_RE = re.compile(r"bus cat=(\w+)")
 

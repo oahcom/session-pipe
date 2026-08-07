@@ -163,11 +163,11 @@ def _validate_schema(template: dict) -> ValidationReport:
 
     # name
     if not isinstance(template.get("name"), str) or len(template["name"]) < 2:
-        report.add_error(f"name 需≥2字符")
+        report.add_error("name 需≥2字符")
 
     # description
     if not isinstance(template.get("description"), str) or len(template["description"]) < 4:
-        report.add_error(f"description 需≥4字符")
+        report.add_error("description 需≥4字符")
 
     # trigger_scene
     ts = template.get("trigger_scene", [])

@@ -3,7 +3,6 @@
 
 import json
 import sys
-import time
 from pathlib import Path
 
 _src = Path(__file__).resolve().parent.parent
@@ -33,7 +32,6 @@ def check() -> dict:
         "FROM workflow_instances WHERE status='running'"
     )
     stale_count = 0
-    now = time.time()
     for r in stale_rows:
         d = dict(r)
         sr = json.loads(d.get("step_results", "{}"))

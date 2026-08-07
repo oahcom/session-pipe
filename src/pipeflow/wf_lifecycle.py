@@ -443,7 +443,7 @@ class WorkflowLifecycleMixin:
                     ctx["title"] = task["title"]
                     ctx["description"] = task["description"]
                     ctx["assignee"] = step.target_role
-            except Exception as _e:
+            except Exception:
                 LOGGER.exception("_write_step_prompt task context fetch failed for %s", run.id)
         prompt = step.prompt_template + "\n" + extra_prompt if extra_prompt else step.prompt_template
         for k, v in ctx.items():

@@ -126,7 +126,7 @@ def write_bus(role: str, title: str):
 
 
 def main():
-    print(f"=== CCS 批量任务推送 ===\n")
+    print("=== CCS 批量任务推送 ===\n")
     total_tasks = sum(len(tasks) for tasks in ROLE_TASKS.values())
     print(f"计划: {total_tasks} 个任务, {len(ROLE_TASKS)} 个角色\n")
 
@@ -138,7 +138,7 @@ def main():
 
     print(f"\n=== 完成: sent={sent}, errors={errors} ===")
     if sent > 0:
-        print(f"子 agent 将在任务完成后独立评估收益")
+        print("子 agent 将在任务完成后独立评估收益")
 
 
 if __name__ == "__main__":

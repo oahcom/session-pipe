@@ -10,7 +10,7 @@
 
 子 agent 拿到这些数据后自行判断哪些 task 有实际收益。
 """
-import sqlite3, json, sys, subprocess, time, os
+import sqlite3, json, subprocess, time
 from pathlib import Path
 
 DB = Path.home() / ".hermes" / "state" / "workflows.db"

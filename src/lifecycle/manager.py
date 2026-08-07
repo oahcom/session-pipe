@@ -701,7 +701,6 @@ class LifecycleManager:
                 # 降级兜底：ccs send 失败时写 bus，确保审批请求不丢失
                 # （WL-P2-03：ccs send 失败 → 自动降级为 bus 消息写入）
                 try:
-                    import json as _json
                     from workflow.client import _get_ccs_cli  # noqa: F401 复用路径解析
                     self._bb_write_fallback(wf_id, step_id, token, approval_prompt, assigner)
                 except Exception as _fb_err:
@@ -734,7 +733,7 @@ class LifecycleManager:
         if not sub_tpl_id or not sub_assignee:
             self._set_step_result_unsafe(wf_id, step_id, "failed", results)
             self._log_unsafe(wf_id, task_id, "subflow_failed",
-                             detail=f"missing subflow_template_id or subflow_assignee")
+                             detail="missing subflow_template_id or subflow_assignee")
             return "failed"
 
         # 构建子任务描述：父 prompt + 步骤上下文
@@ -876,7 +875,6 @@ class LifecycleManager:
                 if step.get("type") != "gate":
                     continue
                 timeout_hours = step.get("estimated_hours", 24)
-                escalation_role = step.get("target_role", "coordinator")
                 rows = self._conn.execute(
                     "SELECT * FROM workflow_instances "
                     "WHERE template_id=? AND status='running' AND current_step_id=?",

@@ -18,7 +18,8 @@ _PIPELINE_SRC = str(Path(__file__).resolve().parent)
 if _PIPELINE_SRC not in sys.path or sys.path[0] != _PIPELINE_SRC:
     sys.path.insert(0, _PIPELINE_SRC)
 # Pre-load pipeline's config_loader before .hermes/scripts shadows it
-import config_loader  # noqa: F401 (caches correct version in sys.modules)
+import config_loader as _cfg_preload
+_cfg_preload.get_config  # 副作用引用：确保模块加载，缓存正确版本到 sys.modules
 
 # 使用绝对导入确保读到 pipeline 的 paths（避免被 launcher 的 paths 遮蔽）
 _paths_spec = importlib.util.spec_from_file_location(
@@ -27,8 +28,10 @@ _paths_mod = importlib.util.module_from_spec(_paths_spec)
 _paths_spec.loader.exec_module(_paths_mod)
 SENTINEL_DIR = _paths_mod.CCS_SENTINEL_DIR
 
-from routing.auto import route_all, route_all_to_ccs, health_check
-from reliability import setup_logging, LOGGER, METRICS
+from routing.auto import route_all, route_all_to_ccs
+from reliability import LOGGER, METRICS
+
+__all__ = ["route_all", "route_all_to_ccs", "LOGGER", "METRICS"]
 
 INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔

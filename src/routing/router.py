@@ -268,11 +268,6 @@ class Router:
         for role, r in self._routing.items():
             produce = r.get("produce", [])
             consume = r.get("consume", [])
-            produce_str = ", ".join(CATEGORY_DESC.get(c, c) for c in produce) if produce else "（无）"
-            if "*" in consume:
-                consume_str = "所有分类"
-            else:
-                consume_str = ", ".join(CATEGORY_DESC.get(c, c) for c in consume) if consume else "（无）"
             lines.append(f"  {role}: 产出={produce}  消费={consume}")
 
         return "\n".join(lines)

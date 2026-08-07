@@ -15,7 +15,6 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
 
 
 def _get_db_path() -> Path:
@@ -194,7 +193,6 @@ class RoutingDB:
         Returns:
             int: 变更数量（新增/更新/删除总和）
         """
-        now = time.time()
         changes = 0
 
         # 获取现有角色

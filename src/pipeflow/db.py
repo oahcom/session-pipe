@@ -17,11 +17,10 @@ Schema 统一在 workflow/db.py 定义，本文件复用之。
 """
 
 import json
-import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from paths import WORKFLOWS_DB as DB_PATH
 from workflow.db import create_connection

@@ -8,7 +8,6 @@ Workflow Engine --- 数据驱动的对话工作流执行引擎。
 """
 
 import json
-import os
 import re
 import time
 import uuid
@@ -22,8 +21,6 @@ from typing import Any, Optional
 from paths import ensure_paths
 ensure_paths()
 from paths import HERMES_WORKFLOWS as _WORKFLOWS_DIR
-from paths import CCS_CLI as _CCS_CLI
-from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 
 from bus_protocol import Blackboard
 

@@ -184,9 +184,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     """
     from bus_protocol import Blackboard as _Blackboard
     from routing.auto import poll_unconsumed as _poll
-    from routing.rdb import RoutingDB as _RDB
 
-    router = _rt_mod.get_router()
     category_limit = 10
 
     # 消费该角色未消费的消息
@@ -367,8 +365,6 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
     dry_run: 仅展示分配方案，不实际路由
     """
     from bus_protocol import Blackboard
-    router = _rt_mod.get_router()
-
     bb = Blackboard()
     facts = bb.read(cat=category, limit=50)
 

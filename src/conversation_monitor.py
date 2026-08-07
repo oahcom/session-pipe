@@ -28,7 +28,7 @@ def _load_forbidden_ops() -> dict:
     """从 session-launcher 的 routing.roles 拉取禁区定义"""
     try:
         from pathlib import Path
-        import importlib.util, sys
+        import importlib.util
         launcher_src = str(Path.home() / "session-launcher" / "src")
         spec = importlib.util.spec_from_file_location(
             "launcher_roles", str(Path(launcher_src) / "routing" / "roles.py"))
