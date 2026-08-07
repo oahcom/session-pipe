@@ -8,7 +8,7 @@ L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
 集成方式：routing_daemon 每 120s 调 tick()。
 独立于 CCS 侧代码，纯外部观测。
 """
-import json, logging, os, subprocess, sys, time, http.client, urllib.parse
+import json, logging, os, re, subprocess, sys, time, http.client, urllib.parse
 from pathlib import Path
 from typing import Any
 

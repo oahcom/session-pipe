@@ -4,24 +4,27 @@
 负责模块级实例初始化、配置重载、健康检查。
 """
 from reliability_core import (
-    RetryPolicy, with_retry, CircuitState, CircuitBreaker,
-    CircuitOpenError, ConsumerHeartbeat, TtlPruner,
-    MetricsCollector, METRICS,
-    setup_logging, JsonFormatter, with_trace_id, LOGGER,
-    init_cursor_db, get_last_cursor, set_last_cursor,
+    RetryPolicy, with_retry,
+    CircuitBreaker, CircuitState, CircuitOpenError,
+    ConsumerHeartbeat, TtlPruner,
+    MetricsCollector, METRICS, setup_logging, with_trace_id, LOGGER,
+    get_last_cursor, set_last_cursor,
 )
+
+# re-exports
+__all__ = ["RetryPolicy", "with_retry",
+           "CircuitBreaker", "CircuitState", "CircuitOpenError",
+           "ConsumerHeartbeat", "TtlPruner", "MetricsCollector",
+           "METRICS", "setup_logging", "with_trace_id", "LOGGER",
+           "get_last_cursor", "set_last_cursor"]
 
 import os
 import signal
 import sqlite3
-import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional
 
 import logging as _logging
 
@@ -405,7 +408,6 @@ class AckTracker:
 
         返回成功重试的数量。
         """
-        from bus_protocol import Blackboard
         failed = self.get_failed_acks()
         retried = 0
         for ack in failed:
@@ -433,7 +435,6 @@ _CONFIG_MTIME = _config_mtime()
 
 
 if __name__ == "__main__":
-    import sys
     reconfigure()
     print("Reliability module self-check:")
     print(f"  CircuitBreaker: {CIRCUIT_BREAKER._state}")
