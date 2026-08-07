@@ -30,69 +30,69 @@ class TaskGeneratorMixin:
         except (ValueError, KeyError, TypeError):
             LOGGER.debug("lifecycle ping failed during _scan_tasks")
         try:
-            conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
-            rows = conn.execute(
-                "SELECT DISTINCT t.task_id, t.status FROM tasks t "
-                "JOIN workflow_instances wi ON t.task_id = wi.task_id "
-                "WHERE t.status NOT IN ('completed', 'failed', 'cancelled', 'step_done_ready')"
-            ).fetchall()
-            for row in rows:
-                task_id = row["task_id"]
-                inst_rows = conn.execute(
-                    "SELECT status FROM workflow_instances WHERE task_id=?",
-                    (task_id,)
+            with lm._conn_tx() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT t.task_id, t.status FROM tasks t "
+                    "JOIN workflow_instances wi ON t.task_id = wi.task_id "
+                    "WHERE t.status NOT IN ('completed', 'failed', 'cancelled', 'step_done_ready')"
                 ).fetchall()
-                statuses = [dict(r)["status"] for r in inst_rows]
-                if not statuses:
-                    continue
-                if all(s in ("completed", "failed", "cancelled") for s in statuses):
-                    ts = "completed" if all(s == "completed" for s in statuses) else "failed"
-                    conn.execute(
-                        "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
-                        (ts, time.time(), task_id))
-                    conn.commit()
-            # 子工作流完成 → 推进父工作流
-            for _sub_row in conn.execute(
-                "SELECT wi.instance_id, wi.current_step_id, wi.step_results FROM workflow_instances wi "
-                "WHERE wi.status='running' AND wi.template_id IN (SELECT template_id FROM workflow_templates)"
-            ).fetchall():
-                _sr = json.loads(_sub_row["step_results"] or "{}")
-                for _step_id, _sdata in _sr.items():
-                    if not isinstance(_sdata, dict):
-                        continue  # 简写值（如 "done"）没有 subflow_id
-                    _sf = _sdata.get("subflow_id", "")
-                    if _sf:
-                        # 只处理当前步骤的 subflow：历史步骤的 subflow 已完成会重复
-                        # 触发 _advance_production_wf，而 advance 又为带 subflow_template
-                        # 的下一步创建新 subflow → 每 tick 新建 → 垃圾任务堆积
-                        if _step_id != _sub_row["current_step_id"]:
-                            continue
-                        _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
-                        if _sub_status and _sub_status['status'] in ('completed', 'step_done_ready'):
-                            _sdata["status"] = "completed"
-                            _sdata["completed_at"] = time.time()
-                            conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                                (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
-                            conn.commit()
-                            # 推进父工作流
-                            _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
-                            if _tmpl:
-                                _wf = self._workflows.get(_tmpl["template_id"])
-                                if _wf:
-                                    self._advance_production_wf(_sub_row["instance_id"], lm, _tmpl["template_id"], _step_id, _sr)
+                for row in rows:
+                    task_id = row["task_id"]
+                    inst_rows = conn.execute(
+                        "SELECT status FROM workflow_instances WHERE task_id=?",
+                        (task_id,)
+                    ).fetchall()
+                    statuses = [dict(r)["status"] for r in inst_rows]
+                    if not statuses:
+                        continue
+                    if all(s in ("completed", "failed", "cancelled") for s in statuses):
+                        ts = "completed" if all(s == "completed" for s in statuses) else "failed"
+                        conn.execute(
+                            "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
+                            (ts, time.time(), task_id))
+                        conn.commit()
+                # 子工作流完成 → 推进父工作流
+                for _sub_row in conn.execute(
+                    "SELECT wi.instance_id, wi.current_step_id, wi.step_results FROM workflow_instances wi "
+                    "WHERE wi.status='running' AND wi.template_id IN (SELECT template_id FROM workflow_templates)"
+                ).fetchall():
+                    _sr = json.loads(_sub_row["step_results"] or "{}")
+                    for _step_id, _sdata in _sr.items():
+                        if not isinstance(_sdata, dict):
+                            continue  # 简写值（如 "done"）没有 subflow_id
+                        _sf = _sdata.get("subflow_id", "")
+                        if _sf:
+                            # 只处理当前步骤的 subflow：历史步骤的 subflow 已完成会重复
+                            # 触发 _advance_production_wf，而 advance 又为带 subflow_template
+                            # 的下一步创建新 subflow → 每 tick 新建 → 垃圾任务堆积
+                            if _step_id != _sub_row["current_step_id"]:
+                                continue
+                            _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
+                            if _sub_status and _sub_status['status'] in ('completed', 'step_done_ready'):
+                                _sdata["status"] = "completed"
+                                _sdata["completed_at"] = time.time()
+                                conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                    (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                                conn.commit()
+                                # 推进父工作流
+                                _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
+                                if _tmpl:
+                                    _wf = self._workflows.get(_tmpl["template_id"])
+                                    if _wf:
+                                        self._advance_production_wf(_sub_row["instance_id"], lm, _tmpl["template_id"], _step_id, _sr)
 
-            conn.commit()
-            self._check_anomalies()
-            # ponytail: 动态任务生成——每轮 run_once 检查一次每个角色是否需要新任务
-            self._generate_tasks_from_state()
-            # ponytail: 任务质量反馈闭环——每轮 run_once 评估最近完成的任务并写入 bus
-            try:
-                from task_evidence import evaluate_and_feedback
-                _feed = evaluate_and_feedback()
-                if _feed.get("evaluated", 0):
-                    LOGGER.info("task-evidence: evaluated %d completed tasks", _feed["evaluated"])
-            except Exception as _e:
-                LOGGER.debug("task_evidence feedback failed: %s", _e)
+                conn.commit()
+                self._check_anomalies(conn)
+                # ponytail: 动态任务生成——每轮 run_once 检查一次每个角色是否需要新任务
+                self._generate_tasks_from_state()
+                # ponytail: 任务质量反馈闭环——每轮 run_once 评估最近完成的任务并写入 bus
+                try:
+                    from task_evidence import evaluate_and_feedback
+                    _feed = evaluate_and_feedback()
+                    if _feed.get("evaluated", 0):
+                        LOGGER.info("task-evidence: evaluated %d completed tasks", _feed["evaluated"])
+                except Exception as _e:
+                    LOGGER.debug("task_evidence feedback failed: %s", _e)
         except Exception as _e:
             LOGGER.exception("_scan_tasks 异常")
             try:
@@ -101,11 +101,18 @@ class TaskGeneratorMixin:
             except (ValueError, KeyError, TypeError):
                 LOGGER.debug("bus write fail in _scan_tasks error handler")
 
-    def _check_anomalies(self):
+    def _check_anomalies(self, conn=None):
         """Detect workflows stuck across multiple steps; auto-heal.
-        Also monitors overall completion rate and backlog health."""
+        Also monitors overall completion rate and backlog health.
+
+        conn: 由调用方传入的持锁事务连接（_scan_tasks 持锁期间调用）；
+        None 时自取（独立调用场景，如 CLI tick）。"""
         try:
-            conn = self._lifecycle._conn  # ponytail: 同上一轮重构时统一
+            if conn is None:
+                lm2 = self._lifecycle
+                with lm2._conn_tx() as conn:
+                    self._check_anomalies(conn)
+                return
             # 全局健康仪表板
             _total = conn.execute("SELECT COUNT(*) as c FROM workflow_instances").fetchone()
             _completed = conn.execute("SELECT COUNT(*) as c FROM workflow_instances WHERE status='completed'").fetchone()

@@ -250,7 +250,7 @@ class StepHandlerMixin:
             try:
                 self._lifecycle.complete_step(run.id, step.id)
             except Exception as e:
-                print(f"  [wf] LM complete_step 失败: {e}", flush=True)
+                LOGGER.error("[wf] LM complete_step 失败: %s", e)
                 # 步骤不匹配说明 lifecycle 已推进到下一步 → 跳过不重试
                 if "步骤不匹配" in str(e):
                     return

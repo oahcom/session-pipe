@@ -34,7 +34,7 @@ class WorkflowLifecycleMixin:
         try:
             for row in lm.query(
                 "SELECT instance_id, template_id, created_at, step_results "
-                "FROM workflow_instances WHERE status='running'"
+                "FROM workflow_instances WHERE status IN ('running', 'step_done_ready')"
             ):
                 d = dict(row)
                 wf_id = d["instance_id"]
@@ -107,12 +107,12 @@ class WorkflowLifecycleMixin:
         """推进生产工作流到下一步，并通知目标角色。"""
         from pipeflow.engine import _UNMATCHED_VAR_RE
         try:
-            conn = lm._conn  # ponytail: 事务内批量操作，下一轮重构时统一用 execute_raw
-            # 防重闭合守卫：launcher wf complete 全量覆写 step_results 会把已
-            # completed 的工作流打回 step_done_ready，这里拒绝二次推进。
-            _row = conn.execute(
-                "SELECT status FROM workflow_instances WHERE instance_id=?", (wf_id,)
-            ).fetchone()
+            with lm._conn_tx() as conn:
+                # 防重闭合守卫：launcher wf complete 全量覆写 step_results 会把已
+                # completed 的工作流打回 step_done_ready，这里拒绝二次推进。
+                _row = conn.execute(
+                    "SELECT status FROM workflow_instances WHERE instance_id=?", (wf_id,)
+                ).fetchone()
             if _row and _row["status"] == "completed":
                 LOGGER.debug("advance skipped: %s already completed", wf_id)
                 return

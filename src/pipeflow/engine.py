@@ -149,9 +149,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     from template_registry import _validate_meta as _vmeta
                     _vr = _vmeta(data)
                     if not _vr.passed:
-                        print(f"  [wf] 警告: {f.name} 质量检查不通过:")
+                        LOGGER.warning("[wf] 警告: %s 质量检查不通过:", f.name)
                         for _e in _vr.errors[:4]:
-                            print(f"        - {_e}")
+                            LOGGER.warning("        - %s", _e)
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("workflow meta validation failed for %s", f.name)
                 self._workflows[data["name"]] = WorkflowDef(
@@ -167,7 +167,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     is_subflow=data.get("is_subflow", False),
                 )
             except Exception as e:
-                print(f"  [wf] 加载 {f.name} 失败: {e}")
+                    LOGGER.warning("[wf] 加载 %s 失败: %s", f.name, e)
         # 也从 SQLite 加载模板（仅默认目录时）
         if self.workflows_dir != _WORKFLOWS_DIR:
             return
@@ -216,7 +216,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     is_subflow=t.get("is_subflow", False),
                 )
         except Exception as e:
-            print(f"  [wf] SQLite 模板加载失败: {e}")
+            LOGGER.warning("[wf] SQLite 模板加载失败: %s", e)
 
     def list_workflows(self) -> list[str]:
         return sorted(name for name, wf in self._workflows.items() if not wf.is_subflow)
@@ -239,7 +239,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 self._lifecycle.start_wf(run.id, current_step_id=wf.steps[0].id,
                                           template_id=name, context=context)
             except Exception as e:
-                print(f"  [wf] LM start_wf 失败: {e}", flush=True)
+                LOGGER.error("[wf] LM start_wf 失败: %s", e)
             self._write_step_prompt(run, wf.steps[0])
             return run.id
 
@@ -265,7 +265,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 quality_standards=wf.quality_standards,
             )
         except Exception as e:
-            print(f"  [wf] upsert template 失败: {e}", flush=True)
+            LOGGER.error("[wf] upsert template 失败: %s", e)
 
     def status(self, wid: str) -> dict:
         try:

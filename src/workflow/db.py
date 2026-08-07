@@ -19,7 +19,8 @@ SCHEMA_SQL = """
         allowed_initiators TEXT,
         allowed_executors TEXT,
         max_duration_hours INTEGER DEFAULT 24,
-        quality_standards TEXT DEFAULT ''
+        quality_standards TEXT DEFAULT '',
+        is_subflow INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS workflow_instances (
         instance_id TEXT PRIMARY KEY,
@@ -76,12 +77,15 @@ def create_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA_SQL)
     # 迁移：已存在的 DB 添加新列
     _migrate_add_column(conn, "workflow_instances", "parent_wf_id", "TEXT")
     _migrate_add_column(conn, "workflow_instances", "subflow_source_step_id", "TEXT")
     _migrate_add_column(conn, "workflow_instances", "context", "TEXT DEFAULT '{}'")
     _migrate_add_column(conn, "tasks", "parent_task_id", "TEXT")
+    _migrate_add_column(conn, "workflow_templates", "is_subflow", "INTEGER DEFAULT 0")
     conn.commit()
     return conn
 

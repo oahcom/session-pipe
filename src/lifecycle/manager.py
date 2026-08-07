@@ -11,8 +11,9 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to relative when moved to subpackage
 
@@ -63,6 +64,8 @@ class LifecycleManager:
         self._conn = sqlite3.connect(str(self.db_path), timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA wal_autocheckpoint=1000")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._ensure_schema()
 
     # ── 状态查询 ─────────────────────────────────
@@ -71,6 +74,11 @@ class LifecycleManager:
         """安全的 DB 查询代理（替代外部直接访问 _conn）。"""
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
+
+    def query_one(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        """单行查询代理。无匹配返回 None。"""
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
 
     def execute(self, sql: str, params: tuple = ()) -> None:
         """安全的 DB 写入代理（替代外部直接访问 _conn）。"""
@@ -106,6 +114,21 @@ class LifecycleManager:
                 self._conn.execute("BEGIN IMMEDIATE")
             except Exception:
                 pass  # ponytail: 已在事务中时静默 RLock 已保证线程安全
+
+    @contextmanager
+    def _conn_tx(self) -> Iterator[sqlite3.Connection]:
+        """事务连接上下文：持有 RLock 期间返回原始连接，退出时释放锁。
+
+        用于需要在单个事务中执行多次读写 + 检查结果（fetchone/rowcount）
+        的场景（如 _advance_production_wf）。RLock 可重入，事务内仍可调
+        self.commit()/rollback()（它们也加同一把锁，可重入不阻塞）。
+        ponytail: 直接暴露原始连接；升级路径：execute_raw 返回 cursor 后
+        改拆成多次 execute_raw 调用。"""
+        self._lock.acquire()
+        try:
+            yield self._conn
+        finally:
+            self._lock.release()
 
     def ping(self) -> bool:
         """检查连接是否存活。"""
@@ -1017,6 +1040,7 @@ class LifecycleManager:
             ("workflow_templates", "allowed_executors", "TEXT"),
             ("workflow_templates", "max_duration_hours", "INTEGER DEFAULT 24"),
             ("workflow_templates", "quality_standards", "TEXT DEFAULT ''"),
+            ("workflow_templates", "is_subflow", "INTEGER DEFAULT 0"),
             ("workflow_instances", "context", "TEXT DEFAULT '{}'"),
             ("workflow_instances", "parent_wf_id", "TEXT"),
             ("workflow_instances", "subflow_source_step_id", "TEXT"),

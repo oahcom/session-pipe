@@ -46,6 +46,8 @@ def _get_cursor_conn() -> sqlite3.Connection:
         _CURSOR_DB.parent.mkdir(parents=True, exist_ok=True)
         _CURSOR_CONN = sqlite3.connect(str(_CURSOR_DB), check_same_thread=False)
         _CURSOR_CONN.execute("PRAGMA journal_mode=WAL")
+        _CURSOR_CONN.execute("PRAGMA wal_autocheckpoint=1000")
+        _CURSOR_CONN.execute("PRAGMA busy_timeout=5000")
     return _CURSOR_CONN
 
 def get_last_cursor(consumer: str, category: str = "", instance_id: str = "") -> int:

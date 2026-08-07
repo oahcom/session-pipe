@@ -364,20 +364,29 @@ class TemplateRegistry:
         self._conn = sqlite3.connect(str(self.db_path), timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA wal_autocheckpoint=1000")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._ensure_schema()
 
     def _ensure_schema(self):
-        """确保模板相关的表和索引存在（含迁移）。"""
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS workflow_templates (
-                template_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                steps_json TEXT NOT NULL,
-                steps_mermaid TEXT,
-                created_at REAL NOT NULL
-            );
-        """)
+        """确保模板相关的表和索引存在（含迁移）。
+
+        使用 workflow/db.py 的 SCHEMA_SQL 作为权威来源，避免重复定义漂移；
+        import 失败时回退到本地精简定义（保持旧行为）。"""
+        try:
+            from workflow.db import SCHEMA_SQL as _SCHEMA_SQL
+            self._conn.executescript(_SCHEMA_SQL)
+        except ImportError:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS workflow_templates (
+                    template_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    steps_json TEXT NOT NULL,
+                    steps_mermaid TEXT,
+                    created_at REAL NOT NULL
+                );
+            """)
         # 迁移：添加新列（V2 schema 扩展）
         _migrate_cols = [
             ("is_active", "INTEGER NOT NULL DEFAULT 1"),
