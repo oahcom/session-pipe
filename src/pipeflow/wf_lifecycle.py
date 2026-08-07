@@ -196,7 +196,8 @@ class WorkflowLifecycleMixin:
                         task_title, task_desc, results, prev_step_id=step_id)
                     if _UNMATCHED_VAR_RE.search(prompt):
                         unmatched = _UNMATCHED_VAR_RE.findall(prompt)
-                        conn.rollback()
+                        if conn.in_transaction:
+                            conn.rollback()
                         LOGGER.warning("advance skip notify: %s/%s step=%s 含未替换变量 %s，已回滚推进",
                                       wf_id[:8], wf_name, next_step.id, unmatched)
                         return
@@ -364,7 +365,8 @@ class WorkflowLifecycleMixin:
                     created_new = True
                 except Exception as _e:
                     LOGGER.error("loop new iteration failed %s: %s", wf_id, _e)
-                    conn.rollback()
+                    if conn.in_transaction:
+                        conn.rollback()
         except Exception as _e:
             LOGGER.warning("_handle_wf_loop failed %s: %s", wf_id, _e)
             return
