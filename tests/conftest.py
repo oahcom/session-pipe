@@ -60,38 +60,7 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
 
-# 5. engine._lifecycle 类级 patch 污染重置：
-#    test_stability_regression 的 patch.object 启动时替换类的 _lifecycle property，
-#    若某测试未触发 tearDown（模块收集异常/超时等）则后续测试文件看到 mock。
-@pytest.fixture(autouse=True, scope="function")
-def _reset_engine_lifecycle():
-    """每个测试前后保存/恢复 WorkflowEngine._lifecycle property，防止跨文件污染。"""
-    try:
-        from pipeflow.engine import WorkflowEngine
-        original = type.__dict__.get(
-            WorkflowEngine, "_lifecycle",
-            type.__dict__.get(WorkflowEngine.__class__.__mro__[0], "__dict__", {}).get("_lifecycle")
-        )
-        # 用 __dict__ 看类是否有 _lifecycle 条目
-        original = WorkflowEngine.__dict__.get("_lifecycle")
-    except Exception:
-        original = None
-    yield
-    # 恢复：删掉测试期间可能被注入的非 descriptor 条目
-    try:
-        from pipeflow.engine import WorkflowEngine
-        current = WorkflowEngine.__dict__.get("_lifecycle")
-        if current is not original:
-            # patch.object 插入的 PropertyMock 不是原始 property descriptor
-            # 删除类级条目，让描述符 MRO 重新生效
-            try:
-                del WorkflowEngine.__dict__["_lifecycle"]
-            except KeyError:
-                pass
-    except Exception:
-        pass
-
-# 4. BUS_DB 隔离：当前 Blackboard 实例化时不读 hermes_bus.config.BLACKBOARD_DB
+# 4. BUS_DB 隔离：当前 Blackboard 实象化时不读 hermes_bus.config.BLACKBOARD_DB
 #    （import 时快照到 blackboard_legacy.BLACKBOARD_DB 常量），
 #    因此改 config 无效。测试仍写生产 blackboard.db，靠测试内 mark_consumed 清理。
 #    多 session 并发时可能冲突，但 workflow DB 已完全隔离，实际无数据污染。
