@@ -71,9 +71,9 @@ def set_last_cursor(consumer: str, category: str, fact_id: int, instance_id: str
         conn.commit()
 
 def init_cursor_db() -> None:
-    """初始化 cursor 表。"""
-    conn = sqlite3.connect(str(_cursor_db_path()))
-    try:
+    """初始化 cursor 表（复用持久连接，与 get/set 一致）。"""
+    with _CURSOR_LOCK:
+        conn = _get_cursor_conn()
         conn.execute(
             "CREATE TABLE IF NOT EXISTS cursors("
             "consumer TEXT, category TEXT, instance_id TEXT DEFAULT '', "
@@ -93,8 +93,6 @@ def init_cursor_db() -> None:
             conn.execute("DROP TABLE cursors")
             conn.execute("ALTER TABLE cursors_new RENAME TO cursors")
         conn.commit()
-    finally:
-        conn.close()
 
 # 初始化 cursor DB（延迟到首次使用，避免 import 时副作用）
 _CURSOR_INITIALIZED = False

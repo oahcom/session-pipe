@@ -87,13 +87,18 @@ class CronScheduler:
             LOGGER.warning("idle state save failed: %s", e)
 
     def report_idle(self, role: str):
-        """角色巡检产出空报告 → 记录空转，累计达 2 次触发 24h 冷却。"""
+        """角色巡检产出空报告 → 记录空转，累计达 2 次触发 24h 冷却。
+
+        冷却触发后重置计数：否则计数永远 >= 2，冷却结束后的下一次 idle
+        会立即再次触发冷却（角色 24h 只有一次触发窗口）。
+        """
         role = role.replace("scheduled_tick:", "")
         self._idle_counts[role] = self._idle_counts.get(role, 0) + 1
         if self._idle_counts[role] >= 2:
             self._last_idle_value[role] = time.time() + _IDLE_COOLDOWN
+            self._idle_counts[role] = 0
             LOGGER.info("cron idle: %s 连续 %d 次空转 → 冷却 %d h",
-                        role, self._idle_counts[role], _IDLE_COOLDOWN // 3600)
+                        role, self._idle_counts[role] + 2, _IDLE_COOLDOWN // 3600)
         self._save_idle_state()
 
     def _in_cooldown(self, role: str) -> bool:

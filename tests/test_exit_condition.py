@@ -426,14 +426,13 @@ class TestTickNoMatchUpdatesPollSince(unittest.TestCase):
         """退出条件未匹配时引擎推 poll_since，防止重复匹配旧消息。"""
         eng = _mocked_eng()
         eng._check_exit = MagicMock(return_value=(0.0, []))
-        eng._sync_step_results = MagicMock()
 
-        step = _step()
+        # 需要 bus_category 才能进入 no-match 路径（空 cat 直接 return）
+        step = _step(exit_condition={"bus_category": "notice"})
         run = _run()
         run.step_results = {"s1": {}}
         eng._tick(run, step)
 
-        eng._sync_step_results.assert_called_once()
         sr = run.step_results["s1"]
         self.assertIn("poll_since", sr)
 

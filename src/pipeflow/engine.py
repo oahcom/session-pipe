@@ -1203,13 +1203,15 @@ class WorkflowEngine:
             }
             self._sync_step_results(run.id, run.step_results)
 
-            # schema/verify 只报警不阻停——角色写了 exit 消息就放行推进
+            # schema/verify 失败 → 写 blocker 且不推进，等角色补产出后重试
             if step.exit_schema:
                 ok, errs = self._validate_exit_schema(step, run)
                 if not ok:
                     self._bb.write("blocker",
                         f"[workflow] {run.workflow_name} {step.id} schema: {'; '.join(errs)}",
                         src="workflow_engine")
+                    self._sync_step_results(run.id, run.step_results)
+                    return
 
             if step.verify:
                 ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
@@ -1224,6 +1226,8 @@ class WorkflowEngine:
                     self._bb.write("blocker",
                         f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}",
                         src="workflow_engine")
+                    self._sync_step_results(run.id, run.step_results)
+                    return
 
             try:
                 self._lifecycle.complete_step(run.id, step.id)
@@ -1333,18 +1337,18 @@ class WorkflowEngine:
                 all_matches = [Path(m) for m in _gl.glob(str(fpath))]
                 # 过滤：只检查工作流创建后被修改/新建的文件（本次任务产出），
                 # 排除 workspace 历史遗留文件导致的 minLength/mustContain 误报
+                # 计数检查（minCount）不依赖 matched——即使 matched 为空也需执行
                 _wf_created = getattr(run, 'created_at', 0) or 0
                 matched = [m for m in all_matches if m.stat().st_mtime >= _wf_created] if _wf_created else all_matches
-                if not matched and all_matches:
-                    # 所有匹配文件均在工作流创建前，跳过内容检查（无本次产出可校验）
-                    continue
             else:
                 matched = [fpath] if fpath.exists() else []
 
             if not matched and fpath.is_dir():
                 matched = []  # minFiles 走单独检查，不混入内容检查
-            elif not matched:
-                # 无匹配且非目录：所有内容检查均失败
+            elif not matched and not ("*" in fname and all_matches):
+                # 无匹配且非目录、且非"通配符匹配到但全部是历史文件"：
+                # 所有内容检查均失败。历史文件场景跳过内容检查（无本次产出可校验），
+                # 但 minCount 计数仍会执行
                 for prop_key in ("minLength", "mustContain", "mustContainUrl", "checksum", "maxAgeMinutes"):
                     if prop_key in props:
                         errs.append(f"缺少产出: {fname}")
@@ -1391,9 +1395,11 @@ class WorkflowEngine:
             if "minCount" in props:
                 if "*" in fname:
                     import glob as _gl
-                    matches = _gl.glob(str(fpath))
-                    if len(matches) < props["minCount"]:
-                        errs.append(f"{fname} glob 匹配不足 ({len(matches)}<{props['minCount']})")
+                    # ponytail: minCount 计数所有 glob 匹配，不受 mtime 过滤影响；
+                    # 升级路径：增加 minCount.created_after 配置项按需过滤
+                    all_cnt = len(_gl.glob(str(fpath)))
+                    if all_cnt < props["minCount"]:
+                        errs.append(f"{fname} glob 匹配不足 ({all_cnt}<{props['minCount']})")
                 elif fpath.exists():
                     pass  # file exists but no glob → ok
 
