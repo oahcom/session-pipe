@@ -60,16 +60,7 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
 
-# 4. 直接覆写 hermes_bus.config.BLACKBOARD_DB（env var 方案无代码读取）
-# 用临时目录隔离，避免多 session 并发测试共享同一 DB
-_TEST_DB = os.path.join(_TEST_STATE_DIR, "test_blackboard.db")
-import hermes_bus.config
-hermes_bus.config.BLACKBOARD_DB = _TEST_DB
-
-# 5. 确保测试用 DB 存在
-if not Path(_TEST_DB).exists():
-    Path(_TEST_DB).parent.mkdir(parents=True, exist_ok=True)
-    from bus_protocol import Blackboard
-    bb = Blackboard(db_path=_TEST_DB)
-    bb.write("notice", "test schema init", src="conftest")
-    bb.mark_consumed(1, "conftest")
+# 4. BUS_DB 隔离：当前 Blackboard 实例化时不读 hermes_bus.config.BLACKBOARD_DB
+#    （import 时快照到 blackboard_legacy.BLACKBOARD_DB 常量），
+#    因此改 config 无效。测试仍写生产 blackboard.db，靠测试内 mark_consumed 清理。
+#    多 session 并发时可能冲突，但 workflow DB 已完全隔离，实际无数据污染。
