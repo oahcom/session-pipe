@@ -63,13 +63,26 @@ _fake_config_loader._resolve_exceptions = MagicMock(
 
 _fake_bus_protocol = MagicMock()
 
-for mod_name, mock_mod in [
-    ("config_loader", _fake_config_loader),
-    ("bus_protocol", _fake_bus_protocol),
-]:
-    if mod_name in sys.modules:
-        del sys.modules[mod_name]
-    sys.modules[mod_name] = mock_mod
+# 用 pytest module-scope fixture 覆盖 sys.modules（而非模块级裸替换），
+# 确保 finally 块在模块测试全部结束后才恢复真实版本。
+# 模块级裸替换在 pytest 收集其他模块时即可见，导致 collectstart 恢复逻辑
+# 在 fixture 还没运行前就把 bus_protocol 还原为真实版本。
+import pytest
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolate_reliability_deps():
+    saved = {m: sys.modules.get(m) for m in ("config_loader", "bus_protocol")}
+    for mod_name, mock_mod in [
+        ("config_loader", _fake_config_loader),
+        ("bus_protocol", _fake_bus_protocol),
+    ]:
+        sys.modules[mod_name] = mock_mod
+    yield
+    for mod_name, saved_mod in saved.items():
+        if saved_mod is not None:
+            sys.modules[mod_name] = saved_mod
+        else:
+            sys.modules.pop(mod_name, None)
 
 from reliability_core import (
     RetryPolicy, CircuitBreaker, CircuitState, CircuitOpenError,

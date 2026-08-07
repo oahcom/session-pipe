@@ -17,6 +17,8 @@ import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 sys.path.insert(0, str(Path.home() / "session-pipeline" / "src"))
 
 import pipeflow.engine as eng_mod
@@ -28,11 +30,13 @@ from pipeflow.engine import WorkflowEngine, WorkflowRun, Step, WorkflowDef
 # mock engine 全部 subprocess（tmux/ccs），防止真 spawn 挂起 30s。
 # stdout="claude\n"：_ensure_role_alive 的 has-session 返回 0 → alive；
 # _is_agent_alive 读到 "claude" → 命中直接返回 True，不 spawn 不 sleep 30s。
-_sp_mock = patch("pipeflow.engine._sp.run",
-                 lambda *a, **k: MagicMock(returncode=0, stdout="claude\n"))
-_sp_mock.start()
-import atexit
-atexit.register(_sp_mock.stop)
+@pytest.fixture(scope="module", autouse=True)
+def _mock_subprocess():
+    """mock engine 全部 subprocess；module scope 只在本模块生效，
+    避免 atexit/session 级污染后续测试模块。"""
+    with patch("pipeflow.engine._sp.run",
+               lambda *a, **k: MagicMock(returncode=0, stdout="claude\n")):
+        yield
 
 HOME = Path.home()
 ROLE = "e2e_test"

@@ -27,11 +27,17 @@ pipeflow.engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
 # mock engine 全部 subprocess（tmux/ccs），防止真 spawn 挂起 30s。
 # stdout="claude\n" 有讲究：_ensure_role_alive 的 has-session 返回 0 → alive；
 # _is_agent_alive 读到 "claude" → 命中直接返回 True，不 spawn 不 sleep 30s。
-_sp_mock = patch("pipeflow.engine._sp.run",
-                 lambda *a, **k: MagicMock(returncode=0, stdout="claude\n"))
-_sp_mock.start()
-import atexit
-atexit.register(_sp_mock.stop)
+# 用 pytest fixture（session 级）替代模块级 patch.start()——
+# 模块级 start() 只在 atexit 恢复，全量跑时会污染后续测试模块。
+import pytest
+
+@pytest.fixture(scope="module", autouse=True)
+def _mock_subprocess():
+    """mock engine 全部 subprocess；module scope 只在本模块生效，
+    避免 atexit/session 级污染后续测试模块。"""
+    with patch("pipeflow.engine._sp.run",
+               lambda *a, **k: MagicMock(returncode=0, stdout="claude\n")):
+        yield
 
 
 def _make_wf_dir():

@@ -204,9 +204,13 @@ class P0Exemption:
         return self._p0_deny_reason(role) is None
 
     def can_mark_draft(self, role: str = None) -> bool:
-        """检查角色是否有权标记 P0_draft (仅允许定义的工程角色)。"""
+        """检查角色是否有权标记 P0_draft (仅允许定义的工程角色)。
+
+        pm 的 P0 权限由 _p0_deny_reason 单独处理（工作时间），
+        能标记 P0 的角色必然能标记 P0_draft。
+        """
         role = role or self.role
-        return role in (ALLOWED_P0_ROLES | ALLOWED_DRAFT_ROLES)
+        return role in (ALLOWED_P0_ROLES | ALLOWED_DRAFT_ROLES) or role == "pm"
 
     def mark_p0_draft(self, task_id: str, reason: str, role: str) -> dict:
         """标记 P0_draft。仅 ALLOWED_P0_ROLES ∪ ALLOWED_DRAFT_ROLES 有权限。

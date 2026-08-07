@@ -79,14 +79,25 @@ class WorkflowClient:
 
     @classmethod
     def _title_is_placeholder(cls, title: str) -> bool:
-        """检查标题是否为占位符（纯编号/角色+编号），拒绝创建空转任务。"""
-        t = title.strip().lower()
-        if not t or len(t) < 8:
+        """检查标题是否为占位符（纯编号/角色+编号），拒绝创建空转任务。
+
+        长度判定区分中英文：中文字符信息密度高，4 个中文字即有效；
+        ASCII 标题需 ≥8 字符。空标题始终判占位符。
+        """
+        t = title.strip()
+        if not t:
+            return True
+        has_cjk = any('一' <= ch <= '鿿' for ch in t)
+        if has_cjk and len(t) >= 4:
+            # 中文 ≥4 字 → 不是占位符（跳过正则，中文无占位符模式）
+            return False
+        tl = t.lower()
+        if len(tl) < 8:
             return True
         import re
-        if re.match(r'^(reviewer|qa|engineer|writer|maintainer|scout)\s*task\s*#?\d*$', t):
+        if re.match(r'^(reviewer|qa|engineer|writer|maintainer|scout)\s*task\s*#?\d*$', tl):
             return True
-        if re.match(r'^task\s*#?\d*$', t):
+        if re.match(r'^task\s*#?\d*$', tl):
             return True
         return False
 

@@ -217,7 +217,7 @@ def test_consume_linkage():
     from routing.router import Router
 
     router = Router()
-    linked = router.consume_linkage(1, "code_fix")
+    linked = router.consume_linkage("code_fix")
     assert isinstance(linked, list), "应返回列表"
     print("  ✓ consume_linkage")
 

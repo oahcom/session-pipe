@@ -22,7 +22,8 @@ CCS_WORKSPACES = Path(_HOME / "ccs-workspaces")
 
 # ── 数据目录 ──
 HERMES_STATE = _HOME / ".hermes" / "state"
-WORKFLOWS_DB = HERMES_STATE / "workflows.db"
+# env var 覆盖: 测试隔离用（conftest 设置 SESSION_PIPELINE_WORKFLOWS_DB 指向临时 DB）
+WORKFLOWS_DB = Path(os.environ.get("SESSION_PIPELINE_WORKFLOWS_DB", HERMES_STATE / "workflows.db"))
 CURSOR_DB = HERMES_STATE / "pipeline_cursor.db"
 ROUTING_DB = HERMES_STATE / "routing.db"
 ACK_TRACKER_DB = HERMES_STATE / "ack_tracker.db"

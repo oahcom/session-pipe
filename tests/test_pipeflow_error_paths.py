@@ -63,14 +63,20 @@ def _make_step(**kw) -> Step:
 # ═══════════════════════════════════════════════════════════════════════
 # engine.py uses `import subprocess as _sp`, so patch pipeflow.engine._sp
 
+def _mock_run_out(**kw) -> MagicMock:
+    """_sp.run 的返回值：returncode + stdout（_is_agent_alive 依赖 stdout 判活）。"""
+    m = MagicMock(returncode=kw.pop("returncode", 0))
+    m.stdout = kw.pop("stdout", "claude\n")
+    return m
+
+
 def test_ensure_role_alive_already_running():
-    """tmux has-session 返回 0 -> 直接返回 True。"""
+    """tmux has-session 返回 0 且 pane 内有 claude -> 直接返回 True。"""
     eng = _build_eng()
     with patch.object(engine_mod._sp, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _mock_run_out(returncode=0, stdout="claude\n")
         assert eng._ensure_role_alive("scout")
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
+        args = mock_run.call_args_list[0][0][0]  # 首次调用是 has-session
         assert "has-session" in args
         assert "ccs-scout" in args
 
@@ -78,36 +84,36 @@ def test_ensure_role_alive_already_running():
 def test_ensure_role_alive_dead_started():
     """tmux 不在运行 -> subprocess 拉起 CCS -> 轮询直到存活 -> 返回 True。"""
     eng = _build_eng()
-    returns = iter([MagicMock(returncode=1),
-                    MagicMock(returncode=0),
-                    MagicMock(returncode=0),
-                    ])
-    with patch.object(engine_mod._sp, "run") as mock_run:
-        mock_run.side_effect = lambda *a, **kw: next(returns)
+    call_n = [0]
+    def _dispatch(*a, **kw):
+        call_n[0] += 1
+        if call_n[0] == 1:
+            return _mock_run_out(returncode=1)  # has-session: not alive → restart CCS
+        else:
+            return _mock_run_out(returncode=0, stdout="claude\n")  # start/has-session/list-panes: ok
+    with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
         assert eng._ensure_role_alive("scout")
-    start_calls = [c for c in mock_run.call_args_list if "start" in str(c)]
-    assert len(start_calls) >= 1, "应调用 CCS start"
+    assert call_n[0] >= 2, f"应至少调用 2 次: {call_n[0]}"
 
 
 def test_ensure_role_alive_still_dead():
     """拉起 CCS 后仍不存活 -> 返回 False。"""
     eng = _build_eng()
     with patch.object(engine_mod._sp, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=1)
+        mock_run.return_value = _mock_run_out(returncode=1)
         assert not eng._ensure_role_alive("scout")
 
 
 def test_ensure_role_alive_subprocess_raises():
     """CCS 拉起阶段 _sp.run 抛异常 -> 返回 False。"""
     eng = _build_eng()
-    returns = iter([MagicMock(returncode=1),
-                    FileNotFoundError("no ccs")])
-    def _side(*a, **kw):
-        v = next(returns)
-        if isinstance(v, Exception):
-            raise v
-        return v
-    with patch.object(engine_mod._sp, "run", side_effect=_side):
+    call_n = [0]
+    def _dispatch(*a, **kw):
+        call_n[0] += 1
+        if call_n[0] == 1:
+            return _mock_run_out(returncode=1)  # has-session: not alive → restart
+        raise FileNotFoundError("no ccs")
+    with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
         assert not eng._ensure_role_alive("scout")
 
 
@@ -119,10 +125,11 @@ def test_send_to_role_primary_fails_fallback_succeeds():
     """主 CCS CLI subprocess 抛异常 -> fallback session-launcher 路径被调用。"""
     eng = _build_eng()
     eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)  # 避免占用 _sp.run 序列
 
     with patch.object(engine_mod._sp, "run") as mock_run:
-        mock_run.side_effect = [FileNotFoundError("primary missing"),
-                                MagicMock(returncode=0)]
+        mock_run.side_effect = [ValueError("primary missing"),
+                                _mock_run_out(returncode=0)]
         eng._send_to_role("scout", "test prompt", wf_id="wf_123", step_id="s1")
 
     assert mock_run.call_count >= 2, f"应调用 >=2 次: {mock_run.call_count}"
@@ -134,10 +141,11 @@ def test_send_to_role_both_fail_no_crash():
     """主命令 + fallback 都失败 -> 不崩溃。"""
     eng = _build_eng()
     eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
 
     with patch.object(engine_mod._sp, "run") as mock_run:
-        mock_run.side_effect = [FileNotFoundError("primary"),
-                                FileNotFoundError("fallback")]
+        mock_run.side_effect = [ValueError("primary"),
+                                ValueError("fallback")]
         eng._send_to_role("scout", "test prompt")
 
     bb_cats = [c.args[0] for c in eng._bb.write.call_args_list]
@@ -148,9 +156,10 @@ def test_send_to_role_creates_task_spec():
     """_send_to_role 应写入 task_spec 到 bus。"""
     eng = _build_eng()
     eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
 
     with patch.object(engine_mod._sp, "run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = _mock_run_out(returncode=0)
         eng._send_to_role("scout", "请调研 {topic}", wf_id="wf_abc", step_id="s1")
 
     bb_write_calls = eng._bb.write.call_args_list

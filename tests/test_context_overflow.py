@@ -24,9 +24,16 @@ def _get_test_eng():
     return WorkflowEngine(workflows_dir=_WORKFLOWS_DIR)
 
 
+def _make_overflow_eng():
+    """隔离 DB：mock _lifecycle.query，避免真实 DB 的 assignee 干扰角色集合。"""
+    eng = _get_test_eng()
+    eng._lm = MagicMock()
+    eng._lm.query.return_value = []
+    return eng
+
 def test_pane_overflow_triggers_compact():
     """捕获到溢出信号 → 发送 /compact 并更新 _last_compact。"""
-    eng = _get_test_eng()
+    eng = _make_overflow_eng()
     role = "lr"
     eng._last_compact = {}  # 清掉旧状态，避免类级残留
     send_keys = []
@@ -52,7 +59,7 @@ def test_pane_overflow_triggers_compact():
 
 def test_cooldown_prevents_duplicate():
     """同一角色 300s 内不重复发 /compact。"""
-    eng = _get_test_eng()
+    eng = _make_overflow_eng()
     role = "lr"
     eng._last_compact = {role: time.time()}  # 刚发过
     send_keys = []
