@@ -19,9 +19,13 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 2171 | Data-driven workflow execution engine |
-| **lifecycle/manager.py** | 1090 | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **template_registry.py** | 755 | 模板注册中心 |
+| **pipeflow/engine.py** | 580 | Data-driven workflow execution engine (core) |
+| **pipeflow/step_handler.py** | 471 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 421 | 角色生命周期 mixin：存活检查/通知/发送 (from engine.py split) |
+| **pipeflow/task_generator.py** | 400 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 469 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **lifecycle/manager.py** | 1114 | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **template_registry.py** | 764 | 模板注册中心 |
 | **eval_checker.py** | 536 | 安全白名单命令执行检查 |
 | **workflow/client.py** | 497 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 460 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
@@ -55,7 +59,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **pipeflow/db.py** | 328 | Three-layer SQLite: Template → Instance → Task |
 | **p0_exemption.py** | 486 | P0 豁免通道 |
 
-**Total: 34 modules（不含 `__init__.py`），合计 ~11000 行 Python**
+**Total: 38 modules（不含 `__init__.py`），合计 ~10700 行 Python**
 
 ## Data flow
 

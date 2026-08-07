@@ -29,6 +29,7 @@ class TaskGeneratorMixin:
             lm.ping()
         except (ValueError, KeyError, TypeError):
             LOGGER.debug("lifecycle ping failed during _scan_tasks")
+        deferred: list = []
         try:
             with lm._conn_tx() as conn:
                 rows = conn.execute(
@@ -74,25 +75,18 @@ class TaskGeneratorMixin:
                                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                                     (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
                                 conn.commit()
-                                # 推进父工作流
+                                # 推进父工作流（advance 内部自带锁内 DB + 锁外 subprocess）
                                 _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
                                 if _tmpl:
                                     _wf = self._workflows.get(_tmpl["template_id"])
                                     if _wf:
-                                        self._advance_production_wf(_sub_row["instance_id"], lm, _tmpl["template_id"], _step_id, _sr)
+                                        deferred.append(
+                                            lambda wfid=_sub_row["instance_id"], tpl=_tmpl["template_id"], sid=_step_id, sr=_sr:
+                                                self._advance_production_wf(wfid, lm, tpl, sid, sr)
+                                        )
 
                 conn.commit()
-                self._check_anomalies(conn)
-                # ponytail: 动态任务生成——每轮 run_once 检查一次每个角色是否需要新任务
-                self._generate_tasks_from_state()
-                # ponytail: 任务质量反馈闭环——每轮 run_once 评估最近完成的任务并写入 bus
-                try:
-                    from task_evidence import evaluate_and_feedback
-                    _feed = evaluate_and_feedback()
-                    if _feed.get("evaluated", 0):
-                        LOGGER.info("task-evidence: evaluated %d completed tasks", _feed["evaluated"])
-                except Exception as _e:
-                    LOGGER.debug("task_evidence feedback failed: %s", _e)
+                self._check_anomalies(conn, deferred)
         except Exception as _e:
             LOGGER.exception("_scan_tasks 异常")
             try:
@@ -100,19 +94,44 @@ class TaskGeneratorMixin:
                                evidence=str(_e), src="pipeflow")
             except (ValueError, KeyError, TypeError):
                 LOGGER.debug("bus write fail in _scan_tasks error handler")
+        # ── 锁外阶段：subprocess/IO 不再持锁，busy_timeout=5s 不再冲突 ──
+        for _fn in deferred:
+            try:
+                _fn()
+            except Exception as _d:
+                LOGGER.debug("deferred advance failed: %s", _d)
+        # ponytail: 动态任务生成——每轮 run_once 检查一次每个角色是否需要新任务
+        self._generate_tasks_from_state()
+        # ponytail: 任务质量反馈闭环——每轮 run_once 评估最近完成的任务并写入 bus
+        try:
+            from task_evidence import evaluate_and_feedback
+            _feed = evaluate_and_feedback()
+            if _feed.get("evaluated", 0):
+                LOGGER.info("task-evidence: evaluated %d completed tasks", _feed["evaluated"])
+        except Exception as _e:
+            LOGGER.debug("task_evidence feedback failed: %s", _e)
 
-    def _check_anomalies(self, conn=None):
+    def _check_anomalies(self, conn=None, deferred=None):
         """Detect workflows stuck across multiple steps; auto-heal.
         Also monitors overall completion rate and backlog health.
 
         conn: 由调用方传入的持锁事务连接（_scan_tasks 持锁期间调用）；
-        None 时自取（独立调用场景，如 CLI tick）。"""
+        None 时自取（独立调用场景，如 CLI tick）。
+        deferred: 锁外执行的 subprocess 收集列表（_notify_role/_send_to_role 不持锁）；
+        None 时独立执行（锁内收集，锁外执行）。"""
+        if conn is None:
+            lm2 = self._lifecycle
+            _deferred = []
+            with lm2._conn_tx() as _c:
+                self._check_anomalies(_c, _deferred)
+            for _fn in _deferred:
+                try:
+                    _fn()
+                except Exception as _d:
+                    LOGGER.debug("deferred anomaly action failed: %s", _d)
+            return
+        _deferred = deferred if deferred is not None else []
         try:
-            if conn is None:
-                lm2 = self._lifecycle
-                with lm2._conn_tx() as conn:
-                    self._check_anomalies(conn)
-                return
             # 全局健康仪表板
             _total = conn.execute("SELECT COUNT(*) as c FROM workflow_instances").fetchone()
             _completed = conn.execute("SELECT COUNT(*) as c FROM workflow_instances WHERE status='completed'").fetchone()
@@ -157,22 +176,24 @@ class TaskGeneratorMixin:
                     if _tc >= _mr + 1:
                         timed_out_steps += 1
                 if timed_out_steps >= 2 and not _escalated:
-                    self._notify_role("maintainer",
-                        f"工作流多步骤超时: {inst['instance_id'][:12]}",
-                        f"{timed_out_steps} 个步骤已耗尽重试次数，当前步骤={inst.get('current_step_id','?')} 角色={inst.get('assignee','?')}")
+                    _deferred.append(lambda i=inst:
+                        self._notify_role("maintainer",
+                            f"工作流多步骤超时: {i['instance_id'][:12]}",
+                            f"{timed_out_steps} 个步骤已耗尽重试次数，当前步骤={i.get('current_step_id','?')} 角色={i.get('assignee','?')}"))
                 if timed_out_steps >= 3:
-                    self._notify_role("maintainer",
-                        f"工作流多步骤超限自愈: {inst['instance_id'][:12]}",
-                        f"{timed_out_steps} 个步骤全部超限，正在强制重推，检查是否需人工介入。")
+                    _deferred.append(lambda i=inst:
+                        self._notify_role("maintainer",
+                            f"工作流多步骤超限自愈: {i['instance_id'][:12]}",
+                            f"{timed_out_steps} 个步骤全部超限，正在强制重推，检查是否需人工介入。"))
                     _role = inst.get("assignee", "")
                     _sid = inst.get("current_step_id", "")
-                    if _role:
-                        self._ensure_role_alive(_role)
                     if _sid and _role and wf:
                         _sf = next((s for s in wf.steps if s.id == _sid), None)
                         if _sf:
                             _prompt = _sf.prompt_template
-                            self._send_to_role(_role, _prompt, wf_id=inst["instance_id"], step_id=_sid)
+                            _deferred.append(lambda role=_role, p=_prompt, i=inst, s=_sid:
+                                (self._ensure_role_alive(role),
+                                 self._send_to_role(role, p, wf_id=i["instance_id"], step_id=s)))
                     if _sid and _sid in results:
                         conn.execute("BEGIN IMMEDIATE")
                         try:
