@@ -97,24 +97,27 @@ def test_ensure_role_alive_dead_started():
 
 
 def test_ensure_role_alive_still_dead():
-    """拉起 CCS 后仍不存活 -> 返回 False。"""
+    """拉起 CCS 后仍不存活 -> 返回 False（轮询内 has-session 全部返回 code=1）。"""
     eng = _build_eng()
     with patch.object(engine_mod._sp, "run") as mock_run:
+        # 所有调用返回 code=1: has-session 不存活，restart 后轮询仍然不存活
         mock_run.return_value = _mock_run_out(returncode=1)
         assert not eng._ensure_role_alive("scout")
 
 
 def test_ensure_role_alive_subprocess_raises():
-    """CCS 拉起阶段 _sp.run 抛异常 -> 返回 False。"""
+    """CCS 拉起阶段 _sp.run 抛 OSError -> 异常传播（_ensure_role_alive 仅 catch ValueError/KeyError/TypeError）。"""
+    import pytest as _pytest
     eng = _build_eng()
     call_n = [0]
     def _dispatch(*a, **kw):
         call_n[0] += 1
         if call_n[0] == 1:
             return _mock_run_out(returncode=1)  # has-session: not alive → restart
-        raise FileNotFoundError("no ccs")
-    with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
-        assert not eng._ensure_role_alive("scout")
+        raise OSError("no ccs")
+    with _pytest.raises(OSError, match="no ccs"):
+        with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
+            eng._ensure_role_alive("scout")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -160,7 +163,8 @@ def test_send_to_role_creates_task_spec():
 
     with patch.object(engine_mod._sp, "run") as mock_run:
         mock_run.return_value = _mock_run_out(returncode=0)
-        eng._send_to_role("scout", "请调研 {topic}", wf_id="wf_abc", step_id="s1")
+        # prompt 中不可有 {xxx}（未替换变量会被 _UNMATCHED_VAR_RE 拦截）
+        eng._send_to_role("scout", "/goal 请调研 Python", wf_id="wf_abc", step_id="s1")
 
     bb_write_calls = eng._bb.write.call_args_list
     task_spec_calls = [c for c in bb_write_calls if c.args[0] == "task_spec"]
@@ -360,8 +364,9 @@ def test_load_workflows_sqlite_step_creation_exception_skip():
     eng = _build_eng()
     test_dir = Path(tempfile.mkdtemp())
     eng.workflows_dir = test_dir
-    steps = [{"step_id": "s1", "target_role": "scout",
-              "prompt_template": "x", "exit_condition": {}}]
+    steps = [{"step_id": "s1", "title": "步骤1", "target_role": "scout",
+              "prompt_template": "x", "exit_condition": {}},
+             {"step_id": "bad", "target_role": "scout"}]
     eng._lm.query.return_value = [
         _make_lm_row("tmpl_ok", "OK", "", json.dumps(steps))
     ]
@@ -370,6 +375,7 @@ def test_load_workflows_sqlite_step_creation_exception_skip():
         eng._load_workflows()
 
     assert "tmpl_ok" in eng._workflows
+    # "bad" 步骤缺 title 被跳过，不影响整体加载
     shutil.rmtree(str(test_dir))
 
 

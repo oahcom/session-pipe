@@ -72,19 +72,27 @@
 | `format_pipeline()` | — | `str` |
 | `unconsumed_by_role(role, limit)` | str, int | `list[dict]` |
 
+## Routing (`routing/routes.py`)
+
+| 函数 | 参数 | 返回 |
+|------|------|------|
+| `route_all(consumer, dry_run, parallel, instance_id)` | str, bool, bool, str | `dict` |
+| `route_to_ccs(role_name, dry_run)` | str, bool | `dict` |
+| `route_all_to_ccs(dry_run)` | bool | `dict` |
+| `dispatch_investigator(category, dry_run)` | str, bool | `dict` |
+
+## AutoRouting (`routing/auto.py`)
+
+| 函数 | 参数 | 返回 |
+|------|------|------|
+| `poll_unconsumed(category, consumer, instance_id, limit)` | str?, str?, str, int | `list[dict]` |
+| `consume_with_linkage(fact_id, category, consumer)` | int, str, str | `dict` |
+
 ## Reliability (`reliability.py`)
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
-| `poll_unconsumed(category, consumer, instance_id, limit)` | str, str, str, int | `list[dict]` |
-| `route_all(consumer, dry_run, parallel, instance_id)` | str, bool, bool, str | `dict` |
-| `route_to_ccs(role_name, dry_run)` | str, bool | `dict` |
-| `route_all_to_ccs(dry_run)` | bool | `dict` |
-| `consume_with_linkage(fact_id, category, consumer)` | int, str, str | `dict` |
-| `dispatch_investigator(category, dry_run)` | str, bool | `dict` |
-| `status()` | — | `dict` |
-
-## Reliability (`reliability.py`)
+| `health_check()` | — | `dict` |
 
 内部使用，不对外暴露。核心全局单例：
 

@@ -44,9 +44,9 @@ PYTHONPATH=src python3 -c "from routing.router import get_router; print(get_rout
 
 ```bash
 # 路由
-python3 src/routing/auto.py                    # 查看队列
-python3 src/routing/auto.py --route-all        # 路由所有
-python3 src/routing/auto.py --daemon           # 守护模式
+PYTHONPATH=src python3 -m routing.auto               # 查看队列
+PYTHONPATH=src python3 -m routing.auto --route-all   # 路由所有
+PYTHONPATH=src python3 -m routing.auto --daemon      # 守护模式
 
 # 工作流
 python3 -m pipeflow.engine list                # 列出模板

@@ -19,21 +19,43 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **routing/router.py** | 365 | Route table: derive produce/consume from roles_export.json, priority routing |
-| **routing/routes.py** | 284 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
-| **routing/auto.py** | 303 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
-| **routing/polling.py** | 81 | Message polling with cursor (dedup across restarts) |
-| **routing/rdb.py** | 285 | Route table SQLite persistence + audit log |
-| **pipeflow/engine.py** | 847 | Data-driven workflow execution engine |
-| **pipeflow/daemon.py** | 88 | Main loop: `while True: engine.run_once(); sleep(10)` |
-| **pipeflow/db.py** | ~420 | Three-layer SQLite: Template → Instance → Task |
-| **lifecycle/manager.py** | 995 | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **reliability.py** | ~100 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **reliability_core.py** | ~200 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
-| **config_loader.py** | ~100 | YAML config loading with env override and hot-reload |
-| **workflow/client.py** | ~420 | High-level API for CCS roles to interact with workflow DB |
+| **pipeflow/engine.py** | 2171 | Data-driven workflow execution engine |
+| **lifecycle/manager.py** | 1090 | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **template_registry.py** | 755 | 模板注册中心 |
+| **eval_checker.py** | 536 | 安全白名单命令执行检查 |
+| **workflow/client.py** | 497 | High-level API for CCS roles to interact with workflow DB |
+| **reliability_core.py** | 460 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
+| **reliability.py** | 444 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
+| **routing/routes.py** | 409 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/router.py** | 391 | Route table: derive produce/consume from roles_export.json, priority routing |
+| **routing/survival_monitor.py** | 373 | 存活监测 |
+| **routing/rdb.py** | 299 | Route table SQLite persistence + audit log |
+| **routing/auto.py** | 299 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
+| **routing_daemon.py** | 281 | 路由守护进程 |
+| **task_evidence.py** | 294 | 任务证据链 |
+| **contract_updater.py** | 233 | 合约同步 |
+| **conversation_monitor.py** | 203 | 对话监控 |
+| **config_loader.py** | 187 | YAML config loading with env override and hot-reload |
+| **workflow/gateway.py** | 193 | 工作流网关门禁 |
+| **dispatch_tasks.py** | 145 | 任务分发 |
+| **drift_detector.py** | 143 | 架构漂移检测 |
+| **cron_scheduler.py** | 139 | cron 调度器 |
+| **eval_consistency.py** | 137 | 评估一致性 |
+| **routing/consistency.py** | 120 | 路由一致性 |
+| **pipeflow/daemon.py** | 108 | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **workflow_metrics.py** | 103 | 工作流指标 |
+| **role_validator.py** | 92 | 角色校验 |
+| **workflow/db.py** | 92 | 工作流数据访问 |
+| **output_validator.py** | 90 | 输出格式验证 |
+| **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
+| **paths.py** | 84 | 路径常量 |
+| **pipeflow/health_check.py** | 67 | 健康检查 |
+| **workflow/sync.py** | 55 | 工作流同步 |
 
-**Total: ~4000 lines Python across ~13 modules**
+| **pipeflow/db.py** | 328 | Three-layer SQLite: Template → Instance → Task |
+| **p0_exemption.py** | 486 | P0 豁免通道 |
+
+**Total: 34 modules（不含 `__init__.py`），合计 ~11000 行 Python**
 
 ## Data flow
 
