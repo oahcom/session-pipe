@@ -20,8 +20,9 @@ _real_config_loader = None
 try:
     import bus_protocol as _real_bus_protocol
     import config_loader as _real_config_loader
-except ImportError:
-    pass
+except ImportError as e:
+    import warnings
+    warnings.warn(f"conftest: 无法预加载 bus_protocol/config_loader: {e}", stacklevel=1)
 
 
 def pytest_runtest_setup(item):
@@ -60,8 +61,8 @@ import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
 
 # 4. 直接覆写 hermes_bus.config.BLACKBOARD_DB（env var 方案无代码读取）
-_HERMES_HOME = os.path.expanduser("~/.hermes")
-_TEST_DB = os.path.join(_HERMES_HOME, "sister_bus", "test_blackboard.db")
+# 用临时目录隔离，避免多 session 并发测试共享同一 DB
+_TEST_DB = os.path.join(_TEST_STATE_DIR, "test_blackboard.db")
 import hermes_bus.config
 hermes_bus.config.BLACKBOARD_DB = _TEST_DB
 

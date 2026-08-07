@@ -240,6 +240,10 @@ class TestCanMarkDraft(unittest.TestCase):
             pex = _make_pex(role)
             self.assertTrue(pex.can_mark_draft(), f"{role} should be able to draft")
 
+    def test_unknown_role_cannot_draft(self):
+        pex = _make_pex("unauthorized_role")
+        self.assertFalse(pex.can_mark_draft(), "unknown role should not be able to draft")
+
 
 class TestMarkP0Draft(unittest.TestCase):
 

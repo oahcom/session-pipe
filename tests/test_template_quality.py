@@ -226,3 +226,35 @@ class TestCreateTaskAutoRecommend:
         with pytest.raises(ValueError, match="无法为任务"):
             self.client.create_task_v2(
                 "xyzzy_no_match", assignee="engineer", initiator_role="coordinator")
+
+
+class TestTitlePlaceholder:
+    """_title_is_placeholder 边界测试（中英文判定）。"""
+
+    def test_chinese_3_chars_is_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("测试A") is True
+
+    def test_chinese_4_chars_not_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("编码实现") is False
+
+    def test_empty_string_is_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("") is True
+
+    def test_whitespace_only_is_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("   ") is True
+
+    def test_ascii_short_is_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("fix") is True
+
+    def test_ascii_long_enough_not_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("implement user auth flow") is False
+
+    def test_engineer_task_1_is_placeholder(self):
+        from workflow.client import WorkflowClient
+        assert WorkflowClient._title_is_placeholder("engineer task #1") is True

@@ -282,10 +282,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             d = dict(row)
         except Exception:
             return {"error": "行数据异常"}
+        try:
+            results = json.loads(d.get("step_results") or "{}")
+        except (ValueError, TypeError):
+            results = {}
         return {
             "id": d.get("instance_id", wid), "workflow": d.get("template_id", ""),
             "status": d.get("status", "unknown"), "current_step": d.get("current_step_id", ""),
-            "retries": {}, "results": json.loads(d.get("step_results") or "{}"),
+            "retries": {}, "results": results,
         }
 
     def cancel(self, wid: str) -> bool:
