@@ -25,15 +25,7 @@ _PATCHERS: list = []
 
 
 class _MockTestCase(unittest.TestCase):
-    """基类：每个测试方法后自动 stop 所有通过 _eng 注册的 patcher，
-    防止 _lifecycle PropertyMock 污染后续测试文件。"""
-    def tearDown(self):
-        for p in list(_PATCHERS):
-            try:
-                p.stop()
-            except RuntimeError:
-                pass
-        _PATCHERS.clear()
+    """基类（保留兼容；实例属性覆盖方案不再需要 teardown 清理类）。"""
 
 
 def _eng(**overrides) -> WorkflowEngine:
@@ -42,11 +34,10 @@ def _eng(**overrides) -> WorkflowEngine:
         eng = WorkflowEngine()
     eng._HEALTH_DIR = _HEALTH
     eng._lm = MagicMock()
-    # _lifecycle 是懒加载 property，用 patch.object 注入 mock（自动清理）
-    p = patch.object(type(eng), "_lifecycle", new_callable=PropertyMock,
-                     return_value=eng._lm)
-    p.start()
-    _PATCHERS.append(p)
+    # _lifecycle 是 @property，用 eng.__dict__ 直接设实例属性遮蔽类 property。
+    # 不修改类级属性 → 不污染后续测试文件（旧 patch.object 方案在多实例嵌套
+    # 时恢复出错）。
+    eng.__dict__["_lifecycle"] = eng._lm
     eng._lm.close_wf = MagicMock()
     eng._lm.query = MagicMock(return_value=[])
     eng._lm.complete_step = MagicMock()
