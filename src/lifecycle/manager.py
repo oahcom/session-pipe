@@ -691,13 +691,16 @@ class LifecycleManager:
 
         确保审批请求不因 send 失败而丢失：写入 bus cat=workflow，
         assigner 角色通过 bus 轮询可收到。
+        token 脱敏：bus 为共享通道，明文泄漏 = 任意角色可伪造 confirm_step。
         """
+        # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token L648）
+        safe_prompt = approval_prompt.replace(token, "***")
         from blackboard import Blackboard
         bb = Blackboard()
         bb.write(
             "workflow",
             f"[审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求（ccs send 失败，经 bus 投递）",
-            evidence=f"审批人: {assigner}\n密钥: {token}\n有效期: 1小时\n提示: {approval_prompt}",
+            evidence=f"审批人: {assigner}\n密钥: ***(仅通过 ccs send 安全投递)\n有效期: 1小时\n提示: {safe_prompt}",
             src="workflow_engine",
         )
 

@@ -827,8 +827,9 @@ class WorkflowEngine:
                                           "poll_since": time.time(), "bus_anchor": time.time()}
             conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                         (json.dumps(new_results, ensure_ascii=False), wf_id))
-            conn.commit()
-            # 通知目标角色
+            # 通知目标角色（先在未提交事务里试跑 variable 检查——
+            # 未替换变量时回滚推进，DB 保持原状，避免步骤卡死在 'notified'
+            # 且角色收不到通知，timeout_count 递增到自动取消）
             task = conn.execute(
                 "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
                 (wf_id,)
@@ -838,12 +839,14 @@ class WorkflowEngine:
             prompt = self._fill_prompt_vars(
                 next_step.prompt_template, next_step, wf_name,
                 task_title, task_desc, results, prev_step_id=step_id)
-            # 未替换变量检测：advance 层提前拦截，跳过通知但不中断推进（步骤状态已更新）
             if _UNMATCHED_VAR_RE.search(prompt):
                 unmatched = _UNMATCHED_VAR_RE.findall(prompt)
-                LOGGER.warning("advance skip notify: %s/%s step=%s 含未替换变量 %s",
+                conn.rollback()
+                LOGGER.warning("advance skip notify: %s/%s step=%s 含未替换变量 %s，已回滚推进",
                               wf_id[:8], wf_name, next_step.id, unmatched)
                 return
+            conn.commit()
+            # 变量完整 → 提交推进，通知目标角色
             self._send_to_role(next_step.target_role, prompt,
                                wf_id=wf_id, step_id=next_step.id)
             # 如果步骤有子工作流模板 → 自动创建子工作流
@@ -1071,7 +1074,7 @@ class WorkflowEngine:
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} "
                         f"排队 {_queued} 次仍未响应（角色 {step.target_role} 活跃但可能卡死），请介入",
-                        wf_id=run.id, step_id=run.current_step, force=True)
+                        wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                 run.step_results[step.id] = {
                     **run.step_results.get(step.id, {}),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
@@ -1105,13 +1108,13 @@ class WorkflowEngine:
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} "
                         f"超时1次但{step.target_role}忙碌（有其他任务执行中），自动排队等待",
-                        wf_id=run.id, step_id=run.current_step, force=True)
+                        wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                 else:
                     self._send_to_role(step.target_role, step.prompt_template,
                                        wf_id=run.id, step_id=step.id, force=True)
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
-                        wf_id=run.id, step_id=run.current_step, force=True)
+                        wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
 
             # ── 宽松推进：角色已写同工作流 bus 消息但分类不匹配（如 evolution_report
             #    写成了 architecture）→ 产出存在即推进，避免"产出已存在却死锁"。
@@ -1597,7 +1600,8 @@ class WorkflowEngine:
             pass
 
     def _send_to_role(self, role: str, prompt: str,
-                       wf_id: str = "", step_id: str = "", force: bool = False):
+                       wf_id: str = "", step_id: str = "", force: bool = False,
+                       scheduler_noise: bool = False):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。
         force=True 时跳过 pending/busy 检查，用于超时重推。"""
         # 并发保护：角色已有另一个 workflow 的活跃步骤时，跳过推送
@@ -1633,10 +1637,9 @@ class WorkflowEngine:
         # coordinator 只接收真实任务（task_spec 语义），排队/超时/告警升级消息
         # 写 blocker 即可，不 ccs send —— 避免 /goal 前缀注入 coordinator 死锁
         # （bus #141691 根因：q/goal [] 循环。coordinator 是调度者不是目标执行者）
-        _is_scheduler_noise = role == "coordinator" and any(
-            kw in prompt for kw in ["排队", "超时", "持续超时", "请介入", "等待角色响应"]
-        )
-        if _is_scheduler_noise:
+        # 噪声由调用点显式标记（scheduler_noise=True），不再按消息内容猜——
+        # 内容含"超时/排队"的真实任务（如"检查超时配置合理性"）会被旧启发式误杀
+        if scheduler_noise and role == "coordinator":
             LOGGER.info("send-to-role coordinator 跳过: 调度噪音消息 (wf=%s step=%s)",
                         wf_id[:12] if wf_id else "?", step_id)
             self._bb.write("blocker",
