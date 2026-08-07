@@ -381,7 +381,8 @@ class TestTickExitSchemaBlocked(unittest.TestCase):
         eng._validate_exit_schema = MagicMock(return_value=(False, ["schema error"]))
         eng._send_to_role = MagicMock()
 
-        step = _step(exit_schema={"required": ["nonexistent"]})
+        # 需要 bus_category 才能进入 schema 校验路径（空 cat 直接 return）
+        step = _step(exit_condition={"bus_category": "notice"}, exit_schema={"required": ["nonexistent"]})
         run = _run()
         eng._tick(run, step)
 
@@ -402,7 +403,7 @@ class TestTickVerifyBlocked(unittest.TestCase):
         failed_proc.stderr = b"verify error output"
         mock_sp.run.return_value = failed_proc
 
-        step = _step(verify="test_command")
+        step = _step(exit_condition={"bus_category": "notice"}, verify="test_command")
         run = _run()
         eng._tick(run, step)
 

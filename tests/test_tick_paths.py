@@ -169,6 +169,7 @@ def test_tick_timeout_increments_count():
     eng._lm.execute_raw = MagicMock()
     eng._lm.execute = MagicMock()
     eng._lm.ping = MagicMock()
+    eng._is_role_busy = MagicMock(return_value=False)
 
     with patch.object(eng, "_check_exit", return_value=(0.0, [])):
         step = _make_step(exit_condition={"timeout_minutes": 0})
@@ -187,6 +188,7 @@ def test_tick_escalation_every_third():
     """第 1 次超时 → timeout_count=1 → coordinator 通知。"""
     eng = _build_eng()
     eng._lm.escalate_step = MagicMock()
+    eng._is_role_busy = MagicMock(return_value=False)
 
     with patch.object(eng, "_check_exit", return_value=(0.0, [])):
         step = _make_step(exit_condition={"timeout_minutes": 0},
