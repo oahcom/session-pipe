@@ -21,19 +21,37 @@ from pipeflow.engine import WorkflowEngine, Step, WorkflowRun
 _HEALTH = Path(tempfile.mkdtemp())
 
 
+_PATCHERS: list = []
+
+
+class _MockTestCase(unittest.TestCase):
+    """基类：每个测试方法后自动 stop 所有通过 _eng 注册的 patcher，
+    防止 _lifecycle PropertyMock 污染后续测试文件。"""
+    def tearDown(self):
+        for p in list(_PATCHERS):
+            try:
+                p.stop()
+            except RuntimeError:
+                pass
+        _PATCHERS.clear()
+
+
 def _eng(**overrides) -> WorkflowEngine:
     """构造最小可用 engine mock。"""
     with patch.object(WorkflowEngine, "__init__", lambda self: None):
         eng = WorkflowEngine()
     eng._HEALTH_DIR = _HEALTH
     eng._lm = MagicMock()
-    # _lifecycle 是懒加载 property（内部 new LifecycleManager），直接 mock 掉
+    # _lifecycle 是懒加载 property，用 patch.object 注入 mock（自动清理）
+    p = patch.object(type(eng), "_lifecycle", new_callable=PropertyMock,
+                     return_value=eng._lm)
+    p.start()
+    _PATCHERS.append(p)
     eng._lm.close_wf = MagicMock()
     eng._lm.query = MagicMock(return_value=[])
     eng._lm.complete_step = MagicMock()
     eng._lm.start_wf = MagicMock()
     eng._lm.upsert_template = MagicMock()
-    type(eng)._lifecycle = PropertyMock(return_value=eng._lm)
     eng._bb = MagicMock()
     eng._workflows = {}
     eng._tmux_pane_alive = MagicMock(return_value=False)
@@ -67,7 +85,7 @@ class _WorkflowStub:
     def __init__(self):
         self.steps = [_step(id="s1", target_role="qa")]
 
-class TestPaneFallbackBusy(unittest.TestCase):
+class TestPaneFallbackBusy(_MockTestCase):
     """survival L2 失效时 pane_fallback 兜底。"""
 
     def test_idle_health_pane_alive_is_busy(self):
@@ -104,7 +122,7 @@ class TestPaneFallbackBusy(unittest.TestCase):
         self.assertFalse(eng._is_role_busy("qa", pane_fallback=False))
 
 
-class TestTimeoutQueuedNotIncremented(unittest.TestCase):
+class TestTimeoutQueuedNotIncremented(_MockTestCase):
     """排队路径：角色忙时递增 queued 而非 timeout_count（防误回收）。"""
 
     def test_busy_role_increments_queued_only(self):
@@ -124,7 +142,7 @@ class TestTimeoutQueuedNotIncremented(unittest.TestCase):
             "排队路径应递增 queued")
 
 
-class TestAutoCancelThreshold(unittest.TestCase):
+class TestAutoCancelThreshold(_MockTestCase):
     """超限自动 cancel 阈值 = max(max_retries+3, 4)。"""
 
     def test_threshold_reached_cancels(self):
@@ -145,7 +163,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestIsRoleBusyEdgeCases(unittest.TestCase):
+class TestIsRoleBusyEdgeCases(_MockTestCase):
     """_is_role_busy 边缘情况：损坏健康文件 / DB 信号2 / pane 超时保护边界。"""
 
     def test_corrupt_health_file_degrades_to_db(self):
@@ -211,7 +229,7 @@ class TestIsRoleBusyEdgeCases(unittest.TestCase):
         eng._lifecycle.query.return_value = []
         self.assertFalse(eng._is_role_busy("qa"))
 
-class TestCancelMinimumSurvival(unittest.TestCase):
+class TestCancelMinimumSurvival(_MockTestCase):
     """cancel 最小存活时间保护：创建不足 5 分钟 (300s) 的工作流禁止取消。"""
 
     @staticmethod
@@ -262,7 +280,7 @@ class TestCancelMinimumSurvival(unittest.TestCase):
         self.assertFalse(eng.cancel("wf_bad"))
 
 
-class TestEvalCheckerHotReload(unittest.TestCase):
+class TestEvalCheckerHotReload(_MockTestCase):
     """routing_daemon eval_checker 热重载: mtime 变更触发 reload，不变跳过。
 
     测试直接模拟 daemon 主循环中的热重载分支（routing_daemon.py L213-236）:
