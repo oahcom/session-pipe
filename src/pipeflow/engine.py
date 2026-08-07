@@ -1263,6 +1263,9 @@ class WorkflowEngine:
 
             # ── 自动确认 handoff 步骤，推进到下一棒 ──
             # daemon 替代人工 approve，用 step 角色名作为密钥
+            # handoff 步骤需等人工审批，不自动确认
+            if step.type == "handoff":
+                return
             try:
                 _token = self._lifecycle.get_approval_token(run.id, step.id)
                 if _token:
