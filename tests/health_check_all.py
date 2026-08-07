@@ -15,7 +15,7 @@ Session 三项目端到端健康自检 — 可独立运行，写入可观测痕�
     python3 health_check_all.py          # 全量检查
     python3 health_check_all.py --bus    # 结果写 Blackboard
 """
-import sys, os, json, time, traceback
+import sys, os, json, time
 from pathlib import Path
 
 # ── 三个项目的 src/ 路径 ──
@@ -73,11 +73,11 @@ def test_load_roles():
     roles = list_roles()
     personas = list_personas()
     cats = list_categories()
-    assert count > 0, f"loaded 0 items"
+    assert count > 0, "loaded 0 items"
     assert len(roles) >= 14, f"expected ≥14 roles, got {len(roles)}"
     # 验证每个角色都有核心字段
     for r in roles:
-        assert r.name, f"role missing name"
+        assert r.name, "role missing name"
         assert r.lifecycle in ("infinite", "ondemand"), f"{r.name}: bad lifecycle"
         assert r.drive in ("cron", "loop", "ondemand", "goal"), f"{r.name}: bad drive"
     ok(f"角色定义: {len(roles)} roles + {len(personas)} personas, {len(cats)} 分类")
@@ -101,7 +101,7 @@ def test_prompt_rendering():
 @check("pipeline")
 def test_router():
     os.chdir(str(_PIPELINE_SRC.parent))
-    from routing.router import Router, priority, CATEGORY_PRIORITY
+    from routing.router import Router, priority
     from routing.rdb import RoutingDB
     r = Router()
     routing = r.routing
@@ -237,9 +237,9 @@ def test_launcher_imports_from_roles():
 def test_pipeline_imports_from_launcher():
     """验证 session-pipeline 能引用 launcher 的路由。"""
     try:
-        from core import _is_alive
+        __import__('core')._is_alive  # side-effect: 验证 launcher.core 可导入
         ok("pipeline → launcher 导入正常 (_is_alive)")
-    except ImportError:
+    except (ImportError, AttributeError):
         fail("pipeline 无法导入 launcher.core")
 
 

@@ -6,12 +6,10 @@ All subprocess calls (tmux, ccs) are mocked for isolation.
 Run: cd ~/session-pipeline && python3 -m pytest tests/test_workcycle_e2e.py -x -q
 """
 import json
-import os
 import signal
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 

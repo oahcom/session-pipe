@@ -1,7 +1,6 @@
 """test_routing_daemon.py — routing_daemon 核心函数测试覆盖。"""
 import json
 import sys
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 

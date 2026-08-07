@@ -11,12 +11,10 @@ test_survival_monitor_unit.py — SurvivalMonitor 三层存活检测单元测试
 """
 
 import json
-import os
 import sys
-import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import MagicMock
 
 _SRC = str(Path.home() / "session-pipeline" / "src")
 if _SRC not in sys.path:

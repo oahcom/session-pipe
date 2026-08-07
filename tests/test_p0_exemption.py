@@ -20,17 +20,16 @@ p0_exemption.py 单元测试 — P0 豁免通道 + 审计轨迹。
 import json
 import os
 import sys
-import tempfile
 import time
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 _PIPELINE_SRC = str(os.path.expanduser("~/session-pipeline/src"))
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
 from p0_exemption import (
-    P0Exemption, ALLOWED_P0_ROLES, ALLOWED_DRAFT_ROLES,
+    P0Exemption,
     P0_TIMEOUT_HOURS, P0_DRAFT_CONFIRM_WINDOW,
     PM_WORK_START, PM_WORK_END,
 )

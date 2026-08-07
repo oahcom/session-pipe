@@ -12,13 +12,11 @@ TE (Test Engineer) 使用本模块提供的工具编写测试场景。
 
 __test__ = False  # 工具库，非测试文件
 import json
-import os
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 # ── 路径工具 ────────────────────────────────────────────────────
 
@@ -44,7 +42,7 @@ def tmp_db(module: str = "workflow_db") -> tuple:
         tid = db.create_task("测试任务")
         assert db.get_task(tid) is not None
         db.close()
-        os.unlink(path)
+        Path(path).unlink(missing_ok=True)
     """
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     f.close()
@@ -177,7 +175,7 @@ class ScenarioRegistry:
             try:
                 fn()
                 results[name] = True
-            except Exception as e:
+            except Exception:
                 results[name] = False
         return results
 

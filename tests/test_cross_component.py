@@ -17,7 +17,6 @@ import sys
 import tempfile
 import time
 import threading
-import uuid
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -34,8 +33,7 @@ for p in reversed([_pipeline_src, _launcher_src, _hermes_scripts]):
         sys.path.insert(0, p)
 
 from pipeflow.db import WorkflowDB
-from pipeflow.engine import WorkflowEngine, WorkflowDef, Step
-from bus_protocol import Blackboard
+from pipeflow.engine import WorkflowEngine
 
 
 def _tmp_db():
@@ -122,7 +120,7 @@ def test_full_lifecycle():
     """完整生命周期：创建模板→任务→工作流→推进→完成。"""
     db_path, db = _tmp_db()
     # 1. 创建模板
-    tid = db.create_template("review", "代码审查", {
+    db.create_template("review", "代码审查", {
         "steps": [
             {"id": "s1", "title": "初审"},
             {"id": "s2", "title": "修订"},

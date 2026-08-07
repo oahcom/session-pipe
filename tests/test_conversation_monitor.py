@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import hashlib
 from conversation_monitor import (
     capture_role_pane, parse_conversation_signals,
-    get_conversation_signal, ConversationSignal,
     _last_hash,
 )
 
@@ -91,7 +90,7 @@ def test_idle_excludes_waiting_for_coordinator():
     """信号2: waiting for coordinator 不触发 idle"""
     text = "状态: ⏳ standby — 等待 coordinator 修复 cron-worker"
     sig = parse_conversation_signals(text, "lr")
-    assert not sig.idle_complaint, f"期望不触发 idle (等待 coordinator)，但触发了"
+    assert not sig.idle_complaint, "期望不触发 idle (等待 coordinator)，但触发了"
 
 
 def test_idle_excludes_waiting_reply():

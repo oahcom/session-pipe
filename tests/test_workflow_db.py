@@ -156,9 +156,9 @@ def test_list_tasks_filters():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         tmppath = f.name
     db = WorkflowDB(tmppath)
-    t1 = db.create_task("A", assigner="alice", assignee="bob")
-    t2 = db.create_task("B", assigner="alice", assignee="carol")
-    t3 = db.create_task("C", assigner="eve", assignee="bob")
+    db.create_task("A", assigner="alice", assignee="bob")
+    db.create_task("B", assigner="alice", assignee="carol")
+    db.create_task("C", assigner="eve", assignee="bob")
     assert len(db.list_tasks(assignee="bob")) == 2
     assert len(db.list_tasks(assigner="alice")) == 2
     assert len(db.list_tasks(status="created")) == 3
@@ -242,7 +242,7 @@ def test_create_workflow_from_template():
         tmppath = f.name
     db = WorkflowDB(tmppath)
     steps = {"steps": [{"id": "s1", "title": "调研"} for _ in range(2)]}
-    tmpl_id = db.create_template("dev", "开发流程", steps)
+    db.create_template("dev", "开发流程", steps)
     task_id = db.create_task("开发任务", assigner="alice", assignee="bob")
     wf_id = db.create_workflow(task_id, "dev", "alice", "bob")
     assert wf_id is not None
@@ -455,7 +455,7 @@ def test_compute_progress_basic():
     assert prog["completed"] == 0
     # 创建 2 个工作流
     w1 = db.create_workflow(task_id, "t", "a", "b")
-    w2 = db.create_workflow(task_id, "t", "a", "b")
+    db.create_workflow(task_id, "t", "a", "b")
     db.update_workflow(w1, status="completed", completed_at=time.time())
     prog = db.get_task(task_id)["progress"]
     assert prog["workflow_count"] == 2
@@ -493,7 +493,7 @@ def test_get_logs_filter():
     t1 = db.create_task("A", assigner="a")
     t2 = db.create_task("B", assigner="b")
     w1 = db.create_workflow(t1, "t", "a", "c")
-    w2 = db.create_workflow(t2, "t", "b", "d")
+    db.create_workflow(t2, "t", "b", "d")
     assert len(db.get_logs(task_id=t1)) >= 1
     assert len(db.get_logs(workflow_instance_id=w1)) >= 1
     assert len(db.get_logs(task_id="ghost")) == 0

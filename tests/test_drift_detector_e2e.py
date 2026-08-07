@@ -10,7 +10,6 @@ _src = str(Path(__file__).resolve().parents[1] / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-import pytest
 from drift_detector import detect_drift, detect_all_drift
 
 

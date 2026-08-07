@@ -5,11 +5,9 @@ WorkflowEngine 测试 — 工作流执行引擎全功能覆盖。
 运行：cd /home/administrator/session-pipeline && python3 tests/test_workflow_engine.py
 """
 import json
-import os
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -17,7 +15,7 @@ _PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
-from pipeflow.engine import WorkflowEngine, WorkflowDef, WorkflowRun, Step
+from pipeflow.engine import WorkflowEngine
 
 # Patch timeout constants to make timeout tests fast (not wait 10+ seconds)
 import pipeflow.engine
@@ -469,7 +467,7 @@ def test_workspace_summary_in_prompt():
               "max_retries": 0, "condition": "", "rollback_to": ""}]
     _write_wf(wf_dir, "ws_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("ws_test", {"topic": "x", "project_name": "test_ws_project"})
+    eng.start("ws_test", {"topic": "x", "project_name": "test_ws_project"})
     # workspace_summary 通过 _write_step_prompt → _send_to_role → bus(task_spec) 发送
     # 检查 _send_to_role 是否被调用且 prompt 中包含 workspace_summary
     all_facts = eng._bb.read(cat="task_spec", limit=500)
@@ -499,7 +497,6 @@ def test_run_once_missing_workflow_def():
 
 def test_cli_list_steers():
     """验证 CLI 子命令解析（不实际执行 daemon）。"""
-    import argparse
     p = __import__('argparse').ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("start")

@@ -11,7 +11,6 @@ exit_condition 匹配逻辑专项测试 — _check_exit / _validate_exit_schema 
 运行: cd ~/session-pipeline && python3 -m pytest tests/test_exit_condition.py -v
 """
 import hashlib
-import os
 import sys
 import tempfile
 import time
@@ -203,7 +202,7 @@ class TestValidateExitSchema(unittest.TestCase):
         ws = Path.home() / "ccs-workspaces" / "scout"
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"urlok_{_UNIQUE}.md"
-        fpath.write_text(f"参考: https://github.com/example/proj\n")
+        fpath.write_text("参考: https://github.com/example/proj\n")
         try:
             eng = _make_eng()
             step = _step(exit_schema={

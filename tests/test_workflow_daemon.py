@@ -93,7 +93,6 @@ def test_non_main_thread_skip_signal():
     lock_file = _test_lock_file()
     _set_lock_file(lock_file)
     eng = MagicMock()
-    timer_ev = threading.Event()
 
     def _throw_on_signal(*args):
         raise RuntimeError("signal.signal 不应在非主线程调用")

@@ -1,6 +1,6 @@
 """Test contract_updater.py — 合约更新器 e2e 测试。"""
 
-import json, subprocess, sys
+import subprocess, sys
 from pathlib import Path
 from unittest.mock import patch
 

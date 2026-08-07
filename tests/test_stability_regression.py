@@ -10,7 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import sys
 sys.path.insert(0, str(Path.home() / "session-pipeline" / "src"))
@@ -166,7 +166,6 @@ class TestIsRoleBusyEdgeCases(_MockTestCase):
 
     def test_db_signal_busy_when_role_has_active_step(self):
         eng = _eng()
-        now = time.time()
         eng._lifecycle.query.return_value = [
             {"instance_id": "wf_other", "template_id": "tpl", "current_step_id": "s1",
              "step_results": json.dumps({"s1": {"status": "notified", "timeout_count": 0}})}
@@ -176,7 +175,6 @@ class TestIsRoleBusyEdgeCases(_MockTestCase):
 
     def test_db_signal_busy_excludes_self_wf(self):
         eng = _eng()
-        now = time.time()
         eng._lifecycle.query.return_value = [
             {"instance_id": "wf_t", "template_id": "tpl", "current_step_id": "s1",
              "step_results": json.dumps({"s1": {"status": "running"}})}
@@ -314,7 +312,6 @@ class TestEvalCheckerHotReload(_MockTestCase):
 
     def test_reload_failure_logs_and_keeps_running(self):
         """reload 抛异常 → daemon 不崩溃（失败仅记日志，后续循环仍可用）。"""
-        daemon = None
         try:
             import importlib as _il
             _il.reload(__import__("re"))

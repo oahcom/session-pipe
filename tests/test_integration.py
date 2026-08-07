@@ -4,10 +4,8 @@
 
 运行：cd session-pipeline && python3 tests/test_integration.py
 """
-import json
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -61,7 +59,7 @@ def test_bus_mark_consumed():
 def test_route_all_e2e():
     """route-all 端到端：写入消息 → route_all 消费 → 状态 idle。"""
     from bus_protocol import Blackboard
-    from routing.auto import route_all, status
+    from routing.auto import route_all
 
     bb = Blackboard()
     import uuid
@@ -82,7 +80,6 @@ def test_priority_routing():
     """优先级路由：security 消息应被 security 消费者先消费。"""
     from bus_protocol import Blackboard
     from routing.auto import route_all
-    from routing.router import priority
 
     bb = Blackboard()
     import uuid
@@ -121,7 +118,6 @@ def test_reliability_circuit_breaker():
     from reliability import CircuitBreaker, CircuitState, CircuitOpenError
 
     cb = CircuitBreaker(failure_threshold=2, recovery_timeout=0.1, half_open_max_calls=3)
-    call_count = 0
 
     def fail():
         raise ValueError("test error")

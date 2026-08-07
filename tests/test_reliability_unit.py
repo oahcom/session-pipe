@@ -14,13 +14,11 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 _SRC = str(Path.home() / "session-pipeline" / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
-
-import pytest
 
 # ── 模块级隔离 ──────────────────────────────────────────────────────────
 # reliability.py 在 import 时自动调用 reconfigure()
@@ -85,7 +83,7 @@ def _isolate_reliability_deps():
             sys.modules.pop(mod_name, None)
 
 from reliability_core import (
-    RetryPolicy, CircuitBreaker, CircuitState, CircuitOpenError,
+    RetryPolicy, CircuitBreaker,
     ConsumerHeartbeat, TtlPruner,
 )
 import reliability

@@ -7,7 +7,6 @@
 4. is_subflow=True 的模板不出现在 list_workflows() 中
 5. _generate_tasks_from_state 跳过 is_subflow 模板
 """
-import subprocess
 import time
 import sys
 from pathlib import Path
@@ -112,7 +111,7 @@ def test_subflow_excluded_from_list():
     eng._workflows["subflow_test"] = fake_wf
 
     wf_list = eng.list_workflows()
-    assert "subflow_test" not in wf_list, f"list_workflows 应排除 subflow_test"
+    assert "subflow_test" not in wf_list, "list_workflows 应排除 subflow_test"
     print("✅ is_subflow 模板不在 list_workflows() 中 ✓")
 
 

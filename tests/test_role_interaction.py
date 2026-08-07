@@ -14,7 +14,6 @@ Role Interaction Tests — 模拟角色间通过 Sister Bus 的完整交互链�
 """
 import json
 import sys
-import time
 import uuid
 from pathlib import Path
 
@@ -229,8 +228,6 @@ def test_scenario_closer_closes_loop():
     # mark 所有闭环消息为已消费
     bb.mark_consumed(closer_note, "closer_self")
 
-    unconsumed = bb.unconsumed()
-    open_tasks = [f for f in unconsumed if f.id == final_fix or f.id == closer_note]
     _check("closer → architecture: 闭环通知可写入", closer_note > 0)
 
 

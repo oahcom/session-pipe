@@ -9,13 +9,8 @@ test_rdb.py — RoutingDB 单元测试
 - 环境变量覆盖 DB 路径
 """
 
-import json
-import os
 import sys
-import tempfile
-import time
 from pathlib import Path
-from unittest import mock
 
 _SRC = str(Path.home() / "session-pipeline" / "src")
 if _SRC not in sys.path:

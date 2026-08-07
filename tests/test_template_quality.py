@@ -1,5 +1,5 @@
 """模板质量与推荐系统测试。不依赖 Blackboard。"""
-import json, os, sys, tempfile
+import os, sys, tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))

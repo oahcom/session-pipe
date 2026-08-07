@@ -18,13 +18,12 @@ _tick 路径专项测试 — 覆盖现有 test_workflow_engine.py 未达边界:
 
 运行: cd /home/administrator/session-pipeline && python3 tests/test_tick_paths.py
 """
-import json
 import os
 import sys
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock, PropertyMock, call
+from unittest.mock import patch, MagicMock
 
 _PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
 if _PIPELINE_SRC not in sys.path:
@@ -293,7 +292,7 @@ def test_daemon_loop_cleans_pid_on_error():
 
     dm._LOCK_FILE = orig
     assert not pid_file.exists() or pid_file.read_text().strip() == str(os.getpid()), \
-        f"PID 文件应被清理或包含当前 PID"
+        "PID 文件应被清理或包含当前 PID"
     pid_file.unlink(missing_ok=True)
 
 

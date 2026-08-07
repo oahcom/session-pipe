@@ -13,7 +13,6 @@ TE (Test Engineer) 通过 --te 模式使用。
     python3 tests/run.py --coverage   # 报告覆盖盲区
 """
 import argparse
-import os
 import subprocess
 import sys
 import time

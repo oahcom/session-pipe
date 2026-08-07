@@ -1,7 +1,6 @@
 """test_role_validator.py — 角色名校验装饰器测试覆盖。"""
 import sys
 import json
-import tempfile
 from pathlib import Path
 
 import pytest

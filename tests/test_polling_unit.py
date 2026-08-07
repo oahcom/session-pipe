@@ -2,7 +2,7 @@
 Mocks all external deps (Blackboard, config, circuit breaker, metrics, cursor)."""
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 _src = Path(__file__).resolve().parent.parent / "src"
 if str(_src) not in sys.path:

@@ -13,7 +13,6 @@ import json
 import sys
 import tempfile
 import time
-import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -25,7 +24,7 @@ import pipeflow.engine as eng_mod
 eng_mod._TIMEOUT_GRACE = 0.05
 eng_mod._REMINDER_INTERVAL = 60  # 测试周期长，不干扰
 
-from pipeflow.engine import WorkflowEngine, WorkflowRun, Step, WorkflowDef
+from pipeflow.engine import WorkflowEngine
 
 # mock engine 全部 subprocess（tmux/ccs），防止真 spawn 挂起 30s。
 # stdout="claude\n"：_ensure_role_alive 的 has-session 返回 0 → alive；

@@ -1,6 +1,6 @@
 """Unit tests for routing/auto.py core functions.
 Mocks external dependencies (bus, sentinel, launcher)."""
-import sys, os, tempfile, json
+import sys
 from pathlib import Path
 
 # Ensure src is on path
@@ -10,7 +10,7 @@ if str(_src) not in sys.path:
 
 # Mock external dependencies before importing auto
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 
 class TestAutoStatus(unittest.TestCase):

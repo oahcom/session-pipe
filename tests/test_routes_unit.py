@@ -210,7 +210,7 @@ def test_route_all_system_category_skips_workflow(mock_metrics, mock_hb, mock_cu
          patch("bus_protocol.Blackboard") as mock_bb_cls, \
          patch("routing.routes.WorkflowClient") as mock_wf, \
          patch("routing.routes.IDEMPOTENT_CONSUME") as mock_idem, \
-         patch("routing.routes.ACK_TRACKER") as mock_ack, \
+         patch("routing.routes.ACK_TRACKER"), \
          patch("routing.routes.CIRCUIT_BREAKER") as mock_cb:
         mock_rt_mod.get_router.return_value = mock_router
         mock_idem.safe_consume.return_value = {"status": "consumed"}

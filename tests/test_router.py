@@ -8,7 +8,6 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 # launcher 路径（环境变量覆盖）
 _launcher_src = os.environ.get(
@@ -257,7 +256,6 @@ def test_status_format():
 def test_poll_unconsumed_sorted_by_priority():
     """poll_unconsumed 返回的消息按优先级排序。"""
     from routing.auto import poll_unconsumed
-    from routing.router import priority
 
     messages = poll_unconsumed()
     if not messages or "error" in messages[0]:

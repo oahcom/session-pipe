@@ -3,7 +3,6 @@ import os
 import sys
 import tempfile
 
-import pytest
 from pathlib import Path
 
 # 确保 src/ 在 sys.path 最前面（各测试文件的 sys.path.insert 在模块顶层执行，
