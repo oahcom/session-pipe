@@ -307,46 +307,78 @@ class WorkflowLifecycleMixin:
             return
         role = getattr(step, "target_role", "") or ""
         detail = {}
+        # 产出时间窗：从步骤完成时刻回溯 2 小时，只统计窗口内新增/修改的文件，
+        # 避免角色 workspace 历史文件干扰（同一角色多任务共用 workspace）
+        _step_ts = step_data.get("ts", step_data.get("notified_at", 0)) or 0
+        _window_start = _step_ts - 2 * 3600 if _step_ts else 0
         if role:
             ws = _CCS_WORKSPACES / role
             if ws.exists():
                 try:
                     _files = []
-                    for f in sorted((f for f in ws.rglob("*") if ".git" not in f.parts), key=lambda p: p.stat().st_mtime,
-                                    reverse=True)[:12]:
-                        if f.is_file() and f.stat().st_size > 0:
-                            # 相对 _CCS_WORKSPACES 记录，与 home 解耦（测试环境）
-                            try:
-                                _name = str(f.relative_to(_CCS_WORKSPACES))
-                            except ValueError:
-                                _name = str(f.relative_to(Path.home()))
-                            if _name.startswith("ccs-workspaces/"):
-                                _name = _name[len("ccs-workspaces/"):]
-                            if any(_s in _name for _s in ("TASKS.md", "CLAUDE.md.", "base.md")):
-                                continue
-                            _files.append({
-                                "f": _name,
-                                "size": f.stat().st_size,
-                                "preview": f.read_text(encoding="utf-8", errors="ignore")[:80].replace("\n", " "),
-                            })
+                    for f in (f for f in ws.rglob("*") if ".git" not in f.parts):
+                        if not f.is_file() or f.stat().st_size <= 0:
+                            continue
+                        _mtime = f.stat().st_mtime
+                        if _window_start and _mtime < _window_start:
+                            continue  # 超出本步骤时间窗，跳过
+                        # 相对 _CCS_WORKSPACES 记录，与 home 解耦（测试环境）
+                        try:
+                            _name = str(f.relative_to(_CCS_WORKSPACES))
+                        except ValueError:
+                            _name = str(f.relative_to(Path.home()))
+                        if _name.startswith("ccs-workspaces/"):
+                            _name = _name[len("ccs-workspaces/"):]
+                        if any(_s in _name for _s in ("TASKS.md", "CLAUDE.md.", "base.md",
+                                                       ".claude/", ".pytest_cache/", "__pycache__/", ".pyc")):
+                            continue
+                        _files.append({
+                            "f": _name,
+                            "size": f.stat().st_size,
+                            "mtime": _mtime,
+                            "preview": f.read_text(encoding="utf-8", errors="ignore")[:80].replace("\n", " "),
+                        })
+                    # 按修改时间降序取窗口内最新 3 个
+                    _files.sort(key=lambda x: x["mtime"], reverse=True)
                     detail["outputs"] = _files[:3]
                 except Exception as _fe:
                     LOGGER.debug("output scan failed: %s", _fe)
-        # git 改动：ccs-workspaces 仓库近 10 分钟未提交的改动
+        # git 改动：ccs-workspaces 仓库未提交的改动（含 diffstat 行级统计）
         try:
             _git = _engine_mod._sp.run(
                 ["git", "-C", str(_CCS_WORKSPACES),
                  "status", "--porcelain"],
                 capture_output=True, text=True, timeout=10)
             if _git.returncode == 0:
-                _changed = []
+                _changed_files = []
                 for _line in _git.stdout.splitlines():
                     # porcelain 格式: "XY filename"（2 字符状态 + 空格）
                     _f = _line[3:].strip()
                     if not _f or any(_s in _f for _s in ("TASKS.md", "CLAUDE.md", "base.md")):
                         continue
-                    _changed.append(_f)
-                detail["git_changed"] = _changed[:10]
+                    _changed_files.append(_f)
+                # diffstat：受影响文件 + 行数增减（更精确的"改了什么"）
+                _diffstat = []
+                if _changed_files:
+                    _df = _engine_mod._sp.run(
+                        ["git", "-C", str(_CCS_WORKSPACES),
+                         "diff", "--stat", "--no-color"],
+                        capture_output=True, text=True, timeout=10)
+                    if _df.returncode == 0 and _df.stdout.strip():
+                        for _dl in _df.stdout.splitlines():
+                            if "|" not in _dl:
+                                continue
+                            _parts = _dl.rsplit("|", 1)
+                            _fname = _parts[0].strip()
+                            _stat = _parts[1].strip().split()[0] if _parts[1].strip() else ""
+                            if _fname and not _fname.startswith((" ", "-")):
+                                _diffstat.append(f"{_fname} | {_stat}")
+                    elif not _df.stdout.strip():
+                        # 无 diff（可能全部 staged 或全新文件）→ 退化为仅文件名
+                        _diffstat = _changed_files[:10]
+                detail["git_changed"] = _changed_files[:10]
+                if _diffstat:
+                    detail["git_diffstat"] = _diffstat[:10]
         except Exception as _ge:
             LOGGER.debug("git scan failed: %s", _ge)
         if not detail.get("outputs") and not detail.get("git_changed"):
@@ -354,6 +386,17 @@ class WorkflowLifecycleMixin:
         detail["step"] = getattr(step, "id", "")
         detail["title"] = getattr(step, "title", "")
         detail["role"] = role
+        # 子工作流聚合：向上查 parent_wf（主食物链 ID），让主查询可聚合子链产出
+        try:
+            _parent_rows = self._lifecycle.query(
+                "SELECT instance_id FROM workflow_instances WHERE step_results LIKE ?",
+                (f'%"subflow_id": "{wf_id}"%',))
+            if _parent_rows:
+                _pwf = _parent_rows[0]["instance_id"]
+                if isinstance(_pwf, str):
+                    detail["parent_wf"] = _pwf[:12]
+        except Exception:
+            pass
         # exit_messages 摘要作为产出内容证据
         _msgs = []
         for m in (step_data.get("exit_messages") or []):
@@ -366,6 +409,16 @@ class WorkflowLifecycleMixin:
                 f"[step_output] {wf_id[:12]}/{detail['step']} {role} 产出审计",
                 evidence=json.dumps(detail, ensure_ascii=False)[:1500],
                 src="workflow_engine")
+        except (TypeError, ValueError):
+            # exit_messages 含不可序列化对象（测试 mock）→ 去掉后重试
+            detail.pop("exit_messages", None)
+            try:
+                self._bb.write("workflow",
+                    f"[step_output] {wf_id[:12]}/{detail['step']} {role} 产出审计",
+                    evidence=json.dumps(detail, ensure_ascii=False)[:1500],
+                    src="workflow_engine")
+            except Exception as _we2:
+                LOGGER.debug("step_output bus write failed: %s", _we2)
         except Exception as _we:
             LOGGER.debug("step_output bus write failed: %s", _we)
 

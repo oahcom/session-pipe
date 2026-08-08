@@ -33,28 +33,25 @@ def _make():
     return mixin
 
 
-import contextlib
-@contextlib.contextmanager
-def monkeypatch_home(home: Path):
-    _orig = Path.home
-    _orig_ccs = wf_lifecycle._CCS_WORKSPACES
-    Path.home = staticmethod(lambda: home)
-    wf_lifecycle._CCS_WORKSPACES = home / "ccs-workspaces"
-    try:
-        yield
-    finally:
-        Path.home = _orig
-        wf_lifecycle._CCS_WORKSPACES = _orig_ccs
-
-
 def _mock_git(stdout=""):
     mock_sp = MagicMock()
     mock_sp.run.return_value = MagicMock(returncode=0, stdout=stdout)
     return patch.object(wf_lifecycle, "_engine_mod", MagicMock(_sp=mock_sp))
 
 
+def _patch_home(home: Path, git_out=""):
+    """同时 patch Path.home + _CCS_WORKSPACES + git subprocess。"""
+    ccs = home / "ccs-workspaces"
+    mock_sp = MagicMock()
+    mock_sp.run.return_value = MagicMock(returncode=0, stdout=git_out)
+    return (
+        patch.object(Path, "home", staticmethod(lambda: home)),
+        patch.object(wf_lifecycle, "_CCS_WORKSPACES", ccs),
+        patch.object(wf_lifecycle, "_engine_mod", MagicMock(_sp=mock_sp)),
+    )
+
+
 def _setup_workspace(home, role, files):
-    """helper: 创建角色 workspace 并写入指定文件。"""
     ws = home / "ccs-workspaces" / role
     ws.mkdir(parents=True, exist_ok=True)
     for name, content in files.items():
@@ -70,7 +67,8 @@ def test_records_output_files():
         mixin = _make()
         step = FakeStep("s1", "scout", "情报生产")
         sdata = {"exit_messages": [{"text": "s1-complete 报告"}]}
-        with monkeypatch_home(home), _mock_git():
+        patches = _patch_home(home)
+        with patches[0], patches[1], patches[2]:
             mixin._record_step_output("wf_test123", step, sdata)
         assert len(mixin._bb.entries) == 1
         d = json.loads(mixin._bb.entries[0][2]["evidence"])
@@ -86,7 +84,8 @@ def test_records_exit_messages_summary():
         mixin = _make()
         step = FakeStep("s2", "pm", "需求审视")
         sdata = {"exit_messages": [{"text": "s2-complete 需求已审视"}]}
-        with monkeypatch_home(home), _mock_git():
+        patches = _patch_home(home)
+        with patches[0], patches[1], patches[2]:
             mixin._record_step_output("wf_xxx", step, sdata)
         d = json.loads(mixin._bb.entries[0][2]["evidence"])
         assert "s2-complete" in d["exit_messages"][0]
@@ -98,7 +97,8 @@ def test_no_workspace_no_crash():
         home = Path(tmp)
         (home / "ccs-workspaces").mkdir()
         mixin = _make()
-        with monkeypatch_home(home), _mock_git():
+        patches = _patch_home(home)
+        with patches[0], patches[1], patches[2]:
             mixin._record_step_output("wf_noop", FakeStep("s1", "nonexistent_role"), {"exit_messages": []})
         assert len(mixin._bb.entries) == 0
 
@@ -106,7 +106,8 @@ def test_no_workspace_no_crash():
 # ── 4. step_data 为空时不写 bus ──
 def test_empty_step_data_no_write():
     mixin = _make()
-    with _mock_git():
+    patches = _patch_home(Path("/tmp/wf_test_nonexist"))
+    with patches[0], patches[1], patches[2]:
         mixin._record_step_output("wf_x", FakeStep("s1", "scout"), {})
     assert len(mixin._bb.entries) == 0
 
@@ -119,14 +120,15 @@ def test_mixed_output_and_messages():
         mixin = _make()
         step = FakeStep("s4", "engineer", "编码实现")
         sdata = {"exit_messages": [{"text": "[s4-complete] 实现完成"}]}
-        with monkeypatch_home(home), _mock_git():
+        patches = _patch_home(home)
+        with patches[0], patches[1], patches[2]:
             mixin._record_step_output("wf_eng", step, sdata)
         d = json.loads(mixin._bb.entries[0][2]["evidence"])
         assert any("main.py" in o["f"] for o in d["outputs"])
         assert "[s4-complete]" in d["exit_messages"][0]
 
 
-# ── 6. git 有改动时记录 git_changed ──
+# ── 6. git 有改动时记录 git_changed + diffstat ──
 def test_git_changed_files_recorded():
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
@@ -134,7 +136,8 @@ def test_git_changed_files_recorded():
         mixin = _make()
         step = FakeStep("s1", "scout", "情报生产")
         git_out = "M  new_file.py\n?  untracked.txt\n"
-        with monkeypatch_home(home), _mock_git(git_out):
+        patches = _patch_home(home, git_out)
+        with patches[0], patches[1], patches[2]:
             mixin._record_step_output("wf_git", step, {"status": "step_done_ready"})
         d = json.loads(mixin._bb.entries[0][2]["evidence"])
         assert "new_file.py" in d["git_changed"]
