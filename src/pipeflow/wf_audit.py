@@ -84,7 +84,7 @@ def _now_step_outputs(wf_id: str) -> list:
     """查指定工作流的 step_output bus 消息（含子工作流 parent_wf 聚合）。"""
     conn = _bus()
     rows = conn.execute(
-        "SELECT e FROM facts WHERE t LIKE '%step_output%' AND e LIKE ? "
+        "SELECT e FROM facts WHERE t LIKE '%step_output%' AND t LIKE ? "
         "ORDER BY ts DESC",
         (f'%{wf_id[:12]}%',)).fetchall()
     conn.close()
