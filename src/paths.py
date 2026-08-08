@@ -25,6 +25,7 @@ WORKFLOWS_DB = Path(os.environ.get("SESSION_PIPELINE_WORKFLOWS_DB", HERMES_STATE
 CURSOR_DB = HERMES_STATE / "pipeline_cursor.db"
 ROUTING_DB = HERMES_STATE / "routing.db"
 ACK_TRACKER_DB = HERMES_STATE / "ack_tracker.db"
+STARVE_STATE = Path.home() / ".hermes" / "run" / "wf_starve.json"
 # ── 模板与配置 ──
 HERMES_TEMPLATES = _HOME / ".hermes" / "templates"
 HERMES_BACKUPS = _HOME / ".hermes" / "backups"

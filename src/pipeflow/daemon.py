@@ -47,10 +47,10 @@ INTERVAL = 10  # 秒
 # 时，写 bus 触发 scout 生产新情报，让食物链重新转起来。
 _STARVE_ROUNDS = 36          # 连续 36 轮（=6 分钟）无活跃工作流
 _STARVE_COOLDOWN = 6 * 3600  # 触发后 6 小时冷却，防止高频骚扰
-from paths import BUS_CLIENT, CCS_CLI
+from paths import BUS_CLIENT, CCS_CLI, STARVE_STATE
 
 _BUS_SCRIPT = BUS_CLIENT
-_STARVE_STATE = Path.home() / ".hermes" / "run" / "wf_starve.json"
+_STARVE_STATE = STARVE_STATE
 _CCS_PY = CCS_CLI
 
 

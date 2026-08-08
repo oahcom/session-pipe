@@ -81,13 +81,21 @@ def _scan_outputs(role: str, window_start: float = 0) -> list:
 
 
 def _now_step_outputs(wf_id: str) -> list:
-    """查指定工作流的 step_output bus 消息（含子工作流 parent_wf 聚合）。"""
+    """查指定工作流的 step_output bus 消息（含子工作流 parent_wf 聚合）。
+
+    parent_wf 存 wf_id[:12] 前缀，无法精确匹配——但 step_output 的 t 列
+    标题含完整 wf_id（_record_step_output 写 wf_id[:12]，bus 标题写完整），
+    e 列 evidence 含完整 wf_id 前缀片段时用 LIKE 最长前缀降低碰撞概率。
+    """
     conn = _bus()
-    rows = conn.execute(
-        "SELECT e FROM facts WHERE t LIKE '%step_output%' "
-        "AND (t LIKE ? OR e LIKE ?) ORDER BY ts DESC",
-        (f'%{wf_id[:12]}%', f'%"parent_wf": "{wf_id[:12]}%')).fetchall()
-    conn.close()
+    try:
+        _wf_prefix = wf_id[:12]
+        rows = conn.execute(
+            "SELECT e FROM facts WHERE t LIKE '%step_output%' "
+            "AND (e LIKE ? OR e LIKE ?) ORDER BY ts DESC",
+            (f'%{wf_id}%', f'%"parent_wf": "{_wf_prefix}"%')).fetchall()
+    finally:
+        conn.close()
     return [json.loads(r["e"]) for r in rows if r["e"]]
 
 
