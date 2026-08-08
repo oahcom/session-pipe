@@ -86,7 +86,7 @@ def _check_cron_schedules() -> int:
     now = time.time()
     now_minute = int(now // 60) * 60  # 当前分钟的开始
     triggered_count = 0
-    launcher = Path.home() / "session-launcher" / "src" / "ccs.py"
+    launcher = _paths_mod.CCS_CLI
 
     for f in sorted(roles_dir.glob("persona_*.json")):
         try:

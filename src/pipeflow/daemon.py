@@ -47,10 +47,11 @@ INTERVAL = 10  # 秒
 # 时，写 bus 触发 scout 生产新情报，让食物链重新转起来。
 _STARVE_ROUNDS = 36          # 连续 36 轮（=6 分钟）无活跃工作流
 _STARVE_COOLDOWN = 6 * 3600  # 触发后 6 小时冷却，防止高频骚扰
-_ACTIVE_STATUSES = ("pending", "running", "step_done_ready")
-_BUS_SCRIPT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
+from paths import BUS_CLIENT, CCS_CLI
+
+_BUS_SCRIPT = BUS_CLIENT
 _STARVE_STATE = Path.home() / ".hermes" / "run" / "wf_starve.json"
-_CCS_PY = Path.home() / "session-launcher" / "src" / "ccs.py"
+_CCS_PY = CCS_CLI
 
 
 def _ensure_role_alive(role: str) -> bool:
@@ -73,15 +74,7 @@ def _ensure_role_alive(role: str) -> bool:
 
 def _active_count(eng: WorkflowEngine) -> int:
     """当前活跃工作流数（pending/running/step_done_ready）。"""
-    try:
-        rows = eng._lifecycle.query(
-            f"SELECT COUNT(*) AS cnt FROM workflow_instances "
-            f"WHERE status IN {_ACTIVE_STATUSES!r}"
-        )
-        return rows[0]["cnt"] if rows else 0
-    except Exception as e:
-        LOGGER.warning("活跃工作流查询失败: %s", e)
-        return 0
+    return eng.active_workflow_count()
 
 
 def _starve_signal(eng: WorkflowEngine) -> None:

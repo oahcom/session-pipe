@@ -11,10 +11,7 @@
   - 通过 bus task_spec + ccs send 推送，路由层自动创建 workflow
 """
 import subprocess, sys, time
-from pathlib import Path
-
-BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
-CCS_CLI = Path.home() / "session-launcher" / "src" / "ccs.py"
+from paths import BUS_CLIENT
 
 # 角色职责映射（标题必须描述性、在角色职责内）
 ROLE_TASKS = {

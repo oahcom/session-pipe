@@ -31,7 +31,7 @@ class WorkflowLifecycleMixin:
         step_done_ready 是"步骤完成等待审批"的正常状态，用更长阈值避免
         24h 无人审批即被误杀（可能是跨周末的手工审批）。
         """
-        from pipeflow.engine import _ZOMBIE_TEMPLATES
+        from pipeflow.engine import ZOMBIE_TEMPLATES as _ZOMBIE_TEMPLATES
         now = time.time()
         try:
             for row in lm.query(
@@ -119,7 +119,7 @@ class WorkflowLifecycleMixin:
           1) with lm._conn_tx(): 读守卫、子流程检查、UPDATE+commit（锁内）
           2) 锁外: 完成后部署 + loop 处理；推进后 _send_to_role + 建子工作流
         """
-        from pipeflow.engine import _UNMATCHED_VAR_RE
+        from pipeflow.engine import UNMATCHED_VAR_RE as _UNMATCHED_VAR_RE
         wf = self._workflows.get(wf_name)
         if not wf:
             return
@@ -221,6 +221,13 @@ class WorkflowLifecycleMixin:
                 self._handle_wf_loop(wf, wf_id, lm)
             return
 
+        # 产出审计：记录该步骤产出文件 + git 改动，供回溯追溯
+        try:
+            _done_step = steps[idx]  # 刚完成的步骤
+            self._record_step_output(wf_id, _done_step, results.get(_done_step.id, {}))
+        except Exception as _audit_err:
+            LOGGER.debug("step_output audit failed %s/%s: %s", wf_id[:8], step_id, _audit_err)
+
         # 变量完整 → 已提交推进，通知目标角色
         self._send_to_role(next_step.target_role, prompt,
                            wf_id=wf_id, step_id=next_step.id)
@@ -287,6 +294,74 @@ class WorkflowLifecycleMixin:
                 LOGGER.info("deployed %d outputs from %s", len(deployed), wf_id[:12])
         except Exception as e:
             LOGGER.debug("deploy_production_outputs failed: %s", e)
+
+    def _record_step_output(self, wf_id: str, step, step_data: dict):
+        """记录步骤产出审计：产出文件列表 + 内容预览 + git 改动，写 workflow_logs。
+
+        回溯追溯"哪个工作流/步骤产出了什么、改了什么代码"：
+          - 产出文件: 该角色 workspace 下最新修改的 3 个文件（名称+大小+首行预览）
+          - git 改动: ccs-workspaces git 仓库中近 10 分钟未提交的改动文件
+            （排除系统文件 TASKS.md/CLAUDE.md，那是引擎自己写的）
+        """
+        if not step or not step_data:
+            return
+        role = getattr(step, "target_role", "") or ""
+        detail = {}
+        if role:
+            ws = _CCS_WORKSPACES / role
+            if ws.exists():
+                try:
+                    _files = []
+                    for f in sorted(ws.rglob("*"), key=lambda p: p.stat().st_mtime,
+                                    reverse=True)[:12]:
+                        if f.is_file() and f.stat().st_size > 0:
+                            _name = str(f.relative_to(Path.home()))
+                            if _name.startswith("ccs-workspaces/"):
+                                _name = _name[len("ccs-workspaces/"):]
+                            if any(_s in _name for _s in ("TASKS.md", "CLAUDE.md.", "base.md")):
+                                continue
+                            _files.append({
+                                "f": _name,
+                                "size": f.stat().st_size,
+                                "preview": f.read_text(encoding="utf-8", errors="ignore")[:80].replace("\n", " "),
+                            })
+                    detail["outputs"] = _files[:3]
+                except Exception as _fe:
+                    LOGGER.debug("output scan failed: %s", _fe)
+        # git 改动：ccs-workspaces 仓库近 10 分钟未提交的改动
+        try:
+            _git = _engine_mod._sp.run(
+                ["git", "-C", str(Path.home() / "ccs-workspaces"), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=10)
+            if _git.returncode == 0:
+                _changed = []
+                for _line in _git.stdout.splitlines():
+                    _f = _line[3:].strip()
+                    if not _f or any(_s in _f for _s in ("TASKS.md", "CLAUDE.md", "base.md")):
+                        continue
+                    _changed.append(_f)
+                detail["git_changed"] = _changed[:10]
+        except Exception as _ge:
+            LOGGER.debug("git scan failed: %s", _ge)
+        if not detail.get("outputs") and not detail.get("git_changed"):
+            return
+        detail["step"] = getattr(step, "id", "")
+        detail["title"] = getattr(step, "title", "")
+        detail["role"] = role
+        # exit_messages 摘要作为产出内容证据
+        _msgs = []
+        for m in (step_data.get("exit_messages") or []):
+            if isinstance(m, dict):
+                _msgs.append(str(m.get("text", ""))[:100])
+        if _msgs:
+            detail["exit_messages"] = _msgs[:3]
+        try:
+            self._bb.write("workflow",
+                f"[step_output] {wf_id[:12]}/{detail['step']} {role} 产出审计",
+                evidence=json.dumps(detail, ensure_ascii=False)[:1500],
+                src="workflow_engine")
+        except Exception as _we:
+            LOGGER.debug("step_output bus write failed: %s", _we)
 
     def _handle_wf_loop(self, wf: WorkflowDef, wf_id: str, lm):
         """食物链循环处理：检查价值门禁 → 创建新迭代（锁内）→ 重启生产者（锁外）。

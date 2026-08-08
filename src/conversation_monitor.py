@@ -29,7 +29,8 @@ def _load_forbidden_ops() -> dict:
     try:
         from pathlib import Path
         import importlib.util
-        launcher_src = str(Path.home() / "session-launcher" / "src")
+        from paths import SESSION_LAUNCHER_SRC
+        launcher_src = str(SESSION_LAUNCHER_SRC)
         spec = importlib.util.spec_from_file_location(
             "launcher_roles", str(Path(launcher_src) / "routing" / "roles.py"))
         mod = importlib.util.module_from_spec(spec)

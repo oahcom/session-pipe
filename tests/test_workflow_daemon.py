@@ -34,6 +34,7 @@ def test_daemon_loop_runs_engine(mock_engine_cls):
     lock_file = _test_lock_file()
     _set_lock_file(lock_file)
     mock_eng = MagicMock()
+    mock_eng.active_workflow_count.return_value = 0
     mock_engine_cls.return_value = mock_eng
 
     t = threading.Thread(target=daemon.daemon_loop, args=(0.05,), daemon=True)
@@ -49,6 +50,7 @@ def test_daemon_loop_continues_on_error(mock_engine_cls):
     lock_file = _test_lock_file()
     _set_lock_file(lock_file)
     mock_eng = MagicMock()
+    mock_eng.active_workflow_count.return_value = 0
     mock_engine_cls.return_value = mock_eng
     call_count = 0
     def side_effect():
@@ -93,6 +95,7 @@ def test_non_main_thread_skip_signal():
     lock_file = _test_lock_file()
     _set_lock_file(lock_file)
     eng = MagicMock()
+    eng.active_workflow_count.return_value = 0
 
     def _throw_on_signal(*args):
         raise RuntimeError("signal.signal 不应在非主线程调用")
@@ -115,6 +118,7 @@ def test_daemon_loop_lock_cleanup_in_finally():
     _set_lock_file(lock_file)
     with patch("pipeflow.daemon.WorkflowEngine") as mock_cls:
         mock_eng = MagicMock()
+        mock_eng.active_workflow_count.return_value = 0
         mock_cls.return_value = mock_eng
         # 启动 timer 在 0.3s 后发 SIGTERM
         timer = threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGTERM))
@@ -140,6 +144,7 @@ def test_main_loop_lock_file_created(mock_engine_cls):
     lock_file = _test_lock_file()
     _set_lock_file(lock_file)
     eng = MagicMock()
+    eng.active_workflow_count.return_value = 0
     mock_engine_cls.return_value = eng
     t = threading.Thread(target=daemon.daemon_loop, args=(0.05,), daemon=True)
     t.start()
@@ -154,6 +159,7 @@ def test_run_once_exception_message_printed(mock_engine_cls):
     lock_file = _test_lock_file()
     _set_lock_file(lock_file)
     mock_eng = MagicMock()
+    mock_eng.active_workflow_count.return_value = 0
     mock_engine_cls.return_value = mock_eng
     call_count = 0
     def side_effect():

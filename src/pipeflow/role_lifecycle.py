@@ -116,7 +116,7 @@ class RoleLifecycleMixin:
         条件: step 处于 notified 状态超过 3 分钟，且无 timeout_count 递增
         (timeout_count 由 tick 处理，这里补 tick 照顾不到的冷启动停滞)
         """
-        from pipeflow.engine import _UNMATCHED_VAR_RE
+        from pipeflow.engine import UNMATCHED_VAR_RE as _UNMATCHED_VAR_RE
         lm = self._lifecycle
         now = time.time()
         try:
@@ -335,7 +335,7 @@ class RoleLifecycleMixin:
             return
         # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用
         # 这些内容作 StopHook 条件时 bool([]) 为 False → 死循环
-        from pipeflow.engine import _UNMATCHED_VAR_RE
+        from pipeflow.engine import UNMATCHED_VAR_RE as _UNMATCHED_VAR_RE
         if _UNMATCHED_VAR_RE.search(prompt):
             unmatched = _UNMATCHED_VAR_RE.findall(prompt)
             LOGGER.warning("send-to-role %s 跳过: prompt 含未替换变量 %s (wf=%s step=%s)",
@@ -372,6 +372,8 @@ class RoleLifecycleMixin:
                 evidence=prompt[:200], src="workflow_engine")
             return
         # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
+        # 防污染：角色已有其他活跃工作流的任务文件时，拒写本任务（并发任务应排队，
+        # 否则后写者覆盖先写者 → 角色执行错误任务。观测案例：测试风暴覆盖 scout 真实任务）。
         if wf_id:
             try:
                 ws_dir = Path.home() / "ccs-workspaces" / role
@@ -382,11 +384,26 @@ class RoleLifecycleMixin:
                 ) if hasattr(self, '_lifecycle') else []
                 if task_rows:
                     t = task_rows[0]
-                    (ws_dir / "TASKS.md").write_text(
-                        f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
-                        f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
-                        f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n",
-                        encoding="utf-8")
+                    tasks_file = ws_dir / "TASKS.md"
+                    _skip_write = False
+                    if tasks_file.exists():
+                        _existing = tasks_file.read_text(encoding="utf-8", errors="ignore")
+                        if _existing and "工作流任务" in _existing and wf_id not in _existing:
+                            # 已有其他工作流的任务文件 → 不覆盖，追加排队标记
+                            LOGGER.info("TASKS.md 防污染: %s 已有 %s 的任务，本任务 %s 排队（不覆盖）",
+                                        role, _existing.split("来源\n")[-1].split("/")[0].strip()
+                                        if "来源\n" in _existing else "其他", wf_id)
+                            tasks_file.write_text(
+                                _existing.rstrip() +
+                                f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",
+                                encoding="utf-8")
+                            _skip_write = True
+                    if not _skip_write:
+                        tasks_file.write_text(
+                            f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
+                            f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
+                            f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n",
+                            encoding="utf-8")
             except (ValueError, KeyError, TypeError):
                 pass
         # 超时/告警通知走 blocker 而非 task_spec，防止 coordinator 误认为新任务
@@ -406,7 +423,7 @@ class RoleLifecycleMixin:
             )
         except (ValueError, KeyError, TypeError):
             try:
-                ccs_cli = Path.home() / "session-launcher" / "src" / "ccs.py"
+                ccs_cli = _CCS_CLI
                 _engine_mod._sp.run(
                     ["python3", str(ccs_cli), "send", role, prompt[:2000]],
                     capture_output=True, timeout=10,

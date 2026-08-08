@@ -26,20 +26,22 @@ from bus_protocol import Blackboard
 
 from dataclasses import dataclass
 
-_ZOMBIE_TEMPLATES = frozenset({
+ZOMBIE_TEMPLATES = frozenset({
     "test", "hr", "back_ccs", "busy_ccs", "stuck_ccs", "heartbeat",
     "ho", "research", "dev", "prompt_test", "cancel_test", "cond_test",
     "cond_block", "timeout_test", "retry_test", "fast_ccs", "ws_test",
     "single_wf", "two_step", "handoff_wf", "reject_wf", "cancel_wf",
     "alpha", "beta", "ok", "quick", "valid", "empty",
 })
+_ZOMBIE_TEMPLATES = ZOMBIE_TEMPLATES  # 兼容别名
 
 _POLL_SLEEP = 5
 _REMINDER_INTERVAL = 120
 
 # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用它作
 # StopHook 条件时 bool([]) 为 False → 死循环
-_UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
+UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
+_UNMATCHED_VAR_RE = UNMATCHED_VAR_RE  # 兼容别名
 
 
 @dataclass
@@ -217,6 +219,18 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
 
     def list_workflows(self) -> list[str]:
         return sorted(name for name, wf in self._workflows.items() if not wf.is_subflow)
+
+    def active_workflow_count(self) -> int:
+        """当前活跃工作流数（pending/running/step_done_ready）。"""
+        try:
+            rows = self._lifecycle.query(
+                "SELECT COUNT(*) AS cnt FROM workflow_instances "
+                "WHERE status IN ('pending', 'running', 'step_done_ready')"
+            )
+            return rows[0]["cnt"] if rows else 0
+        except Exception as e:
+            LOGGER.warning("活跃工作流查询失败: %s", e)
+            return 0
 
     def start(self, name: str, context: dict = None) -> str:
         wf = self._workflows.get(name)

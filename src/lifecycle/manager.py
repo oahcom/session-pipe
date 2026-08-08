@@ -43,9 +43,9 @@ def check_resource_constraints(role: str) -> dict:
         mem = subprocess.run(["free","-m"], capture_output=True, text=True, timeout=5)
         for line in mem.stdout.split("\n"):
             if line.startswith("Mem:"):
-                usage["memory_mb"] = int(line.split()[6])
-                if usage["memory_mb"] < budget["max_memory_mb"]:
-                    violations.append(f"mem {usage["memory_mb"]} > {budget["max_memory_mb"]}MB exceed")
+                usage["memory_mb"] = int(line.split()[2])
+                if usage["memory_mb"] > budget["max_memory_mb"]:
+                    violations.append("mem %d > %dMB exceed" % (usage["memory_mb"], budget["max_memory_mb"]))
     except Exception: usage["memory_mb"] = -1
     return {"ok": len(violations)==0, "violations": violations, "usage": usage}
 
