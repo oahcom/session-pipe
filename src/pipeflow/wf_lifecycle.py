@@ -317,9 +317,10 @@ class WorkflowLifecycleMixin:
                 try:
                     _files = []
                     for f in (f for f in ws.rglob("*") if ".git" not in f.parts):
-                        if not f.is_file() or f.stat().st_size <= 0:
+                        _st = f.stat()
+                        if not f.is_file() or _st.st_size <= 0:
                             continue
-                        _mtime = f.stat().st_mtime
+                        _mtime = _st.st_mtime
                         if _window_start and _mtime < _window_start:
                             continue  # 超出本步骤时间窗，跳过
                         # 相对 _CCS_WORKSPACES 记录，与 home 解耦（测试环境）
@@ -329,12 +330,12 @@ class WorkflowLifecycleMixin:
                             _name = str(f.relative_to(Path.home()))
                         if _name.startswith("ccs-workspaces/"):
                             _name = _name[len("ccs-workspaces/"):]
-                        if any(_s in _name for _s in ("TASKS.md", "CLAUDE.md.", "base.md",
+                        if any(_s in _name for _s in ("TASKS.md", "CLAUDE.md", "base.md", "settings.json",
                                                        ".claude/", ".pytest_cache/", "__pycache__/", ".pyc")):
                             continue
                         _files.append({
                             "f": _name,
-                            "size": f.stat().st_size,
+                            "size": _st.st_size,
                             "mtime": _mtime,
                             "preview": f.read_text(encoding="utf-8", errors="ignore")[:80].replace("\n", " "),
                         })

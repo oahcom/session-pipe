@@ -59,9 +59,10 @@ def _scan_outputs(role: str, window_start: float = 0) -> list:
     out = []
     try:
         for f in (f for f in ws.rglob("*") if ".git" not in f.parts):
-            if not f.is_file() or f.stat().st_size <= 0:
+            st = f.stat()
+            if not f.is_file() or st.st_size <= 0:
                 continue
-            mtime = f.stat().st_mtime
+            mtime = st.st_mtime
             if window_start and mtime < window_start:
                 continue
             name = str(f.relative_to(CCS_WORKSPACES))
@@ -70,7 +71,7 @@ def _scan_outputs(role: str, window_start: float = 0) -> list:
             if _is_system(name):
                 continue
             out.append({
-                "f": name, "size": f.stat().st_size, "mtime": mtime,
+                "f": name, "size": st.st_size, "mtime": mtime,
                 "preview": preview_head(f),
             })
     except Exception:
@@ -96,11 +97,10 @@ def _history_replay(wf_id: str) -> list:
     row = conn.execute(
         "SELECT template_id, step_results, status FROM workflow_instances "
         "WHERE instance_id=?", (wf_id,)).fetchone()
-    conn.close()
     if not row:
+        conn.close()
         return []
     results = json.loads(row["step_results"] or "{}")
-    conn = _wf()
     tpl = conn.execute("SELECT steps_json FROM workflow_templates WHERE template_id=?",
                        (row["template_id"],)).fetchone()
     conn.close()
