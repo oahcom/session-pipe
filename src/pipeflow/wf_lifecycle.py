@@ -312,10 +312,14 @@ class WorkflowLifecycleMixin:
             if ws.exists():
                 try:
                     _files = []
-                    for f in sorted(ws.rglob("*"), key=lambda p: p.stat().st_mtime,
+                    for f in sorted((f for f in ws.rglob("*") if ".git" not in f.parts), key=lambda p: p.stat().st_mtime,
                                     reverse=True)[:12]:
                         if f.is_file() and f.stat().st_size > 0:
-                            _name = str(f.relative_to(Path.home()))
+                            # 相对 _CCS_WORKSPACES 记录，与 home 解耦（测试环境）
+                            try:
+                                _name = str(f.relative_to(_CCS_WORKSPACES))
+                            except ValueError:
+                                _name = str(f.relative_to(Path.home()))
                             if _name.startswith("ccs-workspaces/"):
                                 _name = _name[len("ccs-workspaces/"):]
                             if any(_s in _name for _s in ("TASKS.md", "CLAUDE.md.", "base.md")):
@@ -331,11 +335,13 @@ class WorkflowLifecycleMixin:
         # git 改动：ccs-workspaces 仓库近 10 分钟未提交的改动
         try:
             _git = _engine_mod._sp.run(
-                ["git", "-C", str(Path.home() / "ccs-workspaces"), "status", "--porcelain"],
+                ["git", "-C", str(_CCS_WORKSPACES),
+                 "status", "--porcelain"],
                 capture_output=True, text=True, timeout=10)
             if _git.returncode == 0:
                 _changed = []
                 for _line in _git.stdout.splitlines():
+                    # porcelain 格式: "XY filename"（2 字符状态 + 空格）
                     _f = _line[3:].strip()
                     if not _f or any(_s in _f for _s in ("TASKS.md", "CLAUDE.md", "base.md")):
                         continue
@@ -405,7 +411,7 @@ class WorkflowLifecycleMixin:
                 _vg_file = _vg.get("file", "")
                 _vg_ws = _vg.get("workspace", "")
                 if _vg_file and _vg_ws:
-                    _audit_path = Path.home() / "ccs-workspaces" / _vg_ws / _vg_file
+                    _audit_path = _CCS_WORKSPACES / _vg_ws / _vg_file
                     if _audit_path.exists():
                         _text = _audit_path.read_text(encoding="utf-8", errors="ignore")
                         if "FAIL" in _text.upper() or "REJECT" in _text.upper():
@@ -478,7 +484,7 @@ class WorkflowLifecycleMixin:
         prompt = prompt.replace("{topic}", task_title)
         # workspace 摘要：给角色上下文（首步生产扫描在调用前已替换，这里统一兜底）
         try:
-            _ws_dir = Path.home() / "ccs-workspaces" / step.target_role
+            _ws_dir = _CCS_WORKSPACES / step.target_role
             prompt = prompt.replace("{workspace_summary}",
                                     self._collect_workspace_summary(_ws_dir))
         except Exception:
