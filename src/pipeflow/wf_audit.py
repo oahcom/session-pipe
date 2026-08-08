@@ -27,7 +27,8 @@ def _main():
     sql, params = "", []
     if args.wf:
         sql += "AND t LIKE ?"
-        params.append(f"%{args.wf}%")
+        # t 列只存 wf_id[:12] 前缀（见 _record_step_output），完整 ID 需截断后匹配
+        params.append(f"%{args.wf[:12]}%")
     if args.role:
         sql += "AND e LIKE ?"
         params.append(f'%"role": "{args.role}"%')
