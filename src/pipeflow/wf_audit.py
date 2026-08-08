@@ -36,16 +36,17 @@ def _main():
         sql += "AND ts > ?"
         params.append(__import__("time").time() - h * 3600)
 
-    rows = _facts_where(sql, params)
+    limit = 10 if args.latest else 20
+    rows = _facts_where(sql, params, limit)
     _render(rows)
 
 
-def _facts_where(extra, params):
+def _facts_where(extra, params, limit):
     conn = sqlite3.connect(BUS)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT id, t, e, ts FROM facts WHERE t LIKE '%step_output%' "
-        f"{extra} ORDER BY ts DESC LIMIT 10", params).fetchall()
+        f"{extra} ORDER BY ts DESC LIMIT ?", params + [limit]).fetchall()
     conn.close()
     return rows
 
