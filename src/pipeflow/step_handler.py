@@ -89,6 +89,20 @@ class StepHandlerMixin:
                         f"[workflow] {run.workflow_name}/{run.current_step} "
                         f"排队 {_queued} 次仍未响应（角色 {step.target_role} 活跃但可能卡死），请介入",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
+                    # 排队上限 = 角色被其他工作流占用，子链无法执行 → auto-cancel
+                    if _queued >= 10:
+                        LOGGER.warning("auto-cancel subflow: %s queued=%d，角色 %s 活跃占用",
+                                       run.id[:12], _queued, step.target_role)
+                        try:
+                            self._lifecycle.close_wf(run.id, status="cancelled")
+                            self._bb.write("workflow",
+                                f"[workflow] {run.workflow_name} 排队超限自动取消: "
+                                f"角色 {step.target_role} 被其他工作流占用，"
+                                f"排队 {_queued} 次后自动回收",
+                                src="workflow_engine")
+                        except Exception as _cancel_e:
+                            LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
+                        return
                 run.step_results[step.id] = {
                     **run.step_results.get(step.id, {}),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
@@ -129,6 +143,11 @@ class StepHandlerMixin:
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
+                    # 审计信号：记录轮次超时（供 monitor_audit 查看 SLA）
+                    self._bb.write("monitor_audit",
+                        f"决策: 轮次超时 → {run.workflow_name}/{run.current_step} "
+                        f"step={step.id} role={step.target_role} 超时 {timeout}s，已重推+升级",
+                        src="workflow_engine")
 
             # ── 宽松推进：角色已写同工作流 bus 消息但分类不匹配（如 evolution_report
             #    写成了 architecture）→ 产出存在即推进，避免"产出已存在却死锁"。

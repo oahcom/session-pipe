@@ -228,6 +228,31 @@ class WorkflowLifecycleMixin:
         except Exception as _audit_err:
             LOGGER.debug("step_output audit failed %s/%s: %s", wf_id[:8], step_id, _audit_err)
 
+        # ── 返工门禁：review 步骤被拒绝 → 不推进，s6 保持 notified，引擎下一轮 tick
+        # 自动重查 exit 匹配（修复后新 review 结果会正常推进）。
+        # 同时创建 engineer 返工子链（若已有则不重复创建）。
+        _reject = False
+        try:
+            _done_sr = results.get(step_id, {}) if isinstance(results, dict) else {}
+            _msgs_text = " ".join(
+                m.get("text", "") for m in _done_sr.get("exit_messages", [])
+                if isinstance(m, dict)
+            ).lower()
+            if any(kw in _msgs_text for kw in ("changes_requested", "rejected", "fix", "需修复", "回退")):
+                _reject = True
+        except Exception:
+            pass
+        if _reject and getattr(steps[idx], "type", "") == "review":
+            LOGGER.warning("review rejected: %s/%s → 返工门禁触发，s%s 保持 notified",
+                           wf_id[:8], step_id, step_id)
+            # 创建 engineer 返工子链（复用 engineer_feature 模板）
+            try:
+                self._create_rework_subflow(wf_id, lm, wf_name, step_id,
+                                            steps[idx], next_step, results)
+            except Exception as _rw_err:
+                LOGGER.warning("rework subflow 创建失败 %s: %s", wf_id[:8], _rw_err)
+            return  # 不推进到下一步，等修复后重新触发
+
         # 变量完整 → 已提交推进，通知目标角色
         self._send_to_role(next_step.target_role, prompt,
                            wf_id=wf_id, step_id=next_step.id)
@@ -243,6 +268,14 @@ class WorkflowLifecycleMixin:
                     _db_sdata = (json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"]
                                  else {}).get(next_step.id, {})
                     if isinstance(_db_sdata, dict) and _db_sdata.get("subflow_id"):
+                        return
+                    # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
+                    # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
+                    # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
+                    if self._is_role_busy(next_step.target_role, exclude_wf_id=wf_id,
+                                          pane_fallback=False):
+                        LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
+                                    next_step.target_role, next_step.subflow_template)
                         return
                     _sub_wf = self._workflows.get(next_step.subflow_template)
                     if _sub_wf and _sub_wf.steps and _sub_wf.steps[0].target_role == next_step.target_role:
@@ -295,6 +328,178 @@ class WorkflowLifecycleMixin:
         except Exception as e:
             LOGGER.debug("deploy_production_outputs failed: %s", e)
 
+    def _create_rework_subflow(self, wf_id: str, lm, wf_name: str, review_step_id: str,
+                               review_step, next_step, results: dict):
+        """review 被拒绝 → 解析【系统问题】/【业务问题】分类，分别创建修复子链。
+
+        系统问题 → maintainer_health_monitor（维护者修引擎/模板缺陷）
+        业务问题 → engineer_feature（开发修功能实现）
+
+        reviewer 模板要求在完成消息中用 【系统问题】【业务问题】标记分类列出，
+        引擎据此分别创建子链——同一份 review 可同时触发两条返工链。
+        防重：review 步骤的 step_results 若已有 rework_ids → 不重复创建。
+        """
+        _done_sr = results.get(getattr(review_step, "id", ""), {}) if isinstance(results, dict) else {}
+        _msgs_text = "\n".join(
+            m.get("text", "") for m in _done_sr.get("exit_messages", [])
+            if isinstance(m, dict)
+        )
+        # 从结构化分类中提取问题列表
+        _sys_issues, _biz_issues = self._parse_review_issues(_msgs_text)
+        if not _sys_issues and not _biz_issues:
+            LOGGER.info("rework: %s/%s review 无分类问题，跳过返工", wf_id[:8], review_step_id)
+            return
+        # 问题类型 → (模板, 角色, 分类标签)
+        _rework_map = [
+            (_sys_issues, "maintainer_health_monitor", "maintainer", "系统/引擎问题"),
+            (_biz_issues, "engineer_feature", "engineer", "业务问题"),
+        ]
+        try:
+            with lm._conn_tx() as conn:
+                _db_res = conn.execute(
+                    "SELECT step_results FROM workflow_instances WHERE instance_id=?", (wf_id,)
+                ).fetchone()
+                if _db_res is None:
+                    LOGGER.warning("rework: %s 不存在于 DB，跳过返工", wf_id[:8])
+                    return
+                _sr = json.loads(_db_res["step_results"]) if _db_res["step_results"] else {}
+                _review_sdata = _sr.get(review_step.id, {})
+                _existing_reworks = set(
+                    _review_sdata.get("rework_ids", []) if isinstance(_review_sdata, dict)
+                    else ([_review_sdata["rework_id"]] if isinstance(_review_sdata, dict) and _review_sdata.get("rework_id") else [])
+                )
+                _new_reworks = []
+                for _issues, _tpl, _role, _type_label in _rework_map:
+                    if not _issues:
+                        continue
+                    # 逐类防重（P0 修复）：按模板判断该类 rework 是否已存在，
+                    # 而非总数>=模板数——某类模板缺失时另一类不会无限堆积
+                    _tpl_exists = any(
+                        str(_rw).startswith("wf_rw_") and
+                        self._rework_tpl_for(_rw) == _tpl
+                        for _rw in _existing_reworks
+                    )
+                    if _tpl_exists:
+                        LOGGER.info("rework 已存在 %s/%s 类型=%s，不重复创建",
+                                    wf_id[:8], _type_label, _tpl)
+                        continue
+                    _sub_wf = self._workflows.get(_tpl)
+                    if not _sub_wf or not _sub_wf.steps:
+                        LOGGER.warning("rework: 模板 %s 不存在，跳过 %s", _tpl, _type_label)
+                        continue
+                    _task_id = f"task_rework_{uuid.uuid4().hex[:8]}"
+                    _wf_id_rw = f"wf_rw_{uuid.uuid4().hex[:12]}"
+                    _issue_summary = "; ".join(_issues[:5])  # 任务描述中列问题摘要（最多5条）
+                    _review_title = getattr(review_step, "title", "review")
+                    _task_desc = (
+                        f"返工任务（{_type_label}）：[{review_step.id}] {_review_title} 审查被拒，"
+                        f"修复后重新提交审查。\n"
+                        f"问题清单:\n" + "\n".join(f"  - {i}" for i in _issues[:10]) +
+                        f"\n\n评审意见见 bus cat=code_review。"
+                    )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO tasks "
+                        "(task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) "
+                        "VALUES (?,?,?,?,?,'in_progress',?,?,?)",
+                        (_task_id, f"{wf_name}/{review_step.id}: 返工({_type_label})", _task_desc,
+                         "reviewer", _role, time.time(), time.time(), _tpl))
+                    conn.execute(
+                        "INSERT OR IGNORE INTO workflow_instances "
+                        "(instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at) "
+                        "VALUES (?,?,?,?,?,'pending','s1',?,?)",
+                        (_wf_id_rw, _tpl, _task_id, "reviewer", _role,
+                         json.dumps({}), time.time()))
+                    _new_reworks.append(_wf_id_rw)
+                    LOGGER.info("rework 子链: %s → %s (%s, %d 条问题)",
+                                wf_id[:12], _wf_id_rw[:12], _type_label, len(_issues))
+                # 更新 review 步骤的 rework_ids（list，支持多条）
+                # CAS 写回（P2 并发修复）：WHERE 带上旧 step_results，行数=0 说明
+                # 并发调用已改过（含我们刚创建的 rework）→ 重读合并，防后写覆盖
+                if _new_reworks:
+                    _new_sr = dict(_sr)
+                    _existing = _review_sdata.get("rework_ids", []) if isinstance(_review_sdata, dict) else []
+                    _merged = list(dict.fromkeys(_existing + _new_reworks))
+                    _new_sr.setdefault(review_step.id, {})["rework_ids"] = _merged
+                    _cur = conn.execute(
+                        "UPDATE workflow_instances SET step_results=? "
+                        "WHERE instance_id=? AND step_results=?",
+                        (json.dumps(_new_sr, ensure_ascii=False), wf_id,
+                         json.dumps(_sr, ensure_ascii=False)))
+                    if _cur.rowcount == 0:
+                        # 并发冲突：重读并合并（保留双方创建的 rework）
+                        _fresh = conn.execute(
+                            "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                            (wf_id,)).fetchone()
+                        if _fresh and _fresh["step_results"]:
+                            _fresh_sr = json.loads(_fresh["step_results"])
+                            _fresh_sdata = _fresh_sr.get(review_step.id, {})
+                            _fresh_ids = _fresh_sdata.get("rework_ids", []) if isinstance(_fresh_sdata, dict) else []
+                            _fresh_sdata["rework_ids"] = list(dict.fromkeys(_fresh_ids + _new_reworks))
+                            conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                         (json.dumps(_fresh_sr, ensure_ascii=False), wf_id))
+                conn.commit()
+        except Exception as _e:
+            LOGGER.warning("rework subflow creation failed %s: %s", wf_id[:8], _e)
+
+    def _rework_tpl_for(self, rework_id: str) -> str:
+        """从 DB 查 rework 工作流实例的模板（用于逐类防重判断）。"""
+        try:
+            rows = self._lifecycle.query(
+                "SELECT template_id FROM workflow_instances WHERE instance_id=?",
+                (rework_id,)
+            )
+            return rows[0]["template_id"] if rows else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse_review_issues(msgs_text: str) -> tuple:
+        """从 review 完成消息中解析【系统问题】和【业务问题】两个分类的问题列表。
+
+        返回 (system_issues, business_issues)。
+        """
+        _sys = []
+        _biz = []
+        _sys_keywords = (
+            "exit_condition", "变量", "busy", "polling", "rework", "daemon",
+            "引擎", "engine", "exit schema", "verify", "timeout", "deadlock",
+            "tmux", "pane", "survival", "workflow_engine", "模板", "template",
+            "竞态", "race", "卡死", "死循环", "防污", "推送", "notify", "step_result",
+        )
+        in_sys = False
+        in_biz = False
+        for line in msgs_text.splitlines():
+            _line = line.strip()
+            if "【系统问题】" in _line:
+                in_sys = True
+                in_biz = False
+                continue
+            if "【业务问题】" in _line:
+                in_sys = False
+                in_biz = True
+                continue
+            if not _line or _line.startswith(("##", "#", "---")):
+                continue
+            # 跳过分类标记行（【系统问题】|无 ）和表头分隔行
+            if _line.startswith("【") or _line.startswith("|--"):
+                continue
+            # 提取问题条目（跳过表头/空行）
+            if not (_line.startswith("-") or _line.startswith("|")):
+                continue
+            _item = _line.lstrip("-|").strip()
+            if not _item or len(_item) < 10:
+                continue
+            # 根据位置（已在系统/业务块中）直接归类；位置不明则用关键词判断
+            if in_sys:
+                _sys.append(_item)
+            elif in_biz:
+                _biz.append(_item)
+            elif any(kw in _item.lower() for kw in _sys_keywords):
+                _sys.append(_item)
+            else:
+                _biz.append(_item)
+        return _sys, _biz
+
     def _record_step_output(self, wf_id: str, step, step_data: dict):
         """记录步骤产出审计：产出文件列表 + 内容预览 + git 改动，写 workflow_logs。
 
@@ -309,7 +514,7 @@ class WorkflowLifecycleMixin:
         detail = {}
         # 产出时间窗：从步骤完成时刻回溯 2 小时，只统计窗口内新增/修改的文件，
         # 避免角色 workspace 历史文件干扰（同一角色多任务共用 workspace）
-        _step_ts = step_data.get("ts", step_data.get("notified_at", 0)) or 0
+        _step_ts = step_data.get("completed_at", step_data.get("ts", 0)) or 0
         _window_start = _step_ts - 2 * 3600 if _step_ts else 0
         if role:
             ws = _CCS_WORKSPACES / role
@@ -353,8 +558,11 @@ class WorkflowLifecycleMixin:
             if _git.returncode == 0:
                 _changed_files = []
                 for _line in _git.stdout.splitlines():
-                    # porcelain 格式: "XY filename"（2 字符状态 + 空格）
-                    _f = _line[3:].strip()
+                    # porcelain 格式: "XY filename" 或 rename "XY old -> new"
+                    if " -> " in _line:
+                        _f = _line.split(" -> ", 1)[-1].strip()
+                    else:
+                        _f = _line[3:].strip()
                     if not _f or any(_s in _f for _s in ("TASKS.md", "CLAUDE.md", "base.md")):
                         continue
                     _changed_files.append(_f)
@@ -546,13 +754,19 @@ class WorkflowLifecycleMixin:
         # 步骤间数据传递：上一步骤的 exit_messages 填充后续步骤变量
         prev_sr = (results or {}).get(prev_step_id, {}) if prev_step_id else {}
         prev_msgs = prev_sr.get("exit_messages", []) if isinstance(prev_sr, dict) else []
+        fallback = task_desc or task_title or wf_name
         if prev_msgs:
             prev_text = "\n".join(str(m) for m in prev_msgs)[:3000]
+            # 上一步消息用于目标/发现/结果变量；{project}/{changes}/{task_list} 仍用 fallback 填充
+            # （不填充会导致 _UNMATCHED_VAR_RE 拦截推进，architect/qa 子链 s2 卡死）
             for var in ("{target}", "{findings}", "{results}", "{backlog}",
                         "{exception_info}", "{focus_area}"):
                 prompt = prompt.replace(var, prev_text)
+            for var in ("{changes}", "{task_list}", "{assignments}",
+                        "{workspace_summary}", "{project}"):
+                if var in prompt:
+                    prompt = prompt.replace(var, fallback)
         else:
-            fallback = task_desc or task_title or wf_name
             for var in ("{target}", "{findings}", "{results}", "{backlog}",
                         "{exception_info}", "{focus_area}", "{changes}",
                         "{task_list}", "{assignments}", "{workspace_summary}", "{project}"):

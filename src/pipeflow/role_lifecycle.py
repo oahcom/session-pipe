@@ -226,6 +226,10 @@ class RoleLifecycleMixin:
                            capture_output=True, timeout=5).returncode == 0:
                     time.sleep(3)  # 等 agent 进程启动
                     if self._is_agent_alive(role):
+                        # 审计信号：记录角色被 workflow 引擎拉起（供 monitor_audit 查看）
+                        self._bb.write("monitor_audit",
+                            f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)",
+                            src="workflow_engine")
                         return True
         except (ValueError, KeyError, TypeError):
             LOGGER.debug("CCS role alive check failed for %s", role)
@@ -245,12 +249,22 @@ class RoleLifecycleMixin:
             if hp.exists():
                 h = json.loads(hp.read_text())
                 overall = h.get("survival_overall", "unknown")
-                # idle/unknown → 查 tmux pane 兜底：tmux 3.4 的 pane_activity 恒为空，
-                # survival L2 信号失效，忙任务被误判 idle → 超时误回收。pane 存活即视为 busy。
-                if overall in ("idle", "stale", "dead", "orphan", "unknown"):
+                # orphan/unknown: tmux 存活但 Claude 进程已死 → 角色不在干活 → 不忙。
+                # 避免子工作流超时路径被阻塞导致无限卡死（观测：architect/qa s2 queued=N）。
+                if overall in ("orphan", "unknown"):
+                    LOGGER.info("health=%s → 角色不可用，不视为 busy", overall)
+                    return False
+                # stale/dead: survival 检测角色失活 → 查 tmux pane 兜底（pane 真正活着才忙）
+                if overall in ("stale", "dead"):
                     if pane_fallback and self._tmux_pane_alive(role):
-                        LOGGER.info("health=%s 但 tmux pane 存活 → 视为 busy (survival L2 兜底)", overall)
+                        LOGGER.info("health=%s 但 tmux pane 存活 → 视为 busy", overall)
                         return True
+                    return False
+                # idle: survival 已确认角色空闲 → 不判定 busy（tmux 3.4 #{pane_active} 恒为 1，
+                # pane_alive 兜底不可靠，会导致空闲角色被永久卡住无法接收任务）。
+                if overall == "idle":
+                    if pane_fallback and self._tmux_pane_alive(role):
+                        LOGGER.info("health=idle → 角色空闲，tmux pane 存活不作 busy 判定")
                     return False
                 # healthy: 角色可能在工作，继续信号2确认
                 # stale/l2=false: 角色空闲，放行
@@ -282,8 +296,11 @@ class RoleLifecycleMixin:
                 sdata = sr.get(r["current_step_id"], {})
                 if isinstance(sdata, dict) and sdata.get("status") in ("notified", "running"):
                     _q = sdata.get("queued", 0)
-                    if _q >= 6:
-                        LOGGER.info("%s queued=%d >= 6 → 不再视为 busy", role, _q)
+                    # queued>=6 豁免仅适用于"同一工作流"的重推（角色卡死不该无限挡自己），
+                    # 但绝不能豁免"其他工作流"的插入——否则排队中的角色会被并发任务
+                    # 抢占（观测案例: pm 子链 queued=17 时仍被新任务判定"不忙"）。
+                    if _q >= 6 and exclude_wf_id and r["instance_id"] == exclude_wf_id:
+                        LOGGER.info("%s queued=%d 同一工作流 → 豁免 busy", role, _q)
                         continue
                     if sdata.get("timeout_count", 0) < 3:
                         LOGGER.info("skip: %s busy with %s/%s (step=%s)",
@@ -388,11 +405,12 @@ class RoleLifecycleMixin:
                     _skip_write = False
                     if tasks_file.exists():
                         _existing = tasks_file.read_text(encoding="utf-8", errors="ignore")
-                        if _existing and "工作流任务" in _existing and wf_id not in _existing:
+                        # 精确边界匹配：只在 "工作流 wf_id /" 格式中匹配，防止 UUID 前缀碰撞
+                        # （如 wf_abc123 不误匹配 wf_abc123def456）
+                        _wf_in_existing = f"工作流 {wf_id} /" in _existing or wf_id in _existing.split("## 来源")[-1] if "## 来源" in _existing else False
+                        if _existing and "工作流任务" in _existing and not _wf_in_existing:
                             # 已有其他工作流的任务文件 → 不覆盖，追加排队标记
-                            LOGGER.info("TASKS.md 防污染: %s 已有 %s 的任务，本任务 %s 排队（不覆盖）",
-                                        role, _existing.split("来源\n")[-1].split("/")[0].strip()
-                                        if "来源\n" in _existing else "其他", wf_id)
+                            LOGGER.info("TASKS.md 防污染: %s 已有其他任务，本任务 %s 排队（不覆盖）", role, wf_id)
                             tasks_file.write_text(
                                 _existing.rstrip() +
                                 f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",

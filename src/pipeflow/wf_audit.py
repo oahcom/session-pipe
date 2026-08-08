@@ -160,20 +160,22 @@ def _main():
         return
 
     conn = _bus()
-    sql = "SELECT e, ts FROM facts WHERE t LIKE '%step_output%'"
-    params = []
-    if args.role:
-        sql += " AND e LIKE ?"
-        params.append(f'%"role": "{args.role}"%')
-    if args.since:
-        h = int(args.since.rstrip("h"))
-        sql += " AND ts > ?"
-        params.append(time.time() - h * 3600)
-    if not args.role and not args.since:
-        args.latest = True
-    sql += " ORDER BY ts DESC LIMIT 10" if args.latest else " ORDER BY ts DESC"
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
+    try:
+        sql = "SELECT e, ts FROM facts WHERE t LIKE '%step_output%'"
+        params = []
+        if args.role:
+            sql += " AND e LIKE ?"
+            params.append(f'%"role": "{args.role}"%')
+        if args.since:
+            h = int(args.since.rstrip("h"))
+            sql += " AND ts > ?"
+            params.append(time.time() - h * 3600)
+        if not args.role and not args.since:
+            args.latest = True
+        sql += " ORDER BY ts DESC LIMIT 10" if args.latest else " ORDER BY ts DESC"
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
     entries = [json.loads(r["e"]) for r in rows if r["e"]]
     _render(entries)
 

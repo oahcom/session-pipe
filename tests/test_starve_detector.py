@@ -42,12 +42,14 @@ def test_active_count_empty():
 def test_active_count_db_error_returns_zero():
     """engine.active_workflow_count 内部捕获 DB 错误并返回 0。"""
     from pipeflow.engine import WorkflowEngine
-    from unittest.mock import MagicMock, patch
-    eng = WorkflowEngine(db_path=":memory:")
-    mock_lm = MagicMock()
-    mock_lm.query.side_effect = Exception("db locked")
-    eng._lm = mock_lm  # 直接注入内部缓存，绕过 @property
-    assert eng.active_workflow_count() == 0
+    from unittest.mock import MagicMock
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        eng = WorkflowEngine(workflows_dir=Path(tmp) / "_wf")
+        mock_lm = MagicMock()
+        mock_lm.query.side_effect = Exception("db locked")
+        eng._lm = mock_lm
+        assert eng.active_workflow_count() == 0
 
 
 # ── 4. 冷却期内不重复触发 ──
