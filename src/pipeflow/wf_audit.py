@@ -18,6 +18,7 @@ BUS = Path.home() / ".hermes" / "sister_bus" / "blackboard.db"
 
 def _main():
     ap = argparse.ArgumentParser(description="工作流产出审计查询")
+    ap.add_argument("--latest", action="store_true", help="最近 10 条产出审计")
     ap.add_argument("--wf", help="工作流实例 ID（前缀匹配）")
     ap.add_argument("--role", help="角色名")
     ap.add_argument("--since", default="", help="时间窗（如 2h）")
@@ -25,7 +26,7 @@ def _main():
 
     sql, params = "", []
     if args.wf:
-        sql += "AND e LIKE ?"
+        sql += "AND t LIKE ?"
         params.append(f"%{args.wf}%")
     if args.role:
         sql += "AND e LIKE ?"
@@ -44,7 +45,7 @@ def _facts_where(extra, params):
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT id, t, e, ts FROM facts WHERE t LIKE '%step_output%' "
-        f"{extra} ORDER BY ts DESC LIMIT 20", params).fetchall()
+        f"{extra} ORDER BY ts DESC LIMIT 10", params).fetchall()
     conn.close()
     return rows
 
