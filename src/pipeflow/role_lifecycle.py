@@ -149,7 +149,9 @@ class RoleLifecycleMixin:
                 if not _role or _role in ("coordinator",):
                     continue
                 # 角色已有挂起的任务 → 不打扰
-                if self._is_role_busy(_role):
+                # 排除自己：检验中就是当前停滞步骤，若不排除会把自身判 busy，
+                # 导致停滞步骤永不重推（2026-08-10 观测 wf_cde32/s1 skip 30 分钟）
+                if self._is_role_busy(_role, exclude_wf_id=row["instance_id"]):
                     continue
                 LOGGER.info("kick-stalled: %s/%s role=%s notified=%ds ago",
                             row["template_id"], row["instance_id"], _role, now - _notified_at)
@@ -180,17 +182,22 @@ class RoleLifecycleMixin:
 
     @staticmethod
     def _is_agent_alive(role: str) -> bool:
-        """检查 CCS tmux pane 内是否有 claude agent 进程在运行。"""
+        """检查 CCS tmux pane 是否存活。
+
+        ponytail: 用 pane 存活判定而非进程名白名单——claude agent 执行 /goal 时
+        pane_current_command 可能是子进程 wrapper（bash/sleep/node），不在
+        白名单会误判"无 agent"→ kill-session 杀掉正在工作的角色（观测：pm
+        工作时被杀 8 次，2026-08-09）。tmux 会话存在即视为 agent 存活，
+        只有 pane 完全消失才判定失活。
+        """
         try:
             r = _engine_mod._sp.run(
                 ["tmux", "list-panes", "-t", f"ccs-{role}",
-                 "-F", "#{pane_current_command}"],
+                 "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=5,
             )
-            if r.returncode != 0 or not r.stdout.strip():
-                return False
-            cmd = r.stdout.strip().split("\n")[0]
-            return cmd in ("claude", "claude-code", "python3", "python")
+            # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
+            return r.returncode == 0 and bool(r.stdout.strip())
         except (ValueError, KeyError, TypeError):
             return False
 
@@ -227,9 +234,13 @@ class RoleLifecycleMixin:
                     time.sleep(3)  # 等 agent 进程启动
                     if self._is_agent_alive(role):
                         # 审计信号：记录角色被 workflow 引擎拉起（供 monitor_audit 查看）
-                        self._bb.write("monitor_audit",
-                            f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)",
-                            src="workflow_engine")
+                        # 写失败不阻断拉起（审计是旁路，DB 锁/连接异常不应让角色拉起中断）
+                        try:
+                            self._bb.write("monitor_audit",
+                                f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)",
+                                src="workflow_engine")
+                        except Exception:
+                            LOGGER.debug("monitor_audit write failed for %s", role)
                         return True
         except (ValueError, KeyError, TypeError):
             LOGGER.debug("CCS role alive check failed for %s", role)
@@ -260,12 +271,14 @@ class RoleLifecycleMixin:
                         LOGGER.info("health=%s 但 tmux pane 存活 → 视为 busy", overall)
                         return True
                     return False
-                # idle: survival 已确认角色空闲 → 不判定 busy（tmux 3.4 #{pane_active} 恒为 1，
-                # pane_alive 兜底不可靠，会导致空闲角色被永久卡住无法接收任务）。
+                # idle: survival 报空闲 → 但 DB 可能有该角色的活跃步骤（并发保护）。
+                # 不直接放行，落到信号2 DB 检查兜底（2026-08-09 观测：health=idle
+                # 时 pm 同时收到 4 条 task_spec，idle 短路跳过 DB 检查导致并发失效）。
                 if overall == "idle":
                     if pane_fallback and self._tmux_pane_alive(role):
-                        LOGGER.info("health=idle → 角色空闲，tmux pane 存活不作 busy 判定")
-                    return False
+                        LOGGER.info("health=idle → pane 存活但不作 busy 判定，继续 DB 检查")
+                    else:
+                        LOGGER.info("health=idle → 无 pane，继续 DB 检查确认是否真正空闲")
                 # healthy: 角色可能在工作，继续信号2确认
                 # stale/l2=false: 角色空闲，放行
                 if h.get("survival_l2_thinking") is False:
@@ -289,23 +302,28 @@ class RoleLifecycleMixin:
                 _wf = self._workflows.get(r["template_id"])
                 if not _wf:
                     continue
-                _step = next((s for s in _wf.steps if s.id == r["current_step_id"]), None)
-                if not _step or _step.target_role != role:
-                    continue
-                sr = json.loads(r["step_results"] or "{}")
-                sdata = sr.get(r["current_step_id"], {})
-                if isinstance(sdata, dict) and sdata.get("status") in ("notified", "running"):
-                    _q = sdata.get("queued", 0)
-                    # queued>=6 豁免仅适用于"同一工作流"的重推（角色卡死不该无限挡自己），
-                    # 但绝不能豁免"其他工作流"的插入——否则排队中的角色会被并发任务
-                    # 抢占（观测案例: pm 子链 queued=17 时仍被新任务判定"不忙"）。
-                    if _q >= 6 and exclude_wf_id and r["instance_id"] == exclude_wf_id:
-                        LOGGER.info("%s queued=%d 同一工作流 → 豁免 busy", role, _q)
+                # 扫描该工作流所有步骤中对 role 的活跃分配，不只看 current_step_id。
+                # （2026-08-09 观测：food_chain_loop 从 s1 推进到 s2 的时序窗口里，
+                # DB current_step 还是 s1/scout，s2 的 pm 任务已由 _send_to_role 发出，
+                # 只看 current_step 会把 pm 判定为"不忙"→ 并发任务插入。）
+                for _s in _wf.steps:
+                    if _s.target_role != role:
                         continue
-                    if sdata.get("timeout_count", 0) < 3:
-                        LOGGER.info("skip: %s busy with %s/%s (step=%s)",
-                                    role, r["instance_id"][:8], r["current_step_id"], sdata.get("status"))
-                        return True
+                    _sdata = (json.loads(r["step_results"] or "{}") or {}).get(_s.id, {})
+                    if not isinstance(_sdata, dict):
+                        continue
+                    if _sdata.get("status") in ("notified", "running", "step_done_ready"):
+                        _q = _sdata.get("queued", 0)
+                        # queued>=6 豁免仅适用于"同一工作流"的重推（角色卡死不该无限挡自己），
+                        # 但绝不能豁免"其他工作流"的插入——否则排队中的角色会被并发任务
+                        # 抢占（观测案例: pm 子链 queued=17 时仍被新任务判定"不忙"）。
+                        if _q >= 6 and exclude_wf_id and r["instance_id"] == exclude_wf_id:
+                            LOGGER.info("%s queued=%d 同一工作流 → 豁免 busy", role, _q)
+                            continue
+                        if _sdata.get("timeout_count", 0) < 3:
+                            LOGGER.info("skip: %s busy with %s/%s (step=%s)",
+                                        role, r["instance_id"][:8], _s.id, _sdata.get("status"))
+                            return True
             return False
         except Exception:
             return False

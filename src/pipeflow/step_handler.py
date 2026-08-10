@@ -9,11 +9,21 @@ import os
 import re
 import time
 import logging
+import pathlib
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.engine import Step, WorkflowRun
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
+from pipeflow.integrity import (
+    DIMENSIONS as _integ_dimensions,
+    load_state as _integ_load,
+    activate as _integ_activate, should_send_now as _integ_should_send,
+    get_next_dimension as _integ_next_dim, advance_index as _integ_advance,
+    on_reply_received as _integ_reply, on_retry_or_timeout as _integ_retry,
+    format_dim_prompt as _integ_format, make_full_prompt as _integ_full_prompt,
+    send_bypass_reminder as _integ_send_bypass,
+)
 
 LOGGER = logging.getLogger("workflow.engine")
 
@@ -42,20 +52,25 @@ class StepHandlerMixin:
         # 初始化时用 notified_at（步骤首次通知时间），确保不跳过消息
         if _bus_anchor is None:
             _bus_anchor = run.step_results.get(step.id, {}).get("notified_at", _persisted)
-        last_ts = _bus_anchor
+        # 时间下限 = max(锚定, 工作流创建时间)：bus_anchor 可能被旧工作流残留值污染
+        # （wf_7f37 匹配到 wf_cde32 的旧消息，bus_anchor=旧消息 ts, 2026-08-10）。
+        # 工作流创建前绝对不存在属于它的消息 → 硬下限。
+        last_ts = max(_bus_anchor or 0.0, run.created_at or 0.0)
 
         # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
         _sdata = run.step_results.get(step.id, {})
-        if isinstance(_sdata, dict) and _sdata.get("exit_messages") and _sdata.get("status") != "completed":
+        if isinstance(_sdata, dict) and _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_sent")):
+            # bypass 补发完整性提醒（tick rescue 直接 complete，跳过双节点审查）
+            # 两个问题分开发送（用户约束：每个步骤分开提示词）
+            _integ_send_bypass(run, step, "tick rescue",
+                               send_to_role=self._send_to_role,
+                               sync_step_results=self._sync_step_results)
             try:
                 self._lifecycle.complete_step(run.id, step.id)
                 LOGGER.info("tick rescue: %s/%s exit_messages pre-existing → completed", run.workflow_name, step.id)
-                return
             except Exception as _e:
                 LOGGER.debug("tick rescue failed for %s/%s: %s", run.workflow_name, step.id, _e)
-
-        # exit_schema 校验（文件/内容约束）— 放在退出条件匹配之后，
-        # 避免 schema 在步骤完成之前就阻塞推进。
+            return  # P2-1 修复：complete 后不 fall-through 到 integrity/timeout（防重复 complete）
         # ── Timeout 检查（每次 tick 都执行，不受 schema/verify 影响）──
         # 超时后自动升级到 coordinator，不会被 schema 失败 return 阻断。
         # 超限阈值: max(max_retries+2, 3) 次超时后自动 cancel，防止无限重试堆积。
@@ -68,7 +83,8 @@ class StepHandlerMixin:
                 # 角色忙 ≠ 任务未完成：先做 exit 匹配，产出已存在则直接推进
                 # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
                 if cat:
-                    _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
+                    _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
+                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
                     if _busy_match_ts:
                         run.step_results[step.id] = {
                             **run.step_results.get(step.id, {}),
@@ -76,11 +92,14 @@ class StepHandlerMixin:
                             "exit_messages": _busy_match_msgs,
                         }
                         self._sync_step_results(run.id, run.step_results)
+                        # bypass 补发完整性提醒（busy exit-match 直接推进，跳过双节点审查）
+                        _integ_send_bypass(run, step, "busy",
+                                           send_to_role=self._send_to_role,
+                                           sync_step_results=self._sync_step_results)
                         try:
                             self._lifecycle.complete_step(run.id, step.id)
                         except Exception as _e:
                             LOGGER.debug("busy exit-match complete_step 失败: %s", _e)
-                        return
                 _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
                 # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
                 # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
@@ -102,14 +121,13 @@ class StepHandlerMixin:
                                 src="workflow_engine")
                         except Exception as _cancel_e:
                             LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
-                        return
                 run.step_results[step.id] = {
                     **run.step_results.get(step.id, {}),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
                     "queued": _queued,
                 }
                 self._sync_step_results(run.id, run.step_results)
-                return
+                return  # 排队路径不递增 timeout_count（防误回收）
 
             timeout_count = run.step_results.get(step.id, {}).get("timeout_count", 0) + 1
             run.step_results[step.id] = {
@@ -127,7 +145,6 @@ class StepHandlerMixin:
                 self._notify_role("maintainer",
                     f"工作流超时自动回收: {run.workflow_name}/{run.id}",
                     f"step={run.current_step} timeout_count={timeout_count} >= {_auto_cancel_at}\n请排查该步骤为何持续超时。")
-                return
             # 重推任务（最多重推 1 次，不自动完成）
             # 角色忙（有其他任务在跑）→ 不强制重推，通知 coordinator 排队
             if timeout_count == 1:
@@ -144,19 +161,51 @@ class StepHandlerMixin:
                         f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                     # 审计信号：记录轮次超时（供 monitor_audit 查看 SLA）
-                    self._bb.write("monitor_audit",
-                        f"决策: 轮次超时 → {run.workflow_name}/{run.current_step} "
-                        f"step={step.id} role={step.target_role} 超时 {timeout}s，已重推+升级",
-                        src="workflow_engine")
+                    # 写失败不阻断超时处理（审计是旁路，DB 锁/连接异常不应中断 tick）
+                    try:
+                        self._bb.write("monitor_audit",
+                            f"决策: 轮次超时 → {run.workflow_name}/{run.current_step} "
+                            f"step={step.id} role={step.target_role} 超时 {timeout}s，已重推+升级",
+                            src="workflow_engine")
+                    except Exception:
+                        LOGGER.debug("monitor_audit write failed for %s/%s", run.workflow_name, step.id)
+            # ── dual_node 超时抢救：node1_done 后角色完成审查但未推进，直接匹配 exit 推进 ──
+            elif step.dual_node and _sdata.get("node1_done") and not _sdata.get("node2_sent"):
+                # 超时但审查指令已发、角色可能已完成 → 检查 exit 匹配
+                _wide = re.sub(r"-complete$", "-", text_filter)
+                _match_ts2, _match_msgs2 = self._check_exit(cat, src_filter, _wide, created_after=last_ts,
+                    wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+                if _match_ts2:
+                    # 防御：__new__ 实例化（测试路径）可能无此属性，timeout 段先于初始化引用
+                    if not hasattr(self, "_consumed_exit_ids"):
+                        self._consumed_exit_ids = set()
+                    _match_msgs2 = [m for m in _match_msgs2 if m["id"] not in self._consumed_exit_ids]
+                    if _match_msgs2:
+                        _match_ts2 = _match_msgs2[0]["ts"]
+                        self._consumed_exit_ids.update(m["id"] for m in _match_msgs2)
+                        _sdata["exit_messages"] = _match_msgs2
+                        run.step_results[step.id] = _sdata
+                        self._sync_step_results(run.id, run.step_results)
+                        # bypass: dual_node 超时抢救补发完整性提醒
+                        _integ_send_bypass(run, step, "dual_node_timeout_rescue",
+                                           send_to_role=self._send_to_role,
+                                           sync_step_results=self._sync_step_results)
+                        try:
+                            self._lifecycle.complete_step(run.id, step.id)
+                        except Exception:
+                            pass
+                # 未匹配第二条 → 继续等，return
 
             # ── 宽松推进：角色已写同工作流 bus 消息但分类不匹配（如 evolution_report
             #    写成了 architecture）→ 产出存在即推进，避免"产出已存在却死锁"。
             #    触发条件：步骤已超时 >=1 次（角色确实执行过）且非首步。
             #    匹配策略：先找引擎发的 task_spec（含 wf 前缀）→ 再匹配该角色在
             #    task_spec 之后写的任意消息（标题可能不含 wf 前缀，按时间窗匹配）。
-            if timeout_count >= 1:
+            if timeout_count >= 1 and not step.dual_node:
                 try:
-                    _role_msgs = self._bb.read(limit=100)
+                    # 全量读：_has_anchor 需跨分类找 task_spec 锚点（cat 过滤会漏掉），
+                    # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
+                    _role_msgs = self._bb.read(limit=500)
                     _wf_id = run.id
                     _notified_ts = run.step_results.get(step.id, {}).get("notified_at", 0)
                     _relaxed = [
@@ -186,6 +235,10 @@ class StepHandlerMixin:
                             f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
                             f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
                             src="workflow_engine")
+                        # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
+                        _integ_send_bypass(run, step, "relaxed",
+                                           send_to_role=self._send_to_role,
+                                           sync_step_results=self._sync_step_results)
                         try:
                             self._lifecycle.complete_step(run.id, step.id)
                         except Exception as _e:
@@ -193,6 +246,90 @@ class StepHandlerMixin:
                         return
                 except Exception as _relax_err:
                     LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
+
+
+        # ── 完整性提醒阶段（在 timeout 之前，任何步骤完成时都触发）──
+        # 用户原话：「daemon需要重复提醒ccs（你真的解决用户的问题了吗？
+        #            你真的有严格按用户的提示去完成任务吗）」
+        # fire-and-forget：发提醒但不 return/不阻塞 exit 匹配（codex 审查：#5 阻塞风险）
+        # dual_node 未到 node2 时跳过（双节点机制自行管理审查，避免冲突）
+        if not hasattr(self, '_consumed_exit_ids'):
+            self._consumed_exit_ids = set()  # 完整性阶段也用，先于 exit 匹配初始化
+        # 防无限增长（P2 修复）：超过 1000 条时 LRU 淘汰保留最近 500 条，
+        # 避免全量清空导致跨实例消息去重失效（bus #162146 防护）
+        if len(self._consumed_exit_ids) > 1000:
+            self._consumed_exit_ids = set(list(self._consumed_exit_ids)[-500:])
+        _integ_state = _integ_load(run.step_results, step.id)
+        _integ_dual_pending = (getattr(step, 'dual_node', False)
+                               and not run.step_results.get(step.id, {}).get("node2_sent"))
+        if _integ_state.pending and not _integ_state.complete and not _integ_dual_pending:
+            if _integ_should_send(_integ_state):
+                _dim = _integ_next_dim(_integ_state)
+                if _dim:
+                    _goal = _integ_full_prompt(run, step, run.step_results)
+                    _output_summary = str(
+                        run.step_results.get(step.id, {}).get("exit_messages", [""])
+                    )[:200]
+                    _prompt_text = _integ_format(_dim, step_goal=_goal, output_summary=_output_summary)
+                    _bus_msg = (
+                        f"[{_dim['id']}/{len(_integ_dimensions)}] {run.workflow_name}/{step.id}\n"
+                        f"{_prompt_text}\n\n"
+                        f"请逐条回答上述完整性审查维度，完成后写 bus "
+                        f"cat={cat}，标题含 {step.id}-integrity-approved"
+                    )
+                    try:
+                        self._send_to_role(
+                            step.target_role,
+                            f"/goal\n## 完整性审查\n{_bus_msg}",
+                            wf_id=run.id, step_id=step.id, force=True
+                        )
+                        _integ_advance(run.step_results, step.id)
+                        self._sync_step_results(run.id, run.step_results)
+                        LOGGER.info("integrity: %s/%s sent %s/%d",
+                                   run.workflow_name, step.id, _dim['id'], len(_integ_dimensions))
+                    except Exception as _e:
+                        LOGGER.warning("integrity: send failed %s/%s: %s",
+                                     run.workflow_name, step.id, _e)
+                return  # pending阶段：dims 未发完，return 等下一 tick 继续发送
+
+        if _integ_state.complete and not _integ_dual_pending:
+            # 维度已发完，等待角色回复（{step_id}-integrity-approved）
+            _integ_filter = f"{step.id}-integrity-approved"
+            _integ_ts, _integ_msgs = self._check_exit(
+                cat, src_filter, _integ_filter, created_after=last_ts,
+                wf_id=run.id if ec.get("require_wf") else "", strict_wf=False
+            )
+            if _integ_ts:
+                _integ_msgs = [m for m in _integ_msgs if m["id"] not in self._consumed_exit_ids]
+                if _integ_msgs:
+                    self._consumed_exit_ids.update(m["id"] for m in _integ_msgs)
+                    _integ_reply(run.step_results, step.id)
+                    self._sync_step_results(run.id, run.step_results)
+                    LOGGER.info("integrity: %s/%s reply matched, proceeding",
+                               run.workflow_name, step.id)
+                    # codex P1 修复：直接 complete_step 而非 fall-through 到 exit 匹配。
+                    # fall-through 时 exit_messages 已被 _consumed_exit_ids 过滤，
+                    # 本轮不 complete → 下轮 tick rescue 又补发 bypass 造成重复提问。
+                    try:
+                        self._lifecycle.complete_step(run.id, step.id)
+                    except Exception as _e:
+                        LOGGER.debug("integrity reply complete_step 失败: %s", _e)
+                    return
+            else:
+                _integ_elapsed = time.time() - run.step_results.get(step.id, {}).get(
+                    "integrity_last_sent_at", time.time())
+                _integ_timeout = ec.get("timeout_minutes", 30) * 60
+                _fail_open = False
+                if _integ_elapsed >= _integ_timeout:
+                    if not _integ_retry(run.step_results, step.id):
+                        self._sync_step_results(run.id, run.step_results)
+                        LOGGER.error("integrity: %s/%s fail-open, bypassing",
+                                   run.workflow_name, step.id)
+                        _fail_open = True  # 不 return → 继续走 exit 匹配/超时（避免悬死）
+                    else:
+                        self._sync_step_results(run.id, run.step_results)
+                if not _fail_open:
+                    return  # 仍在等回复，return 等下一 tick 检查
 
             # 无 bus_category 的步骤不走 exit 匹配（纯超时 + 角色 wf complete 驱动），
             # 否则空 cat 匹配所有 bus 消息，导致 engine 自产告警被当作角色产出完成步骤。
@@ -203,7 +340,16 @@ class StepHandlerMixin:
             # 消息去重：同一消息不应被多个工作流同时消费（bus #162146 QA 4任务共享测试结果）
             if not hasattr(self, '_consumed_exit_ids'):
                 self._consumed_exit_ids = set()
-            _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
+            # dual_node：node2_sent 后将 filter 改为 s{N}-（匹配 s2-complete 和 s2-codex-approved）
+            _node2_sent = (run.step_results.get(step.id, {}) or {}).get("node2_sent", False)
+            if step.dual_node and _node2_sent:
+                # 宽匹配：第二节点消息（codex-approved）到达时也能匹配
+                _wide_filter = re.sub(r"-complete$", "-", text_filter)
+                _match_ts, _match_msgs = self._check_exit(cat, src_filter, _wide_filter, created_after=last_ts,
+                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+            else:
+                _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
+                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
             if _match_ts:
                 # 过滤已被其他工作流消费的消息
                 _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
@@ -211,24 +357,161 @@ class StepHandlerMixin:
             if _match_ts:
                 # 标记消息已消费，防止其他工作流重复匹配（bus #162146）
                 self._consumed_exit_ids.update(m["id"] for m in _match_msgs)
+                _old = run.step_results.get(step.id, {})
                 run.step_results[step.id] = {
-                    **run.step_results.get(step.id, {}),
+                    **_old,
                     "bus_anchor": _match_ts,
                     "exit_messages": _match_msgs,
+                    # 双节点状态必须持久化，不能被 exit 匹配覆盖
+                    "node1_done": _old.get("node1_done", False),
+                    "node1_at": _old.get("node1_at"),
+                    "node2_sent": _old.get("node2_sent", False),
                 }
                 self._sync_step_results(run.id, run.step_results)
-                try:
-                    self._lifecycle.complete_step(run.id, step.id)
-                except Exception as _e:
-                    LOGGER.debug("exit-match complete_step 失败: %s", _e)
-                return
-            return
 
-        # 无 bus_category 的步骤不走 exit 匹配（纯超时 + 角色 wf complete 驱动），
-        # 否则空 cat 匹配所有 bus 消息，导致 engine 自产告警被当作角色产出完成步骤。
+                # ── 双节点机制：第一节点消息到达 → 注入 codex CLI 审查指令 ──
+                # 用户需求：角色完成任务写 bus 后，引擎发 codex CLI 三方 20 维度审查，
+                # 连续两次零问题后角色再写第二条 bus，两条都到才算完成。
+                # dual_node 步骤走此路径；非 dual_node 走 integrity 20 维问答。
+                if getattr(step, 'dual_node', False):
+                    _sdata = run.step_results.get(step.id, {}) or {}
+                    if not _sdata.get("node2_sent"):
+                        _codex_prompt = (
+                            "/goal\n## codex CLI 三方审查\n"
+                            f"对 {run.workflow_name}/{step.id} 的产出执行 codex review --uncommitted：\n"
+                            "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
+                            "2. 若发现问题修复后重跑，直到连续两次零问题\n"
+                            "3. 通过后写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved\n"
+                            "## 完成\n"
+                            "写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved。"
+                        )
+                        run.step_results[step.id] = {
+                            **_sdata,
+                            "node1_done": True, "node1_at": time.time(),
+                            "node2_sent": True, "node2_sent_at": time.time(),
+                        }
+                        self._sync_step_results(run.id, run.step_results)
+                        LOGGER.info("双节点: %s/%s 第一节点完成，已发 codex 审查指令", run.workflow_name, step.id)
+                        self._send_to_role(step.target_role, _codex_prompt,
+                                           wf_id=run.id, step_id=step.id, force=True)
+                        return
+                    else:
+                        # 第二节点（codex-approved）消息到达 → 完成步骤
+                        # 用户要求"每个步骤"都提醒 → dual_node 完成路径也补发
+                        _integ_send_bypass(run, step, "dual_node_codex_approved",
+                                           send_to_role=self._send_to_role,
+                                           sync_step_results=self._sync_step_results)
+                        try:
+                            self._lifecycle.complete_step(run.id, step.id)
+                        except Exception as _e:
+                            LOGGER.debug("双节点 codex-approved complete_step 失败: %s", _e)
+                        return
+                else:
+                    # 非 dual_node → 激活 integrity（两个核心问题审查）
+                    # P0 修复：激活后 return，让下一 tick 走完整性阶段（发 dims）。
+                    # 若 fire-and-forget 直接 complete → integrity 孤儿化，用户核心需求失效。
+                    # interval 可配置：从 exit_condition.integrity_interval_sec 读取，默认 30s
+                    _integ_interval = ec.get("integrity_interval_sec", 30)
+                    _integ_activate(run.step_results, step.id, interval_sec=_integ_interval)
+                    return  # 完整性阶段接管：下 tick 发 dim01/dim02，等回复后推进
+
+            # bus 未匹配 → 检查 completion_check 文件判据（handoff/gate 通用）
+            # 防止角色完成产出文件但忘了写 bus 导致工作流永久卡死（2026-08-09 观测：
+            # scout 写了 SCOUT_REPORT.md 但未写 evolution_report bus → pm 步骤永远等不到）
+            _cc = getattr(step, 'completion_check', None) or ec.get('completion_check')
+            if _cc and _cc.get("file"):
+                _fp = pathlib.Path(_cc["file"]).expanduser()
+                _min = _cc.get("min_size", 0)
+                if _fp.exists() and _fp.stat().st_size >= _min:
+                    LOGGER.info("completion_check: %s 文件存在且 ≥%d 字节 → 推进 %s",
+                                _fp.name, _min, step.id)
+                    if step.dual_node:
+                        # dual_node：文件存在 = 第一节点完成，注入第二节点审查指令
+                        _sdata = run.step_results.get(step.id, {}) or {}
+                        if not _sdata.get("node1_done"):
+                            _sdata["node1_done"] = True
+                            _sdata["node1_at"] = time.time()
+                            _sdata["ts"] = time.time()
+                            # 发 codex CLI 审查指令（第二节点）+ 设 node2_sent 阻断 complete_step
+                            _codex_prompt = (
+                                "/goal\n## codex CLI 三方审查\n"
+                                f"对 {run.workflow_name}/{step.id} 的产出执行 codex review --uncommitted：\n"
+                                "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
+                                "2. 若发现问题修复后重跑，直到连续两次零问题\n"
+                                "3. 通过后写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved\n"
+                                "## 完成\n"
+                                "写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved。"
+                            )
+                            _sdata["node2_sent"] = True
+                            _sdata["node2_sent_at"] = time.time()
+                            run.step_results[step.id] = _sdata
+                            self._sync_step_results(run.id, run.step_results)
+                            try:
+                                self._send_to_role(step.target_role, _codex_prompt,
+                                                   wf_id=run.id, step_id=step.id, force=True)
+                                LOGGER.info("双节点: %s/%s 第一节点完成，codex 审查指令已发送", run.workflow_name, step.id)
+                            except Exception as _send_err:
+                                LOGGER.exception("双节点: %s/%s 审查指令发送失败: %s", run.workflow_name, step.id, _send_err)
+                            return
+                    # bypass 补发完整性提醒（不阻塞完成）：
+                    # completion_check 文件判据直接推进，跳过 dual_node 审查流程。
+                    _integ_send_bypass(run, step, "completion_check",
+                                       send_to_role=self._send_to_role,
+                                       sync_step_results=self._sync_step_results)
+                    try:
+                        self._lifecycle.complete_step(run.id, step.id)
+                    except Exception as _e:
+                        LOGGER.debug("completion_check complete_step 失败: %s", _e)
+                    return
+
+        # track 消费：步骤执行期间的轮次追踪（旧 --bus-track 收编）
+        # exit_condition 是一次性退出匹配，track 是步骤执行期间的持续轮询
+        if step.track:
+            track_cat = step.track.get("bus_category", "")
+            if track_cat and track_cat != cat:
+                # 与 exit_condition 不同的分类才单独追踪，避免重复
+                track_timeout = step.track.get("timeout_sec", 300)
+                notify_roles = step.track.get("notify_roles", [])
+                latest = self._bb.read(cat=track_cat, limit=1)
+                if latest:
+                    # 作者过滤（旧 tracker 语义）：若最新消息作者是 target_role 自己，
+                    # 说明角色没卡死（刚写过），不是死锁，跳过告警
+                    if latest[0].src == step.target_role:
+                        pass  # 自己写的消息，不报死锁
+                    else:
+                        # 超时基准：自步骤通知（notified_at）以来该分类无新消息才判超时
+                        _notified = run.step_results.get(step.id, {}).get("notified_at", 0)
+                        age = time.time() - max(latest[0].ts, _notified)
+                        if age >= track_timeout:
+                            # 节流：同一 tracking 周期只通知一次
+                            _sdata = run.step_results.get(step.id, {}) or {}
+                            _last = _sdata.get("track_notified_at", 0)
+                            if time.time() - _last >= track_timeout:
+                                _sdata["track_notified_at"] = time.time()
+                                run.step_results[step.id] = _sdata
+                                # 持久化：run 每 tick 从 DB 重建，不落库则 _last 恒为 0
+                                self._sync_step_results(run.id, run.step_results)
+                                try:
+                                    self._bb.write("monitor_audit",
+                                        f"决策: 轮次追踪超时 → {run.workflow_name}/{run.current_step} "
+                                        f"track={track_cat} 超时 {int(age)}s",
+                                        src="workflow_engine")
+                                except Exception:
+                                    LOGGER.debug("monitor_audit write failed for %s", run.workflow_name)
+                                try:
+                                    for nr in notify_roles:
+                                        # 存活检查（旧 tracker 交叉验证语义）：先确保通知
+                                        # 对象活着（死了由引擎拉起），再发提醒
+                                        self._ensure_role_alive(nr)
+                                        self._send_to_role(nr,
+                                            f"[deadlock] {track_cat} 超时 {int(age)}s，请继续",
+                                            wf_id=run.id, step_id=step.id, force=True)
+                                except Exception:
+                                    LOGGER.debug("track notify failed for %s", run.workflow_name)
         if not cat:
             return
-        _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts)
+        _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
+                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
             # 同时保存 exit_messages 作为角色产出证据（task_evidence 依赖此字段判定收益）
@@ -294,10 +577,10 @@ class StepHandlerMixin:
             except Exception as _idle_err:
                 LOGGER.debug("idle detection skipped: %s", _idle_err)
 
-            # ── 自动确认 handoff 步骤，推进到下一棒 ──
+            # ── 自动确认单步/通知步骤，推进到下一棒 ──
             # daemon 替代人工 approve，用 step 角色名作为密钥
-            # handoff 步骤需等人工审批，不自动确认
-            if step.type == "handoff":
+            # handoff/review 步骤需等人工审批，不自动确认
+            if step.type in ("handoff", "review", "subflow"):
                 return
             try:
                 _token = self._lifecycle.get_approval_token(run.id, step.id)
@@ -406,6 +689,18 @@ class StepHandlerMixin:
                     missing = [kw for kw in props["mustContain"] if kw not in content]
                     if missing:
                         errs.append(f"{mf.name} 缺少必需内容: {missing}")
+            if "mustNotContain" in props:
+                for mf in matched:
+                    content = mf.read_text(encoding="utf-8", errors="replace")
+                    forbidden = [kw for kw in props["mustNotContain"] if kw in content]
+                    if forbidden:
+                        errs.append(f"{mf.name} 含禁止内容（可能为历史遗留）: {forbidden}")
+            if "mustContainAnyOf" in props:
+                for mf in matched:
+                    content = mf.read_text(encoding="utf-8", errors="replace")
+                    hit = [kw for kw in props["mustContainAnyOf"] if kw in content]
+                    if not hit:
+                        errs.append(f"{mf.name} 缺少评估深度证据: 必须含其一 {props['mustContainAnyOf']}")
 
             if "mustContainUrl" in props and props["mustContainUrl"]:
                 for mf in matched:
@@ -470,8 +765,17 @@ class StepHandlerMixin:
             return False
         return sr.get("status") == expected
 
-    def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None) -> tuple:
-        """检查 bus 是否有匹配 exit_condition 的消息。返回 (timestamp, matched_msgs)"""
+    def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
+                    wf_id: str = "", strict_wf: bool = False) -> tuple:
+        """查 exit 是否有匹配消息。返回 (timestamp, matched_msgs)。
+
+        wf_id 非空时过滤"消息必须含当前工作流实例 id"——防止新工作流
+        匹配旧工作流的同分类消息（2026-08-09 观测：wf_4c51d890c082/s2
+        匹配到 wf_6e338fd3 的 s2-complete，跨实例串消息）。
+        strict_wf=True（require_wf=true 时）：消息必须含当前 wf_id，否则不匹配。
+        防止旧工作流的同分类消息（不带 wf_id）串入 require_wf 步骤
+        （2026-08-10 观测：wf_7f37 s1 匹配到 wf_cde32 的 s1-complete）。
+        """
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         earliest = 0.0
         matched = []
@@ -482,6 +786,15 @@ class StepHandlerMixin:
             if text_filter and text_filter not in f.t:
                 continue
             if created_after and f.ts < created_after:
+                continue
+            # wf 归属校验：消息含别的 wf_id → 串消息 → 过滤；
+            # 消息不含 wf_id 时，若 strict_wf（require_wf=true）→ 不匹配，
+            # 否则时间窗口已保证属于当前实例，放行。
+            # 角色写消息通常不带 wf_id（2026-08-10 观测：scout/pm 的完成消息无 wf 前缀），
+            # 但 require_wf=true 是引擎硬校验，必须严格：无 wf_id 的消息不能匹配，
+            # 否则旧工作流的同分类消息会串入新工作流（观测 wf_7f37 匹配到 wf_cde32 的
+            # s1-complete，跨工作流误推进，2026-08-10）。
+            if wf_id and f.t and 'wf_' in f.t and wf_id not in f.t and wf_id.replace('wf_','') not in f.t:
                 continue
             matched.append({"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src})
             if earliest == 0 or f.ts < earliest:

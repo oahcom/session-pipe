@@ -79,12 +79,14 @@ class _WorkflowStub:
 class TestPaneFallbackBusy(_MockTestCase):
     """survival L2 失效时 pane_fallback 兜底。"""
 
-    def test_idle_health_pane_alive_is_busy(self):
+    def test_idle_health_pane_alive_is_free(self):
+        """idle 时 pane 存活不算 busy（tmux 3.4 pane_active 恒 1，pane_alive 兜底
+        不可靠，会导致空闲角色被永久卡住无法接收任务——修复后行为）。"""
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "idle"}))
         eng._tmux_pane_alive.return_value = True
-        self.assertTrue(eng._is_role_busy("qa"))
+        self.assertFalse(eng._is_role_busy("qa"))
 
     def test_idle_health_no_pane_is_free(self):
         eng = _eng()
@@ -92,6 +94,22 @@ class TestPaneFallbackBusy(_MockTestCase):
             {"survival_overall": "idle"}))
         eng._tmux_pane_alive.return_value = False
         self.assertFalse(eng._is_role_busy("qa"))
+
+    def test_idle_health_db_has_active_step_is_busy(self):
+        """idle 不短路 → 继续 DB 检查，DB 有该角色活跃步骤 → busy。
+
+        2026-08-09 根因：pm 收到 4 条 task_spec（idle 短路导致并发任务抢占）。"""
+        eng = _eng()
+        (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
+            {"survival_overall": "idle"}))
+        eng._tmux_pane_alive.return_value = False
+        eng._lifecycle.query.return_value = [
+            {"instance_id": "wf_other", "template_id": "tpl",
+             "current_step_id": "s1",
+             "step_results": json.dumps({"s1": {"status": "notified"}})}
+        ]
+        eng._workflows = {"tpl": _WorkflowStub()}
+        self.assertTrue(eng._is_role_busy("qa"), "idle+DB活跃步骤应判定忙，防并发抢占")
 
     def test_l2_false_pane_alive_is_busy(self):
         eng = _eng()

@@ -305,6 +305,29 @@ def _validate_step(step: dict, index: int, report: ValidationReport):
         if step["type"] not in valid_types:
             report.add_error(f"steps[{index}].type 无效: {step['type']}，需为 {valid_types}")
 
+    # guard 结构校验（协作能力声明）
+    if "guard" in step:
+        g = step["guard"]
+        if not isinstance(g, dict):
+            report.add_error(f"steps[{index}].guard 必须是对象")
+        elif not isinstance(g.get("watch", []), list) or not all(isinstance(r, str) for r in g.get("watch", [])):
+            report.add_error(f"steps[{index}].guard.watch 必须是字符串数组")
+
+    # track 结构校验（轮次追踪声明）
+    if "track" in step:
+        t = step["track"]
+        if not isinstance(t, dict):
+            report.add_error(f"steps[{index}].track 必须是对象")
+        else:
+            if not isinstance(t.get("bus_category", ""), str) or not t.get("bus_category"):
+                report.add_error(f"steps[{index}].track.bus_category 必须是非空字符串")
+            if not isinstance(t.get("notify_roles", []), list) \
+                    or not all(isinstance(r, str) for r in t.get("notify_roles", [])):
+                report.add_error(f"steps[{index}].track.notify_roles 必须是字符串数组")
+            _ts = t.get("timeout_sec", 300)
+            if not isinstance(_ts, (int, float)) or _ts <= 0:
+                report.add_error(f"steps[{index}].track.timeout_sec 必须是正数（当前: {_ts}）")
+
     if "prompt_template" in step:
         pt = step["prompt_template"]
         if isinstance(pt, str):

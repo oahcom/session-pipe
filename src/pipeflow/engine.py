@@ -9,6 +9,7 @@ Workflow Engine --- 数据驱动的对话工作流执行引擎。
 
 import json
 import re
+import sys
 import time
 import uuid
 import logging
@@ -59,7 +60,15 @@ class Step:
     verify: str = ""
     failure_patterns: list[str] = None
     subflow_template: str = ""  # 该步骤对应的子工作流模板名
+    # 协作能力声明（旧 ccs.py --partner/--bus-track 收编）
+    # guard: 额外守护的角色（target_role 已由引擎自动守护，watch 定义 target_role 之外的）
+    #   {"watch": ["role_a"], "auto_restart": true}
+    # track: 步骤执行期间的轮次追踪（与 exit_condition 一次性退出不同，这是持续轮询）
+    #   {"bus_category": "cat", "timeout_sec": 300, "notify_roles": ["role_c"]}
+    dual_node: bool = False  # 双节点完成机制：第一节点写 bus 后引擎注入 codex 审查，第二条 bus 才推进
     exit_schema: dict = None  # 退出校验 schema（文件校验/内容校验/自定义校验）
+    guard: dict = None  # CCS 守护声明
+    track: dict = None  # 轮次追踪声明
 
 
 @dataclass
@@ -124,6 +133,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self._bb = Blackboard()
         self._workflows: dict[str, WorkflowDef] = {}
         self._lm = None
+        self._consumed_exit_ids: set[int] = set()
         self._load_workflows()
 
     @property
@@ -137,12 +147,73 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
     def _load_workflows(self):
         if not self.workflows_dir.exists():
             return
+        # 角色 collab 缓存（persona 声明，模板未显式声明时注入）
+        # 直接读 JSON 避免跨项目 import（pipeline 不依赖 launcher 的 routing）
+        # 按目录 mtime 缓存：persona 变更频率远低于模板，避免每 tick 重读 29 个 JSON
+        _role_collab: dict[str, dict] = {}
+        _roles_dir = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+        if _roles_dir.exists():
+            _dir_mtime = _roles_dir.stat().st_mtime
+            if (getattr(self, "_collab_mtime", None) != _dir_mtime
+                    or not getattr(self, "_role_collab_cache", None)):
+                self._collab_mtime = _dir_mtime
+                self._collab_reload: dict[str, dict] = {}
+                for _pf in _roles_dir.glob("persona_*.json"):
+                    try:
+                        _pd = json.loads(_pf.read_text())
+                        _name = _pd.get("name", "")
+                        _collab = _pd.get("collab")
+                        if _name and _collab:
+                            self._collab_reload[_name] = _collab
+                    except Exception:
+                        LOGGER.debug("persona 读取失败: %s", _pf.name)
+                self._role_collab_cache = dict(self._collab_reload)  # 浅拷贝防引用变异
+            _role_collab = self._role_collab_cache
         for f in sorted(self.workflows_dir.glob("*.json")):
             if f.parent == self.runs_dir:
                 continue
             try:
                 data = json.loads(f.read_text())
-                steps = [Step(**{k: v for k, v in s.items() if k in Step.__dataclass_fields__}) for s in data.get("steps", [])]
+                steps = []
+                for _s in data.get("steps", []):
+                    _clean = {k: v for k, v in _s.items() if k in Step.__dataclass_fields__}
+                    # persona collab 注入：模板未显式声明 guard/track 时，
+                    # 用 target_role persona 的 collab 字段（声明一次全模板生效）
+                    _tr = _clean.get("target_role", "")
+                    if _tr and (not _clean.get("guard") or not _clean.get("track")):
+                        _rc = _role_collab.get(_tr) or {}
+                        if not _clean.get("guard") and _rc.get("guard"):
+                            _g = _rc["guard"]
+                            # 结构校验：watch 必须是字符串数组，否则遍历字符会拉起不存在的角色
+                            if isinstance(_g, dict) and isinstance(_g.get("watch"), list) \
+                                    and all(isinstance(r, str) for r in _g.get("watch", [])):
+                                _clean["guard"] = _g
+                            else:
+                                LOGGER.warning("collab guard 结构非法，跳过注入: %s", _tr)
+                        if not _clean.get("track") and _rc.get("track"):
+                            _t = _rc["track"]
+                            if isinstance(_t, dict) and isinstance(_t.get("bus_category"), str) \
+                                    and _t.get("bus_category"):
+                                _clean["track"] = _t
+                            else:
+                                LOGGER.warning("collab track 结构非法，跳过注入: %s", _tr)
+                    # 统一结构校验（覆盖模板显式声明 + persona 注入两来源）：
+                    # 非法 watch/notify_roles 会在消费点逐字符遍历 → 拉起不存在角色
+                    _g2 = _clean.get("guard")
+                    if isinstance(_g2, dict) and (not isinstance(_g2.get("watch"), list)
+                                                  or not all(isinstance(r, str) for r in _g2.get("watch", []))):
+                        LOGGER.warning("guard 结构非法，丢弃: %s/%s", f.name, _tr)
+                        _clean["guard"] = None
+                    _t2 = _clean.get("track")
+                    if isinstance(_t2, dict):
+                        if not isinstance(_t2.get("bus_category"), str) or not _t2.get("bus_category"):
+                            LOGGER.warning("track 结构非法，丢弃: %s/%s", f.name, _tr)
+                            _clean["track"] = None
+                        elif not isinstance(_t2.get("notify_roles", []), list) \
+                                or not all(isinstance(r, str) for r in _t2.get("notify_roles", [])):
+                            LOGGER.warning("track.notify_roles 非法，丢弃: %s/%s", f.name, _tr)
+                            _clean["track"] = None
+                    steps.append(Step(**_clean))
                 # 模板质量自动校验
                 try:
                     from template_registry import _validate_meta as _vmeta
@@ -264,7 +335,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                  "prompt_template": s.prompt_template,
                  "max_retries": s.max_retries,
                  "verify": s.verify,
-                 "subflow_template": s.subflow_template}
+                 "subflow_template": s.subflow_template,
+                 "dual_node": s.dual_node,
+                 "exit_condition": s.exit_condition,
+                 "exit_schema": s.exit_schema,
+                 "guard": s.guard,
+                 "track": s.track}
                 for s in wf.steps
             ]
             self._lifecycle.upsert_template(
@@ -338,26 +414,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         except Exception as e:
             LOGGER.debug("stale cleanup in run_once failed: %s", e)
 
-        # 确保工作流涉及的角色存活
-        # 注意：assignee 可能是 coordinator 创建任务时的派发角色（首步目标角色），
-        # 后续步骤的 target_role 才是真正的执行者。只检查 assignee 会漏拉起
-        # 后续步骤角色，因此同时检查当前步骤的 target_role。
-        _alive_roles = set()
-        for _wf_row in self._lifecycle.query("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"):
-            _alive_roles.add(_wf_row["assignee"])
-        for _wf_row in self._lifecycle.query(
-            "SELECT instance_id, template_id, current_step_id FROM workflow_instances WHERE status IN ('running','pending')"
-        ):
-            _wf = self._workflows.get(_wf_row["template_id"])
-            if not _wf:
-                continue
-            _step = next((s for s in _wf.steps if s.id == _wf_row["current_step_id"]), None)
-            if _step:
-                _alive_roles.add(_step.target_role)
-        for _role in _alive_roles:
-            self._ensure_role_alive(_role)
-
-        # JSON 工作流路径已删除
+        # 确保工作流涉及的角色存活（assignee + target_role + guard.watch）
+        self._ensure_guard_roles()
         # SQLite production 工作流 — 复用 _lifecycle 连接避免泄漏
         lm = self._lifecycle
         try:
@@ -439,8 +497,13 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     tasks_file.write_text(f"# 当前任务\n\n## 标题\n{task_title}\n\n## 描述\n{task_desc or task_title}\n\n## 工作流\n{wf_name} — 步骤 {step.id}: {step.title}\n", encoding="utf-8")
                     prompt = prompt.replace("{workspace_summary}", self._collect_workspace_summary(Path.home() / "ccs-workspaces" / step.target_role) if hasattr(self,'_collect_workspace_summary') else "")
                     self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
-                    # 标记已通知
-                    results[step_id] = {"status": "notified", "ts": time.time(), "notified_at": time.time()}
+                    # 标记已通知（若已有旧状态如 node1_done，必须合并保留——2026-08-10 观测：
+                    # 状态机对 status 缺失时重建覆盖，丢失 exit_messages/node1_done）
+                    _existing_sr = results.get(step_id, {}) or {}
+                    results[step_id] = {
+                        **{k: v for k, v in _existing_sr.items() if k != 'status'},
+                        "status": "notified", "ts": time.time(), "notified_at": time.time()
+                    }
                     lm.execute(
                         "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                         (json.dumps(results, ensure_ascii=False), inst["instance_id"])
@@ -450,6 +513,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 步骤已完成 → 自动推进到下一步
                 # step_done_ready/completed 由角色或外部系统标记，无需额外的 completion_check
                 if step_status in ("step_done_ready", "completed"):
+                    # 用户要求"每个步骤"都提醒 → step_done_ready 路径也补发完整性提醒
+                    try:
+                        from pipeflow.integrity import send_bypass_reminder as _sbr
+                        _sbr_run = type("R", (), {"id": inst["instance_id"], "step_results": results})()
+                        _sbr_step = type("S", (), {
+                            "id": step_id,
+                            "target_role": step.target_role,
+                            "prompt_template": step.prompt_template,
+                        })()
+                        _sbr(_sbr_run, _sbr_step, "step_done_ready",
+                             send_to_role=self._send_to_role,
+                             sync_step_results=lambda *a: None)
+                    except Exception:
+                        LOGGER.debug("step_done_ready integrity send failed for %s", inst["instance_id"])
                     self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
                     # 推进后立即把行 status 改为 running（推进到非最后一步时），
                     # 避免角色重复 wf complete 把行 status 打回 step_done_ready
@@ -514,6 +591,35 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             self._check_context_overflow()
         except Exception:
             LOGGER.debug("context overflow check failed")
+
+    def _collect_guard_roles(self) -> set[str]:
+        """收集所有活跃工作流步骤需要守护的角色（guard.watch + target_role + assignee）。"""
+        _alive_roles: set[str] = set()
+        try:
+            for _wf_row in self._lifecycle.query("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"):
+                if _wf_row["assignee"]:
+                    _alive_roles.add(_wf_row["assignee"])
+            for _wf_row in self._lifecycle.query("SELECT instance_id, template_id, current_step_id FROM workflow_instances WHERE status IN ('running','pending')"):
+                _wf = self._workflows.get(_wf_row["template_id"])
+                if not _wf:
+                    continue
+                _step = next((s for s in _wf.steps if s.id == _wf_row["current_step_id"]), None)
+                if _step:
+                    _alive_roles.add(_step.target_role)
+                    if _step.guard:
+                        for _g_role in _step.guard.get("watch", []):
+                            if _step.guard.get("auto_restart", True):
+                                _alive_roles.add(_g_role)
+        except Exception as e:
+            LOGGER.debug("guard 收集异常（非致命，返回已收集的角色）: %s", e)
+        return _alive_roles
+
+    def _ensure_guard_roles(self) -> set[str]:
+        """收集并拉起所有活跃工作流的守护角色。"""
+        _alive_roles = self._collect_guard_roles()
+        for _role in _alive_roles:
+            self._ensure_role_alive(_role)
+        return _alive_roles
 
 
 def main():

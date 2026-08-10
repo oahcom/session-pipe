@@ -264,6 +264,28 @@ class LifecycleManager:
                 step_type = step.get("type", "single")
                 task_id = wf.get("task_id")
 
+                # ── 双节点完成机制（2026-08-09 需求）──
+                # 步骤声明 dual_node: true 时，第一步完成（bus 到）只标记 node1_done，
+                # 引擎注入 codex 审查指令后，第二条消息到才真正完成。
+                # 角色不知双节点——第二步由引擎在 _tick 中注入。
+                if step.get("dual_node"):
+                    _n1 = results.get(step_id, {}).get("node1_done", False)
+                    if not _n1:
+                        # 第一节点到达：标记 node1_done，删除 status 字段防止
+                        # 残留 step_done_ready 驱动 _advance 推进（2026-08-09 根因）
+                        _sr = results.setdefault(step_id, {})
+                        _sr["node1_done"] = True
+                        _sr["node1_at"] = time.time()
+                        # 保持 status=notified（不 pop）——status 缺失会让引擎下次 tick
+                        # 重建覆盖双节点状态（2026-08-10 根因：status pop 后 node1_done 丢失）
+                        _sr["status"] = "notified"
+                        self._conn.execute(
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(results, ensure_ascii=False), wf_id))
+                        self._conn.commit()
+                        return "node1_done"
+                    # 第二节点已到 → 走正常完成
+
                 handler = {
                     "single": self._complete_single_unsafe,
                     "handoff": self._complete_handoff_unsafe,
@@ -300,8 +322,15 @@ class LifecycleManager:
             for i, s in enumerate(steps):
                 if s.get("step_id") == step_id:
                     if i == 0:
-                        return wf.get("assigner", "")
-                    return steps[i - 1].get("target_role", "")
+                        assigner = wf.get("assigner", "")
+                        # 系统角色（workflow_engine）不是真人，无法审批 → 跳过 approval
+                        if assigner in ("workflow_engine", "system", ""):
+                            return ""
+                        return assigner
+                    prev = steps[i - 1].get("target_role", "")
+                    if prev in ("workflow_engine", "system"):
+                        return ""
+                    return prev
         return ""
 
     def get_approval_token(self, wf_id: str, step_id: str) -> Optional[str]:
@@ -701,7 +730,7 @@ class LifecycleManager:
                 # 降级兜底：ccs send 失败时写 bus，确保审批请求不丢失
                 # （WL-P2-03：ccs send 失败 → 自动降级为 bus 消息写入）
                 try:
-                    from workflow.client import _get_ccs_cli  # noqa: F401 复用路径解析
+                    from workflow.client import get_ccs_cli  # noqa: F401 复用路径解析
                     self._bb_write_fallback(wf_id, step_id, token, approval_prompt, assigner)
                 except Exception as _fb_err:
                     logger.warning("bus fallback failed: %s", _fb_err)
@@ -1022,6 +1051,7 @@ class LifecycleManager:
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY, title TEXT, description TEXT,
                     assigner TEXT, assignee TEXT, priority INTEGER DEFAULT 0, status TEXT,
+                    template_id TEXT,
                     current_workflow_id TEXT,
                     progress TEXT DEFAULT '{}',
                     created_at REAL, updated_at REAL, completed_at REAL,
@@ -1043,6 +1073,7 @@ class LifecycleManager:
             ("workflow_instances", "parent_wf_id", "TEXT"),
             ("workflow_instances", "subflow_source_step_id", "TEXT"),
             ("tasks", "parent_task_id", "TEXT"),
+            ("tasks", "template_id", "TEXT"),
         ]:
             existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in existing:

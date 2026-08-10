@@ -84,6 +84,28 @@ class WorkflowLifecycleMixin:
                         _cur = d.get("current_step_id", "")
                         _sdata = sr.get(_cur, {}) if isinstance(sr, dict) else {}
                         if isinstance(_sdata, dict) and _sdata.get("exit_messages"):
+                            # 用户要求"每个步骤"都提醒 → stale rescue 也补发完整性提醒
+                            try:
+                                _step_tpl = None
+                                for _s in (d.get("steps") or []):
+                                    if _s.get("id") == _cur:
+                                        _step_tpl = _s
+                                        break
+                                if _step_tpl:
+                                    from pipeflow.integrity import send_bypass_reminder as _sbr
+                                    _sbr_run = type("R", (), {
+                                        "id": wf_id, "step_results": sr,
+                                    })()
+                                    _sbr_step = type("S", (), {
+                                        "id": _cur,
+                                        "target_role": _step_tpl.get("target_role", ""),
+                                        "prompt_template": _step_tpl.get("prompt_template", ""),
+                                    })()
+                                    _sbr(_sbr_run, _sbr_step, "stale_rescue",
+                                         send_to_role=self._send_to_role,
+                                         sync_step_results=lambda *a: None)
+                            except Exception:
+                                LOGGER.debug("stale rescue integrity send failed for %s", wf_id)
                             self._lifecycle.complete_step(wf_id, _cur)
                             LOGGER.info("stale rescue: %s step %s exit_messages 已就绪 → 已闭合",
                                         wf_id, _cur)
@@ -289,6 +311,13 @@ class WorkflowLifecycleMixin:
                         _wf_id = f"wf_sub_{uuid.uuid4().hex[:12]}"
                         conn2.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
                             (_task_id, f"{wf_name}/{next_step.id}: {next_step.title}", task_desc, _prev_done, next_step.target_role, time.time(), time.time(), next_step.subflow_template))
+                        # 兼容迁移前的表（template_id 列可能缺失）——子工作流 tasks 行的 template_id
+                        # 只做溯源用途，缺列时静默降级为 parent_task_id 记录父工作流（2026-08-10 观测）
+                        try:
+                            conn2.execute("SELECT template_id FROM tasks LIMIT 1")
+                        except Exception:
+                            conn2.execute("UPDATE tasks SET parent_task_id=? WHERE task_id=?", (wf_id, _task_id))
+                            conn2.commit()
                         conn2.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at) VALUES (?,?,?,?,?,'pending','s1',?,?)",
                             (_wf_id, next_step.subflow_template, _task_id, _prev_done, next_step.target_role, json.dumps({}), time.time()))
                         conn2.commit()
