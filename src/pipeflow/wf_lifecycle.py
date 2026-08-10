@@ -101,9 +101,19 @@ class WorkflowLifecycleMixin:
                                         "target_role": _step_tpl.get("target_role", ""),
                                         "prompt_template": _step_tpl.get("prompt_template", ""),
                                     })()
+                                    def _persist_sr(*args):
+                                        # 真落库：bypass flag 写入 DB（否则 daemon 重启后重复提醒）
+                                        try:
+                                            _sr_merged = sr  # 已在 send_bypass_reminder 内 setdefault 更新
+                                            lm.execute(
+                                                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                                (json.dumps(_sr_merged, ensure_ascii=False), wf_id)
+                                            )
+                                        except Exception:
+                                            LOGGER.debug("stale rescue persist sr failed for %s", wf_id)
                                     _sbr(_sbr_run, _sbr_step, "stale_rescue",
                                          send_to_role=self._send_to_role,
-                                         sync_step_results=lambda *a: None)
+                                         sync_step_results=_persist_sr)
                             except Exception:
                                 LOGGER.debug("stale rescue integrity send failed for %s", wf_id)
                             self._lifecycle.complete_step(wf_id, _cur)

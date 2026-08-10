@@ -168,7 +168,7 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     # 两个核心问题（与 DIMENSIONS 前两条一致）；分母动态 = 问题数，不硬编码 2
     _questions = [
         f"步骤 {step.id} 即将完成（{path}），请回答：\n你真的解决了用户的问题吗？（简答）\n需求：{goal_text[:300]}",
-        "你真的有严格按用户的提示去完成任务吗？（简答）",
+        f"你真的有严格按用户的提示去完成任务吗？（简答）\n用户指令：{goal_text[:300]}",
     ]
     for i, q in enumerate(_questions, 1):
         try:

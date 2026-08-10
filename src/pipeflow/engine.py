@@ -522,9 +522,18 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             "target_role": step.target_role,
                             "prompt_template": step.prompt_template,
                         })()
+                        def _persist_step_done(*args):
+                            # bypass flag 真落库（daemon 重启后不重复提醒）
+                            try:
+                                lm.execute(
+                                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                    (json.dumps(results, ensure_ascii=False), inst["instance_id"])
+                                )
+                            except Exception:
+                                LOGGER.debug("step_done_ready persist sr failed for %s", inst["instance_id"])
                         _sbr(_sbr_run, _sbr_step, "step_done_ready",
                              send_to_role=self._send_to_role,
-                             sync_step_results=lambda *a: None)
+                             sync_step_results=_persist_step_done)
                     except Exception:
                         LOGGER.debug("step_done_ready integrity send failed for %s", inst["instance_id"])
                     self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)

@@ -147,7 +147,10 @@ class StepHandlerMixin:
                     f"step={run.current_step} timeout_count={timeout_count} >= {_auto_cancel_at}\n请排查该步骤为何持续超时。")
             # 重推任务（最多重推 1 次，不自动完成）
             # 角色忙（有其他任务在跑）→ 不强制重推，通知 coordinator 排队
-            if timeout_count == 1:
+            # 架构 P1-2：完整性阶段进行中时跳过重推（避免 /goal 覆盖完整性提醒）
+            # 注意：此处在完整性阶段的 if not cat: return 之后，_integ_state 需重新读取
+            _integ_retry_guard = _integ_load(run.step_results, step.id)
+            if timeout_count == 1 and not _integ_retry_guard.pending and not _integ_retry_guard.complete:
                 if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
                     # 角色在忙，延长超时窗口：通知 coordinator 而非重推
                     self._send_to_role("coordinator",
@@ -420,9 +423,16 @@ class StepHandlerMixin:
             # scout 写了 SCOUT_REPORT.md 但未写 evolution_report bus → pm 步骤永远等不到）
             _cc = getattr(step, 'completion_check', None) or ec.get('completion_check')
             if _cc and _cc.get("file"):
-                _fp = pathlib.Path(_cc["file"]).expanduser()
+                # 支持 glob（与 exit_schema 一致，工程 P1-6）：含 * 时用 glob 匹配，否则 exists()
+                _cc_file = _cc["file"]
                 _min = _cc.get("min_size", 0)
-                if _fp.exists() and _fp.stat().st_size >= _min:
+                _fp = pathlib.Path(_cc_file).expanduser()
+                if "*" in _cc_file:
+                    _matches = sorted(_fp.parent.glob(_fp.name))
+                    _fp_ok = bool(_matches) and _matches[0].stat().st_size >= _min
+                else:
+                    _fp_ok = _fp.exists() and _fp.stat().st_size >= _min
+                if _fp_ok:
                     LOGGER.info("completion_check: %s 文件存在且 ≥%d 字节 → 推进 %s",
                                 _fp.name, _min, step.id)
                     if step.dual_node:
