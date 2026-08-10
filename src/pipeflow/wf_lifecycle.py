@@ -187,10 +187,14 @@ class WorkflowLifecycleMixin:
                             continue
                         _sf = _sdata.get("subflow_id", "")
                         if _sf:
-                            _st = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
+                            _st = conn.execute("SELECT status, created_at FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
                             if not _st or _st['status'] not in ('completed', 'step_done_ready'):
-                                _all_subs_done = False
-                                break
+                                # 子链未完成：已超宽限期（5 分钟）→ 强制完成主链，不无限等待
+                                # （2026-08-10 观测：lr 子链未跑完导致主链 s7 永远卡在收尾）
+                                _sub_created = _st['created_at'] if _st else 0
+                                if _st and time.time() - _sub_created < 300:
+                                    _all_subs_done = False
+                                    break
                     if not _all_subs_done:
                         return
                     LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
