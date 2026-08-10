@@ -134,10 +134,6 @@ class RoleLifecycleMixin:
                 _notified_at = _sr.get("notified_at", 0)
                 if not _notified_at or now - _notified_at < 180:
                     continue
-                # 停滞超过 10 分钟 + 无 timeout_count → 重推
-                _tc = _sr.get("timeout_count", 0)
-                if _tc > 0:
-                    continue  # tick 已经在处理
                 _wf = self._workflows.get(row["template_id"])
                 if not _wf:
                     continue
@@ -148,6 +144,14 @@ class RoleLifecycleMixin:
                 _role = _step.target_role
                 if not _role or _role in ("coordinator",):
                     continue
+                # 角色 pane 存活 → 角色正在干活，不打扰（2026-08-10 观测：
+                # scout Orchestrating 中，kick-stalled 201s 即重推，浪费 token）
+                if self._tmux_pane_alive(_role):
+                    continue
+                # 停滞超过 3 分钟 + pane 不存活 + 无 timeout_count → 重推
+                _tc = _sr.get("timeout_count", 0)
+                if _tc > 0:
+                    continue  # tick 已经在处理
                 # 角色已有挂起的任务 → 不打扰
                 # 排除自己：检验中就是当前停滞步骤，若不排除会把自身判 busy，
                 # 导致停滞步骤永不重推（2026-08-10 观测 wf_cde32/s1 skip 30 分钟）
