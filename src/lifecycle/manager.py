@@ -870,6 +870,19 @@ class LifecycleManager:
             "UPDATE workflow_instances SET current_step_id=? WHERE instance_id=?",
             (next_step["step_id"], wf_id)
         )
+        # advance 时把旧步骤 status 改为 completed，防止 DB 扫描时
+        # 旧步骤的 notified 状态误判角色 busy（2026-08-10 观测：
+        # s1 推进到 s2 后，_is_role_busy 扫到 s1 的 notified → pm 误判 busy）
+        try:
+            _sr = self._parse_results(wf)
+            _old_sid = current
+            if _old_sid and _sr.get(_old_sid, {}).get("status") != "completed":
+                _sr[_old_sid]["status"] = "completed"
+                self._conn.execute(
+                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                    (json.dumps(_sr, ensure_ascii=False), wf_id))
+        except Exception:
+            pass  # 非关键：旧步骤 status 残留仅影响 busy 判断，不影响推进
         # ── advance 时同步拉起下一棒角色，不等 daemon tick 轮询 ──
         _next_role = next_step.get("target_role", "")
         if _next_role and _next_role != wf.get("assignee", "") and self._on_advance:
