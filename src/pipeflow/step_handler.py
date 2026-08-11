@@ -108,17 +108,53 @@ class StepHandlerMixin:
                 except Exception as _e:
                     LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
                 return  # 产出已确认，跳过 timeout/催办
+        # ── tmux 信号节流与升级 ──
+        # 计数存于 step_results["tmux_signals"]（跨 tick 持久化），
+        # 防高频骚扰：闲置提醒 ≥3 次/越界 ≥1 次后各自冷却 5 分钟；
+        # 升级：闲置/越界累计 ≥5 次 → cancel 步骤（角色不响应，继续等待无意义）。
+        _sig_state = (run.step_results.get(step.id, {}) or {}).get("tmux_signals") or {}
+        _now = time.time()
         if sig and sig.idle_complaint:
-            try:
-                _remind_tmux_idle(run, step, sig.idle_evidence, send_to_role=self._send_to_role)
-            except Exception as _e:
-                LOGGER.debug("tmux 空闲提醒失败: %s", _e)
+            _idle_n = _sig_state.get("idle_count", 0) + 1
+            _idle_cool = _sig_state.get("idle_cool_until", 0)
+            if _idle_n >= 5:
+                try:
+                    self._lifecycle.cancel_step(run.id, step.id)
+                    LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次空闲", run.workflow_name, step.id, _idle_n)
+                except Exception as _e:
+                    LOGGER.debug("tmux 空闲 cancel_step 失败: %s", _e)
+                _sig_state["idle_count"] = _idle_n
+            elif _now >= _idle_cool or _idle_n == 1:
+                try:
+                    _remind_tmux_idle(run, step, sig.idle_evidence, send_to_role=self._send_to_role)
+                except Exception as _e:
+                    LOGGER.debug("tmux 空闲提醒失败: %s", _e)
+                _sig_state["idle_cool_until"] = _now + 300  # 5 分钟冷却
+            _sig_state["idle_count"] = _idle_n
         if sig and sig.violation_found:
+            _viol_n = _sig_state.get("violation_count", 0) + 1
+            if _viol_n >= 5:
+                try:
+                    self._lifecycle.cancel_step(run.id, step.id)
+                    LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次越界", run.workflow_name, step.id, _viol_n)
+                except Exception as _e:
+                    LOGGER.debug("tmux 越界 cancel_step 失败: %s", _e)
+            else:
+                try:
+                    _stop_tmux_violation(run, step, sig.violation_commands, sig.violation_role,
+                                         send_to_role=self._send_to_role)
+                except Exception as _e:
+                    LOGGER.debug("tmux 越界停止指令失败: %s", _e)
+            _sig_state["violation_count"] = _viol_n
+        if _sig_state:
+            run.step_results[step.id] = {
+                **run.step_results.get(step.id, {}),
+                "tmux_signals": _sig_state,
+            }
             try:
-                _stop_tmux_violation(run, step, sig.violation_commands, sig.violation_role,
-                                     send_to_role=self._send_to_role)
+                self._sync_step_results(run.id, run.step_results)
             except Exception as _e:
-                LOGGER.debug("tmux 越界停止指令失败: %s", _e)
+                LOGGER.debug("tmux 信号状态同步失败: %s", _e)
         # ── Timeout 检查（每次 tick 都执行，不受 schema/verify 影响）──
         # 超时后自动升级到 coordinator，不会被 schema 失败 return 阻断。
         # 超限阈值: max(max_retries+2, 3) 次超时后自动 cancel，防止无限重试堆积。

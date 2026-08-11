@@ -2,6 +2,7 @@
 """conversation_monitor × step_handler 集成测试 — tmux 信号补充 exit_condition 触发。"""
 
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -99,6 +100,59 @@ def test_tmux_idle_triggers_reminder_not_cancel():
         remind = eng._send_to_role.call_args_list[0]
         assert "空闲" in str(remind) or "提醒" in str(remind), \
             f"空闲应发提醒，实际: {remind}"
+
+
+def test_tmux_idle_throttled_after_first():
+    """第二次 idle 信号在冷却期内 → 不发提醒（节流）。"""
+    eng = FakeEngine()
+    step = _step({"bus_category": "workflow", "timeout_minutes": 30})
+    run = _run()
+    # 预置：第一次 idle 已计过数且在冷却期内
+    run.step_results["s1"]["tmux_signals"] = {"idle_count": 1,
+                                              "idle_cool_until": time.time() + 300}
+
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=ConversationSignal(idle_complaint=True,
+                                               idle_evidence="无任务待办")) as mock_sig:
+        eng._tick(run, step)
+        mock_sig.assert_called_once()
+        # 冷却期内不应有新的 idle 提醒（原 idle 只发过一次）
+        idle_msgs = [c for c in eng._send_to_role.call_args_list
+                     if "空闲" in str(c) or "提醒" in str(c)]
+        assert len(idle_msgs) == 0, f"冷却期不应发空闲提醒，实际: {idle_msgs}"
+
+
+def test_tmux_idle_escalates_to_cancel_after_5():
+    """连续 5 次 idle 信号 → cancel_step（不再等待）。"""
+    eng = FakeEngine()
+    step = _step({"bus_category": "workflow", "timeout_minutes": 30})
+    run = _run()
+    run.step_results["s1"]["tmux_signals"] = {"idle_count": 4}  # 已 4 次
+
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=ConversationSignal(idle_complaint=True,
+                                               idle_evidence="无任务待办")):
+        eng._tick(run, step)
+        assert eng._lifecycle.cancel_step.call_count == 1, \
+            "第 5 次 idle 应升级 cancel_step"
+        assert eng._lifecycle.cancel_step.call_args[0][:2] == ("wf_test", "s1")
+
+
+def test_tmux_violation_escalates_to_cancel_after_5():
+    """连续 5 次 violation → cancel_step。"""
+    eng = FakeEngine()
+    step = _step({"bus_category": "workflow", "timeout_minutes": 30})
+    run = _run()
+    run.step_results["s1"]["tmux_signals"] = {"violation_count": 4}
+
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=ConversationSignal(violation_found=True,
+                                               violation_commands=["deploy: kubectl apply"],
+                                               violation_role="scout")):
+        eng._tick(run, step)
+        assert eng._lifecycle.cancel_step.call_count == 1, \
+            "第 5 次 violation 应升级 cancel_step"
+        assert eng._lifecycle.cancel_step.call_args[0][:2] == ("wf_test", "s1")
 
 
 def test_tmux_violation_injects_stop():
