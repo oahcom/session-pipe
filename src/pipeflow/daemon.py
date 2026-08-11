@@ -54,6 +54,17 @@ _STARVE_STATE = STARVE_STATE
 _CCS_PY = CCS_CLI
 
 
+def _safe_write_state(state: dict) -> None:
+    """原子写状态文件（临时文件 + rename），避免并发写半截 JSON。"""
+    try:
+        _STARVE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _STARVE_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(_STARVE_STATE)
+    except OSError as e:
+        LOGGER.warning("starve 状态写入失败: %s", e)
+
+
 def _ensure_role_alive(role: str) -> bool:
     """通过 ccs.py start 拉起未运行的角色 session（幂等，已运行则跳过）。"""
     try:
@@ -77,6 +88,10 @@ def _active_count(eng: WorkflowEngine) -> int:
     return eng.active_workflow_count()
 
 
+_STARVE_FAIL_BACKOFF = 24 * 3600  # 连续失败 ≥5 次后退避 24 小时（非 6 小时）
+_STARVE_FAIL_THRESHOLD = 5         # 连续失败阈值，达到后切换退避策略
+
+
 def _starve_signal(eng: WorkflowEngine) -> None:
     """连续饥饿 → 拉起 scout session + 创建 food_chain_loop 工作流，冷却期内静默。"""
     now = time.time()
@@ -87,8 +102,11 @@ def _starve_signal(eng: WorkflowEngine) -> None:
     except (OSError, ValueError):
         pass
 
+    # ── 冷却检查：正常冷却 或 连续失败退避 ──
     last_fire = state.get("last_fire", 0)
-    if now - last_fire < _STARVE_COOLDOWN:
+    consec_fails = state.get("consecutive_failures", 0)
+    cooldown = _STARVE_FAIL_BACKOFF if consec_fails >= _STARVE_FAIL_THRESHOLD else _STARVE_COOLDOWN
+    if now - last_fire < cooldown:
         return  # 冷却期内不重复骚扰
 
     # 1) 确保首步角色（scout）session 已启动
@@ -101,11 +119,17 @@ def _starve_signal(eng: WorkflowEngine) -> None:
             "reason": "连续6分钟无活跃工作流",
         })
     except Exception as e:
-        LOGGER.warning("饥饿创建工作流失败: %s", e)
+        LOGGER.warning("饥饿创建工作流失败 (连续第 %d 次): %s", consec_fails + 1, e)
+        state["consecutive_failures"] = consec_fails + 1
+        state["last_failure_ts"] = now
+        _safe_write_state(state)
         return
     # 类型守卫：mock/非 str 返回值（测试环境污染）禁止写入 bus 与状态文件
     if not isinstance(wf_id, str) or not wf_id.startswith("wf_"):
         LOGGER.error("饥饿触发返回值异常，丢弃: %r", wf_id)
+        state["consecutive_failures"] = consec_fails + 1
+        state["last_failure_ts"] = now
+        _safe_write_state(state)
         return
     LOGGER.info("饥饿触发: food_chain_loop 已创建 wf=%s", wf_id)
 
@@ -124,7 +148,9 @@ def _starve_signal(eng: WorkflowEngine) -> None:
 
     state["last_fire"] = now
     state["last_wf"] = wf_id
-    _STARVE_STATE.write_text(json.dumps(state))
+    state.pop("consecutive_failures", None)  # 成功 → 清零失败计数
+    state.pop("last_failure_ts", None)
+    _safe_write_state(state)
 
 
 _LOCK_FILE = Path.home() / ".hermes" / "run" / "workflow-daemon.lock"

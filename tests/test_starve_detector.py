@@ -105,8 +105,8 @@ def test_first_fire_without_state_file():
             assert saved["last_wf"] == "wf_first"
 
 
-# ── 7. 工作流创建失败时不写状态文件 ──
-def test_workflow_create_failure_no_state():
+# ── 7. 工作流创建失败时写入 failure 计数 ──
+def test_workflow_create_failure_writes_failure_count():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
@@ -115,8 +115,11 @@ def test_workflow_create_failure_no_state():
             eng = MagicMock()
             eng.start.side_effect = Exception("模板不存在")
             daemon._starve_signal(eng)
-            # state 文件不应被写入（提前 return）
-            assert not state_path.exists()
+            # 失败时写入 consecutive_failures（用于退避计算）
+            assert state_path.exists()
+            saved = json.loads(state_path.read_text())
+            assert saved["consecutive_failures"] == 1
+            assert "last_failure_ts" in saved
 
 
 # ── 8. run_once 饥饿计数器逻辑模拟 ──
@@ -198,3 +201,69 @@ if __name__ == "__main__":
             print(f"FAIL {t.__name__}: {e}")
     print(f"\n{'PASS' if failed == 0 else 'FAIL'}: {passed}/{passed+failed} tests passed")
     sys.exit(1 if failed else 0)
+
+# ── 11. 连续失败退避：失败次数≥5 后冷却 24h（非 6h） ──
+def test_backoff_after_consecutive_failures():
+    from unittest.mock import patch, MagicMock
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        fails = 6  # 已 6 次连续失败
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 100,  # 100 秒前
+            "consecutive_failures": fails,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_backoff"
+            daemon._starve_signal(eng)
+            # 6 次失败后冷却 24h，100 秒前不够 → 不触发
+            eng.start.assert_not_called()
+
+# ── 12. 失败次数<5 时冷却仍为 6h ──
+def test_normal_cooldown_below_threshold():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 100,
+            "consecutive_failures": 3,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_ok"
+            daemon._starve_signal(eng)
+            # 3 次失败 < 5 → 冷却 6h，100 秒前不够 → 不触发
+            eng.start.assert_not_called()
+
+# ── 13. 失败会累加计数并持久化 ──
+def test_failure_increments_counter():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.side_effect = Exception("模板不存在")
+            daemon._starve_signal(eng)
+            saved = json.loads(state_path.read_text())
+            assert saved["consecutive_failures"] == 1
+
+# ── 14. 成功后清零失败计数 ──
+def test_success_resets_failures():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - daemon._STARVE_COOLDOWN - 1,
+            "consecutive_failures": 3,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_success"
+            daemon._starve_signal(eng)
+            saved = json.loads(state_path.read_text())
+            assert "consecutive_failures" not in saved
