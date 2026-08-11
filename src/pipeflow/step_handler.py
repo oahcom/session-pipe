@@ -262,7 +262,8 @@ class StepHandlerMixin:
                 # 超时但审查指令已发、角色可能已完成 → 检查 exit 匹配
                 _wide = re.sub(r"-complete$", "-", text_filter)
                 _match_ts2, _match_msgs2 = self._check_exit(cat, src_filter, _wide, created_after=last_ts,
-                    wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+                    wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
+                    wait_roles=getattr(step, "wait_roles", None))
                 if _match_ts2:
                     # 防御：__new__ 实例化（测试路径）可能无此属性，timeout 段先于初始化引用
                     if not hasattr(self, "_consumed_exit_ids"):
@@ -881,8 +882,10 @@ class StepHandlerMixin:
         matched = []
         for f in facts:
             # src 精确匹配；src=claude（bus 默认值）视为角色未设 src，不排除
+            # wait_roles 协作门：协作角色的消息也放行（否则 src 过滤器拦死门控）
             if src_filter and f.src != src_filter and f.src != "claude":
-                continue
+                if not wait_roles or f.src not in wait_roles:
+                    continue
             if text_filter and text_filter not in f.t:
                 continue
             if created_after and f.ts < created_after:
@@ -900,8 +903,29 @@ class StepHandlerMixin:
             if earliest == 0 or f.ts < earliest:
                 earliest = f.ts
         # 多角色协作门：所有声明角色都有匹配消息才通过（仲裁模式）
+        # 高流量分类下 50 条窗口可能滑掉早写入的协作消息 → 按角色补查（滚动窗口）
+        # ponytail: per-role 补查限 200 条，极端流量仍可能滑出；升级路径：按角色+时间戳游标
         if wait_roles:
             have = {m["src"] for m in matched}
-            if not set(wait_roles).issubset(have):
-                return (0.0, [])  # 还有角色没产出，不推进
+            missing = set(wait_roles) - have
+            for _r in missing:
+                _rfacts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
+                _rmsg = None
+                for _f in _rfacts:
+                    if _f.src != _r and _f.src != "claude":
+                        continue
+                    if text_filter and text_filter not in _f.t:
+                        continue
+                    if created_after and _f.ts < created_after:
+                        continue
+                    if wf_id and _f.t and 'wf_' in _f.t and wf_id not in _f.t \
+                            and wf_id.replace('wf_', '') not in _f.t:
+                        continue
+                    _rmsg = {"id": _f.id, "text": _f.t[:200], "ts": _f.ts, "src": _f.src}
+                    break
+                if _rmsg is None:
+                    return (0.0, [])  # 还有角色没产出，不推进
+                matched.append(_rmsg)
+                if earliest == 0 or _rmsg["ts"] < earliest:
+                    earliest = _rmsg["ts"]
         return (earliest, matched)

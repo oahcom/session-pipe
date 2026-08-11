@@ -246,6 +246,79 @@ class TestDualNodeNode2Complete(unittest.TestCase):
         eng._lifecycle.complete_step.assert_called()
 
 
+class TestDualNodeWaitRolesGateRescue(unittest.TestCase):
+    """dual_node 超时抢救不绕过 wait_roles 门（codex P0：协作门被跳过）。"""
+
+    def test_rescue_with_wait_roles_missing_role_blocks(self):
+        """wait_roles 中有角色未产出 → dual_node 超时抢救也不 complete。"""
+        eng = _eng()
+        # 只有 engineer 写消息，qa/reviewer 都没写 → 门不过
+        eng._check_exit = MagicMock(return_value=(0.0, []))
+        eng._bb = MagicMock()
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        eng._lifecycle.complete_step = MagicMock()
+        step = Step(
+            id="s1", title="t", target_role="engineer", prompt_template="t",
+            exit_condition={"bus_category": "notice", "text_contains": "DONE",
+                            "timeout_minutes": 1},
+            dual_node=True, wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_dnw", workflow_name="test_dnw", context={},
+            current_step="s1", status="running",
+            step_results={"s1": {"status": "notified", "ts": time.time() - 600,
+                                 "node1_done": True, "node2_sent": True,
+                                 "timeout_count": 1, "exit_messages": []}})
+        eng._tick(run, step)
+        eng._lifecycle.complete_step.assert_not_called()
+
+    def test_rescue_with_wait_roles_all_roles_advances(self):
+        """wait_roles 全部产出 → dual_node 超时抢救正常 complete。"""
+        eng = _eng()
+        _ts = time.time() - 100
+        eng._check_exit = MagicMock(return_value=(_ts, [
+            {"id": "m1", "text": "s1-codex-approved", "ts": _ts, "src": "engineer"},
+            {"id": "m2", "text": "s1-codex-approved", "ts": _ts, "src": "qa"},
+            {"id": "m3", "text": "s1-codex-approved", "ts": _ts, "src": "reviewer"}]))
+        eng._bb = MagicMock()
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        step = Step(
+            id="s1", title="t", target_role="engineer", prompt_template="t",
+            exit_condition={"bus_category": "notice", "text_contains": "DONE",
+                            "timeout_minutes": 1},
+            dual_node=True, wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_dnw2", workflow_name="test_dnw2", context={},
+            current_step="s1", status="running",
+            step_results={"s1": {"status": "notified", "ts": time.time() - 600,
+                                 "node1_done": True, "node2_sent": True,
+                                 "timeout_count": 1, "exit_messages": []}})
+        eng._tick(run, step)
+        eng._lifecycle.complete_step.assert_called()
+
+
+class TestCollectGuardRolesIncludesWaitRoles(unittest.TestCase):
+    """_collect_guard_roles 收集 wait_roles 角色（防止协作门角色不存活）。"""
+
+    def test_wait_roles_collected(self):
+        eng = _eng()
+        wf_def = MagicMock()
+        wf_def.name = "gw"
+        s1 = Step(id="s1", title="t", target_role="engineer", prompt_template="t",
+                  exit_condition={}, wait_roles=["qa", "reviewer"])
+        wf_def.steps = [s1]
+        eng._workflows = {"gw": wf_def}
+        eng._lifecycle.query = MagicMock(side_effect=[
+            [],  # assignee 查询
+            [{"instance_id": "wf1", "template_id": "gw", "current_step_id": "s1"}],
+        ])
+        roles = eng._collect_guard_roles()
+        self.assertIn("engineer", roles, "target_role 应被收集")
+        self.assertIn("qa", roles, "wait_roles 角色应被收集")
+        self.assertIn("reviewer", roles, "wait_roles 角色应被收集")
+
+
 class TestWaitRolesCollaborationGate(unittest.TestCase):
     """协作门 wait_roles: 多角色协作 — 等所有角色产出才推进。"""
 
@@ -328,6 +401,93 @@ class TestWaitRolesCollaborationGate(unittest.TestCase):
             exit_condition={"bus_category": "test_report", "timeout_minutes": 60})
         run = WorkflowRun(
             id="wf_norm", workflow_name="norm_test", context={},
+            current_step="s3", status="running", created_at=time.time() - 1000,
+            step_results={"s3": {"status": "notified", "ts": time.time() - 600,
+                                 "notified_at": time.time() - 1000}})
+        eng._tick(run, step)
+        eng._lifecycle.complete_step.assert_called()
+
+    def test_wait_roles_supplement_after_window_overflow(self):
+        """主查询 50 条窗口滑掉协作消息 → per-role 补查命中 → 门通过（窗口滚动）。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=False)
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        eng._lifecycle.complete_step = MagicMock()
+        _old = time.time() - 600  # 早于 created_after 窗口的消息（被主查询过滤？）
+        # 模拟：主查询(limit=50)返回 qa 消息（在窗口内），reviewer 消息在更早的 200 条窗口
+        # read 第一次调用 → 主查询结果（仅 qa）；第二次调用(limit=200) → 补查命中 reviewer
+        eng._bb.read = MagicMock(side_effect=[
+            # 主查询（limit=50）：qa 消息在窗口内
+            [type("F", (), {"id": "m1", "t": "s3-complete",
+                            "ts": time.time() - 10, "src": "qa"})()],
+            # 补查 reviewer（limit=200）：reviewer 消息滑出主窗口但补查可见
+            [type("F", (), {"id": "m2", "t": "s3-complete",
+                            "ts": _old, "src": "reviewer"})()],
+        ])
+        # target 是 closer，wait_roles=[qa, reviewer]
+        step = Step(
+            id="s3", title="t", target_role="closer", prompt_template="t",
+            exit_condition={"bus_category": "test_report", "timeout_minutes": 60},
+            wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_sup", workflow_name="sup_test", context={},
+            current_step="s3", status="running", created_at=time.time() - 1000,
+            step_results={"s3": {"status": "notified", "ts": time.time() - 600,
+                                 "notified_at": time.time() - 1000}})
+        eng._tick(run, step)
+        # 补查命中 reviewer → 门通过 → complete_step
+        eng._lifecycle.complete_step.assert_called()
+
+    def test_wait_roles_supplement_missing_role_blocks(self):
+        """补查仍找不到角色消息 → 门不过。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=False)
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        eng._lifecycle.complete_step = MagicMock()
+        eng._bb.read = MagicMock(side_effect=[
+            # 主查询：qa 消息在窗口内
+            [type("F", (), {"id": "m1", "t": "s3-complete",
+                            "ts": time.time() - 10, "src": "qa"})()],
+            # 补查 reviewer：空（reviewer 没写）
+            [],
+        ])
+        step = Step(
+            id="s3", title="t", target_role="closer", prompt_template="t",
+            exit_condition={"bus_category": "test_report", "timeout_minutes": 60},
+            wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_sup2", workflow_name="sup_test2", context={},
+            current_step="s3", status="running", created_at=time.time() - 1000,
+            step_results={"s3": {"status": "notified", "ts": time.time() - 600,
+                                 "notified_at": time.time() - 1000}})
+        eng._tick(run, step)
+        eng._lifecycle.complete_step.assert_not_called()
+
+    def test_source_contains_with_wait_roles_passes(self):
+        """source_contains + wait_roles 同设：协作角色消息不被 src 过滤（死锁修复）。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=False)
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        eng._lifecycle.complete_step = MagicMock()
+        # target 是 engineer(source_contains=engineer)，但 wait_roles=qa/reviewer
+        # qa 和 reviewer 的消息 src 不是 engineer → 修复前被 src 过滤 → 死锁
+        eng._bb.read = MagicMock(return_value=[
+            type("F", (), {"id": "m1", "t": "s3-complete",
+                           "ts": time.time() - 10, "src": "engineer"})(),
+            type("F", (), {"id": "m2", "t": "s3-complete",
+                           "ts": time.time() - 5, "src": "qa"})(),
+            type("F", (), {"id": "m3", "t": "s3-complete",
+                           "ts": time.time() - 1, "src": "reviewer"})()])
+        step = Step(
+            id="s3", title="t", target_role="engineer", prompt_template="t",
+            exit_condition={"bus_category": "test_report", "timeout_minutes": 60,
+                            "source_contains": "engineer"},
+            wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_src", workflow_name="src_test", context={},
             current_step="s3", status="running", created_at=time.time() - 1000,
             step_results={"s3": {"status": "notified", "ts": time.time() - 600,
                                  "notified_at": time.time() - 1000}})
