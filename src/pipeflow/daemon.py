@@ -103,11 +103,26 @@ def _starve_signal(eng: WorkflowEngine) -> None:
         pass
 
     # ── 冷却检查：正常冷却 或 连续失败退避 ──
+    # 锚点取 max(成功时间, 最近失败时间)——失败路径写入 last_failure_ts 但从不参与
+    # 冷却判断，导致"从未成功过"的失败场景退避永不生效（codex 三方审查 P1，2026-08-11）
     last_fire = state.get("last_fire", 0)
+    last_failure_ts = state.get("last_failure_ts", 0)
     consec_fails = state.get("consecutive_failures", 0)
     cooldown = _STARVE_FAIL_BACKOFF if consec_fails >= _STARVE_FAIL_THRESHOLD else _STARVE_COOLDOWN
-    if now - last_fire < cooldown:
+    if now - max(last_fire, last_failure_ts) < cooldown:
         return  # 冷却期内不重复骚扰
+
+    # 0) 防双路径竞态：wf_loop 可能在 daemon 触发同时创建了新的 food_chain_loop
+    # 仅真实 WorkflowEngine（类型含 has_active_template）才检查；mock → 跳过
+    if "has_active_template" in type(eng).__dict__:
+        try:
+            if eng.has_active_template("food_chain_loop"):
+                LOGGER.info("饥饿触发跳过: food_chain_loop 已有活跃实例")
+                return
+        except Exception as e:
+            # 竞态检查失败 → 保守跳过（防双实例；失败场景由退避机制兜底）
+            LOGGER.warning("饥饿竞态检查异常，保守跳过: %s", e)
+            return
 
     # 1) 确保首步角色（scout）session 已启动
     _ensure_role_alive("scout")

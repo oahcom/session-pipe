@@ -18,6 +18,7 @@ import subprocess as _sp
 from pathlib import Path
 LOGGER = logging.getLogger("workflow.engine")
 from typing import Any, Optional
+from types import SimpleNamespace
 
 from paths import ensure_paths
 ensure_paths()
@@ -69,6 +70,7 @@ class Step:
     exit_schema: dict = None  # 退出校验 schema（文件校验/内容校验/自定义校验）
     guard: dict = None  # CCS 守护声明
     track: dict = None  # 轮次追踪声明
+    wait_roles: list = None  # 协作门：等这些角色都产出匹配消息才推进（仲裁/对等模式）
 
 
 @dataclass
@@ -303,6 +305,19 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("活跃工作流查询失败: %s", e)
             return 0
 
+    def has_active_template(self, template_id: str) -> bool:
+        """指定模板是否已有活跃实例（防双路径竞态：daemon 饥饿触发与 wf_loop 同时创建）。"""
+        try:
+            rows = self._lifecycle.query(
+                "SELECT COUNT(*) AS cnt FROM workflow_instances "
+                "WHERE template_id=? AND status IN ('pending', 'running', 'step_done_ready')",
+                (template_id,),
+            )
+            return (rows[0]["cnt"] if rows else 0) > 0
+        except Exception as e:
+            LOGGER.warning("活跃模板查询失败 %s: %s", template_id, e)
+            return True  # 查询失败时保守跳过（宁可少创建，不可重复创建）
+
     def start(self, name: str, context: dict = None) -> str:
         wf = self._workflows.get(name)
         if wf:
@@ -340,7 +355,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                  "exit_condition": s.exit_condition,
                  "exit_schema": s.exit_schema,
                  "guard": s.guard,
-                 "track": s.track}
+                 "track": s.track,
+                 "wait_roles": getattr(s, "wait_roles", None),
+                 "failure_patterns": getattr(s, "failure_patterns", None)}
                 for s in wf.steps
             ]
             self._lifecycle.upsert_template(
@@ -516,12 +533,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 用户要求"每个步骤"都提醒 → step_done_ready 路径也补发完整性提醒
                     try:
                         from pipeflow.integrity import send_bypass_reminder as _sbr
-                        _sbr_run = type("R", (), {"id": inst["instance_id"], "step_results": results})()
-                        _sbr_step = type("S", (), {
-                            "id": step_id,
-                            "target_role": step.target_role,
-                            "prompt_template": step.prompt_template,
-                        })()
+                        _sbr_run = SimpleNamespace(id=inst["instance_id"], step_results=results)
+                        _sbr_step = SimpleNamespace(
+                            id=step_id, target_role=step.target_role,
+                            prompt_template=step.prompt_template
+                        )
                         def _persist_step_done(*args):
                             # bypass flag 真落库（daemon 重启后不重复提醒）
                             try:
