@@ -90,9 +90,9 @@ TEMPLATE_SCHEMA = {
     "definitions": {
         "Step": {
             "type": "object",
-            "required": ["step_id", "title", "type", "prompt_template"],
+            "required": ["id", "title", "type", "prompt_template"],
             "properties": {
-                "step_id": {"type": "string", "pattern": "^s\\d+$"},
+                "id": {"type": "string", "pattern": "^s\\d+$"},
                 "title": {"type": "string", "minLength": 2},
                 "type": {
                     "type": "string",
@@ -290,15 +290,15 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
 
 def _validate_step(step: dict, index: int, report: ValidationReport):
     """校验单个步骤。"""
-    # 必填字段
-    for field in ["step_id", "title", "type", "prompt_template"]:
+    # 必填字段（引擎 Step dataclass 用 id，同步 schema 校验）
+    for field in ["id", "title", "type", "prompt_template"]:
         if field not in step:
             report.add_error(f"steps[{index}] 缺少必填字段: {field}")
 
-    if "step_id" in step:
-        sid = step["step_id"]
+    if "id" in step:
+        sid = step["id"]
         if not isinstance(sid, str) or not re.match(r"^s\d+$", sid):
-            report.add_error(f"steps[{index}].step_id 格式无效: {sid}，需为 s+数字")
+            report.add_error(f"steps[{index}].id 格式无效: {sid}，需为 s+数字")
 
     if "type" in step:
         valid_types = {"handoff", "review", "single", "gate", "notify", "subflow"}

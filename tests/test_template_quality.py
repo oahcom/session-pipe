@@ -24,7 +24,7 @@ class TestValidation:
             "max_duration_hours": 24,
             "quality_standards": "单元测试覆盖率 >=80%，接口测试通过率 100%",
             "steps": [{
-                "step_id": "s1", "title": "编码", "type": "handoff",
+                "id": "s1", "title": "编码", "type": "handoff",
                 "target_role": "engineer",
                 "prompt_template": LONG_PROMPT,
                 "failure_patterns": ["编译失败", "测试未通过", "代码风格不合规"],
@@ -85,7 +85,7 @@ class TestValidation:
     def test_missing_completion_header_fails(self):
         report = ValidationReport()
         _validate_step_content({
-            "step_id": "s1",
+            "id": "s1",
             "prompt_template": (
                 "/goal\n## 上网搜索\n搜索信息。\n## 产出\n输出结果。\n"
             ),
@@ -97,7 +97,7 @@ class TestValidation:
     def test_has_completion_header_passes(self):
         report = ValidationReport()
         _validate_step_content({
-            "step_id": "s1",
+            "id": "s1",
             "prompt_template": LONG_PROMPT,
             "failure_patterns": ["失败场景A"],
         }, 0, report)
@@ -106,7 +106,7 @@ class TestValidation:
     def test_boilerplate_failure_patterns_fails(self):
         report = ValidationReport()
         _validate_step_content({
-            "step_id": "s1",
+            "id": "s1",
             "prompt_template": LONG_PROMPT,
             "failure_patterns": ["产出物为空或仅模板占位符"],
         }, 0, report)
@@ -116,7 +116,7 @@ class TestValidation:
     def test_short_prompt_fails(self):
         report = ValidationReport()
         _validate_step_content({
-            "step_id": "s1",
+            "id": "s1",
             "prompt_template": "/goal",
             "failure_patterns": ["失败场景A"],
         }, 0, report)
@@ -140,7 +140,7 @@ class TestRecommend:
             "max_duration_hours": 24,
             "quality_standards": "单元测试覆盖率 >=80%，接口测试通过率 100%",
             "steps": [{
-                "step_id": "s1", "title": "编码", "type": "handoff",
+                "id": "s1", "title": "编码", "type": "handoff",
                 "target_role": "engineer",
                 "prompt_template": LONG_PROMPT,
                 "failure_patterns": ["编译失败", "测试未通过", "代码风格不合规"],
