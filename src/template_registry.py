@@ -329,7 +329,8 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
 def _validate_step(step: dict, index: int, report: ValidationReport):
     """校验单个步骤。"""
     # 必填字段（type 有默认值 single，从必填中移除；有值时校验格式）
-    for field in ["id", "title", "prompt_template"]:
+    # exit_condition 必填：引擎 Step.__init__ 要求非空 dict，缺它会 Step 构造失败
+    for field in ["id", "title", "prompt_template", "exit_condition"]:
         if field not in step:
             report.add_error(f"steps[{index}] 缺少必填字段: {field}")
 
