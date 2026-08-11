@@ -68,8 +68,14 @@ class Step:
     #   {"bus_category": "cat", "timeout_sec": 300, "notify_roles": ["role_c"]}
     dual_node: bool = False  # 双节点完成机制：第一节点写 bus 后引擎注入 codex 审查，第二条 bus 才推进
     exit_schema: dict = None  # 退出校验 schema（文件校验/内容校验/自定义校验）
-    guard: dict = None  # CCS 守护声明
-    track: dict = None  # 轮次追踪声明
+    # 主从模式：guard 声明额外守护角色（target_role 已自动守护），
+    # 引擎每 tick 检查存活，死了拉起（_collect_guard_roles + _ensure_guard_roles）
+    guard: dict = None  # CCS 守护声明 {"watch": ["role_a"], "auto_restart": true}
+    # 对等模式：track 声明轮次追踪，超时提醒 notify_roles，节流防重复，
+    # 伙伴恢复（新消息到达）自动停止告警（_tick track 段）
+    track: dict = None  # 轮次追踪声明 {"bus_category": "cat", "timeout_sec": 300, "notify_roles": [...]}
+    # 仲裁模式：wait_roles 声明协作门——所有角色都产出匹配消息才推进
+    # （_check_exit 门控；source_contains/relaxed-advance/tmux 信号均不绕过）
     wait_roles: list = None  # 协作门：等这些角色都产出匹配消息才推进（仲裁/对等模式）
 
 
@@ -147,6 +153,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         return self._lm
 
     def _load_workflows(self):
+        """加载工作流模板到内存 _workflows 字典。
+
+        路径 1（优先）：扫描 workflows_dir/*.json → 结构校验 → 质量检查 → 写入内存
+        路径 2（DB 补充，仅默认目录）：读 workflow_templates 表 → JSON 同名时跳过 DB 版
+
+        为何路径 1 优先：JSON 文件由模板所有者手工维护，是权威源；DB 模板由引擎运行时
+        写入（_upsert_template），是简化快照。JSON 优先防止简化版覆盖完整定义
+        （bus #167084 根因：s4 步骤 exit_condition 变空 → 工作流卡死）。
+        """
         if not self.workflows_dir.exists():
             return
         # 角色 collab 缓存（persona 声明，模板未显式声明时注入）
@@ -351,6 +366,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         raise ValueError(f"未知工作流: {name}")
 
     def _upsert_template(self, name: str, wf: WorkflowDef):
+        """把模板定义写入 DB（start() 时调用，供实例推进依赖 DB 模板行）。
+
+        三道防线（2026-08 绕过防护确立）：
+        1. 结构校验：无 exit_condition 的简化模板拒绝写 DB（防污染）
+        2. JSON 优先：DB 已有同名 → 不覆盖（防简化版覆盖完整 JSON 定义）
+        3. DB 查询失败 → 不写（宁缺勿滥，不静默降级）
+        统一入口 register() 是唯一"完整校验"写库路径；此处是运行时兜底。
+        """
         # start() 后实例推进依赖 DB 模板行（_load_workflows 从 DB 补充加载）。
         # 防绕过：写 DB 前过结构校验（allow_minimal）——未校验的简化模板
         # （无 exit_condition 的步骤）会被拒绝，不能污染 DB。
@@ -651,7 +674,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.debug("context overflow check failed")
 
     def _collect_guard_roles(self) -> set[str]:
-        """收集所有活跃工作流步骤需要守护的角色（guard.watch + target_role + assignee）。"""
+        """收集所有活跃工作流步骤需要守护的角色。
+
+        来源: assignee + target_role + guard.watch + wait_roles。
+        wait_roles 也收集（2026-08-11 codex P0）——协作门角色不存活 →
+        门永远不通过 → 工作流死锁；拉起后角色可产出消息开门。
+        """
         _alive_roles: set[str] = set()
         try:
             for _wf_row in self._lifecycle.query("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"):
@@ -669,6 +697,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             if _step.guard.get("auto_restart", True):
                                 _alive_roles.add(_g_role)
                     # 协作门角色也要守护：wait_roles 角色不产出 → 门永远不通过
+                    # ponytail: 仅守护 running/pending 的 workflow；step_done_ready（等待审批）
+                    # 不拉起 —— 审批阶段角色状态不归引擎管，拉起反而干扰人工审批流程
                     if _step.wait_roles:
                         _alive_roles.update(_step.wait_roles)
         except Exception as e:

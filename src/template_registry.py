@@ -144,6 +144,13 @@ class ValidationReport:
         return f"ValidationReport(passed={self.passed}, errors={self.errors})"
 
 
+# ── 校验分层（2026-08 统一入口后确立）──
+# 结构层 (_validate_schema): 字段存在/类型/格式 — 不过则拒绝（注册/加载都阻断）
+# 质量层 (_validate_meta): prompt 三段式/长度等建议 — 不过仅 warning（不阻断）
+# 为何分层: 存量 24 模板无 prompt 三段式但仍可运行，质量规则不应阻断"能跑"的模板；
+# 结构缺失（无 exit_condition 的步骤）才会运行期卡死，必须阻断。
+# 质量拦截职责交给 recommend 门禁（推荐时不达标自动不推荐），形成"注册放行-推荐拦截"边界。
+
 def _validate_schema(template: dict, allow_minimal: bool = False) -> ValidationReport:
     """对模板做 JSON Schema 校验。
 

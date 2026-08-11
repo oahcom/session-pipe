@@ -43,8 +43,14 @@ from pipeflow.engine import WorkflowEngine
 INTERVAL = 10  # 秒
 
 # ── 饥饿检测：工作流长期空转 → 触发食物链重启生产 ──
-# 引擎只推进已有工作流，不主动创建；当所有工作流终态且超时未重启
-# 时，写 bus 触发 scout 生产新情报，让食物链重新转起来。
+# 设计背景：引擎只推进已有工作流，不主动创建；当所有工作流终态且超时未重启，
+# 写 bus 触发 scout 生产新情报，让食物链重新转起来。
+# 冷却机制（三层，2026-08 事故后确立）：
+#   成功冷却（6h）：防止高频骚扰——触发成功后 6h 内不再触发
+#   失败短退避（60s）：防止模板缺失时无限重试刷日志
+#   失败长退避（24h）：连续失败≥5次后切换，退避期内不再尝试（需人工介入）
+# 竞态防护：daemon 饥饿触发与 wf_loop 循环可能同时创建 food_chain_loop，
+#   触发前用 has_active_template 检查 DB 是否已有同模板活跃实例（防双写）
 _STARVE_ROUNDS = 36          # 连续 36 轮（=6 分钟）无活跃工作流
 _STARVE_COOLDOWN = 6 * 3600  # 触发后 6 小时冷却，防止高频骚扰
 from paths import BUS_CLIENT, CCS_CLI, STARVE_STATE
