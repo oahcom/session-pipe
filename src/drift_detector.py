@@ -41,9 +41,19 @@ def _load_role_config(role: str) -> Optional[dict]:
 
 
 def _parse_allowed_categories(output_targets: list) -> set:
-    """从 output_targets 列表解析允许的 category 集合"""
+    """从 output_targets 列表解析允许的 category 集合。
+
+    兼容两种条目格式：
+      - 旧式字符串: "bus cat=architecture 新发现"
+      - 新式 dict:   {"bus_cat": "architecture", "label": ...}
+    """
     cats = set()
     for entry in output_targets:
+        if isinstance(entry, dict):
+            bc = entry.get("bus_cat")
+            if isinstance(bc, str):
+                cats.add(bc)
+            continue
         m = re.search(r"cat=(\S+)", entry)
         if m:
             cats.add(m.group(1))
