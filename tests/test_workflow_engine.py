@@ -148,11 +148,13 @@ def test_start_empty_steps():
     wf_dir = _make_wf_dir()
     _write_wf(wf_dir, "empty", [])
     eng = WorkflowEngine(workflows_dir=wf_dir)
+    # 空 steps 模板在加载时即被结构校验拒绝（不注册到 _workflows）
+    assert "empty" not in eng._workflows
     try:
         eng.start("empty")
         assert False, "应抛出 ValueError"
     except ValueError as e:
-        assert "无步骤" in str(e)
+        assert "未知工作流" in str(e)
 
 
 def test_status_nonexistent():

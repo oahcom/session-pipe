@@ -221,17 +221,19 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         LOGGER.warning("wait_roles 结构非法，丢弃: %s/%s", f.name, _tr)
                         _clean["wait_roles"] = None
                     steps.append(Step(**_clean))
-                # 模板质量自动校验：_validate_meta 是质量规则（trigger_scene 等建议），
-                # 不通过仅警告不拒绝——硬 Schema 校验由 start() 的"未知工作流"守卫兜底
+                # 模板结构校验（allow_minimal=True 仅校验核心字段）：
+                # 不通过 → error + 拒绝加载。防止缺 id/target_role/exit_condition 的坏步骤
+                # 进入 _workflows 后运行期卡死或误判退出（如僵尸模板 ws_test 曾进 ZOMBIE 名单）
                 try:
-                    from template_registry import _validate_meta as _vmeta
-                    _vr = _vmeta(data)
+                    from template_registry import _validate_schema as _vschema
+                    _vr = _vschema(data, allow_minimal=True)
                     if not _vr.passed:
-                        LOGGER.warning("[wf] 警告: %s 质量检查不通过:", f.name)
+                        LOGGER.error("[wf] 模板 %s 结构校验不通过，拒绝加载:", f.name)
                         for _e in _vr.errors[:4]:
-                            LOGGER.warning("        - %s", _e)
+                            LOGGER.error("        - %s", _e)
+                        continue  # 跳过该模板，不注册到 _workflows
                 except (ValueError, KeyError, TypeError):
-                    LOGGER.debug("workflow meta validation failed for %s", f.name)
+                    LOGGER.debug("workflow schema validation failed for %s", f.name)
                 self._workflows[data["name"]] = WorkflowDef(
                     name=data["name"], title=data.get("title", ""),
                     description=data.get("description", ""), steps=steps,
@@ -651,6 +653,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         for _g_role in _step.guard.get("watch", []):
                             if _step.guard.get("auto_restart", True):
                                 _alive_roles.add(_g_role)
+                    # 协作门角色也要守护：wait_roles 角色不产出 → 门永远不通过
+                    if _step.wait_roles:
+                        _alive_roles.update(_step.wait_roles)
         except Exception as e:
             LOGGER.debug("guard 收集异常（非致命，返回已收集的角色）: %s", e)
         return _alive_roles

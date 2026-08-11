@@ -144,11 +144,35 @@ class ValidationReport:
         return f"ValidationReport(passed={self.passed}, errors={self.errors})"
 
 
-def _validate_schema(template: dict) -> ValidationReport:
-    """对模板做 10 字段 JSON Schema 校验。"""
+def _validate_schema(template: dict, allow_minimal: bool = False) -> ValidationReport:
+    """对模板做 JSON Schema 校验。
+
+    allow_minimal=True: 仅校验 name+steps+step 核心字段（id/target_role/exit_condition），
+    兼容测试最小模板（无 description/trigger_scene 等生产元数据）。
+    allow_minimal=False（默认）: 完整校验所有必填字段。
+    """
     report = ValidationReport()
 
-    # 检查必填字段
+    if allow_minimal:
+        # 最小 Schema：name + steps 必填，每个 step 的 id/target_role/exit_condition 必填
+        if not isinstance(template.get("name"), str) or len(template["name"]) < 2:
+            report.add_error("name 需为 ≥2 字符字符串")
+        steps = template.get("steps", [])
+        if not isinstance(steps, list) or len(steps) < 1:
+            report.add_error("steps 需为非空数组")
+        else:
+            for i, step in enumerate(steps):
+                if not step.get("id"):
+                    report.add_error(f"steps[{i}] 缺少 id")
+                if not step.get("target_role"):
+                    report.add_error(f"steps[{i}] 缺少 target_role")
+                if not step.get("exit_condition"):
+                    report.add_error(f"steps[{i}] 缺少 exit_condition")
+                if not step.get("prompt_template"):
+                    report.add_error(f"steps[{i}] 缺少 prompt_template")
+        return report
+
+    # 完整 Schema：检查所有必填字段
     for field in TEMPLATE_SCHEMA["required"]:
         if field not in template:
             report.add_error(f"缺少必填字段: {field}")
