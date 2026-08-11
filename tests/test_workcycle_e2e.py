@@ -245,7 +245,9 @@ def test_start_empty_steps(mock_run):
         eng.start("empty", {})
         assert False, "Should raise"
     except ValueError as e:
-        assert "无步骤" in str(e)
+        # 引擎加载时 Schema 校验已拦截空 steps（74ae6bb），
+        # 空模板不再注册 → start 报"未知工作流"；兼容两条路径
+        assert "无步骤" in str(e) or "未知工作流" in str(e)
     _cleanup(d)
 
 
