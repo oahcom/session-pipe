@@ -366,35 +366,19 @@ class TaskGeneratorMixin:
             LOGGER.info("auto-task: 本轮生成 %d 个新任务", _tasks_added)
 
     def _can_assign_role(self, role: str) -> bool:
-        """检查角色是否可分配任务：L1+L2+L3 忙闲检测。
+        """检查角色是否可分配任务：L1+L2 忙闲检测（委托 liveness 统合模块）。
 
-        L1: tmux 会话存活
-        L2: 正在思考（pane 活跃 < 300s）→ busy，跳过
-        L3: 最近有产出（bus 最近 10min 有该角色产出）→ busy，跳过
+        L1: tmux 会话存活（session 不存在 → 不可分配）
+        L2: 正在思考（liveness L1 thinking 信号 → busy，跳过）
         idel/stale/unknown → 放行
         """
         _skip = {"coordinator", "pipeline", "claude", "workflow_engine", ""}
         if role in _skip:
             return False
-        # L1: tmux 存活
-        try:
-            _r = _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
-                         capture_output=True, timeout=5)
-            if _r.returncode != 0:
-                return False
-        except Exception:
+        # L1: tmux 存活（与原实现一致：异常/session 不在 → 不可分配）
+        from liveness import _tmux_has_session, role_liveness
+        if _tmux_has_session(role, timeout=5) is not True:
             return False
-        # L2: pane 活动
-        try:
-            _pr = _engine_mod._sp.run(["tmux", "list-panes", "-t", f"ccs-{role}",
-                           "-F", "#{pane_activity}"],
-                          capture_output=True, text=True, timeout=3)
-            if _pr.returncode == 0 and _pr.stdout.strip():
-                _val = _pr.stdout.strip().split("\n")[0]
-                if _val and _val != "0":
-                    if time.time() - float(_val) < 60:
-                        return False  # 1分钟内活跃 → 真在忙，跳过
-        except Exception:
-            pass
-        # ponytail: L3 bus 产出检查移除——L1+L2 足够判断忙闲，L3 太慢导致空角色无法分配
-        return True
+        # L2: thinking 信号（health 文件 survival_l2_thinking，非 pane_activity 60s）
+        res = role_liveness(role, level=1)
+        return not res["busy"]

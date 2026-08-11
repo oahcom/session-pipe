@@ -253,109 +253,27 @@ class RoleLifecycleMixin:
     def _is_role_busy(self, role: str, exclude_wf_id: str = "", pane_fallback: bool = True) -> bool:
         """检查角色是否真的在工作。
 
-        信号1: survival monitor 健康文件（survival_monitor.py 每 120s 更新）
-          - stale/idle/unknown → 角色不忙，跳过数据库检查直接返回 False
-        信号2: workflow_instances 表中是否有该角色的其他活跃步骤（兜底）
-        pane_fallback: True=tmux pane 存活即视为 busy（超时保护），False=仅 DB 检查（首次投递）
+        委托统合模块 liveness.role_liveness(level=4) —— 与旧实现的信号1（health 文件）
+        + 信号2（DB 步骤级扫描）完全一致，见 liveness._health_gate / _s4_stepping。
         """
-        # 信号1: survival health 文件（直接读，不重跑检测）
+        from liveness import role_liveness
         try:
-            hp = self._HEALTH_DIR / f"{role}.json"
-            if hp.exists():
-                h = json.loads(hp.read_text())
-                overall = h.get("survival_overall", "unknown")
-                # orphan/unknown: tmux 存活但 Claude 进程已死 → 角色不在干活 → 不忙。
-                # 避免子工作流超时路径被阻塞导致无限卡死（观测：architect/qa s2 queued=N）。
-                if overall in ("orphan", "unknown"):
-                    LOGGER.info("health=%s → 角色不可用，不视为 busy", overall)
-                    return False
-                # stale/dead: survival 检测角色失活 → 查 tmux pane 兜底（pane 真正活着才忙）
-                if overall in ("stale", "dead"):
-                    if pane_fallback and self._tmux_pane_alive(role):
-                        LOGGER.info("health=%s 但 tmux pane 存活 → 视为 busy", overall)
-                        return True
-                    return False
-                # idle: survival 报空闲 → 但 DB 可能有该角色的活跃步骤（并发保护）。
-                # 不直接放行，落到信号2 DB 检查兜底（2026-08-09 观测：health=idle
-                # 时 pm 同时收到 4 条 task_spec，idle 短路跳过 DB 检查导致并发失效）。
-                if overall == "idle":
-                    if pane_fallback and self._tmux_pane_alive(role):
-                        LOGGER.info("health=idle → pane 存活但不作 busy 判定，继续 DB 检查")
-                    else:
-                        LOGGER.info("health=idle → 无 pane，继续 DB 检查确认是否真正空闲")
-                # healthy: 角色可能在工作，继续信号2确认
-                # stale/l2=false: 角色空闲，放行
-                if h.get("survival_l2_thinking") is False:
-                    if pane_fallback and self._tmux_pane_alive(role):
-                        LOGGER.info("l2_thinking=false 但 tmux pane 存活 → 视为 busy (survival L2 兜底)")
-                        return True
-                    return False
-        except Exception:
-            pass  # 健康文件损坏，退化到信号2
-        # 信号2: DB 兜底——角色健康但 workflow 层面已有别的活跃步骤
-        # 按当前步骤的 target_role 匹配（同 _role_has_pending_assignment 语义）
-        try:
-            rows = self._lifecycle.query(
-                "SELECT instance_id, template_id, current_step_id, step_results, assigner, "
-                "       parent_wf_id "
-                "FROM workflow_instances "
-                "WHERE status='running'"
+            res = role_liveness(
+                role, level=4, exclude_wf_id=exclude_wf_id,
+                db_conn=self._lifecycle, pane_fallback=pane_fallback,
+                health_dir=self._HEALTH_DIR, workflows=self._workflows,
             )
-            for r in rows:
-                if exclude_wf_id and r["instance_id"] == exclude_wf_id:
-                    continue
-                # 主链推进时自动创建的子工作流（assigner=workflow_engine）不判 busy
-                # 子链由引擎创建后角色才执行，创建即 running 会阻塞主链（2026-08-10 观测：
-                # s2 推进 s3 时创建子链 wf_sub_b16cc，product_architect 被子链 s1 判 busy）
-                # 仅对父工作流豁免（parent_wf_id 与检测者相同）；其他工作流对子链角色的
-                # 忙判仍需生效，避免子链间双线占用角色（codex 三维度审查 P2）
-                if r["instance_id"].startswith("wf_sub_") and r.get("assigner") == "workflow_engine" \
-                        and (exclude_wf_id and r.get("parent_wf_id") == exclude_wf_id):
-                    continue
-                _wf = self._workflows.get(r["template_id"])
-                if not _wf:
-                    continue
-                # 扫描该工作流所有步骤中对 role 的活跃分配，不只看 current_step_id。
-                # （2026-08-09 观测：food_chain_loop 从 s1 推进到 s2 的时序窗口里，
-                # DB current_step 还是 s1/scout，s2 的 pm 任务已由 _send_to_role 发出，
-                # 只看 current_step 会把 pm 判定为"不忙"→ 并发任务插入。）
-                for _s in _wf.steps:
-                    if _s.target_role != role:
-                        continue
-                    _sdata = (json.loads(r["step_results"] or "{}") or {}).get(_s.id, {})
-                    if not isinstance(_sdata, dict):
-                        continue
-                    if _sdata.get("status") in ("notified", "running", "step_done_ready"):
-                        _q = _sdata.get("queued", 0)
-                        # queued>=6 豁免仅适用于"同一工作流"的重推（角色卡死不该无限挡自己），
-                        # 但绝不能豁免"其他工作流"的插入——否则排队中的角色会被并发任务
-                        # 抢占（观测案例: pm 子链 queued=17 时仍被新任务判定"不忙"）。
-                        if _q >= 6 and exclude_wf_id and r["instance_id"] == exclude_wf_id:
-                            LOGGER.info("%s queued=%d 同一工作流 → 豁免 busy", role, _q)
-                            continue
-                        if _sdata.get("timeout_count", 0) < 3:
-                            LOGGER.info("skip: %s busy with %s/%s (step=%s)",
-                                        role, r["instance_id"][:8], _s.id, _sdata.get("status"))
-                            return True
-            return False
+            return res["busy"]
         except Exception:
             return False
 
     def _tmux_pane_alive(self, role: str) -> bool:
         """tmux pane 兜底信号：pane 存活即视为角色在忙。
 
-        tmux 3.4 的 pane_activity 恒为空导致 survival L2 失效（详见 survival_monitor._l2_check），
-        这里用 pane 存在 + active 作为低误报兜底。"""
-        try:
-            r = _engine_mod._sp.run(
-                ["tmux", "list-panes", "-t", f"ccs-{role}", "-F", "#{pane_active}"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if r.returncode == 0 and "1" in r.stdout:
-                return True
-        except Exception:
-            pass
-        return False
+        委托 liveness.tmux_pane_active —— pane_active(0/1)二值，与原实现语义一致。
+        tmux 3.4 的 pane_activity 恒为空导致 survival L2 失效，此处用 pane_active 兜底。"""
+        from liveness import tmux_pane_active
+        return tmux_pane_active(role) is True
 
     def _notify_role(self, role: str, title: str, evidence: str):
         """告警通知：写 blocker bus + ccs send 唤醒角色（绕过并发检查）。"""
