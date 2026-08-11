@@ -184,3 +184,79 @@ print(_validate_meta(d).passed)
 - 旧设计草案: `docs/guard_track_design.md`（8-10 定案, 4 轮 CLEAN, 608 测试）
 - 旧收编方案: `docs/collab-modes-to-workflow.md`（8-08 方案定稿）
 - 本实现基于上述两稿新增 wait_roles 协作门、窗口补查、死锁修复。
+## 十、协作模式入门指南（补充）
+
+生产 25 模板中仅 2 个使用协作模式（food_chain_loop: guard+track, dev_with_collab: guard+wait_roles）。
+采用率低的根因是**作者不知道怎么写**，不是能力缺失。以下是从简单到复杂的模板写法：
+
+### 10.1 最小示例：单步骤守护（主从）
+
+```json
+{
+  "name": "hello_collab",
+  "steps": [{
+    "id": "s1", "type": "handoff", "target_role": "engineer",
+    "guard": {"watch": ["reviewer"], "auto_restart": true},
+    "prompt_template": "## 目标\n...\n\n## 完成\n写 bus cat=code_fix，标题含 s1-complete。",
+    "exit_condition": {"bus_category": "code_fix", "timeout_minutes": 60}
+  }]
+}
+```
+
+效果：engineer 工作时 reviewer 保持存活，死了自动拉起。
+
+### 10.2 对等追踪：步骤超时提醒（对等）
+
+```json
+{
+  "id": "s2", "type": "handoff", "target_role": "engineer",
+  "track": {"bus_category": "code_fix", "timeout_sec": 300, "notify_roles": ["pm"]},
+  "prompt_template": "## 目标\n...\n\n## 完成\n写 bus cat=code_fix，标题含 s1-complete。",
+  "exit_condition": {"bus_category": "code_fix", "timeout_minutes": 60}
+}
+```
+
+效果：5 分钟无产出 → 通知 pm 催办；角色刚写过 → 不重复打扰。
+
+### 10.3 仲裁门：等多人产出才推进（仲裁）
+
+```json
+{
+  "id": "s4", "type": "review", "target_role": "closer",
+  "wait_roles": ["qa", "reviewer"],
+  "prompt_template": "## 目标\n审计 qa 和 reviewer 的产出...\n\n## 完成\n写 bus cat=workflow，标题含 s4-complete。",
+  "exit_condition": {"bus_category": "workflow", "timeout_minutes": 60}
+}
+```
+
+效果：qa 和 reviewer 都产出 test_report 分类消息后，closer 的步骤才推进。
+
+### 10.4 组合：守护 + 追踪 + 门控
+
+```json
+{
+  "id": "s3", "type": "handoff", "target_role": "qa",
+  "guard": {"watch": ["reviewer"], "auto_restart": true},
+  "track": {"bus_category": "test_report", "timeout_sec": 300, "notify_roles": ["pm"]},
+  "wait_roles": ["reviewer"],  // reviewer 产出 review 后才推进
+  "prompt_template": "## 目标\n...\n\n## 完成\n写 bus cat=test_report，标题含 s3-complete。",
+  "exit_condition": {"bus_category": "test_report", "timeout_minutes": 60}
+}
+```
+
+### 10.5 persona 注入（声明一次全模板生效）
+
+```json
+// persona_qaf.json — 在角色 persona 里声明
+{
+  "name": "qa",
+  "collab": {
+    "guard": {"watch": ["reviewer"], "auto_restart": true},
+    "track": {"bus_category": "code_fix", "timeout_sec": 300, "notify_roles": ["pm"]}
+  }
+}
+```
+
+模板里就不用重复写 guard/track（引擎自动注入）。wait_roles 是步骤级声明，
+**不会**从 persona 注入（协作拓扑必须在模板里显式声明）。
+
