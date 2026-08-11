@@ -495,5 +495,52 @@ class TestWaitRolesCollaborationGate(unittest.TestCase):
         eng._lifecycle.complete_step.assert_called()
 
 
+class TestWaitRolesRequeryExactSrc(unittest.TestCase):
+    """re-query 补查：只接受目标角色精确 src，claude-src 消息不得满足缺失角色
+    （codex 9 问题审查 P2：单条 claude 消息曾可满足所有 wait_roles，削弱协作门）。"""
+
+    def _tick(self, bus_msgs):
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=False)
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        lm = MagicMock()
+        eng._lm = lm
+        eng.__dict__["_lifecycle"] = lm
+        # 主循环 50 条窗口内只有 qa 的产出 → reviewer 需走 re-query 补查
+        eng._bb.read = MagicMock(return_value=[
+            type("F", (), {"id": f"id_{i}", "t": m["text"],
+                           "ts": time.time() - 5, "src": m["src"]})()
+            for i, m in enumerate(bus_msgs)])
+        step = Step(
+            id="s3", title="集成", target_role="closer", prompt_template="t",
+            exit_condition={"bus_category": "test_report", "timeout_minutes": 60},
+            wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_requery", workflow_name="requery_test", context={},
+            current_step="s3", status="running", created_at=time.time() - 1000,
+            step_results={"s3": {"status": "notified", "ts": time.time() - 5,
+                                 "notified_at": time.time() - 1000}})
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
+        return eng, lm
+
+    def test_claude_src_does_not_satisfy_missing_role(self):
+        """reviewer 未产出，只有一条 claude-src 消息 → 不推进（re-query 精确匹配）。"""
+        eng, lm = self._tick([
+            {"text": "s5-complete", "src": "qa"},
+            {"text": "s6-complete", "src": "claude"},
+        ])
+        lm.complete_step.assert_not_called()
+
+    def test_exact_role_src_satisfies_requery(self):
+        """reviewer 写了 test_report（主窗口外）→ re-query 补查到 → 推进。"""
+        eng, lm = self._tick([
+            {"text": "s5-complete", "src": "qa"},
+            {"text": "s6-complete", "src": "reviewer"},
+        ])
+        lm.complete_step.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()
