@@ -72,6 +72,9 @@ def detect_drift(role: str, limit: int = 50) -> List[dict]:
     facts = bb.read(src=role, limit=limit)
     drift = []
     for f in facts:
+        # 排除测试场景消息（test_role_interact_* 是测试工作流产物，合法但非生产）
+        if f.t.startswith("[test_role_interact_"):
+            continue
         if f.cat not in allowed:
             drift.append({
                 "category": f.cat,
