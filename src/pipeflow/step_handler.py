@@ -912,7 +912,9 @@ class StepHandlerMixin:
                 _rfacts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
                 _rmsg = None
                 for _f in _rfacts:
-                    if _f.src != _r and _f.src != "claude":
+                    # 精确匹配目标角色 src；不放宽到 claude（否则一条
+                    # claude-src 消息可满足所有缺失角色，削弱协作门）
+                    if _f.src != _r:
                         continue
                     if text_filter and text_filter not in _f.t:
                         continue
