@@ -215,8 +215,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                 or not all(isinstance(r, str) for r in _t2.get("notify_roles", [])):
                             LOGGER.warning("track.notify_roles 非法，丢弃: %s/%s", f.name, _tr)
                             _clean["track"] = None
+                    _wr = _clean.get("wait_roles")
+                    if _wr is not None and (not isinstance(_wr, list)
+                                            or not all(isinstance(r, str) for r in _wr)):
+                        LOGGER.warning("wait_roles 结构非法，丢弃: %s/%s", f.name, _tr)
+                        _clean["wait_roles"] = None
                     steps.append(Step(**_clean))
-                # 模板质量自动校验
+                # 模板质量自动校验：_validate_meta 是质量规则（trigger_scene 等建议），
+                # 不通过仅警告不拒绝——硬 Schema 校验由 start() 的"未知工作流"守卫兜底
                 try:
                     from template_registry import _validate_meta as _vmeta
                     _vr = _vmeta(data)
@@ -343,6 +349,16 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         raise ValueError(f"未知工作流: {name}")
 
     def _upsert_template(self, name: str, wf: WorkflowDef):
+        # JSON 优先守卫：DB 已有同名模板 → 跳过 upsert，防止 client 等路径
+        # 写入的简化版 steps（无 exit_condition）覆盖 JSON 完整定义
+        # （根因：bus #167084，upsert 的简化版覆盖 JSON 定义 → 步骤卡死）
+        try:
+            _existing = self._lifecycle.query(
+                "SELECT 1 FROM workflow_templates WHERE template_id=?", (name,))
+            if _existing:
+                return
+        except Exception:
+            pass  # DB 查询失败时允许 upsert（兼容首次初始化）
         try:
             steps = [
                 {"step_id": s.id, "title": s.title, "type": s.type,
