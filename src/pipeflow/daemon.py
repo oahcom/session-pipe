@@ -100,10 +100,14 @@ def _starve_signal(eng: WorkflowEngine) -> None:
             "source": "starve_detector",
             "reason": "连续6分钟无活跃工作流",
         })
-        LOGGER.info("饥饿触发: food_chain_loop 已创建 wf=%s", wf_id)
     except Exception as e:
         LOGGER.warning("饥饿创建工作流失败: %s", e)
         return
+    # 类型守卫：mock/非 str 返回值（测试环境污染）禁止写入 bus 与状态文件
+    if not isinstance(wf_id, str) or not wf_id.startswith("wf_"):
+        LOGGER.error("饥饿触发返回值异常，丢弃: %r", wf_id)
+        return
+    LOGGER.info("饥饿触发: food_chain_loop 已创建 wf=%s", wf_id)
 
     # 3) 写 bus 供监控审计（非依赖）
     try:
