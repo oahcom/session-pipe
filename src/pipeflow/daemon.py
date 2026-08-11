@@ -88,8 +88,9 @@ def _active_count(eng: WorkflowEngine) -> int:
     return eng.active_workflow_count()
 
 
-_STARVE_FAIL_BACKOFF = 24 * 3600  # 连续失败 ≥5 次后退避 24 小时（非 6 小时）
-_STARVE_FAIL_THRESHOLD = 5         # 连续失败阈值，达到后切换退避策略
+_STARVE_FAIL_BACKOFF = 24 * 3600  # 连续失败 ≥5 次后退避 24 小时
+_STARVE_FAIL_RETRY_INTERVAL = 60  # 未达阈值：失败后短退避 60s 重试窗口
+_STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后切换退避策略
 
 
 def _starve_signal(eng: WorkflowEngine) -> None:
@@ -102,15 +103,21 @@ def _starve_signal(eng: WorkflowEngine) -> None:
     except (OSError, ValueError):
         pass
 
-    # ── 冷却检查：正常冷却 或 连续失败退避 ──
-    # 锚点取 max(成功时间, 最近失败时间)——失败路径写入 last_failure_ts 但从不参与
-    # 冷却判断，导致"从未成功过"的失败场景退避永不生效（codex 三方审查 P1，2026-08-11）
+    # ── 冷却检查 ──
+    # 成功触发冷却: 基于 last_fire（6h 防高频骚扰）
+    # 失败退避: 连续失败≥阈值 → 24h 长退避；未达阈值 → 短退避 60s 重试窗口
+    #（失败计数必须能递增到阈值——若失败也走 6h 冷却则计数永远停在 1，退避永不生效）
     last_fire = state.get("last_fire", 0)
     last_failure_ts = state.get("last_failure_ts", 0)
     consec_fails = state.get("consecutive_failures", 0)
-    cooldown = _STARVE_FAIL_BACKOFF if consec_fails >= _STARVE_FAIL_THRESHOLD else _STARVE_COOLDOWN
-    if now - max(last_fire, last_failure_ts) < cooldown:
-        return  # 冷却期内不重复骚扰
+    if consec_fails >= _STARVE_FAIL_THRESHOLD:
+        if now - max(last_fire, last_failure_ts) < _STARVE_FAIL_BACKOFF:
+            return  # 已达标 → 24h 长退避
+    else:
+        if now - last_fire < _STARVE_COOLDOWN:
+            return  # 成功冷却期内
+        if now - last_failure_ts < _STARVE_FAIL_RETRY_INTERVAL:
+            return  # 失败后短退避（重试窗口内静默）
 
     # 0) 防双路径竞态：wf_loop 可能在 daemon 触发同时创建了新的 food_chain_loop
     # 仅真实 WorkflowEngine（类型含 has_active_template）才检查；mock → 跳过

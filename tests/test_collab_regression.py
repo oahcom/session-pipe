@@ -26,6 +26,9 @@ def _eng(**overrides):
     eng._workflows = {}
     eng._send_to_role = MagicMock()
     eng._notify_role = MagicMock()
+    # 测试不依赖真实 tmux 信号（conversation_monitor 读取真实 pane 会干扰 _tick 流程）
+    eng._gs_patch = patch("pipeflow.step_handler.get_conversation_signal", return_value=None)
+    eng._gs_patch.start()
     for k, v in overrides.items():
         setattr(eng, k, v)
     return eng
@@ -236,7 +239,6 @@ class TestWaitRolesCollaborationGate(unittest.TestCase):
 
     def tearDown(self):
         self._gs_patch.stop()
-    """协作门 wait_roles: 多角色协作 — 等所有角色产出才推进。"""
 
     def _tick_with_wait_roles(self, bus_msgs):
         """构造步骤含 wait_roles，bus 返回指定消息列表，测试 _tick 行为。"""
@@ -245,7 +247,8 @@ class TestWaitRolesCollaborationGate(unittest.TestCase):
         eng._sync_step_results = MagicMock()
         eng._consumed_exit_ids = set()
         lm = MagicMock()
-        eng._lm = lm  # property _lifecycle 返回 self._lm，直接设 _lm 才生效
+        eng._lm = lm
+        eng.__dict__["_lifecycle"] = lm  # 覆盖 _eng() 里缓存的旧 _lifecycle 引用
         fake_facts = [type("F", (), {"id": f"id_{i}", "t": f["text"],
                                       "ts": time.time(), "src": f["src"]})()
                       for i, f in enumerate(bus_msgs)]
