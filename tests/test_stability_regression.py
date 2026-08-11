@@ -27,6 +27,15 @@ _PATCHERS: list = []
 class _MockTestCase(unittest.TestCase):
     """基类（保留兼容；实例属性覆盖方案不再需要 teardown 清理类）。"""
 
+    def setUp(self):
+        # 模块级 _HEALTH 共享目录：清残留 health 文件防测试间污染
+        # （test_no_health_file_degrade_db_check 期望无文件，残留 qa.json 会误判）
+        for f in _HEALTH.glob("*.json"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
 
 def _eng(**overrides) -> WorkflowEngine:
     """构造最小可用 engine mock。"""
