@@ -131,10 +131,19 @@ class TestGuardWatchInvalidType(unittest.TestCase):
         wf_file = eng.workflows_dir / "bad_guard.json"
         wf_file.write_text(json.dumps({
             "name": "bad_guard",
+            "trigger_scene": ["test"],
+            "allowed_initiators": ["pm"],
+            "allowed_executors": ["scout"],
+            "max_duration_hours": 1,
+            "quality_standards": "模板质量校验通过的测试数据",
             "steps": [{
                 "id": "s1", "title": "t", "type": "single",
-                "target_role": "scout", "prompt_template": "x" * 200,
-                "exit_condition": {},
+                "target_role": "scout",
+                "prompt_template": ("## 目标\n执行代码扫描并记录发现，"
+                    "输出格式符合团队规范要求。详细列出每个扫描维度，"
+                    "包括边界情况和异常路径的处理验证。\n\n## 完成\n"
+                    "写 bus cat=scan_result，标题含 s1-complete。"),
+                "exit_condition": {"bus_category": "scan_result"},
                 "guard": {"watch": "scout"}  # 字符串，非法
             }]
         }))

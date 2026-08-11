@@ -342,5 +342,62 @@ class TestLoopValueGate(unittest.TestCase):
                          "PASS 时应 INSERT task + workflow_instance（2 次）")
 
 
+class TestWaitRolesValidation(unittest.TestCase):
+    """wait_roles schema 校验：非法类型丢弃，合法 list 保留。"""
+
+    _GOOD_STEP = {
+        "id": "s1", "title": "t", "type": "single",
+        "target_role": "qa",
+        "prompt_template": ("## 目标\n执行测试验证并记录结果，确保所有关键场景覆盖，"
+                             "输出格式符合团队规范要求。详细列出每个测试用例的执行步骤和预期结果，"
+                             "包括边界情况和异常路径的处理验证，并在报告中注明覆盖范围与遗漏风险，"
+                             "完成后将结果归档。\n\n## 完成\n"
+                             "写 bus cat=test_report，标题含 s1-complete。"),
+        "exit_condition": {"bus_category": "test_report"},
+    }
+
+    @staticmethod
+    def _load_tmpl(eng, name, wait_roles):
+        eng.workflows_dir = Path(__import__("tempfile").mkdtemp())
+        eng.runs_dir = eng.workflows_dir / "runs"
+        eng.runs_dir.mkdir(exist_ok=True)
+        step = dict(TestWaitRolesValidation._GOOD_STEP)
+        step["wait_roles"] = wait_roles
+        eng.workflows_dir.joinpath(f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "trigger_scene": ["test"],
+            "allowed_initiators": ["pm"],
+            "allowed_executors": ["qa"],
+            "max_duration_hours": 1,
+            "quality_standards": "模板质量校验通过的测试数据",
+            "steps": [step]
+        }))
+        eng._role_collab_cache = {}
+        eng._collab_mtime = None
+        eng._load_workflows()
+        return eng._workflows[name].steps[0].wait_roles
+
+    def test_string_type_dropped(self):
+        eng = _eng()
+        self.assertIsNone(self._load_tmpl(eng, "bad1", "qa"))
+
+    def test_int_type_dropped(self):
+        eng = _eng()
+        self.assertIsNone(self._load_tmpl(eng, "bad2", 42))
+
+    def test_dict_type_dropped(self):
+        eng = _eng()
+        self.assertIsNone(self._load_tmpl(eng, "bad3", {"qa": True}))
+
+    def test_list_of_str_kept(self):
+        eng = _eng()
+        self.assertEqual(self._load_tmpl(eng, "ok1", ["qa", "reviewer"]),
+                         ["qa", "reviewer"])
+
+    def test_empty_list_kept(self):
+        eng = _eng()
+        self.assertEqual(self._load_tmpl(eng, "ok2", []), [])
+
+
 if __name__ == "__main__":
     unittest.main()

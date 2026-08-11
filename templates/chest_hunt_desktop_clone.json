@@ -1,0 +1,107 @@
+{
+  "workflow_id": "WL-CHEST01",
+  "name": "桌面分身宝箱寻找功能开发",
+  "description": "使用 BetterGI 多实例任务的桌面分身协作模式，开发宝箱自动寻找与开启功能：识别→路径→开启的完整链路",
+  "trigger_scene": [
+    "用户请求开发宝箱寻找功能",
+    "BetterGI 自动寻宝需求",
+    "多任务实例并行调度开发"
+  ],
+  "allowed_initiators": [
+    "pm",
+    "coordinator",
+    "lr"
+  ],
+  "allowed_executors": [
+    "engineer",
+    "product_architect",
+    "qa"
+  ],
+  "steps": [
+    {
+      "title": "产品架构设计宝箱寻找方案",
+      "type": "handoff",
+      "target_role": "product_architect",
+      "prompt_template": "## 做什么\n设计宝箱寻找功能的架构方案：模块划分（识别模块/寻路模块/交互模块）、复用 BetterGI 现有 AutoPathing 寻路与 AutoOpenChest 识别能力的方案、桌面分身多任务并行调度时的优先级与互斥策略。\n\n## 怎么做\n1. 阅读 BetterGenshinImpact/GameTask/AutoOpenChest/ 与 GameTask/AutoPathing/ 源码\n2. 评估复用度：AutoPathing 的 PathExecutor 可加载宝箱点位路径；AutoOpenChest 的 ChestIconRo 模板识别可复用\n3. 输出 DESIGN.md，明确模块间数据流与任务触发的接入点\n\n## 验收标准\n产出 ccs-workspaces/product_architect/DESIGN.md，包含：模块划分图、现有能力复用清单、桌面分身并行调度优先级方案。至少 30 字描述每个任务与角色的交互链路。\n\n## 完成\n- 输出 DESIGN.md 到 ccs-workspaces/product_architect/",
+      "completion_check": {
+        "output_exists": [
+          "DESIGN.md"
+        ],
+        "contains_keyword": [
+          "宝箱",
+          "寻路"
+        ],
+        "review_required": true
+      },
+      "failure_patterns": [
+        "无地图寻路方案",
+        "未考虑多任务并行调度优先级",
+        "未复用现有 AutoOpenChest 资产"
+      ],
+      "estimated_hours": 2,
+      "id": "s1",
+      "exit_condition": {
+        "bus_category": "notice",
+        "text_contains": "DONE",
+        "timeout_minutes": 30
+      }
+    },
+    {
+      "title": "工程师实现宝箱识别与寻路任务",
+      "type": "single",
+      "target_role": "engineer",
+      "prompt_template": "## 做什么\n在 BetterGenshinImpact 实现宝箱自动寻找功能：扩展 AutoOpenChestTask 支持按宝箱点位路径寻路开启，并接入现有 SoloTask 触发机制。\n\n## 怎么做\n1. 在 GameTask/AutoOpenChest/ 扩展 AutoOpenChestTask，加入路径寻路支持（复用 AutoPathing 的 PathExecutor，加载宝箱点位路径）\n2. 在 GameTask/AutoPathing/Model/Enum/PathingTaskType.cs 增加 Chest 枚举\n3. 用 TaskRunner.RunSoloTaskAsync 接入 TaskSettingsPageViewModel 触发\n4. 完成后 dotnet build BetterGenshinImpact.sln -c Debug 验证编译\n\n## 验收标准\n- 编译通过（dotnet build -c Debug 无错误）\n- 原 AutoOpenChest 识别开启宝箱行为不回归\n- 寻路模式可加载宝箱点位路径\n- TASKS.md 记录变更\n\n## 完成\n- 输出 TASKS.md 变更记录到 ccs-workspaces/engineer/",
+      "completion_check": {
+        "output_exists": [
+          "TASKS.md"
+        ],
+        "contains_keyword": [
+          "寻路",
+          "Chest"
+        ],
+        "review_required": true
+      },
+      "failure_patterns": [
+        "未接入 PathExecutor",
+        "未增加 Chest 路径类型",
+        "编译失败未修复"
+      ],
+      "estimated_hours": 4,
+      "id": "s2",
+      "exit_condition": {
+        "bus_category": "notice",
+        "text_contains": "DONE",
+        "timeout_minutes": 30
+      }
+    },
+    {
+      "title": "QA 验证宝箱寻找功能",
+      "type": "review",
+      "target_role": "qa",
+      "prompt_template": "## 做什么\n编写并执行宝箱寻找功能的验证测试：确认原识别模式不回归、寻路模式可加载宝箱点位路径。\n\n## 怎么做\n1. 阅读 AutoOpenChestTask.cs 与新增寻路模式代码\n2. 编写 test_cases.md：识别模式回归用例 + 寻路模式加载用例\n3. 实际执行并记录结果\n\n## 验收标准\n- 测试用例覆盖识别模式回归与寻路模式加载\n- 输出包含真实执行结果，不可虚报\n- 所有测试必须真实运行\n\n## 完成\n- 输出 ccs-workspaces/qa/test_cases.md 与执行结果",
+      "completion_check": {
+        "output_exists": [
+          "test_cases.md"
+        ],
+        "contains_keyword": [
+          "通过"
+        ],
+        "review_required": true
+      },
+      "failure_patterns": [
+        "未实际运行验证",
+        "只输出测试计划不输出结果",
+        "虚报测试结果"
+      ],
+      "estimated_hours": 2,
+      "id": "s3",
+      "exit_condition": {
+        "bus_category": "notice",
+        "text_contains": "DONE",
+        "timeout_minutes": 30
+      }
+    }
+  ],
+  "max_duration_hours": 8,
+  "quality_standards": "宝箱寻找功能必须满足：1. 编译通过（dotnet build -c Debug 无错误）；2. 原有 AutoOpenChest 识别开启宝箱行为不回归；3. 寻路模式可加载宝箱点位路径；4. 全部改动在 ccs-workspaces 有对应任务记录；5. 任务与角色通过 session 三项目协作完成"
+}
