@@ -111,8 +111,10 @@ def _starve_signal(eng: WorkflowEngine) -> None:
     last_failure_ts = state.get("last_failure_ts", 0)
     consec_fails = state.get("consecutive_failures", 0)
     if consec_fails >= _STARVE_FAIL_THRESHOLD:
-        if now - max(last_fire, last_failure_ts) < _STARVE_FAIL_BACKOFF:
-            return  # 已达标 → 24h 长退避
+        # 达到阈值 + 最近失败在 24h 内 → 退避（不创建）
+        # 失败时间戳过旧（迁移前脏数据/首次触碰）→ 允许创建一次以重置计数
+        if last_failure_ts > 0 and now - last_failure_ts < _STARVE_FAIL_BACKOFF:
+            return  # 24h 内有失败记录 → 退避
     else:
         if now - last_fire < _STARVE_COOLDOWN:
             return  # 成功冷却期内

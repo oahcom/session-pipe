@@ -210,6 +210,7 @@ def test_backoff_after_consecutive_failures():
         fails = 6  # 已 6 次连续失败
         state_path.write_text(json.dumps({
             "last_fire": time.time() - 100,  # 100 秒前
+            "last_failure_ts": time.time() - 100,  # 最近失败 100s 前
             "consecutive_failures": fails,
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
@@ -218,7 +219,7 @@ def test_backoff_after_consecutive_failures():
             eng = MagicMock()
             eng.start.return_value = "wf_backoff"
             daemon._starve_signal(eng)
-            # 6 次失败后冷却 24h，100 秒前不够 → 不触发
+            # 6 次失败 + 最近失败在 24h 内 → 退避，不创建
             eng.start.assert_not_called()
 
 # ── 12. 失败次数<5 时冷却仍为 6h ──
