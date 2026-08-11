@@ -15,6 +15,7 @@ from pathlib import Path
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.engine import Step, WorkflowRun
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
+from conversation_monitor import get_conversation_signal
 from pipeflow.integrity import (
     DIMENSIONS as _integ_dimensions,
     load_state as _integ_load,
@@ -26,6 +27,21 @@ from pipeflow.integrity import (
 )
 
 LOGGER = logging.getLogger("workflow.engine")
+
+
+def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
+    """角色 tmux pane 显示空闲 → 发一轮提醒 prompt（不 cancel，不递增超时）。"""
+    msg = (f"[workflow] {run.workflow_name}/{step.id} 检测到角色空闲（pane 证据: {evidence[:80]}）。"
+           f"请继续完成当前步骤 {step.id}。")
+    send_to_role(step.target_role, msg)
+
+
+def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
+    """角色 tmux pane 显示越界操作 → 注入停止指令（安全护栏，不 cancel 工作流）。"""
+    ops = "、".join(commands[:3])
+    msg = (f"[workflow] {run.workflow_name}/{step.id} 检测到越界操作: {ops}。"
+           f"请立即停止并撤销该操作，仅在当前工作流 {step.id} 范围内工作。")
+    send_to_role(role, msg)
 
 
 class StepHandlerMixin:
@@ -71,6 +87,34 @@ class StepHandlerMixin:
             except Exception as _e:
                 LOGGER.debug("tick rescue failed for %s/%s: %s", run.workflow_name, step.id, _e)
             return  # P2-1 修复：complete 后不 fall-through 到 integrity/timeout（防重复 complete）
+        # ── tmux 信号补充（bus 信号延迟/丢失时的兜底）──
+        # conversation_monitor 从角色 tmux pane 提取 3 信号，作为 bus exit_condition 补充：
+        #   step_completed → 直接推进（产出已在 pane 可见）
+        #   idle_complaint → 发提醒（不 cancel）
+        #   violation      → 注入停止指令（越界操作）
+        try:
+            sig = get_conversation_signal(step.target_role)
+        except Exception as _e:
+            LOGGER.debug("conversation_monitor 信号获取失败: %s", _e)
+            sig = None
+        if sig and sig.step_completed:
+            try:
+                self._lifecycle.complete_step(run.id, step.id)
+                LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
+            except Exception as _e:
+                LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
+            return  # 产出已确认，跳过 timeout/催办
+        if sig and sig.idle_complaint:
+            try:
+                _remind_tmux_idle(run, step, sig.idle_evidence, send_to_role=self._send_to_role)
+            except Exception as _e:
+                LOGGER.debug("tmux 空闲提醒失败: %s", _e)
+        if sig and sig.violation_found:
+            try:
+                _stop_tmux_violation(run, step, sig.violation_commands, sig.violation_role,
+                                     send_to_role=self._send_to_role)
+            except Exception as _e:
+                LOGGER.debug("tmux 越界停止指令失败: %s", _e)
         # ── Timeout 检查（每次 tick 都执行，不受 schema/verify 影响）──
         # 超时后自动升级到 coordinator，不会被 schema 失败 return 阻断。
         # 超限阈值: max(max_retries+2, 3) 次超时后自动 cancel，防止无限重试堆积。
@@ -84,7 +128,8 @@ class StepHandlerMixin:
                 # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
                 if cat:
                     _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
+                        wait_roles=getattr(step, "wait_roles", None))
                     if _busy_match_ts:
                         run.step_results[step.id] = {
                             **run.step_results.get(step.id, {}),
@@ -204,7 +249,8 @@ class StepHandlerMixin:
             #    触发条件：步骤已超时 >=1 次（角色确实执行过）且非首步。
             #    匹配策略：先找引擎发的 task_spec（含 wf 前缀）→ 再匹配该角色在
             #    task_spec 之后写的任意消息（标题可能不含 wf 前缀，按时间窗匹配）。
-            if timeout_count >= 1 and not step.dual_node:
+            # codex P2-1：wait_roles 协作步骤不走 relaxed-advance（避免绕过协作门控）
+            if timeout_count >= 1 and not step.dual_node and not getattr(step, "wait_roles", None):
                 try:
                     # 全量读：_has_anchor 需跨分类找 task_spec 锚点（cat 过滤会漏掉），
                     # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
@@ -341,18 +387,19 @@ class StepHandlerMixin:
             # exit 匹配必须在 timeout 检查之后、return 之前执行，
             # 否则 notified/running 步骤永远无法通过 exit 条件推进（bus #162804）。
             # 消息去重：同一消息不应被多个工作流同时消费（bus #162146 QA 4任务共享测试结果）
-            if not hasattr(self, '_consumed_exit_ids'):
-                self._consumed_exit_ids = set()
+            # _consumed_exit_ids 已在上方完整性阶段初始化（P1-3 死代码已删）
             # dual_node：node2_sent 后将 filter 改为 s{N}-（匹配 s2-complete 和 s2-codex-approved）
             _node2_sent = (run.step_results.get(step.id, {}) or {}).get("node2_sent", False)
+            # 协作门：wait_roles 声明的角色都产出匹配消息才推进（多角色协作）
+            _wait_roles = getattr(step, "wait_roles", None)
             if step.dual_node and _node2_sent:
                 # 宽匹配：第二节点消息（codex-approved）到达时也能匹配
                 _wide_filter = re.sub(r"-complete$", "-", text_filter)
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, _wide_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False, wait_roles=_wait_roles)
             else:
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False, wait_roles=_wait_roles)
             if _match_ts:
                 # 过滤已被其他工作流消费的消息
                 _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
@@ -521,7 +568,8 @@ class StepHandlerMixin:
         if not cat:
             return
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False)
+                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
+                        wait_roles=getattr(step, "wait_roles", None))
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
             # 同时保存 exit_messages 作为角色产出证据（task_evidence 依赖此字段判定收益）
@@ -776,7 +824,7 @@ class StepHandlerMixin:
         return sr.get("status") == expected
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
-                    wf_id: str = "", strict_wf: bool = False) -> tuple:
+                    wf_id: str = "", strict_wf: bool = False, wait_roles: list = None) -> tuple:
         """查 exit 是否有匹配消息。返回 (timestamp, matched_msgs)。
 
         wf_id 非空时过滤"消息必须含当前工作流实例 id"——防止新工作流
@@ -785,6 +833,8 @@ class StepHandlerMixin:
         strict_wf=True（require_wf=true 时）：消息必须含当前 wf_id，否则不匹配。
         防止旧工作流的同分类消息（不带 wf_id）串入 require_wf 步骤
         （2026-08-10 观测：wf_7f37 s1 匹配到 wf_cde32 的 s1-complete）。
+        wait_roles（协作门）：非空时要求所有声明角色都写了匹配消息才返回匹配。
+        多角色协作（仲裁模式）核心：等 qa 和 reviewer 都产出 test_report 才推进。
         """
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         earliest = 0.0
@@ -809,4 +859,9 @@ class StepHandlerMixin:
             matched.append({"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src})
             if earliest == 0 or f.ts < earliest:
                 earliest = f.ts
+        # 多角色协作门：所有声明角色都有匹配消息才通过（仲裁模式）
+        if wait_roles:
+            have = {m["src"] for m in matched}
+            if not set(wait_roles).issubset(have):
+                return (0.0, [])  # 还有角色没产出，不推进
         return (earliest, matched)
