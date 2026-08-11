@@ -403,6 +403,12 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
             return
+        # 自动注入搜索提醒（非 coordinator、非 force 模式才注入）
+        # 让所有角色在每次接收任务时，习惯性地用 WebSearch 查证信息
+        if role != "coordinator" and not force:
+            _search_prefix = "（网络求证）开始工作前先用 WebSearch 搜索1次关键信息：事实数据、最新进展、可行性确认。搜不到的标注为「假设」。\n\n"
+            if not prompt.startswith("（网络求证）"):
+                prompt = _search_prefix + prompt
         # coordinator 只接收真实任务（task_spec 语义），排队/超时/告警升级消息
         # 写 blocker 即可，不 ccs send —— 避免 /goal 前缀注入 coordinator 死锁
         # （bus #141691 根因：q/goal [] 循环。coordinator 是调度者不是目标执行者）
