@@ -98,12 +98,16 @@ class StepHandlerMixin:
             LOGGER.debug("conversation_monitor 信号获取失败: %s", _e)
             sig = None
         if sig and sig.step_completed:
-            try:
-                self._lifecycle.complete_step(run.id, step.id)
-                LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
-            except Exception as _e:
-                LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
-            return  # 产出已确认，跳过 timeout/催办
+            # wait_roles 协作门：tmux 信号不能绕过协作门控（2026-08-10 codex P1），
+            # 等所有声明角色都产出匹配消息才允许推进
+            _wr = getattr(step, "wait_roles", None)
+            if not _wr or set(_wr).issubset({m.get("src", "") for m in (run.step_results.get(step.id, {}) or {}).get("exit_messages", [])}):
+                try:
+                    self._lifecycle.complete_step(run.id, step.id)
+                    LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
+                except Exception as _e:
+                    LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
+                return  # 产出已确认，跳过 timeout/催办
         if sig and sig.idle_complaint:
             try:
                 _remind_tmux_idle(run, step, sig.idle_evidence, send_to_role=self._send_to_role)
