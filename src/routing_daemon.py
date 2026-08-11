@@ -36,6 +36,7 @@ __all__ = ["route_all", "route_all_to_ccs", "LOGGER", "METRICS"]
 INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔
 EVAL_INTERVAL = 600 # eval_criteria 检查间隔（每 10 分钟）
+DRIFT_INTERVAL = 3600  # 角色输出漂移检测间隔（每 1 小时）
 SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
 CRON_SCHEDULE_TRACKER = Path.home() / ".hermes" / "run" / "cron_schedule_triggered.json"  # 去重跟踪
 
@@ -133,6 +134,7 @@ def main():
     last_ccs = 0
     last_eval = 0
     last_survival = 0
+    last_drift = 0
 
     # ── 单实例 PID 锁 ──
     _pid_file = Path.home() / ".hermes" / "run" / "routing_daemon.pid"
@@ -251,6 +253,21 @@ def main():
                     LOGGER.error("eval_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_eval = now
+
+            # 定时角色输出漂移检测（每小时）
+            if now - last_drift >= DRIFT_INTERVAL:
+                try:
+                    from drift_detector import detect_all_drift, report_drift
+                    _drift = detect_all_drift()
+                    if _drift:
+                        n = report_drift(_drift)
+                        LOGGER.warning("drift 检测: %d 个角色有输出偏离", n)
+                    else:
+                        LOGGER.info("drift 检测: 无偏离 ✓")
+                except Exception as e:
+                    LOGGER.error("drift 检测异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
+                last_drift = now
 
             # 存活检测 tick（L1 进程存活 + 哨兵状态）
             if now - last_survival >= SURVIVAL_INTERVAL:
