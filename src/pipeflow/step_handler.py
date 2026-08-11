@@ -385,6 +385,8 @@ class StepHandlerMixin:
         if _integ_state.complete and not _integ_dual_pending:
             # 维度已发完，等待角色回复（{step_id}-integrity-approved）
             _integ_filter = f"{step.id}-integrity-approved"
+            # integrity 有意不传 wait_roles：integrity 是 target_role 1:1 回复协议（非多角色协作门），
+            # 若传 wait_roles，integrity 回复本身也会被协作门死锁（2026-08-11 codex 审查确认）
             _integ_ts, _integ_msgs = self._check_exit(
                 cat, src_filter, _integ_filter, created_after=last_ts,
                 wf_id=run.id if ec.get("require_wf") else "", strict_wf=False
@@ -876,6 +878,14 @@ class StepHandlerMixin:
         （2026-08-10 观测：wf_7f37 s1 匹配到 wf_cde32 的 s1-complete）。
         wait_roles（协作门）：非空时要求所有声明角色都写了匹配消息才返回匹配。
         多角色协作（仲裁模式）核心：等 qa 和 reviewer 都产出 test_report 才推进。
+
+        src=claude 双路径语义（2026-08-11 codex 审查）：
+        - 主查询路径（limit=50）：放行 src=claude —— bus CLI 写消息默认 src=claude，
+          角色未显式指定时消息仍可被匹配（兜底）。
+        - 补查路径（per-role limit=200）：不放行 src=claude —— 否则一条 claude-src
+          消息可同时满足所有缺失角色，协作门被一票绕过。
+        生产实测（2026-08-11 blackboard.db）：协作角色用角色名写 bus（test_report
+        分类 6 条全部 src=qa），精确匹配可行。
         """
         facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
         earliest = 0.0
