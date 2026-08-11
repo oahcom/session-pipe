@@ -351,9 +351,24 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         raise ValueError(f"未知工作流: {name}")
 
     def _upsert_template(self, name: str, wf: WorkflowDef):
-        # JSON 优先守卫：DB 已有同名模板 → 跳过 upsert，防止 client 等路径
-        # 写入的简化版 steps（无 exit_condition）覆盖 JSON 完整定义
-        # （根因：bus #167084，upsert 的简化版覆盖 JSON 定义 → 步骤卡死）
+        # start() 后实例推进依赖 DB 模板行（_load_workflows 从 DB 补充加载）。
+        # 防绕过：写 DB 前过结构校验（allow_minimal）——未校验的简化模板
+        # （无 exit_condition 的步骤）会被拒绝，不能污染 DB。
+        # JSON 优先守卫保留：DB 已有同名 → 不覆盖（防简化版覆盖完整定义）。
+        try:
+            from template_registry import _validate_schema as _vschema
+            _steps_dicts = [
+                {"id": s.id, "title": s.title, "target_role": s.target_role,
+                 "prompt_template": s.prompt_template, "exit_condition": s.exit_condition}
+                for s in wf.steps
+            ]
+            _vr = _vschema({"name": name, "steps": _steps_dicts}, allow_minimal=True)
+            if not _vr.passed:
+                LOGGER.error("[wf] upsert 拒绝: %s 结构校验不通过: %s",
+                             name, _vr.errors[:3])
+                return
+        except Exception:
+            pass  # 校验异常时放行（兼容，不阻断启动）
         try:
             _existing = self._lifecycle.query(
                 "SELECT 1 FROM workflow_templates WHERE template_id=?", (name,))

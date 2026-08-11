@@ -166,3 +166,36 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{'PASS' if failed == 0 else 'FAIL'}: {passed}/{passed+failed} tests passed")
     sys.exit(1 if failed else 0)
+
+# ── 9. 绕过防护：_upsert_template 拒绝坏结构模板 ──
+def test_upsert_rejects_bad_structure():
+    """start() 路径 upsert 无 exit_condition 的模板 → 拒绝写 DB。"""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from pipeflow.engine import WorkflowEngine
+    from pipeflow.engine import WorkflowDef, Step
+    with tempfile.TemporaryDirectory() as tmp:
+        wf_dir = Path(tmp) / "wf"
+        wf_dir.mkdir()
+        eng = WorkflowEngine(workflows_dir=wf_dir, db_path=str(Path(tmp) / "t.db"))
+        # 构造缺 exit_condition 的坏步骤模板
+        bad_wf = WorkflowDef(
+            name="bad_wf", title="坏", description="d",
+            steps=[Step(id="s1", title="t", target_role="engineer",
+                        prompt_template="p", exit_condition={})],
+        )
+        eng._upsert_template("bad_wf", bad_wf)
+        rows = eng._lifecycle.query(
+            "SELECT 1 FROM workflow_templates WHERE template_id='bad_wf'")
+        assert not rows, "坏结构模板不应写入 DB"
+        # 好模板正常写
+        good_wf = WorkflowDef(
+            name="good_wf", title="好", description="d",
+            steps=[Step(id="s1", title="t", target_role="engineer",
+                        prompt_template="p",
+                        exit_condition={"type": "exit_message", "match": "done"})],
+        )
+        eng._upsert_template("good_wf", good_wf)
+        rows = eng._lifecycle.query(
+            "SELECT 1 FROM workflow_templates WHERE template_id='good_wf'")
+        assert rows, "好结构模板应写入 DB"
