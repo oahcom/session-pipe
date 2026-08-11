@@ -93,14 +93,13 @@ class WorkflowLifecycleMixin:
                                         break
                                 if _step_tpl:
                                     from pipeflow.integrity import send_bypass_reminder as _sbr
-                                    _sbr_run = type("R", (), {
-                                        "id": wf_id, "step_results": sr,
-                                    })()
-                                    _sbr_step = type("S", (), {
-                                        "id": _cur,
-                                        "target_role": _step_tpl.get("target_role", ""),
-                                        "prompt_template": _step_tpl.get("prompt_template", ""),
-                                    })()
+                                    from types import SimpleNamespace as _SN
+                                    _sbr_run = _SN(id=wf_id, step_results=sr)
+                                    _sbr_step = _SN(
+                                        id=_cur,
+                                        target_role=_step_tpl.get("target_role", ""),
+                                        prompt_template=_step_tpl.get("prompt_template", ""),
+                                    )
                                     def _persist_sr(*args):
                                         # 真落库：bypass flag 写入 DB（否则 daemon 重启后重复提醒）
                                         try:

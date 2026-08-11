@@ -297,7 +297,10 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
         send_result.stdout = ""
         send_result.stderr = ""
         send_result.returncode = 0
-        mock_run.side_effect = [status_result, send_result]
+        # routes.py 新增 _is_busy：tmux has-session（1 次 subprocess.run）
+        busy_session = MagicMock()
+        busy_session.returncode = 1  # has-session: 无 session → 不忙
+        mock_run.side_effect = [status_result, busy_session, send_result]
         mock_sys.executable = "/usr/bin/python3"
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "routed"
@@ -326,7 +329,10 @@ def test_route_to_ccs_send_failure(mock_metrics, mock_hb):
         send_result.stdout = '{"error": "connection refused"}'
         send_result.stderr = ""
         send_result.returncode = 1
-        mock_run.side_effect = [status_result, send_result]
+        # routes.py 新增 _is_busy：tmux has-session（1 次 subprocess.run）
+        busy_session = MagicMock()
+        busy_session.returncode = 1  # has-session: 无 session → 不忙
+        mock_run.side_effect = [status_result, busy_session, send_result]
         mock_sys.executable = "/usr/bin/python3"
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "failed"
@@ -356,7 +362,10 @@ def test_route_to_ccs_system_category_skips_workflow(mock_metrics, mock_hb):
         send_result.stdout = ""
         send_result.stderr = ""
         send_result.returncode = 0
-        mock_run.side_effect = [status_result, send_result]
+        # routes.py 新增 _is_busy：tmux has-session（1 次 subprocess.run）
+        busy_session = MagicMock()
+        busy_session.returncode = 1  # has-session: 无 session → 不忙
+        mock_run.side_effect = [status_result, busy_session, send_result]
         mock_sys.executable = "/usr/bin/python3"
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "routed"

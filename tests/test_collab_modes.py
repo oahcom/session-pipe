@@ -126,7 +126,8 @@ class TestPeerTrack(unittest.TestCase):
             id="wf_x", workflow_name="food_chain", context={},
             current_step="s1", status="running",
             step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         audit_writes = [c.args for c in eng._bb.write.call_args_list
                         if c.args[0] == "monitor_audit"]
         self.assertTrue(audit_writes, "超时应写 monitor_audit")
@@ -147,11 +148,13 @@ class TestPeerTrack(unittest.TestCase):
             id="wf_throttle", workflow_name="test", context={},
             current_step="s1", status="running",
             step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         first_call_count = eng._send_to_role.call_count
         self.assertEqual(first_call_count, 1, "第一次应提醒")
         # 第二次 tick（节流窗口内，track_notified_at 已设置）
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         second_call_count = eng._send_to_role.call_count
         self.assertEqual(second_call_count, 1, "第二次应被节流，不重复提醒")
 
@@ -167,7 +170,8 @@ class TestPeerTrack(unittest.TestCase):
             id="wf_same", workflow_name="test", context={},
             current_step="s1", status="running",
             step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         audit_writes = [c.args for c in eng._bb.write.call_args_list
                         if c.args[0] == "monitor_audit"]
         self.assertFalse(audit_writes, "相同分类时 track 应跳过，不写审计")
@@ -213,7 +217,8 @@ class TestCombinedMode(unittest.TestCase):
             id="wf_c", workflow_name="test", context={},
             current_step="s2", status="running",
             step_results={"s2": {"status": "notified", "ts": time.time() - 600}})
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
 
         called = {c.args[0] for c in eng._ensure_role_alive.call_args_list}
         self.assertIn("engineer", called, "guard: engineer 被守护")

@@ -34,6 +34,21 @@ DIMENSIONS = [
          "用户指令：{goal}\n实际执行：{output}")},
 ]
 
+# DIMENSIONS 前两条即用户核心问题的标准文本；bypass 复用其问题主干（P1-1 统一）
+# 提取问题句（去掉前缀标记，如【完整性审查 1/2】）供 bypass 复用
+def _question_text(dim: dict) -> str:
+    """从维度 prompt 提取核心问题句（去除编号前缀与模板变量段）。"""
+    _t = dim["prompt"]
+    # 去掉【...】前缀和 {xxx} 变量段
+    import re as _re
+    _t = _re.sub(r"^【[^】]*】", "", _t).strip()
+    _t = _re.sub(r"\{[a-z_]+\}", "", _t).strip()
+    return _t.split("\n")[0].strip()
+
+
+# 两个核心问题（bypass 复用，与 DIMENSIONS 前两条同源）
+CORE_QUESTIONS = [_question_text(DIMENSIONS[0]), _question_text(DIMENSIONS[1])]
+
 # ── 默认配置 ──
 DEFAULT_INTERVAL_SEC = 30
 DEFAULT_MAX_RETRIES = 3
@@ -165,10 +180,10 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     if step_results.get(step.id, {}).get("integrity_reminder_sent_bypass", False):
         return  # 已发过
     goal_text = getattr(step, 'prompt_template', '') or ''
-    # 两个核心问题（与 DIMENSIONS 前两条一致）；分母动态 = 问题数，不硬编码 2
+    # 复用 CORE_QUESTIONS（与 DIMENSIONS 前两条同源，P1-1 统一）
     _questions = [
-        f"步骤 {step.id} 即将完成（{path}），请回答：\n你真的解决了用户的问题吗？（简答）\n需求：{goal_text[:300]}",
-        f"你真的有严格按用户的提示去完成任务吗？（简答）\n用户指令：{goal_text[:300]}",
+        f"步骤 {step.id} 即将完成（{path}），请回答：\n{CORE_QUESTIONS[0]}（简答）\n需求：{goal_text[:300]}",
+        f"{CORE_QUESTIONS[1]}（简答）\n用户指令：{goal_text[:300]}",
     ]
     for i, q in enumerate(_questions, 1):
         try:

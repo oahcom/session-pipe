@@ -211,7 +211,31 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                      capture_output=True, text=True, timeout=10, env=_launcher_env)
         return "未运行" not in r.stdout
 
+    def _is_busy(role):
+        """忙检测：tmux pane 60s 内活跃 → 角色在工作中，本轮跳过推送。
+
+        消息不消费保留在 bus，由 daemon 下轮（300s）再取再试，不丢失。
+        与 task_generator._can_assign_role 的 L2 检测同模式。
+        """
+        import subprocess as _sp
+        try:
+            _r = _sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
+                         capture_output=True, timeout=5)
+            if _r.returncode != 0:
+                return False  # 无 session：交给 _is_running 语义处理
+            _pr = _sp.run(["tmux", "list-panes", "-t", f"ccs-{role}",
+                           "-F", "#{pane_activity}"],
+                          capture_output=True, text=True, timeout=3)
+            if _pr.returncode == 0 and _pr.stdout.strip():
+                _val = _pr.stdout.strip().split("\n")[0]
+                if _val and _val != "0":
+                    return time.time() - float(_val) < 60
+        except Exception:
+            pass
+        return False
+
     running = _is_running(role_name) if not dry_run else None
+    busy = _is_busy(role_name) if not dry_run else None
     details = []
     body_facts: list[dict] = []
 
@@ -232,6 +256,12 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         if not running:
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "skipped", "reason": f"CCS {role_name} 未启动"})
+            continue
+
+        # 忙检测：角色工作中 → 本轮不推送（消息保留在 bus，下轮再试）
+        if busy:
+            details.append({"id": msg["id"], "category": msg["category"],
+                            "action": "deferred", "reason": f"CCS {role_name} 工作中"})
             continue
 
         # Output validation: validate structured JSON content before routing

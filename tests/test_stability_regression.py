@@ -142,7 +142,8 @@ class TestTimeoutQueuedNotIncremented(_MockTestCase):
         step = _step(target_role="qa", exit_condition={"timeout_minutes": 1})
         # 手动设置超时场景
         run.step_results["s1"] = {"ts": time.time() - 100}
-        with patch.object(eng, "_sync_step_results"):
+        with patch.object(eng, "_sync_step_results"), \
+             patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
             eng._tick(run, step)
         sdata = run.step_results["s1"]
         self.assertNotIn("timeout_count", sdata,
@@ -163,7 +164,8 @@ class TestAutoCancelThreshold(_MockTestCase):
                       exit_condition={"timeout_minutes": 1})
         # timeout_count=3, 阈值=4 → 超限
         run.step_results["s1"] = {"ts": time.time() - 200, "timeout_count": 3}
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         eng._lm.close_wf.assert_called_once()
         self.assertEqual(run.step_results["s1"]["timeout_count"], 4)
 
@@ -208,7 +210,8 @@ class TestIsRoleBusyEdgeCases(_MockTestCase):
         run = _run()
         step = _step(target_role="qa", max_retries=0, exit_condition={"timeout_minutes": 1})
         run.step_results["s1"] = {"ts": time.time() - 100, "queued": 5}
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         eng._send_to_role.assert_called()
         args = eng._send_to_role.call_args[0]
         self.assertEqual(args[0], "coordinator")
@@ -222,7 +225,8 @@ class TestIsRoleBusyEdgeCases(_MockTestCase):
         run = _run()
         step = _step(target_role="qa", max_retries=0, exit_condition={"timeout_minutes": 1})
         run.step_results["s1"] = {"ts": time.time() - 200, "timeout_count": 2}
-        eng._tick(run, step)
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
         sdata = run.step_results["s1"]
         self.assertEqual(sdata.get("timeout_count"), 2, "忙时不应递增 timeout_count")
         self.assertGreater(sdata["ts"], time.time() - 1, "忙时 ts 应重置")
