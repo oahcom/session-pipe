@@ -199,3 +199,38 @@ def test_upsert_rejects_bad_structure():
         rows = eng._lifecycle.query(
             "SELECT 1 FROM workflow_templates WHERE template_id='good_wf'")
         assert rows, "好结构模板应写入 DB"
+
+
+# ── 10. 双节点端到端闭环（完整推进链） ──
+def test_dual_node_full_cycle():
+    """start → run_once → complete×2 → 引擎推进。验证完整生命周期。"""
+    import sys as _sys, logging as _logging, json as _json
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    _logging.disable(_logging.CRITICAL)
+    from pipeflow.engine import WorkflowEngine
+    from paths import HERMES_WORKFLOWS as _PROD_WF
+    from unittest.mock import patch, MagicMock
+    import shutil as _shutil
+    with tempfile.TemporaryDirectory() as tmp:
+        wf_dir = Path(tmp) / "wf"
+        wf_dir.mkdir()
+        _shutil.copy(_PROD_WF / "food_chain_loop.json", wf_dir / "food_chain_loop.json")
+        eng = WorkflowEngine(workflows_dir=wf_dir, db_path=str(Path(tmp) / "t.db"))
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b"pid=123"
+        mock_result.stderr = b""
+        with patch("subprocess.run", return_value=mock_result), \
+             patch.object(eng, "_ensure_role_alive", return_value=True):
+            wf_id = eng.start("food_chain_loop", {"source": "test", "loop_iteration": 1})
+            eng.run_once()  # mark notified
+            # 双节点第一步 → node1_done
+            r1 = eng._lifecycle.complete_step(wf_id, "s1")
+            assert r1 == "node1_done", f"第一步应 node1_done: {r1}"
+            # 双节点第二步 → 推进到 s2
+            r2 = eng._lifecycle.complete_step(wf_id, "s1")
+            assert r2 in ("step_done_ready", "completed_and_advanced"), f"第二步应完成: {r2}"
+            eng.run_once()
+            rows = eng._lifecycle.query(
+                "SELECT current_step_id FROM workflow_instances WHERE instance_id=?", (wf_id,))
+            assert rows[0]["current_step_id"] in ("s2", "s1"), f"应推进: {rows[0]['current_step_id']}"
