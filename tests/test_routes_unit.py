@@ -299,10 +299,12 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
         send_result.returncode = 0
         mock_run.side_effect = [status_result, send_result]
         mock_sys.executable = "/usr/bin/python3"
+        # 忙检测 check_task：无活跃工作流 → 不忙 → 走发送路径
+        mock_wf.return_value.check_task.return_value = None
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "routed"
     # 短标题(<80)不创建 workflow（防空模板循环）
-    mock_wf.assert_not_called()
+    mock_wf.return_value.create_task_v2.assert_not_called()
 
 
 @patch("routing.routes.HEARTBEAT")
@@ -317,7 +319,8 @@ def test_route_to_ccs_send_failure(mock_metrics, mock_hb):
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
          patch("routing.routes._rt_mod") as mock_rt_mod, \
          patch("routing.routes.sys") as mock_sys, \
-         patch("subprocess.run") as mock_run:
+         patch("subprocess.run") as mock_run, \
+         patch("routing.routes.WorkflowClient") as mock_wf:
         mock_rt_mod.get_router.return_value = MagicMock()
         status_result = MagicMock()
         status_result.stdout = "running"
@@ -328,6 +331,8 @@ def test_route_to_ccs_send_failure(mock_metrics, mock_hb):
         send_result.returncode = 1
         mock_run.side_effect = [status_result, send_result]
         mock_sys.executable = "/usr/bin/python3"
+        # 忙检测 check_task：无活跃工作流 → 不忙 → 走发送路径
+        mock_wf.return_value.check_task.return_value = None
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "failed"
     assert "connection refused" in result["details"][0]["error"]
@@ -358,9 +363,42 @@ def test_route_to_ccs_system_category_skips_workflow(mock_metrics, mock_hb):
         send_result.returncode = 0
         mock_run.side_effect = [status_result, send_result]
         mock_sys.executable = "/usr/bin/python3"
+        # 忙检测 check_task：无活跃工作流 → 不忙 → 走发送路径
+        mock_wf.return_value.check_task.return_value = None
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "routed"
-    mock_wf.assert_not_called()
+    # system category 不创建 workflow 任务（防空模板循环）
+    mock_wf.return_value.create_task_v2.assert_not_called()
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_busy_defers(mock_metrics, mock_hb):
+    """角色有活跃工作流 → action=deferred，不发送、不创建任务。"""
+    from routing.routes import route_to_ccs
+    msgs = [{
+        "id": 35, "category": "code_fix", "text": "fix now",
+        "priority": 1,
+    }]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("routing.routes.sys") as mock_sys, \
+         patch("subprocess.run") as mock_run, \
+         patch("routing.routes.WorkflowClient") as mock_wf:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = "running"
+        status_result.returncode = 0
+        mock_run.side_effect = [status_result]
+        mock_sys.executable = "/usr/bin/python3"
+        # 忙检测 check_task：有活跃工作流 → 忙 → deferred
+        mock_wf.return_value.check_task.return_value = {"instance_id": "wf_1"}
+        result = route_to_ccs("engineer", dry_run=False)
+    assert result["details"][0]["action"] == "deferred"
+    assert "工作流进行中" in result["details"][0]["reason"]
+    # 忙时不发送、不创建任务
+    mock_run.assert_called_once()  # 只有 _is_running，无 _send
+    mock_wf.return_value.create_task_v2.assert_not_called()
 
 
 # ── route_all_to_ccs ──

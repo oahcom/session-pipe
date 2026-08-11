@@ -213,6 +213,20 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
 
     running = _is_running(role_name) if not dry_run else None
     details = []
+
+    # 忙检测：查角色 DB 是否有活跃工作流（与 _is_role_busy 信号2 同数据源）。
+    # 有活跃工作流 → 本轮跳过推送，消息保留在 bus 下轮再试（不消费不丢失）。
+    # 角色在 workflow 中工作时收到 bus 消息会打断当前任务（观测：role_drift 18 条逐条
+    # 推给 maintainer，AI 处理完每条前又被下一条打断）。
+    # DB 查询失败 → 降级为无忙检测（返回 None，与旧行为一致），不阻断路由。
+    wf_busy = None
+    if running:
+        try:
+            _wf_probe = WorkflowClient(role_name)
+            wf_busy = _wf_probe.check_task() is not None
+            _wf_probe.close()
+        except Exception:
+            wf_busy = None  # DB 不可用 → 不检测，避免误杀路由
     body_facts: list[dict] = []
 
     for msg in messages:
@@ -232,6 +246,12 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         if not running:
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "skipped", "reason": f"CCS {role_name} 未启动"})
+            continue
+
+        # 忙检测：角色有活跃工作流 → 跳过推送（消息留 bus 下轮再试）
+        if wf_busy:
+            details.append({"id": msg["id"], "category": msg["category"],
+                            "action": "deferred", "reason": f"CCS {role_name} 工作流进行中"})
             continue
 
         # Output validation: validate structured JSON content before routing
