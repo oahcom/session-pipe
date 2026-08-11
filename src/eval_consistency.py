@@ -11,18 +11,9 @@ import re
 import sys
 from pathlib import Path
 
-# ── 从 eval_checker.py 硬编码同步（避免跨模块导入依赖）─
-# ponytail: 与 eval_checker._ALLOWED_CMDS 保持一致；若白名单变更需同步更新
-_ALLOWED_CMDS = frozenset({
-    "systemctl", "journalctl", "ps", "df", "free", "grep",
-    "curl", "git", "wc", "find",
-    "cat", "head", "tail", "ls", "stat", "echo", "test",
-    "sort", "uniq", "awk", "sed", "diff", "which", "command",
-    "python3", "cut",
-    "pytest",  # 只读测试运行（eval_criteria 验证用）
-    "sqlite3",  # 只读数据库查询
-    "bash",  # 复合命令外壳（内层已由白名单二次校验保护）
-})
+# 运行时从 eval_checker 导入真实白名单（消除手动同步漂移：
+# 曾硬编码导致漏 ccs/du、误含 bash/pytest，2026-08-11 修复）
+from eval_checker import _ALLOWED_CMDS
 
 _DEFAULT_PERSONAS = (Path.home() / "hermes-session-roles"
                      / "personas" / "session-roles")
