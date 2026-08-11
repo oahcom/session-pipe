@@ -379,6 +379,23 @@ class TaskGeneratorMixin:
         from liveness import _tmux_has_session, role_liveness
         if _tmux_has_session(role, timeout=5) is not True:
             return False
-        # L2: thinking 信号（health 文件 survival_l2_thinking，非 pane_activity 60s）
+        # L2: thinking 信号（health 文件 survival_l2_thinking）。health 文件缺失时
+        # （available=False）降级回 pane_activity 60s 检查，保留原语义兜底——
+        # 否则自动任务生成从"60s 活跃拦截"退化为"无条件放行"（review P1-2 修复）。
         res = role_liveness(role, level=1)
-        return not res["busy"]
+        if res["busy"]:
+            return False
+        if res.get("signals", {}).get(1, {}).get("available"):
+            return True  # health 信号可用且不忙
+        # 降级：health 文件缺失 → pane_activity 60s 兜底（原 _can_assign_role L2 语义）
+        try:
+            _pr = _engine_mod._sp.run(["tmux", "list-panes", "-t", f"ccs-{role}",
+                           "-F", "#{pane_activity}"],
+                          capture_output=True, text=True, timeout=3)
+            if _pr.returncode == 0 and _pr.stdout.strip():
+                _val = _pr.stdout.strip().split("\n")[0]
+                if _val and _val != "0" and time.time() - float(_val) < 60:
+                    return False
+        except Exception:
+            pass
+        return True

@@ -156,10 +156,14 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                     and (exclude_wf_id and _row_get(r, "parent_wf_id", 4) == exclude_wf_id):
                 continue
             template_id = _row_get(r, "template_id", 1)
-            # workflows 参数：优先用内存 WorkflowDef 缓存（_is_role_busy 委托时传入），
-            # 回退到 DB workflow_templates.steps_json（独立调用时）。
-            wf_def = (workflows or {}).get(template_id) if workflows else None
-            if wf_def is not None:
+            # workflows 参数：优先用内存 WorkflowDef 缓存（_is_role_busy 委托时传入）。
+            # 当 workflows 已提供但模板不在其中时，保持旧 _is_role_busy 语义（跳过，
+            # 不查 DB）——engine 未加载的模板说明模板不存在或 schema 校验失败，
+            # 其实例应由清理路径回收，不应由忙检测拦截（2026-08-12 review P1 修复）。
+            if workflows is not None:
+                wf_def = workflows.get(template_id)
+                if wf_def is None:
+                    continue
                 steps = [{"id": s.id, "target_role": s.target_role} for s in getattr(wf_def, "steps", [])]
             else:
                 steps = _load_steps_json(template_id, db_conn)
