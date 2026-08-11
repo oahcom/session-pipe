@@ -342,8 +342,8 @@ class WorkflowLifecycleMixin:
                         except Exception:
                             conn2.execute("UPDATE tasks SET parent_task_id=? WHERE task_id=?", (wf_id, _task_id))
                             conn2.commit()
-                        conn2.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at) VALUES (?,?,?,?,?,'pending','s1',?,?)",
-                            (_wf_id, next_step.subflow_template, _task_id, _prev_done, next_step.target_role, json.dumps({}), time.time()))
+                        conn2.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at,parent_wf_id,subflow_source_step_id) VALUES (?,?,?,?,?,'pending','s1',?,?,?,?)",
+                            (_wf_id, next_step.subflow_template, _task_id, _prev_done, next_step.target_role, json.dumps({}), time.time(), wf_id, next_step.id))
                         conn2.commit()
                         new_results[next_step.id]["subflow_id"] = _wf_id
                         conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
@@ -458,10 +458,10 @@ class WorkflowLifecycleMixin:
                          "reviewer", _role, time.time(), time.time(), _tpl))
                     conn.execute(
                         "INSERT OR IGNORE INTO workflow_instances "
-                        "(instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at) "
-                        "VALUES (?,?,?,?,?,'pending','s1',?,?)",
+                        "(instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at,parent_wf_id,subflow_source_step_id) "
+                        "VALUES (?,?,?,?,?,'pending','s1',?,?,?,?)",
                         (_wf_id_rw, _tpl, _task_id, "reviewer", _role,
-                         json.dumps({}), time.time()))
+                         json.dumps({}), time.time(), wf_id, review_step.id))
                     _new_reworks.append(_wf_id_rw)
                     LOGGER.info("rework 子链: %s → %s (%s, %d 条问题)",
                                 wf_id[:12], _wf_id_rw[:12], _type_label, len(_issues))
