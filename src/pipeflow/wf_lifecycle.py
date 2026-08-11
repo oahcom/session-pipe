@@ -190,10 +190,17 @@ class WorkflowLifecycleMixin:
                             if not _st or _st['status'] not in ('completed', 'step_done_ready'):
                                 # 子链未完成：已超宽限期（5 分钟）→ 强制完成主链，不无限等待
                                 # （2026-08-10 观测：lr 子链未跑完导致主链 s7 永远卡在收尾）
-                                _sub_created = _st['created_at'] if _st else 0
+                                _sub_created = (_st['created_at'] or 0) if _st else 0
                                 if _st and time.time() - _sub_created < 300:
                                     _all_subs_done = False
                                     break
+                                # 超宽限期 → 一并关闭子链，不留孤儿 running
+                                # （codex P2：到期只关主链，子链继续通知角色/拉起 guard）
+                                if _st:
+                                    conn.execute(
+                                        "UPDATE workflow_instances SET status='cancelled' "
+                                        "WHERE instance_id=? AND status NOT IN ('completed')",
+                                        (_sf,))
                     if not _all_subs_done:
                         return
                     LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
@@ -213,6 +220,10 @@ class WorkflowLifecycleMixin:
                     conn.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?",
                                 (wf_id,))
                     new_results = dict(results or {})
+                    # 旧步骤强制 completed：残留 notified/step_done_ready 会让
+                    # _is_role_busy 误判角色忙 → 下棒角色被堵（与 _advance_unsafe 同源修复）
+                    if isinstance(new_results.get(step_id), dict):
+                        new_results[step_id]["status"] = "completed"
                     new_results[next_step.id] = {"status": "notified", "ts": time.time(), "notified_at": time.time(),
                                                   "poll_since": time.time(), "bus_anchor": time.time()}
                     conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",

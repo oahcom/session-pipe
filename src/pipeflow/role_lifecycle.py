@@ -296,7 +296,8 @@ class RoleLifecycleMixin:
         # 按当前步骤的 target_role 匹配（同 _role_has_pending_assignment 语义）
         try:
             rows = self._lifecycle.query(
-                "SELECT instance_id, template_id, current_step_id, step_results, assigner "
+                "SELECT instance_id, template_id, current_step_id, step_results, assigner, "
+                "       parent_wf_id "
                 "FROM workflow_instances "
                 "WHERE status='running'"
             )
@@ -306,7 +307,10 @@ class RoleLifecycleMixin:
                 # 主链推进时自动创建的子工作流（assigner=workflow_engine）不判 busy
                 # 子链由引擎创建后角色才执行，创建即 running 会阻塞主链（2026-08-10 观测：
                 # s2 推进 s3 时创建子链 wf_sub_b16cc，product_architect 被子链 s1 判 busy）
-                if r["instance_id"].startswith("wf_sub_") and r.get("assigner") == "workflow_engine":
+                # 仅对父工作流豁免（parent_wf_id 与检测者相同）；其他工作流对子链角色的
+                # 忙判仍需生效，避免子链间双线占用角色（codex 三维度审查 P2）
+                if r["instance_id"].startswith("wf_sub_") and r.get("assigner") == "workflow_engine" \
+                        and (exclude_wf_id and r.get("parent_wf_id") == exclude_wf_id):
                     continue
                 _wf = self._workflows.get(r["template_id"])
                 if not _wf:
