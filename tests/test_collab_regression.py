@@ -224,3 +224,95 @@ class TestDualNodeNode2Complete(unittest.TestCase):
         eng._tick(run, step)
         # node2 到达 → complete_step 被调用
         eng._lifecycle.complete_step.assert_called()
+
+
+class TestWaitRolesCollaborationGate(unittest.TestCase):
+    """协作门 wait_roles: 多角色协作 — 等所有角色产出才推进。"""
+
+    def setUp(self):
+        # mock conversation_monitor：避免真实 tmux 信号干扰 wait_roles 测试
+        self._gs_patch = patch("pipeflow.step_handler.get_conversation_signal", return_value=None)
+        self._gs_patch.start()
+
+    def tearDown(self):
+        self._gs_patch.stop()
+    """协作门 wait_roles: 多角色协作 — 等所有角色产出才推进。"""
+
+    def _tick_with_wait_roles(self, bus_msgs):
+        """构造步骤含 wait_roles，bus 返回指定消息列表，测试 _tick 行为。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=False)
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        lm = MagicMock()
+        eng._lm = lm  # property _lifecycle 返回 self._lm，直接设 _lm 才生效
+        fake_facts = [type("F", (), {"id": f"id_{i}", "t": f["text"],
+                                      "ts": time.time(), "src": f["src"]})()
+                      for i, f in enumerate(bus_msgs)]
+        eng._bb.read = MagicMock(return_value=fake_facts)
+
+        step = Step(
+            id="s3", title="集成", target_role="closer", prompt_template="t",
+            exit_condition={"bus_category": "test_report", "timeout_minutes": 60},
+            wait_roles=["qa", "reviewer"])
+        run = WorkflowRun(
+            id="wf_wait", workflow_name="wait_test", context={},
+            current_step="s3", status="running", created_at=time.time() - 1000,
+            step_results={"s3": {"status": "notified", "ts": time.time() - 5,
+                                 "notified_at": time.time() - 1000}})
+        # patch 覆盖 _tick 执行期间，防止真实 tmux capture-pane 干扰
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
+        return eng, run, lm
+
+    def test_all_roles_matched_advances(self):
+        """qa 和 reviewer 都写了 test_report → complete_step 被调（协作门通过）。"""
+        eng, run, lm = self._tick_with_wait_roles([
+            {"text": "s5-complete", "ts": time.time() - 10, "src": "qa"},
+            {"text": "s6-complete", "ts": time.time() - 5, "src": "reviewer"},
+        ])
+        # wait_roles 门通过 → exit 匹配 → complete_step
+        self.assertTrue(run.step_results["s3"].get("exit_messages"),
+                        "wait_roles 门通过后应记录 exit_messages")
+        lm.complete_step.assert_called()
+
+    def test_one_role_missing_blocks(self):
+        """只有 qa 写了 test_report，reviewer 没写 → 不推进。"""
+        eng, run, lm = self._tick_with_wait_roles([
+            {"text": "s5-complete", "ts": time.time() - 10, "src": "qa"},
+        ])
+        self.assertFalse(run.step_results["s3"].get("exit_messages"),
+                         "reviewer 未产出，不应记录 exit_messages")
+        lm.complete_step.assert_not_called()
+
+    def test_empty_bus_blocks(self):
+        """bus 完全空 → 不推进。"""
+        eng, run, lm = self._tick_with_wait_roles([])
+        self.assertFalse(run.step_results["s3"].get("exit_messages"),
+                         "bus 空，不应记录 exit_messages")
+        lm.complete_step.assert_not_called()
+
+    def test_no_wait_roles_advances_normally(self):
+        """无 wait_roles → 单角色正常推进（回归保护）。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=False)
+        eng._sync_step_results = MagicMock()
+        eng._consumed_exit_ids = set()
+        eng._lifecycle.complete_step = MagicMock()
+        eng._bb.read = MagicMock(return_value=[
+            type("F", (), {"id": "m1", "t": "s3-complete",
+                           "ts": time.time() - 1, "src": "qa"})()])
+        step = Step(
+            id="s3", title="t", target_role="qa", prompt_template="t",
+            exit_condition={"bus_category": "test_report", "timeout_minutes": 60})
+        run = WorkflowRun(
+            id="wf_norm", workflow_name="norm_test", context={},
+            current_step="s3", status="running", created_at=time.time() - 1000,
+            step_results={"s3": {"status": "notified", "ts": time.time() - 600,
+                                 "notified_at": time.time() - 1000}})
+        eng._tick(run, step)
+        eng._lifecycle.complete_step.assert_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
