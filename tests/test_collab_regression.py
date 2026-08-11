@@ -15,6 +15,9 @@ from pipeflow.engine import WorkflowEngine, Step, WorkflowRun
 
 _HEALTH = Path(tempfile.mkdtemp())
 
+# 模块级单例 patch（_eng() 每次重用时先 stop 旧的，防栈式累积泄漏）
+_GS_PATCH: "unittest.mock._patch" = None
+
 
 def _eng(**overrides):
     with patch.object(WorkflowEngine, "__init__", lambda self: None):
@@ -27,8 +30,13 @@ def _eng(**overrides):
     eng._send_to_role = MagicMock()
     eng._notify_role = MagicMock()
     # 测试不依赖真实 tmux 信号（conversation_monitor 读取真实 pane 会干扰 _tick 流程）
-    eng._gs_patch = patch("pipeflow.step_handler.get_conversation_signal", return_value=None)
-    eng._gs_patch.start()
+    # 模块级单例 patch: 每次 _eng() 前先 stop 旧 patch，防止栈式累积泄漏
+    # （全量测试 flaky 根因: 多次 start 后 get_conversation_signal 意外失效 → 真实 tmux 调用）
+    global _GS_PATCH
+    if _GS_PATCH is not None:
+        _GS_PATCH.stop()
+    _GS_PATCH = patch("pipeflow.step_handler.get_conversation_signal", return_value=None)
+    _GS_PATCH.start()
     for k, v in overrides.items():
         setattr(eng, k, v)
     return eng
@@ -234,11 +242,12 @@ class TestWaitRolesCollaborationGate(unittest.TestCase):
 
     def setUp(self):
         # mock conversation_monitor：避免真实 tmux 信号干扰 wait_roles 测试
-        self._gs_patch = patch("pipeflow.step_handler.get_conversation_signal", return_value=None)
-        self._gs_patch.start()
+        # 复用模块级 _GS_PATCH（_eng() 已 start），此处不重复 start
+        pass
 
     def tearDown(self):
-        self._gs_patch.stop()
+        # 模块级 patch 由下次 _eng() 统一 stop，这里不单独 stop（防双重 stop）
+        pass
 
     def _tick_with_wait_roles(self, bus_msgs):
         """构造步骤含 wait_roles，bus 返回指定消息列表，测试 _tick 行为。"""

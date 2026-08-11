@@ -84,7 +84,6 @@ src/
   contract_updater.py ── 合约同步
   conversation_monitor.py ── 对话监控
   cron_scheduler.py   ── cron 调度器
-  dispatch_tasks.py   ── 任务分发
   drift_detector.py   ── 架构漂移检测
   routing_daemon.py   ── 路由守护进程
   role_validator.py   ── 角色校验
