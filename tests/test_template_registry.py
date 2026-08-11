@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""模板注册中心统一入口测试 — 校验分层 + 双写。
+
+覆盖: workflow_id 格式(WF-)、estimated_hours 可选、三段式移到质量层、
+register 双写(DB+JSON)、JSON 已存在不覆盖、路径穿越拒绝。
+"""
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from template_registry import (
+    TemplateRegistry, _validate_schema, _validate_meta,
+)
+
+from paths import HERMES_WORKFLOWS
+
+
+def _valid_template(name="test_wf", wf_id="WF-test_wf"):
+    """符合完整 Schema 的最小模板。"""
+    return {
+        "workflow_id": wf_id,
+        "name": name,
+        "title": name,
+        "description": "测试模板描述",
+        "trigger_scene": ["编码实现", "功能开发"],
+        "allowed_initiators": ["coordinator", "pm"],
+        "allowed_executors": ["engineer"],
+        "max_duration_hours": 24,
+        "quality_standards": "标准质量要求描述文字",
+        "steps": [{
+            "id": "s1", "title": "编码", "target_role": "engineer",
+            "prompt_template": "做什么：编码\n怎么做：实现\n验收标准：通过",
+            "exit_condition": {"type": "exit_message", "match": "done"},
+            "failure_patterns": ["产出物为空", "格式错误"],
+        }],
+    }
+
+
+# ── 1. workflow_id 格式 ──
+def test_validate_schema_wf_id_format():
+    """WF- 前缀通过，WL- 兼容，其他拒绝。"""
+    t = _valid_template()
+    assert _validate_schema(t).passed
+    t["workflow_id"] = "WL-TEST"
+    assert _validate_schema(t).passed
+    t["workflow_id"] = "XX-bad"
+    assert not _validate_schema(t).passed
+    t["workflow_id"] = ""  # 缺省合法（register 默认 WF-{name}）
+    assert _validate_schema(t).passed
+
+
+# ── 2. estimated_hours 可选 ──
+def test_estimated_hours_optional():
+    """无 estimated_hours 通过；有值但 <0.5 拒绝。"""
+    t = _valid_template()
+    assert _validate_schema(t).passed  # 默认无 estimated_hours
+    t["steps"][0]["estimated_hours"] = 0.3
+    assert not _validate_schema(t).passed
+    t["steps"][0]["estimated_hours"] = 2.0
+    assert _validate_schema(t).passed
+
+
+# ── 3. 三段式移到质量层 ──
+def test_three_sections_in_meta_not_schema():
+    """prompt 缺"做什么"段 → schema 通过（结构层），meta 警告（质量层）。"""
+    t = _valid_template()
+    t["steps"][0]["prompt_template"] = "简单提示词"
+    assert _validate_schema(t).passed  # 结构层放行
+    assert not _validate_meta(t).passed  # 质量层拦截
+
+
+# ── 4. 存量形状可注册 ──
+def test_legacy_shape_registers():
+    """按存量模板形状（WF- id、无 estimated_hours、无三段式）→ 注册通过。"""
+    t = _valid_template(name="legacy_wf", wf_id="WF-legacy_wf")
+    t["steps"][0]["prompt_template"] = "调研任务\n输出报告"
+    with tempfile.TemporaryDirectory() as tmp:
+        reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=Path(tmp))
+        tid = reg.register(t, workflows_dir=Path(tmp))
+        assert tid == "WF-legacy_wf"
+        reg.close()
+
+
+# ── 5. register 双写：JSON 文件出现 ──
+def test_register_writes_json_and_db():
+    """注册后 {name}.json 出现且内容含 workflow_id；DB 有行。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        wf_dir = Path(tmp) / "workflows"
+        reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=wf_dir)
+        tid = reg.register(_valid_template(), workflows_dir=wf_dir)
+        reg.close()
+        # JSON 文件
+        jf = wf_dir / "test_wf.json"
+        assert jf.exists(), "JSON 文件应被写出"
+        data = json.loads(jf.read_text())
+        assert data["workflow_id"] == "WF-test_wf"
+        # DB 行
+        reg2 = TemplateRegistry(db_path=str(Path(tmp) / "t.db"))
+        t = reg2.get("WF-test_wf")
+        assert t is not None and t["name"] == "test_wf"
+        reg2.close()
+
+
+# ── 6. JSON 已存在 → 拒绝不覆盖 ──
+def test_register_refuses_existing_file():
+    """同名 JSON 已存在 → ValueError，不覆盖。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        wf_dir = Path(tmp) / "workflows"
+        wf_dir.mkdir()
+        (wf_dir / "test_wf.json").write_text(json.dumps({"old": True}))
+        reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=wf_dir)
+        try:
+            reg.register(_valid_template(), workflows_dir=wf_dir)
+            assert False, "应拒绝覆盖已有 JSON"
+        except ValueError as e:
+            assert "已存在" in str(e)
+        finally:
+            reg.close()
+        # 原文件未被覆盖
+        assert json.loads((wf_dir / "test_wf.json").read_text()) == {"old": True}
+
+
+# ── 7. 路径穿越拒绝 ──
+def test_register_rejects_path_traversal():
+    """name 含路径分隔符 → ValueError。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"))
+        try:
+            reg.register(_valid_template(name="../evil"), workflows_dir=Path(tmp))
+            assert False, "应拒绝路径穿越"
+        except ValueError as e:
+            assert "路径分隔符" in str(e)
+        finally:
+            reg.close()
+
+
+# ── 8. 存量 24 模板全过结构层（一次性验证） ──
+def test_all_production_templates_pass_structural():
+    """~/.hermes/workflows/*.json 全部通过结构层校验（存量兼容硬约束）。"""
+    bad = []
+    for f in sorted(HERMES_WORKFLOWS.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+            if not _validate_schema(data).passed:
+                bad.append(f.name)
+        except Exception as e:
+            bad.append(f"{f.name}(parse:{e})")
+    assert not bad, f"存量模板不应被拒绝: {bad[:5]}"
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    passed = failed = 0
+    for t in tests:
+        try:
+            t()
+            passed += 1
+        except Exception as e:
+            failed += 1
+            import traceback
+            print(f"FAIL {t.__name__}: {e}")
+            traceback.print_exc()
+    print(f"\n{'PASS' if failed == 0 else 'FAIL'}: {passed}/{passed+failed} tests passed")
+    sys.exit(1 if failed else 0)

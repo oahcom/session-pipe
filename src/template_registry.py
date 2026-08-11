@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from paths import WORKFLOWS_DB as DB_PATH, SESSION_ROLES_PERSONAS
+from paths import WORKFLOWS_DB as DB_PATH, SESSION_ROLES_PERSONAS, HERMES_WORKFLOWS
 
 # ── 有效角色列表（从 persona JSON 动态加载） ──────
 _ROLE_REGISTRY: list[str] = []
@@ -56,12 +56,12 @@ TEMPLATE_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
     "required": [
-        "workflow_id", "name", "description", "trigger_scene",
+        "name", "description", "trigger_scene",
         "allowed_initiators", "allowed_executors", "steps",
         "max_duration_hours", "quality_standards"
     ],
     "properties": {
-        "workflow_id": {"type": "string", "pattern": "^WL-[A-Z0-9]{2,12}$"},
+        "workflow_id": {"type": "string", "pattern": "^(WF|WL)-[A-Za-z0-9_]{2,40}$"},
         "name": {"type": "string", "minLength": 2},
         "description": {"type": "string", "minLength": 4},
         "trigger_scene": {
@@ -180,10 +180,10 @@ def _validate_schema(template: dict, allow_minimal: bool = False) -> ValidationR
     if not report.passed:
         return report
 
-    # workflow_id 格式
+    # workflow_id 格式（可选；缺省时 register 默认 WF-{name}）
     wid = template.get("workflow_id", "")
-    if not re.match(r"^WL-[A-Z0-9]{2,12}$", wid):
-        report.add_error(f"workflow_id 格式无效: {wid}，需为 WL-XXX 格式")
+    if wid and not re.match(r"^(WF|WL)-[A-Za-z0-9_]{2,40}$", wid):
+        report.add_error(f"workflow_id 格式无效: {wid}，需为 WF- 或 WL- 前缀")
 
     # name
     if not isinstance(template.get("name"), str) or len(template["name"]) < 2:
@@ -199,8 +199,8 @@ def _validate_schema(template: dict, allow_minimal: bool = False) -> ValidationR
         report.add_error("trigger_scene 需为非空数组")
     else:
         for i, s in enumerate(ts):
-            if not isinstance(s, str) or len(s) < 4:
-                report.add_error(f"trigger_scene[{i}] 需≥4字符")
+            if not isinstance(s, str) or not s.strip():
+                report.add_error(f"trigger_scene[{i}] 需为非空字符串")
 
     # allowed_initiators
     ai = template.get("allowed_initiators", [])
@@ -279,7 +279,14 @@ def _validate_meta(template: dict) -> ValidationReport:
 
 
 def _validate_step_content(step: dict, index: int, report: ValidationReport):
-    """校验步骤内容质量（prompt 无残留模板、failure_patterns 无泛化）。"""
+    """校验步骤内容质量（prompt 三段式、无残留模板、failure_patterns 无泛化）。"""
+    # Prompt 三段式检查：做什么、怎么做、验收标准（质量层，不阻断结构）
+    pt = step.get("prompt_template", "")
+    if isinstance(pt, str):
+        sections = ["做什么", "怎么做", "验收标准"]
+        for sec in sections:
+            if sec not in pt:
+                report.add_error(f"steps[{index}].prompt_template 缺少'{sec}'段")
     # Prompt 无残留模板段落
     for bp in _BOILER_PROMPT_SECTIONS:
         if bp in step.get("prompt_template", ""):
@@ -314,8 +321,8 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
 
 def _validate_step(step: dict, index: int, report: ValidationReport):
     """校验单个步骤。"""
-    # 必填字段（引擎 Step dataclass 用 id，同步 schema 校验）
-    for field in ["id", "title", "type", "prompt_template"]:
+    # 必填字段（type 有默认值 single，从必填中移除；有值时校验格式）
+    for field in ["id", "title", "prompt_template"]:
         if field not in step:
             report.add_error(f"steps[{index}] 缺少必填字段: {field}")
 
@@ -352,24 +359,14 @@ def _validate_step(step: dict, index: int, report: ValidationReport):
             if not isinstance(_ts, (int, float)) or _ts <= 0:
                 report.add_error(f"steps[{index}].track.timeout_sec 必须是正数（当前: {_ts}）")
 
-    if "prompt_template" in step:
-        pt = step["prompt_template"]
-        if isinstance(pt, str):
-            # 三段式检查：做什么、怎么做、验收标准
-            sections = ["做什么", "怎么做", "验收标准"]
-            for sec in sections:
-                if sec not in pt:
-                    report.add_error(f"steps[{index}].prompt_template 缺少'{sec}'段")
-
-    # failure_patterns 至少 2 项
+    # failure_patterns 至少 2 项（有则校验）
     fp = step.get("failure_patterns", [])
-    if not isinstance(fp, list) or len(fp) < 2:
+    if isinstance(fp, list) and len(fp) > 0 and len(fp) < 2:
         report.add_error(f"steps[{index}].failure_patterns 需≥2 项")
 
-    # estimated_hours 必须有值
-    if "estimated_hours" not in step or step["estimated_hours"] is None:
-        report.add_error(f"steps[{index}].estimated_hours 必须有值")
-    elif not isinstance(step["estimated_hours"], (int, float)) or step["estimated_hours"] < 0.5:
+    # estimated_hours 可选；有则需 ≥0.5（引擎 Step dataclass 无此字段，纯元数据）
+    eh = step.get("estimated_hours")
+    if eh is not None and (not isinstance(eh, (int, float)) or eh < 0.5):
         report.add_error(f"steps[{index}].estimated_hours 需≥0.5")
 
 
@@ -406,8 +403,10 @@ def _check_role_existence(template: dict) -> ValidationReport:
 class TemplateRegistry:
     """模板注册中心：管理 10 字段模板的注册、查询、激活、校验。"""
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, workflows_dir: Path = None):
         self.db_path = Path(db_path) if db_path else DB_PATH
+        # 双写目标目录（CLI 传入）；None = DB-only（测试/内部用，不写文件）
+        self.workflows_dir = Path(workflows_dir) if workflows_dir else None
         self._conn = sqlite3.connect(str(self.db_path), timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -454,11 +453,12 @@ class TemplateRegistry:
 
     # ── 寄存器 ────────────────────────────────────
 
-    def register(self, template: dict) -> str:
-        """注册一个新模板。
+    def register(self, template: dict, workflows_dir: Path = None) -> str:
+        """注册一个新模板（统一入口）。
 
-        校验通过后写入 DB，返回 template_id。
+        校验通过后写 DB；若提供 workflows_dir 同时写 JSON 文件（双写）。
         校验不通过抛出 ValueError，错误信息指向缺失字段。
+        workflows_dir=None 时仅写 DB（测试/内部用）。
         """
         # 合并校验
         schema_report = _validate_schema(template)
@@ -471,14 +471,31 @@ class TemplateRegistry:
         if not full_report.passed:
             raise ValueError(f"模板校验失败: {'; '.join(full_report.errors)}")
 
-        template_id = template.get("workflow_id", f"WL-{uuid.uuid4().hex[:4].upper()}")
+        # 质量层：仅警告不阻断（结构通过即可注册；质量由 recommend 门禁拦截）
+        meta_report = _validate_meta(template)
+        if not meta_report.passed:
+            for _e in meta_report.errors[:5]:
+                print(f"  [warn] 质量检查: {_e}")
 
-        # 检查重复
+        template_id = template.get("workflow_id", f"WF-{template['name']}")
+
+        # 检查重复（DB + 文件）
         existing = self._conn.execute(
             "SELECT 1 FROM workflow_templates WHERE template_id=?", (template_id,)
         ).fetchone()
         if existing:
             raise ValueError(f"模板 '{template_id}' 已存在")
+
+        wf_dir = Path(workflows_dir) if workflows_dir else self.workflows_dir
+        _json_path = None
+        if wf_dir:
+            # 信任边界：name 含路径分隔符 → 拒绝（防路径穿越）
+            if "/" in template["name"] or "\\" in template["name"]:
+                raise ValueError(f"模板 name 含路径分隔符: {template['name']}")
+            wf_dir.mkdir(parents=True, exist_ok=True)
+            _json_path = wf_dir / f"{template['name']}.json"
+            if _json_path.exists():
+                raise ValueError(f"JSON 文件已存在，不覆盖: {_json_path}（引擎 JSON 优先）")
 
         now = time.time()
 
@@ -502,6 +519,10 @@ class TemplateRegistry:
             1 if template.get("is_subflow", False) else 0,
         ))
         self._conn.commit()
+
+        # 双写：先写 JSON 后 DB 已提交；DB 失败时已抛（无回滚需求——DB 是权威）
+        if _json_path:
+            _json_path.write_text(json.dumps(template, ensure_ascii=False, indent=2))
         return template_id
 
     # ── 查询 ──────────────────────────────────────
@@ -687,7 +708,7 @@ class TemplateRegistry:
 # ── CLI 使用 ──────────────────────────────────────
 
 def _cli_register(args: list[str]):
-    """从 JSON 文件注册模板。"""
+    """从 JSON 文件注册模板（写 DB + 写 JSON 到 workflows_dir）。"""
     if not args:
         print("用法: python3 template_registry.py register <template.json>")
         return
@@ -697,10 +718,11 @@ def _cli_register(args: list[str]):
         return
     with open(path) as fh:
         template = json.load(fh)
-    reg = TemplateRegistry()
+    reg = TemplateRegistry(workflows_dir=HERMES_WORKFLOWS)
     try:
-        tid = reg.register(template)
+        tid = reg.register(template, workflows_dir=HERMES_WORKFLOWS)
         print(f"注册成功: {tid}")
+        print(f"JSON: {HERMES_WORKFLOWS / (template['name'] + '.json')}")
     except ValueError as e:
         print(f"注册失败: {e}")
     finally:
