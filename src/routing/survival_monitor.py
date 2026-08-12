@@ -57,6 +57,30 @@ def _load_role_targets() -> dict[str, list[str]]:
     return cache
 
 
+_ROLE_LIFECYCLES_CACHE: dict[str, str] = {}
+_ROLE_LIFECYCLES_TS: float = 0
+
+
+def _load_role_lifecycles() -> dict[str, str]:
+    """加载各角色 lifecycle（infinite/ondemand），供 idle 回收判断。"""
+    global _ROLE_LIFECYCLES_CACHE, _ROLE_LIFECYCLES_TS
+    now = time.time()
+    if now - _ROLE_LIFECYCLES_TS < 300 and _ROLE_LIFECYCLES_CACHE:
+        return _ROLE_LIFECYCLES_CACHE
+    cache: dict[str, str] = {}
+    if PERSONAS_DIR.is_dir():
+        for f in sorted(PERSONAS_DIR.glob("persona_*.json")):
+            try:
+                d = json.loads(f.read_text())
+                name = d.get("name", f.stem)
+                cache[name] = d.get("lifecycle", d.get("drive", "ondemand")) or "ondemand"
+            except Exception:
+                continue
+    _ROLE_LIFECYCLES_CACHE = cache
+    _ROLE_LIFECYCLES_TS = now
+    return cache
+
+
 class SurvivalMonitor:
     """三层存活检测器。"""
 
@@ -318,11 +342,14 @@ class SurvivalMonitor:
             l3 = (self._l3_check(role) if l2.get("thinking") is not False
                   and now - prev.get("l3_ts", 0) > 300 else prev.get("l3", {}))
             overall = self._overall(l1, l2, l3)
+            # R3: 注入 lifecycle（idle 回收判断用）
+            _lifecycle = _load_role_lifecycles().get(role, "ondemand")
             result = {
                 "l1": l1, "l1_ts": now,
                 "l2": l2, "l2_ts": now if "thinking" in l2 else prev.get("l2_ts", 0),
                 "l3": l3, "l3_ts": now if "producing" in l3 else prev.get("l3_ts", 0),
                 "overall": overall,
+                "lifecycle": _lifecycle,
             }
             self._cache[role] = result
             results[role] = result
@@ -366,8 +393,49 @@ class SurvivalMonitor:
         orphaned = [r for r, h in results.items() if h.get("overall") == "orphan"]
         if stalled:
             LOGGER.warning("存活告警 stale/dead: %s", stalled)
+            # D4 修复: 检测到 stale/dead 时尝试恢复（复用 daemon._ensure_role_alive 拉起），
+            # 冷却 600s 防重启风暴；不依赖人工介入
+            now_ts = time.time()
+            _last_rescue = getattr(self, "_last_rescue_ts", 0)
+            if now_ts - _last_rescue > 600:
+                try:
+                    from pipeflow.daemon import _ensure_role_alive as _rescue
+                    for _r in stalled[:2]:
+                        if _rescue(_r):
+                            LOGGER.info("存活恢复: %s 已重新拉起", _r)
+                        else:
+                            LOGGER.warning("存活恢复失败: %s", _r)
+                    self._last_rescue_ts = now_ts
+                except Exception as _re:
+                    LOGGER.warning("存活恢复动作异常（跳过本轮）: %s", _re)
         if orphaned and len(orphaned) <= 3:
             LOGGER.debug("orphan sessions (已清理): %s", orphaned)
+
+        # R3 角色治理: idle+ondemand 角色超时自动回收（"只养不杀"→"能养能杀"）
+        # 10 个 ondemand 角色常驻空转占 2.8GB（角色治理审查发现）。
+        # ondemand 语义 = 用完退出；连 idle 累计 N 次（默认 6 次 = 12 分钟）自动 kill。
+        # infinite 角色不回收（daemon 依赖常驻），仅 stale/dead 走上面的恢复。
+        try:
+            _idle_roles = [r for r, h in results.items()
+                           if h["overall"] == "idle" and h.get("lifecycle") == "ondemand"]
+            for _ir in _idle_roles:
+                _prev = self._state.get(_ir, {})
+                _idle_n = _prev.get("idle_count", 0) + 1
+                self._state.setdefault(_ir, {})["idle_count"] = _idle_n
+                if _idle_n >= 6:
+                    LOGGER.info("角色回收: %s 连续 %d 次 idle（ondemand），kill session", _ir, _idle_n)
+                    try:
+                        _sp.run(["tmux", "kill-session", "-t", f"ccs-{_ir}"],
+                                capture_output=True, timeout=5)
+                        self._write_bus("notice",
+                            f"@ccs-monitor [回收] {_ir} 连续 idle 6 次 → session 已回收",
+                            evidence="ondemand 角色空转超时自动停止（R3 治理）")
+                    except Exception as _ke:
+                        LOGGER.warning("角色回收 kill 失败 %s: %s", _ir, _ke)
+                    self._state.setdefault(_ir, {})["idle_count"] = 0
+        except Exception as _ie:
+            LOGGER.debug("idle 回收检查异常（非致命）: %s", _ie)
+
         LOGGER.debug("survival tick: %d roles, %d stale/dead, %d orphan",
                      len(results), len(stalled), len(orphaned))
         return results

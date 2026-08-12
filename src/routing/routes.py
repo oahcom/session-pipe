@@ -24,9 +24,20 @@ from output_validator import validate_output
 # 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
 # _SYSTEM_CATEGORIES: 跳过 workflow 创建的分类（路由信号）
 # _NON_TASK_CATEGORIES: 跳过路由分发的分类（纯通知/心跳，无任务语义）
-_SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker", "task_spec"})
+_SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker", "task_spec",
+                                       "feedback", "code_review", "verification"})
 _NON_TASK_CATEGORIES = frozenset({"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"})
 SYSTEM_CATEGORIES = _NON_TASK_CATEGORIES  # 向后兼容别名
+
+_CONTENT_WORDS = ("修复", "实现", "设计", "调研", "分析", "测试", "审查", "部署", "监控",
+                  "开发", "优化", "重构", "排查", "处理", "检查", "升级", "清理", "创建",
+                  "fix", "implement", "design", "research", "analy", "test", "review",
+                  "deploy", "monitor", "build", "optimi", "refactor", "investigate")
+
+def _has_content_words(title: str) -> bool:
+    """标题是否含内容性动词（防 'ok'/'hi'/'x' 这类纯占位标题生成无意义 workflow）。"""
+    t = title.lower()
+    return any(w in t for w in _CONTENT_WORDS)
 
 
 
@@ -120,8 +131,8 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                 LOGGER.debug("Skipping workflow creation for system category %s", cat)
                             else:
                                 _t = assignment.get("title", "")
-                                if len(_t) < 80:
-                                    LOGGER.debug("Skipping workflow create: title too short (%d chars) role=%s", len(_t), role)
+                                if len(_t) < 8 or not _has_content_words(_t):
+                                    LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_t), role)
                                 else:
                                     try:
                                         _wc = WorkflowClient(role)
@@ -285,7 +296,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     # 从消息文本提取有意义的标题：取第一段或前 60 字符
                     _title = _raw.split("\n")[0] if _raw else ""
                     _title = _title[:80]
-                    if len(_title) < 80:
+                    if len(_title) < 4:
                         LOGGER.debug("Skipping workflow create: title too short (%d chars) role=%s", len(_title), role_name)
                     else:
                         _wf = WorkflowClient(role_name)
@@ -386,7 +397,8 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
     """
     from bus_protocol import Blackboard
     bb = Blackboard()
-    facts = bb.read(cat=category, limit=50)
+    # codex CL-1 修复: read 不过滤已消费 → 改用 unconsumed，mark_consumed 才有闭环意义
+    facts = bb.unconsumed(cat=category, consumer="auto_route_investigator")[:50]
 
     results = []
     for f in facts:
@@ -409,6 +421,12 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
             bb.write("notice",
                 f"@{role}: 需要刑侦排查. context: {f.t[:100]}",
                 src="auto_route_investigator")
+            # codex D20 修复: 分派后 mark_consumed，防止下轮重复分派同一批
+            # （dispatch 周期无 cursor 推进，不消耗则永久重复）
+            try:
+                bb.mark_consumed(f.id, consumer="auto_route_investigator")
+            except Exception as _mc:
+                LOGGER.warning("dispatch mark_consumed 失败 fid=%s: %s", f.id, _mc)
             results.append({
                 "id": f.id,
                 "category": f.cat,

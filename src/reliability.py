@@ -272,24 +272,47 @@ class IdempotentConsume:
     def safe_consume(self, bb, fact_id: int, consumer: str) -> dict:
         """幂等消费：已消费则返回 skipped，否则执行 consume。
 
+        R3 加固（codex D7/D8）：is_consumed + mark_consumed 合并到一个
+        BEGIN IMMEDIATE 事务，检查与写入原子化——跨进程双 daemon 并发时
+        数据库写锁保证只有一个成功（threading.Lock 只保护进程内）。
+
         返回：
         - {"status": "consumed", "fact_id": N, "consumer": "X"}
         - {"status": "skipped", "fact_id": N, "consumer": "X", "reason": "already_consumed"}
         - {"status": "error", "fact_id": N, "consumer": "X", "error": "..."}
         """
         with self._lock:
-            if self.is_consumed(bb, fact_id, consumer):
-                LOGGER.debug(f"Idempotent skip: #{fact_id} already consumed by {consumer}",
-                           extra=with_trace_id(str(fact_id)))
-                return {
-                    "status": "skipped",
-                    "fact_id": fact_id,
-                    "consumer": consumer,
-                    "reason": "already_consumed",
-                }
-
             try:
-                bb.mark_consumed(fact_id, consumer)
+                with bb._conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        _done = conn.execute(
+                            "SELECT 1 FROM log WHERE fid = ? AND typ = 'consume' AND cat = ? LIMIT 1",
+                            (fact_id, consumer),
+                        ).fetchone()
+                        if _done:
+                            conn.execute("COMMIT")
+                            LOGGER.debug(f"Idempotent skip: #{fact_id} already consumed by {consumer}",
+                                       extra=with_trace_id(str(fact_id)))
+                            return {
+                                "status": "skipped",
+                                "fact_id": fact_id,
+                                "consumer": consumer,
+                                "reason": "already_consumed",
+                            }
+                        # mark_consumed 写入逻辑（log 表 cat 列存 consumer 名）
+                        # INSERT OR IGNORE: unique index (fid,cat) WHERE typ=consume 冲突时静默跳过
+                        conn.execute(
+                            "INSERT OR IGNORE INTO log (fid, cat, typ, ts) VALUES (?, ?, 'consume', ?)",
+                            (fact_id, consumer, time.time()),
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
                 LOGGER.info(f"Consumed #{fact_id} by {consumer}",
                            extra=with_trace_id(str(fact_id)))
                 return {

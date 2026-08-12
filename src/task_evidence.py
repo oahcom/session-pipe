@@ -184,6 +184,29 @@ def evaluate_and_feedback():
                 capture_output=True, timeout=10)
         except Exception:
             pass
+        # R2-2 self-reflection（Reflexion 洞察 3）: 无产出任务写 code_fix 根因总结，
+        # 供后续 session 消费避免同类错误重复（失败后语言化复盘 > 纯重试）
+        if a["quality"] == "negative":
+            try:
+                _reflect = {
+                    "task_id": a["task_id"], "role": a["role"],
+                    "title": a["title"][:60],
+                    "root_cause": "无产出文件、无 bus 证据、无 exit_messages — 任务未真正执行或角色未响应",
+                    "action_items": [
+                        "检查角色是否存活/被拉起（survival_monitor 已接自动恢复）",
+                        "检查任务模板是否被角色实际消费（route_all 是否创建 workflow）",
+                        "确认角色 eval_criteria 是否阻止了执行（eval_consistency 预检）",
+                    ],
+                    "quality": "negative",
+                }
+                subprocess.run(
+                    [str(_bus), "write", "code_fix",
+                     f"[self-reflect] 任务《{a['title'][:40]}》无产出 — 需根因排查",
+                     "--evidence", json.dumps(_reflect, ensure_ascii=False),
+                     "--src", "task_evidence"],
+                    capture_output=True, timeout=10)
+            except Exception:
+                pass
 
     return {"evaluated": len(assessments), "assessments": assessments}
 
