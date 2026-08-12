@@ -145,7 +145,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self._load_workflows()
 
     @property
-    def _lifecycle(self):
+    def _lifecycle(self) -> 'LifecycleManager':
+        """延迟初始化 LifecycleManager（首次访问时创建）。"""
         if self._lm is None:
             from lifecycle.manager import LifecycleManager
             self._lm = LifecycleManager("workflow_engine", db_path=self._db_path,
@@ -234,6 +235,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     if _wr is not None and (not isinstance(_wr, list)
                                             or not all(isinstance(r, str) for r in _wr)):
                         LOGGER.warning("wait_roles 结构非法，丢弃: %s/%s", f.name, _tr)
+                        _clean["wait_roles"] = None
+                    elif isinstance(_wr, list) and len(_wr) == 0:
+                        LOGGER.warning("wait_roles 空列表（语义=无门控），建议删掉字段: %s/%s", f.name, _tr)
                         _clean["wait_roles"] = None
                     steps.append(Step(**_clean))
                 # 模板结构校验（allow_minimal=True 仅校验核心字段）：
@@ -595,6 +599,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             prompt_template=step.prompt_template
                         )
                         def _persist_step_done(*args):
+                            """步骤完成回调：将 bypass 提醒状态持久化到 DB（daemon 重启后不重复）。"""
                             # bypass flag 真落库（daemon 重启后不重复提醒）
                             try:
                                 lm.execute(
@@ -741,6 +746,7 @@ def main():
     _PID_FILE = Path.home() / ".hermes" / "run" / "workflow-engine-daemon.pid"
 
     def _daemon_loop(interval: int):
+        """守护进程主循环：PID 锁单实例，驱动 run_once 推进所有工作流。"""
         if _PID_FILE.exists():
             try:
                 old = int(_PID_FILE.read_text())
@@ -754,6 +760,7 @@ def main():
 
         shutdown = False
         def _handler(s, f):
+            """SIGTERM/SIGINT 信号处理：置 shutdown 标志让主循环优雅退出。"""
             nonlocal shutdown; shutdown = True
         signal.signal(signal.SIGTERM, _handler)
         signal.signal(signal.SIGINT, _handler)

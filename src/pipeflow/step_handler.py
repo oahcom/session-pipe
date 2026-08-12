@@ -48,6 +48,7 @@ class StepHandlerMixin:
     """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _eval_cond / _check_exit。"""
 
     def _tick(self, run: WorkflowRun, step: Step):
+        """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
         if run.status in ('completed', 'cancelled', 'step_done_ready'):
             return
@@ -634,13 +635,15 @@ class StepHandlerMixin:
                     return
 
             if step.verify:
+                import shlex as _shlex
                 ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
                 vcmd = step.verify
+                # D3 P1 安全修复：对 context 值做 shlex.quote，防止模板变量被 shell 解释
                 for k, val in ctx.items():
-                    vcmd = vcmd.replace(f"{{{k}}}", str(val))
+                    vcmd = vcmd.replace(f"{{{k}}}", _shlex.quote(str(val)))
                 # verify 命令可能含 && / 管道等 shell 语法，shlex.split 会把 && 当
                 # 参数传给第一个命令导致 "extra argument" 报错 → 用 shell=True 执行。
-                # verify 命令来自模板注册表（可信内部源），非外部输入，无注入面。
+                # verify 命令来自模板注册表（可信内部源），context 值已 shlex.quote 保护。
                 ver = _engine_mod._sp.run(vcmd, shell=True, capture_output=True, timeout=30)
                 if ver.returncode != 0:
                     self._bb.write("blocker",
@@ -680,8 +683,27 @@ class StepHandlerMixin:
 
             # ── 自动确认单步/通知步骤，推进到下一棒 ──
             # daemon 替代人工 approve，用 step 角色名作为密钥
-            # handoff/review 步骤需等人工审批，不自动确认
+            # handoff/review 步骤默认需等人工审批，不自动确认
             if step.type in ("handoff", "review", "subflow"):
+                # 超时降级：approval_token 超过 TTL+30min grace 未消费 → 自动 approve 推进
+                # （修复 lr_tech_decision 卡死根因：reviewer 未消费导致 24h+ stuck）
+                try:
+                    _token = self._lifecycle.get_approval_token(run.id, step.id)
+                    if _token:
+                        _db_results = self._lifecycle._parse_results(
+                            self._lifecycle._get_wf_unsafe(run.id))
+                        _ttl = _db_results.get(step.id, {}).get("approval_token_ttl", 0)
+                        # _ttl=0 表示字段不存在或 token 无效，不触发降级
+                        if _ttl > 0 and time.time() > _ttl + 1800:  # TTL + 30min grace
+                            self._lifecycle.confirm_step(
+                                run.id, step.id, token=_token, approved=True,
+                                reason="daemon approval_timeout_fallback",
+                                allow_expired=True)  # P0-A 修复: token 已过期时也允许确认
+                            LOGGER.warning("approval_timeout_fallback %s/%s: token 超时 30min 未消费，自动 approve",
+                                           run.workflow_name, step.id)
+                            return
+                except Exception as _e:
+                    LOGGER.debug("approval_timeout check skipped: %s", _e)
                 return
             try:
                 _token = self._lifecycle.get_approval_token(run.id, step.id)
@@ -709,6 +731,7 @@ class StepHandlerMixin:
         return
 
     def _sync_step_results(self, wf_id: str, step_results: dict):
+        """将步骤结果持久化到 DB（事务内更新 step_results 列）。"""
         try:
             lm = self._lifecycle
             lm.begin()
@@ -880,14 +903,14 @@ class StepHandlerMixin:
         多角色协作（仲裁模式）核心：等 qa 和 reviewer 都产出 test_report 才推进。
 
         src=claude 双路径语义（2026-08-11 codex 审查）：
-        - 主查询路径（limit=50）：放行 src=claude —— bus CLI 写消息默认 src=claude，
+        - 主查询路径（limit=200）：放行 src=claude —— bus CLI 写消息默认 src=claude，
           角色未显式指定时消息仍可被匹配（兜底）。
         - 补查路径（per-role limit=200）：不放行 src=claude —— 否则一条 claude-src
           消息可同时满足所有缺失角色，协作门被一票绕过。
         生产实测（2026-08-11 blackboard.db）：协作角色用角色名写 bus（test_report
         分类 6 条全部 src=qa），精确匹配可行。
         """
-        facts = self._bb.read(cat=cat, limit=50) if cat else self._bb.read(limit=50)
+        facts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
         earliest = 0.0
         matched = []
         for f in facts:

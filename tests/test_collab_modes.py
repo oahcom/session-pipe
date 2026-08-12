@@ -394,9 +394,10 @@ class TestWaitRolesValidation(unittest.TestCase):
         self.assertEqual(self._load_tmpl(eng, "ok1", ["qa", "reviewer"]),
                          ["qa", "reviewer"])
 
-    def test_empty_list_kept(self):
+    def test_empty_list_dropped_with_warning(self):
+        """空 wait_roles 列表（语义=无门控）→ 丢弃并置 None（防误写空列表）。"""
         eng = _eng()
-        self.assertEqual(self._load_tmpl(eng, "ok2", []), [])
+        self.assertIsNone(self._load_tmpl(eng, "ok2", []))
 
 
 if __name__ == "__main__":
