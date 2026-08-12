@@ -309,7 +309,7 @@ def test_advance_finishes():
 def test_timeout_triggers_retry():
     wf_dir = _make_wf_dir()
     steps = [{"id": "s1", "title": "调研", "target_role": "scout",
-              "prompt_template": "调研{topic}",
+              "prompt_template": "完成调研任务并输出详细结果，确保信息完整准确，验证数据来源可靠性",
               "exit_condition": {"bus_category": "notice", "text_contains": "TESTTIMEOUT_NOMATCH_123",
                                  "timeout_minutes": 0.001},
               "max_retries": 2, "condition": "", "rollback_to": ""}]

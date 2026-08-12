@@ -59,7 +59,15 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
 
-# 4. BUS_DB 隔离：当前 Blackboard 实象化时不读 hermes_bus.config.BLACKBOARD_DB
-#    （import 时快照到 blackboard_legacy.BLACKBOARD_DB 常量），
-#    因此改 config 无效。测试仍写生产 blackboard.db，靠测试内 mark_consumed 清理。
-#    多 session 并发时可能冲突，但 workflow DB 已完全隔离，实际无数据污染。
+# 4. BUS_DB 隔离：重定向 Blackboard 到临时 DB，测试不再写生产 blackboard.db。
+#    Blackboard.__init__ 默认用 blackboard_legacy 模块导入时的 BLACKBOARD_DB 快照，
+#    因此需 patch 快照值本身（blackboard_legacy.BLACKBOARD_DB + hermes_bus.config.BLACKBOARD_DB）。
+_BLACKBOARD_DB_TEST = os.path.join(_TEST_STATE_DIR, "blackboard.db")
+try:
+    from hermes_bus import blackboard_legacy as _bb_legacy
+    _bb_legacy.BLACKBOARD_DB = Path(_BLACKBOARD_DB_TEST)
+    from hermes_bus import config as _bb_config
+    _bb_config.BLACKBOARD_DB = Path(_BLACKBOARD_DB_TEST)
+except Exception as _bbe:
+    import warnings
+    warnings.warn(f"conftest: bus DB 隔离失败（测试将写生产 bus）: {_bbe}", stacklevel=1)
