@@ -432,9 +432,14 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
                     bb.mark_consumed(f.id, consumer="auto_route_investigator")
                 except Exception as _mc2:
                     LOGGER.error("dispatch mark_consumed 失败(重试) fid=%s: %s, 消息可能丢失", f.id, _mc2)
-                    bb.write("blocker",
-                        f"mark_consumed 失败: fid={f.id} 消息可能重复分派或丢失",
-                        evidence=str(_mc2)[:200], src="auto_route_investigator")
+                    # blocker 写入本身必须防崩：DB 已故障时 write 也会抛，
+                    # 未保护会中断整个 dispatch 循环，丢失剩余消息（codex R3 P1）
+                    try:
+                        bb.write("blocker",
+                            f"mark_consumed 失败: fid={f.id} 消息可能重复分派或丢失",
+                            evidence=str(_mc2)[:200], src="auto_route_investigator")
+                    except Exception:
+                        LOGGER.error("blocker 写入也失败 fid=%s（DB 故障）", f.id)
             results.append({
                 "id": f.id,
                 "category": f.cat,
