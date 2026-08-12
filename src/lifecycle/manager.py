@@ -50,7 +50,16 @@ def check_resource_constraints(role: str) -> dict:
     return {"ok": len(violations)==0, "violations": violations, "usage": usage}
 
 class LifecycleManager:
-    """生命周期管理器：状态机 + 步骤执行 + 推进逻辑。"""
+    """生命周期管理器：状态机 + 步骤执行 + 推进逻辑。
+
+    方法分区（2026-08 标注，按职责分）:
+    - DB 连接/查询: query/query_one/execute/_conn_tx/ping
+    - 模板 CRUD: upsert_template/get_wf/get_step/_get_template
+    - 实例生命周期: start_wf/complete_step/fail_step/rollback_step/close_wf
+    - 审批流: get_approval_token/confirm_step/_issue_approval_token/_notify_result
+    - 内部工具: _get_wf_unsafe/_parse_results/_set_step_result_unsafe/_log_unsafe
+    - 资源治理: 见类外 set_role_budget/check_resource_constraints
+    """
 
     WF_STATUSES = {"pending", "running", "completed", "failed", "cancelled"}
     STEP_STATUSES = {"pending", "running", "step_done_ready", "completed", "failed"}
@@ -342,7 +351,7 @@ class LifecycleManager:
         return results.get(step_id, {}).get("approval_token")
 
     def confirm_step(self, wf_id: str, step_id: str, token: str = "",
-                     approved: bool = True, reason: str = "") -> bool:
+                     approved: bool = True, reason: str = "", allow_expired: bool = False) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -363,7 +372,7 @@ class LifecycleManager:
                         raise PermissionError("approval token required but not provided")
                     if current.get("approval_consumed_at"):
                         raise PermissionError("token already used")
-                    if time.time() > current.get("approval_token_ttl", 0):
+                    if time.time() > current.get("approval_token_ttl", 0) and not allow_expired:
                         raise PermissionError("token expired")
                     if token != stored_token:
                         raise PermissionError("invalid token")
