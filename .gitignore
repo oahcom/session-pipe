@@ -9,6 +9,3 @@ __pycache__/
 workflow.db-shm
 workflow.db-wal
 .coverage
-workflows.db
-workflows.db-shm
-workflows.db-wal
