@@ -123,7 +123,11 @@ def _s3_assigned(role: str, db_conn=None, **opts) -> dict:
 
 
 def _load_steps_json(template_id: str, db_conn) -> list | None:
-    """从 workflow_templates.steps_json 读步骤定义（L4 用，脱离 engine 的 _workflows 缓存）。"""
+    """从 workflow_templates.steps_json 读步骤定义（L4 用，脱离 engine 的 _workflows 缓存）。
+
+    格式兼容：DB 中 steps_json 实际存储为 list（直接步骤数组），但也兼容
+    dict({"steps": [...]}) 格式。返回 [{"id": ..., "target_role": ...}, ...] 或 None。
+    """
     try:
         rows = _db_fetch(db_conn,
             "SELECT steps_json FROM workflow_templates WHERE template_id=?", (template_id,))
@@ -133,9 +137,13 @@ def _load_steps_json(template_id: str, db_conn) -> list | None:
         if not raw:
             return None
         data = json.loads(raw)
-        return data.get("steps", []) if isinstance(data, dict) else None
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("steps", [])
+        return None
     except Exception:
-        return None  # json.JSONDecodeError 是 ValueError 子类，被 Exception 覆盖（review P3）
+        return None
 
 
 def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=None, **opts) -> dict:

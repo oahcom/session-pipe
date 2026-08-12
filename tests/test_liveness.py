@@ -184,6 +184,20 @@ class TestL4Stepping(unittest.TestCase):
         self.assertTrue(s.get("truncated"))
         conn.close()
 
+    def test_list_format_steps_json(self):
+        """steps_json 为 list 格式（真实 DB 生产格式）→ 正确读取步骤定义。"""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE workflow_instances(instance_id TEXT, template_id TEXT, step_results TEXT, assigner TEXT, parent_wf_id TEXT, status TEXT)")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        # list 格式：直接是步骤数组（非 {"steps": [...]} 包装）
+        conn.execute("INSERT INTO workflow_templates VALUES('tpl',?)",
+                      (json.dumps([{"id": "s1", "target_role": "qa"}]),))
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "running", "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertTrue(s["busy"], "list 格式 steps_json 应被正确解析并判忙")
+        conn.close()
+
     def test_corrupt_steps_json_returns_not_busy(self):
         """DB steps_json 损坏 → 无法解析 → 跳过（review P2 补测）。"""
         conn = sqlite3.connect(":memory:")
