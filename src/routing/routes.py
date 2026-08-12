@@ -423,10 +423,18 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
                 src="auto_route_investigator")
             # codex D20 修复: 分派后 mark_consumed，防止下轮重复分派同一批
             # （dispatch 周期无 cursor 推进，不消耗则永久重复）
+            # P1-C 修复: mark_consumed 失败时重试一次并写 blocker，防止消息丢失
             try:
                 bb.mark_consumed(f.id, consumer="auto_route_investigator")
             except Exception as _mc:
-                LOGGER.warning("dispatch mark_consumed 失败 fid=%s: %s", f.id, _mc)
+                LOGGER.warning("dispatch mark_consumed 失败(首次) fid=%s: %s", f.id, _mc)
+                try:
+                    bb.mark_consumed(f.id, consumer="auto_route_investigator")
+                except Exception as _mc2:
+                    LOGGER.error("dispatch mark_consumed 失败(重试) fid=%s: %s, 消息可能丢失", f.id, _mc2)
+                    bb.write("blocker",
+                        f"mark_consumed 失败: fid={f.id} 消息可能重复分派或丢失",
+                        evidence=str(_mc2)[:200], src="auto_route_investigator")
             results.append({
                 "id": f.id,
                 "category": f.cat,

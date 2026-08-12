@@ -90,7 +90,7 @@ TEMPLATE_SCHEMA = {
     "definitions": {
         "Step": {
             "type": "object",
-            "required": ["id", "title", "type", "prompt_template"],
+            "required": ["id", "title", "type", "prompt_template", "exit_condition"],
             "properties": {
                 "id": {"type": "string", "pattern": "^s\\d+$"},
                 "title": {"type": "string", "minLength": 2},
