@@ -13,6 +13,13 @@ db = "/home/administrator/.hermes/state/workflows.db"
 reg = TemplateRegistry(db_path=db)
 
 PROMPT_S1 = """【做什么】根据任务类型（技术方案/产品需求/测试用例/接口文档/运维手册）生成对应的结构化文档
+【本次任务】
+任务标题: {title}
+任务描述: {description}
+【输入唯一性（铁律）】
+以上任务标题和描述是本次唯一的用户需求来源——不是 workspace 里的任何历史文档。
+禁止复用/引用历史 PRD.md、DESIGN.md、DOCUMENT.md（它们属于其他任务）。
+必须在以上任务背景基础上重新生成全新文档。
 【怎么做】
 1. 分析用户原始需求，提取显性需求和隐性需求
 2. 按照文档模板生成结构化文档，必须包含以下章节：
@@ -27,9 +34,17 @@ PROMPT_S1 = """【做什么】根据任务类型（技术方案/产品需求/测
 1. 文档包含全部5个章节（背景与目标、范围与边界、详细设计、风险与依赖、验收标准）
 2. 所有验收标准可量化、可测试
 3. 文档格式符合对应类型模板
-4. 无占位符或模糊表述"""
+4. 无占位符或模糊表述
+
+## 完成
+写 bus cat=architecture，标题含 s1-complete。"""
 
 PROMPT_S2 = """【做什么】使用Codex对阶段1产出的文档进行三方20维度审查
+【审查对象（铁律）】
+阶段1产出的文档：product_architect 在本次任务（{title}）中生成的新文档。
+定位方式：~/ccs-workspaces/product_architect/ 下最近修改（按 mtime）的 DOCUMENT*.md，
+内容必须与本任务标题相关（含任务主题词）。
+禁止审查 DESIGN.md / PRD.md / 其他历史文档——它们属于其他任务。
 【怎么做】
 1. 运行 codex review 命令审查文档
 2. 审查20个维度：逻辑一致性、完整性、清晰度、可执行性、安全性、性能、可维护性、可测试性、向后兼容、错误处理、并发安全、数据完整性、API设计、文档质量、代码影响、回滚方案、可观测性、认证模型、协议合规、原子性
@@ -40,7 +55,10 @@ PROMPT_S2 = """【做什么】使用Codex对阶段1产出的文档进行三方20
 【验收标准】
 1. 连续两轮Codex审查均为0 Issue
 2. 每轮审查结论完整保留
-3. 所有Issue已修复或确认为误报（经连续两轮验证）"""
+3. 所有Issue已修复或确认为误报（经连续两轮验证）
+
+## 完成
+写 bus cat=code_review，标题含 s2-complete。"""
 
 PROMPT_S3 = """【做什么】逐条对照用户原始需求，验证文档是否完整覆盖所有显性需求与隐性隐含诉求
 【怎么做】
@@ -53,7 +71,10 @@ PROMPT_S3 = """【做什么】逐条对照用户原始需求，验证文档是�
 1. 所有显性需求逐条对应到文档章节
 2. 隐性需求已识别并覆盖
 3. 无遗漏的需求项
-4. 需求追溯矩阵完整"""
+4. 需求追溯矩阵完整
+
+## 完成
+写 bus cat=user_story，标题含 s3-complete。"""
 
 PROMPT_S4 = """【做什么】基于已通过审查的文档进行技术设计或开发/架构任务书设计
 【怎么做】
@@ -75,7 +96,10 @@ PROMPT_S4 = """【做什么】基于已通过审查的文档进行技术设计�
 3. 量化指标明确具体
 4. 接口契约使用契约式描述
 5. 异常处理策略完整
-6. 自测清单覆盖三类路径"""
+6. 自测清单覆盖三类路径
+
+## 完成
+写 bus cat=code_fix，标题含 s4-complete。"""
 
 PROMPT_S5 = """【做什么】对照最终版文档，逐项检查实现结果（代码/配置/测试报告等）是否与文档100%一致
 【怎么做】
@@ -91,7 +115,10 @@ PROMPT_S5 = """【做什么】对照最终版文档，逐项检查实现结果�
 1. 实现与文档100%一致
 2. 无新增未文档化内容
 3. 所有差异项已修复
-4. 一致性检查报告完整"""
+4. 一致性检查报告完整
+
+## 完成
+写 bus cat=code_review，标题含 s5-complete。"""
 
 APPROVE_S1 = """请审查文档完整性：
 1. 背景与目标是否清晰说明了为什么要做这件事
@@ -139,49 +166,54 @@ reg.register({
     "quality_standards": "所有阶段通过Codex审查，实现与文档100%一致，无新增未文档化内容",
     "steps": [
         {
-            "step_id": "s1",
+            "id": "s1",
             "title": "阶段1: 文档产出",
             "type": "handoff",
             "target_role": "product_architect",
             "prompt_template": PROMPT_S1,
             "approval_prompt": APPROVE_S1,
             "failure_patterns": ["文档缺少关键章节", "验收标准不可测", "存在占位符或模糊表述", "量化指标不具体"],
+            "exit_condition": {"bus_category": "architecture", "source_contains": "product_architect", "text_contains": "s1-complete", "timeout_minutes": 60, "require_wf": True},
         },
         {
-            "step_id": "s2",
+            "id": "s2",
             "title": "阶段2: Codex三方审查",
             "type": "gate",
             "target_role": "reviewer",
             "prompt_template": PROMPT_S2,
             "approval_prompt": APPROVE_S2,
             "failure_patterns": ["Codex发现Issue", "未连续两轮通过", "审查结论被篡改", "Issue未修复"],
+            "exit_condition": {"bus_category": "code_review", "source_contains": "reviewer", "text_contains": "s2-complete", "timeout_minutes": 45},
         },
         {
-            "step_id": "s3",
+            "id": "s3",
             "title": "阶段3: 需求对齐验证",
             "type": "handoff",
             "target_role": "pm",
             "prompt_template": PROMPT_S3,
             "approval_prompt": APPROVE_S3,
             "failure_patterns": ["需求遗漏", "隐性需求未覆盖", "需求追溯矩阵不完整"],
+            "exit_condition": {"bus_category": "user_story", "source_contains": "pm", "text_contains": "s3-complete", "timeout_minutes": 60},
         },
         {
-            "step_id": "s4",
+            "id": "s4",
             "title": "阶段4: 开发落地设计",
             "type": "handoff",
             "target_role": "engineer",
             "prompt_template": PROMPT_S4,
             "approval_prompt": APPROVE_S4,
             "failure_patterns": ["架构图缺失", "接口契约不完整", "量化指标不具体", "异常处理缺失"],
+            "exit_condition": {"bus_category": "code_fix", "source_contains": "engineer", "text_contains": "s4-complete", "timeout_minutes": 120},
         },
         {
-            "step_id": "s5",
+            "id": "s5",
             "title": "阶段5: 实现一致性检查",
             "type": "review",
             "target_role": "reviewer",
             "prompt_template": PROMPT_S5,
             "approval_prompt": APPROVE_S5,
             "failure_patterns": ["实现与文档不一致", "新增未文档化内容", "差异项未修复"],
+            "exit_condition": {"bus_category": "code_review", "source_contains": "reviewer", "text_contains": "s5-complete", "timeout_minutes": 45},
         },
     ],
 })

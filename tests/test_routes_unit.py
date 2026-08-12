@@ -73,7 +73,7 @@ def test_dispatch_investigator_filters_needs_investigation(mock_bb_cls, mock_rt)
     from routing.routes import dispatch_investigator
     bb = MagicMock()
     mock_bb_cls.return_value = bb
-    bb.read.return_value = [
+    bb.unconsumed.return_value = [
         _make_fact(1, "code_fix", "bug report", "needs_investigation — traceback detected"),
         _make_fact(2, "architecture", "design doc", "no filter keyword here"),
         _make_fact(3, "code_fix", "error log", "needs_triage — crash dump"),
@@ -91,7 +91,7 @@ def test_dispatch_investigator_dry_run_no_write(mock_bb_cls, mock_rt):
     from routing.routes import dispatch_investigator
     bb = MagicMock()
     mock_bb_cls.return_value = bb
-    bb.read.return_value = [
+    bb.unconsumed.return_value = [
         _make_fact(1, "code_fix", "err", "needs_investigation — ImportError"),
     ]
     result = dispatch_investigator(category="code_fix", dry_run=True)
@@ -106,7 +106,7 @@ def test_dispatch_investigator_real_write(mock_bb_cls, mock_rt):
     from routing.routes import dispatch_investigator
     bb = MagicMock()
     mock_bb_cls.return_value = bb
-    bb.read.return_value = [
+    bb.unconsumed.return_value = [
         _make_fact(1, "code_fix", "err", "needs_investigation — segfault"),
     ]
     result = dispatch_investigator(category="code_fix", dry_run=False)
@@ -303,8 +303,8 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
         mock_wf.return_value.check_task.return_value = None
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "routed"
-    # 短标题(<80)不创建 workflow（防空模板循环）
-    mock_wf.return_value.create_task_v2.assert_not_called()
+    # 标题 ≥4 字符时创建 workflow（len<80 是旧 bug 已修复，阈值改回 <4）
+    mock_wf.return_value.create_task_v2.assert_called_once()
 
 
 @patch("routing.routes.HEARTBEAT")

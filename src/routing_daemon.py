@@ -135,6 +135,7 @@ def main():
     last_eval = 0
     last_survival = 0
     last_drift = 0
+    last_metrics = 0
 
     # ── 单实例 PID 锁 ──
     _pid_file = Path.home() / ".hermes" / "run" / "routing_daemon.pid"
@@ -206,6 +207,17 @@ def main():
 
             # 定时执行 eval_criteria 检查
             if now - last_eval >= EVAL_INTERVAL:
+                # D6 生长接入: eval_consistency 预检 persona eval_criteria 与白名单一致性，
+                # 防止运行时 exit=-3 静默跳过（2026-08-11 白名单漂移事故根因）
+                try:
+                    from eval_consistency import main as _ec_main
+                    import io, contextlib
+                    _ec_buf = io.StringIO()
+                    with contextlib.redirect_stdout(_ec_buf):
+                        _ec_main(["--json"])
+                    LOGGER.debug("eval_consistency 预检: %s", _ec_buf.getvalue()[:200])
+                except Exception as _ec:
+                    LOGGER.warning("eval_consistency 预检异常（不阻塞 eval 执行）: %s", _ec)
                 if _run_eval is None:
                     try:
                         from eval_checker import run_eval_check
@@ -287,6 +299,29 @@ def main():
                     LOGGER.error("survival_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_survival = now
+
+            # R2-4 生长接入: workflow_metrics 快照写 bus（每小时一次）
+            # 8.6MB workflow-metrics.jsonl 长期无消费者（D6 发现），
+            # 由 task_generator heal 写入，这里消费输出供监控审计
+            if now - last_metrics >= 3600:
+                try:
+                    from workflow_metrics import snapshot as _wf_snapshot
+                    import io, contextlib
+                    _buf = io.StringIO()
+                    with contextlib.redirect_stdout(_buf):
+                        _wf_snapshot()
+                    _snap_text = _buf.getvalue()
+                    _rate_line = next((l for l in _snap_text.splitlines() if "完成率" in l), "完成率: N/A")
+                    import subprocess as _sp
+                    _sp.run(
+                        [sys.executable, str(Path.home() / ".hermes/scripts/bus_client.py"), "write", "monitor_wf_health",
+                         f"[wf-metrics] {_rate_line.strip()}",
+                         "--evidence", _snap_text[:800],
+                         "--src", "routing_daemon"],
+                        capture_output=True, timeout=10)
+                except Exception as _me:
+                    LOGGER.debug("workflow_metrics 快照写 bus 失败（可选组件）: %s", _me)
+                last_metrics = now
 
             time.sleep(INTERVAL + error_backoff)
     finally:

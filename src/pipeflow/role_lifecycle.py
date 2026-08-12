@@ -317,14 +317,25 @@ class RoleLifecycleMixin:
             prompt = "/goal " + prompt
         # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
         # 用正则剥掉 /goal 前缀（lstrip 字符集会误伤内容开头的 g/o/a/l）
+        # 阈值 10→4：10 会误杀「请调研 Python」这类 6 字合法中文任务；
+        # 4 仍能拦住空/占位符（[]、p、x），继续防 #141691 死循环
         _goal_content = _re.sub(r"^/goal\s*", "", prompt, flags=_re.IGNORECASE).strip()
-        if len(_goal_content) < 10:
+        if len(_goal_content) < 4:
             LOGGER.warning("send-to-role %s 拒绝: goal 内容过短 (len=%d, wf=%s step=%s)",
                           role, len(_goal_content), wf_id[:12] if wf_id else "?", step_id)
             self._bb.write("blocker",
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
             return
+        # 双要素第二关：goal 应含完成形态动词（输出/报告/修复/设计/实现/审查），
+        # 缺少则 warning + bus notice 但不阻断（CrewAI expected_output 模式启发）
+        _ACTION_VERBS = ("输出", "报告", "修复", "设计", "实现", "审查", "创建", "更新", "完成", "分析", "验证",
+                         "write", "report", "fix", "design", "implement", "review", "create", "update", "complete")
+        if not any(v in _goal_content.lower() for v in _ACTION_VERBS):
+            LOGGER.info("send-to-role %s goal 缺完成形态描述 (wf=%s step=%s)", role, wf_id[:12] if wf_id else "?", step_id)
+            self._bb.write("notice",
+                f"[workflow] {role} goal 缺完成形态动词，建议补充「输出XX」类描述",
+                evidence=prompt[:200], src="workflow_engine")
         # 自动注入搜索提醒（非 coordinator、非 force 模式才注入）
         # 让所有角色在每次接收任务时，习惯性地用 WebSearch 查证信息
         if role != "coordinator" and not force:

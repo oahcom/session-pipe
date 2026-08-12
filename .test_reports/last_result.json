@@ -1,25 +1,25 @@
 {
-  "ts": 1786399213.6487188,
-  "datetime": "2026-08-11T06:00:13.648720",
+  "ts": 1786485619.9450457,
+  "datetime": "2026-08-12T06:00:19.945047",
   "all_pass": true,
   "results": [
     {
       "name": "路由逻辑",
       "file": "test_router.py",
       "passed": true,
-      "elapsed": 0.23
+      "elapsed": 0.2
     },
     {
       "name": "集成测试",
       "file": "test_integration.py",
       "passed": true,
-      "elapsed": 0.78
+      "elapsed": 0.88
     },
     {
       "name": "角色交互",
       "file": "test_role_interaction.py",
       "passed": true,
-      "elapsed": 0.27
+      "elapsed": 0.26
     }
   ],
   "total": 3,

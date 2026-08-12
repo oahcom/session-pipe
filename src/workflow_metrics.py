@@ -88,6 +88,33 @@ def by_role():
               f"运行={s.get('running',0):>3} 完成率={done/max(total,1)*100:.0f}%")
 
 
+def fail_rate():
+    """失败率与超时统计：failed 任务数 / 总任务数（含 timeout 累计）。"""
+    db = sqlite3.connect(str(DB))
+    db.row_factory = sqlite3.Row
+    total = db.execute("SELECT COUNT(*) as c FROM tasks").fetchone()["c"]
+    by_status = {
+        r["status"]: r["c"]
+        for r in db.execute("SELECT status, COUNT(*) as c FROM tasks GROUP BY status").fetchall()
+    }
+    failed = by_status.get("failed", 0)
+    # timeout_count 存在 workflow_instances.step_results JSON 中（tasks 表无此列）
+    rows = db.execute("SELECT step_results FROM workflow_instances").fetchall()
+    timeout_sum = 0
+    for r in rows:
+        try:
+            sr = json.loads(r["step_results"] or "{}")
+        except Exception:
+            continue
+        for sdata in sr.values():
+            if isinstance(sdata, dict):
+                timeout_sum += int(sdata.get("timeout_count", 0))
+    print("=== 任务失败率 ===")
+    print(f"任务总数: {total} | 失败: {failed} | 失败率: {failed/max(total,1)*100:.1f}%")
+    print(f"超时累计: {timeout_sum} 次")
+    print()
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--trend" in args:
@@ -98,5 +125,8 @@ if __name__ == "__main__":
         trend(n)
     elif "--by-role" in args:
         by_role()
+    elif "--fail-rate" in args:
+        fail_rate()
     else:
         snapshot()
+        fail_rate()
