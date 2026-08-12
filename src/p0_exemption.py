@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -474,7 +475,7 @@ class P0Exemption:
             return
         import subprocess
         try:
-            cmd = ["python3", str(BUS_CLIENT), "write", category,
+            cmd = [sys.executable, str(BUS_CLIENT), "write", category,
                    f"[{self.role}] {title}", "--src", self.role]
             if evidence:
                 cmd.extend(["--evidence", evidence])

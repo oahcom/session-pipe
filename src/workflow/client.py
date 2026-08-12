@@ -1,6 +1,7 @@
 """workflow/client.py — CCS 角色使用的工作流客户端。"""
 
 import json
+import sys
 import subprocess
 import threading
 import logging
@@ -172,7 +173,7 @@ class WorkflowClient:
         ccs_ok = True
         if not _is_test and assignee and assignee != self.role:
             result = subprocess.run(
-                ["python3", str(CCS_CLI), "send", assignee,
+                [sys.executable, str(CCS_CLI), "send", assignee,
                  f"[{self.role}] 你有新任务: {title} — check_task() 查看详情",
                  "--from", self.role],
                 capture_output=True, timeout=15,
@@ -418,7 +419,7 @@ class WorkflowClient:
 
     def notify(self, category: str, title: str, evidence: str = ""):
         import subprocess
-        cmd = ["python3", str(BUS_CLIENT), "write", category,
+        cmd = [sys.executable, str(BUS_CLIENT), "write", category,
                f"[{self.role}] {title}", "--src", self.role]
         if evidence:
             cmd.extend(["--evidence", evidence])
@@ -427,7 +428,7 @@ class WorkflowClient:
     # ── 委派方法（经 subprocess 调用 launcher partner 模块） ──
 
     def confirm_delivery(self, task_id: str, target_role: str, timeout: int = 300) -> dict:
-        cmd = ["python3", str(CCS_CLI), "partner", "confirm", task_id, target_role, "--as", self.role]
+        cmd = [sys.executable, str(CCS_CLI), "partner", "confirm", task_id, target_role, "--as", self.role]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return {"ok": r.returncode == 0, "output": r.stdout}
 

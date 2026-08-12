@@ -396,6 +396,9 @@ class TaskGeneratorMixin:
                 _val = _pr.stdout.strip().split("\n")[0]
                 if _val and _val != "0" and time.time() - float(_val) < 60:
                     return False
-        except Exception:
-            pass
+        except Exception as _e:
+            # D1 修复: pane_activity 解析失败返回 False（保守），
+            # 防 tmux 异常导致角色误判空闲 → 重复分配任务
+            LOGGER.debug("_can_assign_role pane_activity fallback failed: %s", _e)
+            return False
         return True
