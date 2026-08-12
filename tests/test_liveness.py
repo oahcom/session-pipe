@@ -198,6 +198,25 @@ class TestL4Stepping(unittest.TestCase):
         self.assertTrue(s["busy"], "list 格式 steps_json 应被正确解析并判忙")
         conn.close()
 
+    def test_load_steps_json_direct(self):
+        """直接测试 _load_steps_json 的 list/dict/损坏格式兼容。"""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        # list 格式
+        conn.execute("INSERT INTO workflow_templates VALUES('list_tpl',?)",
+                      (json.dumps([{"id": "s1", "target_role": "qa"}]),))
+        self.assertEqual(len(_load_steps_json("list_tpl", conn)), 1)
+        # dict 格式
+        conn.execute("INSERT INTO workflow_templates VALUES('dict_tpl',?)",
+                      (json.dumps({"steps": [{"id": "s1", "target_role": "qa"}]}),))
+        self.assertEqual(len(_load_steps_json("dict_tpl", conn)), 1)
+        # 不存在
+        self.assertIsNone(_load_steps_json("missing", conn))
+        # 损坏
+        conn.execute("INSERT INTO workflow_templates VALUES('bad','{json!')")
+        self.assertIsNone(_load_steps_json("bad", conn))
+        conn.close()
+
     def test_corrupt_steps_json_returns_not_busy(self):
         """DB steps_json 损坏 → 无法解析 → 跳过（review P2 补测）。"""
         conn = sqlite3.connect(":memory:")
