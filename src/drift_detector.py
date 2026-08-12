@@ -21,7 +21,9 @@ from bus_protocol import Blackboard
 log = logging.getLogger("drift-detector")
 
 # 系统分类，所有角色始终允许
-_ALWAYS_ALLOWED = {"notice", "architecture"}
+# R4 drift P0 修复: monitor_audit 是 tracker/watchdog 审计产物，不应被漂移检测误报
+# （漂移分析发现 maintainer 36 条 + archivist 20 条误报根因）
+_ALWAYS_ALLOWED = {"notice", "architecture", "monitor_audit", "monitor_wf_health"}
 
 
 def _load_role_config(role: str) -> Optional[dict]:
