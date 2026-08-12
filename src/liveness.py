@@ -10,13 +10,23 @@
 - L3/L4 读 DB（workflow_instances / workflow_templates），实时。
 - 信号不可用（无 DB/无 health 文件/无 tmux）时降级：该信号返回 available=False，
   调用方按放行处理（busy=False），不阻断业务。
+
+关键参数说明：
+- pane_fallback: 仅 health 门控的 stale/dead/l2_false 分支用——tmux pane_active
+  （焦点 0/1）为 True 时视为忙（兜底）。注意 pane_active ≠ pane_activity（时间戳），
+  前者在 tmux 3.4 下恒为 1（单 pane 会话），是低误报兜底而非精确判活。
+- workflows: 可选内存 WorkflowDef 缓存（dict[str, WorkflowDef]）。_is_role_busy
+  委托时传入（与原 self._workflows 语义一致）；已提供但模板不在其中 → 跳过该实例
+  （engine 未加载的模板应由清理路径回收，不由忙检测拦截）；未提供 → 回退读 DB
+  workflow_templates.steps_json（独立调用场景）。
+- _STEP_SCAN_LIMIT: L4 扫描上限。超过 40 个 running 实例时截断并返回不忙——
+  安全方向（放行），但会漏忙，日志 warning 提示。
 """
 
 import json
 import logging
 import os
 import subprocess
-import time
 from pathlib import Path
 
 LOGGER = logging.getLogger("liveness")
@@ -124,8 +134,8 @@ def _load_steps_json(template_id: str, db_conn) -> list | None:
             return None
         data = json.loads(raw)
         return data.get("steps", []) if isinstance(data, dict) else None
-    except (Exception, json.JSONDecodeError):
-        return None
+    except Exception:
+        return None  # json.JSONDecodeError 是 ValueError 子类，被 Exception 覆盖（review P3）
 
 
 def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=None, **opts) -> dict:

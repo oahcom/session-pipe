@@ -173,6 +173,29 @@ class TestL4Stepping(unittest.TestCase):
         s = _s4_stepping("qa", None)
         self.assertFalse(s["busy"])
 
+    def test_truncated_scan_returns_not_busy(self):
+        """>40 个 running 实例 → 截断，不判忙（安全方向，review P2 补测）。"""
+        conn = self._conn()
+        for i in range(41):
+            conn.execute("INSERT INTO workflow_instances VALUES(?, 'tpl', ?, 'engineer', NULL, 'running')",
+                          (f"wf_{i}", json.dumps({"s1": {"status": "running", "timeout_count": 0}})))
+        s = _s4_stepping("qa", conn)
+        self.assertFalse(s["busy"])
+        self.assertTrue(s.get("truncated"))
+        conn.close()
+
+    def test_corrupt_steps_json_returns_not_busy(self):
+        """DB steps_json 损坏 → 无法解析 → 跳过（review P2 补测）。"""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE workflow_instances(instance_id TEXT, template_id TEXT, step_results TEXT, assigner TEXT, parent_wf_id TEXT, status TEXT)")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        conn.execute("INSERT INTO workflow_templates VALUES('tpl','{invalid json')")
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "running"}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertFalse(s["busy"])
+        conn.close()
+
     def test_workflows_param_bypasses_db(self):
         """workflows 参数：直接用内存 WorkflowDef，不查 DB steps_json。"""
         class Step:
