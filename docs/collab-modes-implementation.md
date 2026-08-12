@@ -144,11 +144,11 @@ s4（仲裁）：closer 审计，但必须 qa 和 reviewer 都产出 test_report
 `tests/test_collab_modes.py` — 14 个测试：主从 guard 收集、对等 track 超时、
 组合 guard+track、仲裁 multi-guard + wait_roles 校验（string/int/dict/list/empty）。
 
-`tests/test_collab_regression.py` — 21 个测试：wait_roles 门控（全过/缺角色/空 bus/无门）、
+`tests/test_collab_regression.py` — 20 个测试方法：wait_roles 门控（全过/缺角色/空 bus/无门）、
 track 作者过滤/节流/伙伴恢复、guard 非法类型、dual_node+wait_roles 门（受阻/放行）、
 角色收集、窗口溢出补查（命中/缺失）、source_contains 共存。
 
-全量: **645 passed**（无 skip/fail）。
+全量: **673 passed**（2026-08-12 实测，含用户并发新增测试）。
 
 ## 七、验证与部署
 

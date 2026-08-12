@@ -197,8 +197,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     _clean = {k: v for k, v in _s.items() if k in Step.__dataclass_fields__}
                     # persona collab 注入：模板未显式声明 guard/track 时，
                     # 用 target_role persona 的 collab 字段（声明一次全模板生效）
+                    # 仅当 guard 和 track 都未声明时注入：模板显式声明任一字段
+                    # = 作者意图"此步骤仅此能力"，persona 不应补充另一项（2026-08-12 codex P1）
                     _tr = _clean.get("target_role", "")
-                    if _tr and (not _clean.get("guard") or not _clean.get("track")):
+                    if _tr and not _clean.get("guard") and not _clean.get("track"):
                         _rc = _role_collab.get(_tr) or {}
                         if not _clean.get("guard") and _rc.get("guard"):
                             _g = _rc["guard"]
@@ -298,6 +300,16 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         s_clean["exit_condition"] = {}
                     if "target_role" not in s_clean:
                         continue
+                    # DB 路径同样校验协作字段结构（与 JSON 路径 L218-233 一致，
+                    # 2026-08-12 codex P2：防 DB 脏数据拉起不存在角色）
+                    _d_wr = s_clean.get("wait_roles")
+                    if _d_wr is not None and (not isinstance(_d_wr, list)
+                                              or not all(isinstance(r, str) for r in _d_wr)):
+                        s_clean["wait_roles"] = None
+                    _d_t = s_clean.get("track")
+                    if isinstance(_d_t, dict) and (not isinstance(_d_t.get("notify_roles", []), list)
+                                                   or not all(isinstance(r, str) for r in _d_t.get("notify_roles", []))):
+                        s_clean["track"] = None
                     try:
                         steps.append(Step(**s_clean))
                     except (ValueError, KeyError, TypeError):
@@ -394,8 +406,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 LOGGER.error("[wf] upsert 拒绝: %s 结构校验不通过: %s",
                              name, _vr.errors[:3])
                 return
-        except Exception:
-            pass  # 校验异常时放行（兼容，不阻断启动）
+        except Exception as _e:
+            # 校验器自身出错 → 记日志后放行（不阻断启动，但暴露问题）
+            # （2026-08-12 codex P2：静默 pass 会掩盖校验器 bug → 未校验模板写 DB）
+            LOGGER.warning("[wf] upsert 校验异常（放行但需关注）: %s: %s", name, _e)
         try:
             _existing = self._lifecycle.query(
                 "SELECT 1 FROM workflow_templates WHERE template_id=?", (name,))

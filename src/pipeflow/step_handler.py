@@ -172,20 +172,26 @@ class StepHandlerMixin:
                         wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
                         wait_roles=getattr(step, "wait_roles", None))
                     if _busy_match_ts:
-                        run.step_results[step.id] = {
-                            **run.step_results.get(step.id, {}),
-                            "bus_anchor": _busy_match_ts,
-                            "exit_messages": _busy_match_msgs,
-                        }
-                        self._sync_step_results(run.id, run.step_results)
-                        # bypass 补发完整性提醒（busy exit-match 直接推进，跳过双节点审查）
-                        _integ_send_bypass(run, step, "busy",
-                                           send_to_role=self._send_to_role,
-                                           sync_step_results=self._sync_step_results)
-                        try:
-                            self._lifecycle.complete_step(run.id, step.id)
-                        except Exception as _e:
-                            LOGGER.debug("busy exit-match complete_step 失败: %s", _e)
+                        # exit_schema 校验与主路径一致：busy 不绕过文件约束
+                        # （2026-08-12 codex P1：schema 要求不能因忙检测分支成空文）
+                        _schema_ok = True
+                        if step.exit_schema:
+                            _schema_ok, _ = self._validate_exit_schema(step, run)
+                        if _schema_ok:
+                            run.step_results[step.id] = {
+                                **run.step_results.get(step.id, {}),
+                                "bus_anchor": _busy_match_ts,
+                                "exit_messages": _busy_match_msgs,
+                            }
+                            self._sync_step_results(run.id, run.step_results)
+                            # bypass 补发完整性提醒（busy exit-match 直接推进，跳过双节点审查）
+                            _integ_send_bypass(run, step, "busy",
+                                               send_to_role=self._send_to_role,
+                                               sync_step_results=self._sync_step_results)
+                            try:
+                                self._lifecycle.complete_step(run.id, step.id)
+                            except Exception as _e:
+                                LOGGER.debug("busy exit-match complete_step 失败: %s", _e)
                 _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
                 # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
                 # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
@@ -701,6 +707,11 @@ class StepHandlerMixin:
                                 allow_expired=True)  # P0-A 修复: token 已过期时也允许确认
                             LOGGER.warning("approval_timeout_fallback %s/%s: token 超时 30min 未消费，自动 approve",
                                            run.workflow_name, step.id)
+                            # 同步 step_results 到 DB（confirm_step 内部已写，这里确保 run 内存状态也刷新）
+                            _db_after = self._lifecycle._parse_results(
+                                self._lifecycle._get_wf_unsafe(run.id))
+                            run.step_results[step.id] = _db_after.get(step.id, {})
+                            self._sync_step_results(run.id, run.step_results)
                             return
                 except Exception as _e:
                     LOGGER.debug("approval_timeout check skipped: %s", _e)
