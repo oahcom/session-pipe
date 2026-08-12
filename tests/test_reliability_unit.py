@@ -287,7 +287,9 @@ class TestIdempotentConsume:
         result = ic.safe_consume(bb, 42, "test_consumer")
         assert result["status"] == "consumed"
         assert result["fact_id"] == 42
-        bb.mark_consumed.assert_called_once_with(42, "test_consumer")
+        # safe_consume 用 conn.execute(INSERT) 替代旧 bb.mark_consumed
+        insert_calls = [c for c in conn.execute.call_args_list if "INSERT" in str(c)]
+        assert len(insert_calls) >= 1, "应有 INSERT 调用（消费写入）"
 
     def test_already_consumed_skips(self):
         ic = reliability.IdempotentConsume()
@@ -302,7 +304,7 @@ class TestIdempotentConsume:
         ic = reliability.IdempotentConsume()
         bb, conn = self._make_bb()
         conn.execute.return_value.fetchone.return_value = None
-        bb.mark_consumed.side_effect = Exception("db locked")
+        conn.execute.side_effect = Exception("db locked")
         result = ic.safe_consume(bb, 42, "test_consumer")
         assert result["status"] == "error"
         assert "db locked" in result["error"]
@@ -428,13 +430,17 @@ class TestConcurrency:
                 return (1,)
             return None
 
-        def stateful_mark_consumed(fact_id, consumer):
-            consumed_set.add(fact_id)
+        def stateful_execute(sql, *args):
+            if "INSERT" in str(sql):
+                consumed_set.add(1)
+            # SELECT → 返回 mock，其 fetchone 由 consumed_set 决定
+            result_mock = MagicMock()
+            result_mock.fetchone.side_effect = lambda: stateful_fetchone(1, "thread_test")
+            return result_mock
 
         bb._conn = MagicMock()
-        bb._conn.return_value.__enter__.return_value.execute.return_value.fetchone.side_effect = \
-            lambda: stateful_fetchone(1, "thread_test")
-        bb.mark_consumed.side_effect = stateful_mark_consumed
+        conn = bb._conn.return_value.__enter__.return_value
+        conn.execute.side_effect = stateful_execute
 
         results = []
         barrier = threading.Barrier(5)

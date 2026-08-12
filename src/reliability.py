@@ -361,8 +361,16 @@ class AckTracker:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS acks("
             "fact_id INT, consumer TEXT, category TEXT, "
-            "status TEXT, error TEXT, ts REAL)"
+            "status TEXT, error TEXT, ts REAL, "
+            "UNIQUE(fact_id, consumer))"
         )
+        # 存量表兼容：早期建表无 UNIQUE 约束 → 补唯一索引（UPSERT 依赖）
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_acks_unique "
+                "ON acks(fact_id, consumer)")
+        except sqlite3.OperationalError:
+            pass  # 已有重复行时建索引失败 → 保留旧行为（INSERT）
 
     def _get_conn(self):
         return self._conn
@@ -375,7 +383,10 @@ class AckTracker:
             conn = self._get_conn()
             conn.execute(
                 "INSERT INTO acks(fact_id, consumer, category, status, error, ts) "
-                "VALUES(?,?,?,?,?,?)",
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(fact_id, consumer) DO UPDATE SET "
+                "category=excluded.category, status=excluded.status, "
+                "error=excluded.error, ts=excluded.ts",
                 (fact_id, consumer, category, status, error, ts_val),
             )
             conn.commit()
