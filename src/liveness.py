@@ -119,7 +119,7 @@ def _s3_assigned(role: str, db_conn=None, **opts) -> dict:
             (role,))
         return {"available": True, "assigned": len(rows) > 0}
     except Exception:
-        return {"available": False, "assigned": None}
+        return {"available": False, "assigned": None, "error": "db_query_failed"}
 
 
 def _load_steps_json(template_id: str, db_conn) -> list | None:
@@ -155,8 +155,8 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
             "SELECT instance_id, template_id, step_results, assigner, parent_wf_id "
             "FROM workflow_instances WHERE status='running'")
         if len(rows) > _STEP_SCAN_LIMIT:
-            LOGGER.warning("liveness L4: %d running 实例超上限 %d，截断不判忙",
-                           len(rows), _STEP_SCAN_LIMIT)
+            LOGGER.warning("liveness L4: role=%s %d running 实例超上限 %d，截断不判忙",
+                           role, len(rows), _STEP_SCAN_LIMIT)
             return {"available": True, "busy": False, "truncated": True}
         for r in rows:
             inst_id = _row_get(r, "instance_id", 0)
@@ -204,7 +204,7 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                                 "wf_id": inst_id, "step_id": _s.get("id", "?")}
         return {"available": True, "busy": False}
     except Exception:
-        return {"available": False, "busy": False}
+        return {"available": False, "busy": False, "error": "db_query_failed"}
 
 
 def _health_gate(role: str, health_dir: Path, pane_fallback: bool) -> tuple[bool | None, dict | None]:
