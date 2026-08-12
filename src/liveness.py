@@ -46,8 +46,8 @@ def _tmux_has_session(role: str, timeout: float = 3.0) -> bool | None:
         r = subprocess.run(["tmux", "has-session", "-t", f"ccs-{role}"],
                            capture_output=True, timeout=timeout)
         return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None  # OSError: tmux socket 不可达/权限不足（review P3）
 
 
 def _read_health(role: str, health_dir: Path = HEALTH_DIR) -> dict | None:
@@ -322,5 +322,5 @@ def tmux_pane_active(role: str, timeout: float = 3.0) -> bool | None:
         if r.returncode == 0 and "1" in r.stdout:
             return True
         return False
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None  # OSError: tmux socket 不可达/权限不足（review P3）
