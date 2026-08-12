@@ -303,8 +303,11 @@ def role_liveness(role: str, level: int = 4, exclude_wf_id: str = "",
             busy = True
             reason = f"stepping={s4.get('wf_id')}/{s4.get('step_id')}"
 
-    # 降级：信号均不可用 → level_used 降到实际可用的最高级别
-    level_used = max([lvl for lvl, sig in signals.items() if sig.get("available")], default=0)
+    # level_used: 实际参与判定的最高级别（排除 signal 缺失的级别）。
+    # 注意 L0 从不判忙（仅信息），故从参与判定的级别中排除；未被使用的高级
+    # 信号（如 level=4 时 L1/L2 仅记录不判忙）不计数。
+    _used = [lvl for lvl, sig in signals.items() if lvl >= 1 and sig.get("available") and lvl <= level]
+    level_used = max(_used, default=0)
     return {"busy": busy, "level_used": level_used, "signals": signals, "reason": reason}
 
 
