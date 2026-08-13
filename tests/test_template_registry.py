@@ -223,11 +223,12 @@ def test_dual_node_full_cycle():
         with patch("subprocess.run", return_value=mock_result), \
              patch.object(eng, "_ensure_role_alive", return_value=True):
             wf_id = eng.start("food_chain_loop", {"source": "test", "loop_iteration": 1})
-            eng.run_once()  # mark notified
-            # 双节点第一步 → node1_done
-            r1 = eng._lifecycle.complete_step(wf_id, "s1")
-            assert r1 == "node1_done", f"第一步应 node1_done: {r1}"
-            # 双节点第二步 → 推进到 s2
+            eng.run_once()  # run_once 已内置 dual_node 推进: 标记 notified + node1_done + node2_sent
+            # 验证 run_once 已完成第一步（node1）并发送第二步指令
+            _sr0 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
+            assert _sr0.get("s1", {}).get("node1_done") is True, "run_once 应完成 dual_node 第一步"
+            assert _sr0.get("s1", {}).get("node2_sent") is True, "run_once 应发送第二节点指令"
+            # 第二步消息到 → complete_step 完成并推进
             r2 = eng._lifecycle.complete_step(wf_id, "s1")
             assert r2 in ("step_done_ready", "completed_and_advanced"), f"第二步应完成: {r2}"
             eng.run_once()
