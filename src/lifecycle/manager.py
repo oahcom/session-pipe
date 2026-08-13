@@ -471,6 +471,35 @@ class LifecycleManager:
         except Exception as e:
             logger.warning("notify result error: %s", e)
 
+    def cancel_step(self, wf_id: str, step_id: str) -> bool:
+        """取消步骤: 标记 cancelled, 工作流不推进（角色不响应时中止等待）。"""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                wf = self._get_wf_unsafe(wf_id)
+                if not wf:
+                    raise ValueError(f"workflow 不存在: {wf_id}")
+                if wf.get("current_step_id") != step_id:
+                    raise ValueError(
+                        f"步骤不匹配: 当前={wf['current_step_id']}, 传入={step_id}")
+                results = self._parse_results(wf)
+                results[step_id] = {
+                    "status": "cancelled", "cancelled_at": time.time(),
+                    "cancelled_by": self.role,
+                    "reason": "角色持续不响应（tmux 信号自动取消）",
+                }
+                self._conn.execute(
+                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                    (json.dumps(results, ensure_ascii=False), wf_id)
+                )
+                self._log_unsafe(wf_id, wf.get("task_id"), "step_cancelled",
+                                 detail=f"{step_id}: 角色不响应自动取消")
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def fail_step(self, wf_id: str, step_id: str,
                   reason: str = "", allow_retry: bool = False) -> bool:
         with self._lock:
