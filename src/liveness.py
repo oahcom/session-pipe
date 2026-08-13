@@ -230,8 +230,10 @@ def _health_gate(role: str, health_dir: Path, pane_fallback: bool) -> tuple[bool
         return None, None
     overall = h.get("survival_overall", "unknown")
     if overall in ("orphan", "unknown"):
-        LOGGER.info("liveness: health=%s → 角色不可用，不视为 busy", overall)
-        return False, h
+        # 不短路: orphan 可能因 tmux 瞬时故障误判, DB 若有活跃步骤仍应判 busy
+        # （防新任务推送打断工作中角色）。unknown 同理交给 L3/L4 DB 定结论。
+        LOGGER.info("liveness: health=%s → 交 L3/L4 DB 判定", overall)
+        return None, h
     if overall in ("stale", "dead"):
         if pane_fallback and tmux_pane_active(role) is True:
             LOGGER.info("liveness: health=%s 但 tmux pane 活跃 → 视为 busy", overall)
