@@ -54,7 +54,8 @@ def _eng(**overrides) -> WorkflowEngine:
     eng._lm.upsert_template = MagicMock()
     eng._bb = MagicMock()
     eng._workflows = {}
-    eng._tmux_pane_alive = MagicMock(return_value=False)
+    # _is_role_busy 委托 liveness.role_liveness, pane 检查走模块级 tmux_pane_active
+    eng._tmux_pane_alive = MagicMock(return_value=False)  # 兼容旧引用
     eng._send_to_role = MagicMock()
     eng._notify_role = MagicMock()
     for k, v in overrides.items():
@@ -94,15 +95,15 @@ class TestPaneFallbackBusy(_MockTestCase):
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "idle"}))
-        eng._tmux_pane_alive.return_value = True
-        self.assertFalse(eng._is_role_busy("qa"))
+        with patch("liveness.tmux_pane_active", return_value=True):
+            self.assertFalse(eng._is_role_busy("qa"))
 
     def test_idle_health_no_pane_is_free(self):
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "idle"}))
-        eng._tmux_pane_alive.return_value = False
-        self.assertFalse(eng._is_role_busy("qa"))
+        with patch("liveness.tmux_pane_active", return_value=False):
+            self.assertFalse(eng._is_role_busy("qa"))
 
     def test_idle_health_db_has_active_step_is_busy(self):
         """idle 不短路 → 继续 DB 检查，DB 有该角色活跃步骤 → busy。
@@ -111,7 +112,6 @@ class TestPaneFallbackBusy(_MockTestCase):
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "idle"}))
-        eng._tmux_pane_alive.return_value = False
         eng._lifecycle.query.return_value = [
             {"instance_id": "wf_other", "template_id": "tpl",
              "current_step_id": "s1",
@@ -124,8 +124,8 @@ class TestPaneFallbackBusy(_MockTestCase):
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "healthy", "survival_l2_thinking": False}))
-        eng._tmux_pane_alive.return_value = True
-        self.assertTrue(eng._is_role_busy("qa"))
+        with patch("liveness.tmux_pane_active", return_value=True):
+            self.assertTrue(eng._is_role_busy("qa"))
 
     def test_no_health_file_degrade_db_check(self):
         eng = _eng()
@@ -136,8 +136,8 @@ class TestPaneFallbackBusy(_MockTestCase):
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "idle"}))
-        eng._tmux_pane_alive.return_value = True
-        self.assertFalse(eng._is_role_busy("qa", pane_fallback=False))
+        with patch("liveness.tmux_pane_active", return_value=True):
+            self.assertFalse(eng._is_role_busy("qa", pane_fallback=False))
 
 
 class TestTimeoutQueuedNotIncremented(_MockTestCase):
@@ -245,9 +245,9 @@ class TestIsRoleBusyEdgeCases(_MockTestCase):
         eng = _eng()
         (eng._HEALTH_DIR / "qa.json").write_text(json.dumps(
             {"survival_overall": "healthy", "survival_l2_thinking": True}))
-        eng._tmux_pane_alive.return_value = True
-        eng._lifecycle.query.return_value = []
-        self.assertFalse(eng._is_role_busy("qa"))
+        with patch("liveness.tmux_pane_active", return_value=True):
+            eng._lifecycle.query.return_value = []
+            self.assertFalse(eng._is_role_busy("qa"))
 
 class TestCancelMinimumSurvival(_MockTestCase):
     """cancel 最小存活时间保护：创建不足 5 分钟 (300s) 的工作流禁止取消。"""
