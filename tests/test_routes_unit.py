@@ -281,7 +281,7 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
     """发送成功 → action=routed。"""
     from routing.routes import route_to_ccs
     msgs = [{
-        "id": 32, "category": "code_fix", "text": "non-json plain text",
+        "id": 32, "category": "code_fix", "text": "修复登录模块非json文本",
         "priority": 1,
     }]
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
@@ -303,7 +303,7 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
         mock_wf.return_value.check_task.return_value = None
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "routed"
-    # 标题 ≥4 字符时创建 workflow（len<80 是旧 bug 已修复，阈值改回 <4）
+    # 标题含内容词且 ≥8 字符时创建 workflow（与 route_all 阈值统一）
     mock_wf.return_value.create_task_v2.assert_called_once()
 
 
