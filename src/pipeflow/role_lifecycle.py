@@ -5,6 +5,7 @@
 """
 
 import json
+import sys
 import time
 import logging
 import threading
@@ -144,9 +145,11 @@ class RoleLifecycleMixin:
                 _role = _step.target_role
                 if not _role or _role in ("coordinator",):
                     continue
-                # 角色 pane 存活 → 角色正在干活，不打扰（2026-08-10 观测：
+                # 角色最近有产出 → 正在干活，不打扰（2026-08-10 观测：
                 # scout Orchestrating 中，kick-stalled 201s 即重推，浪费 token）
-                if self._tmux_pane_alive(_role):
+                # 用 bus 产出而非 pane_active: tmux 3.4 单 pane 会话 pane_active 恒 1
+                # → pane 判断恒"存活"导致停滞重推整体失效
+                if self._recently_producing(_role):
                     continue
                 # 停滞超过 3 分钟 + pane 不存活 + 无 timeout_count → 重推
                 _tc = _sr.get("timeout_count", 0)
@@ -267,13 +270,26 @@ class RoleLifecycleMixin:
         except Exception:
             return False
 
-    def _tmux_pane_alive(self, role: str) -> bool:
-        """tmux pane 兜底信号：pane 存活即视为角色在忙。
-
-        委托 liveness.tmux_pane_active —— pane_active(0/1)二值，与原实现语义一致。
-        tmux 3.4 的 pane_activity 恒为空导致 survival L2 失效，此处用 pane_active 兜底。"""
-        from liveness import tmux_pane_active
-        return tmux_pane_active(role) is True
+    def _recently_producing(self, role: str) -> bool:
+        """角色最近 180s 是否有 bus 产出（比 pane_active 可靠: 单 pane 恒 1）。"""
+        try:
+            import subprocess
+            r = subprocess.run(
+                [sys.executable, str(Path.home() / ".hermes" / "scripts" / "bus_client.py"),
+                 "read", "--src", role, "--limit", "5", "--json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                facts = json.loads(r.stdout)
+                if isinstance(facts, list) and facts:
+                    recent_ts = max(
+                        float(f.get("created_at", 0) or f.get("timestamp", 0))
+                        for f in facts
+                    )
+                    return time.time() - recent_ts < 180
+        except Exception:
+            pass
+        return False
 
     def _notify_role(self, role: str, title: str, evidence: str):
         """告警通知：写 blocker bus + ccs send 唤醒角色（绕过并发检查）。"""
