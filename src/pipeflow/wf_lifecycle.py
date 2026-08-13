@@ -85,12 +85,19 @@ class WorkflowLifecycleMixin:
                         _sdata = sr.get(_cur, {}) if isinstance(sr, dict) else {}
                         if isinstance(_sdata, dict) and _sdata.get("exit_messages"):
                             # 用户要求"每个步骤"都提醒 → stale rescue 也补发完整性提醒
+                            # steps 定义在 workflow_templates 表（workflow_instances 无 steps 列）
                             try:
                                 _step_tpl = None
-                                for _s in (d.get("steps") or []):
-                                    if _s.get("id") == _cur:
-                                        _step_tpl = _s
-                                        break
+                                _tmpl = lm.query(
+                                    "SELECT steps_json FROM workflow_templates WHERE template_id=?",
+                                    (tpl,)
+                                )
+                                if _tmpl:
+                                    _tsteps = json.loads(_tmpl[0]["steps_json"] or "[]")
+                                    for _s in _tsteps:
+                                        if _s.get("id") == _cur:
+                                            _step_tpl = _s
+                                            break
                                 if _step_tpl:
                                     from pipeflow.integrity import send_bypass_reminder as _sbr
                                     from types import SimpleNamespace as _SN
