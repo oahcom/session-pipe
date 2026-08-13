@@ -402,8 +402,13 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
 
     results = []
     for f in facts:
-        # 只处理 filter=needs_investigation / needs_triage 的消息
+        # 只处理 filter=needs_investigation / needs_triage 的消息；
+        # 非目标消息直接消费（否则永远占 [:50] 窗口, 目标消息被挤出饿死）
         if "needs_investigation" not in (f.e or "").lower() and "needs_triage" not in (f.e or "").lower():
+            try:
+                bb.mark_consumed(f.id, consumer="auto_route_investigator")
+            except Exception:
+                pass  # 非目标消息消费失败不阻塞主流程
             continue
 
         role = _match_investigator(f.e or f.t)
