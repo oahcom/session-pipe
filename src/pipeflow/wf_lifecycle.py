@@ -194,20 +194,24 @@ class WorkflowLifecycleMixin:
                         _sf = _sdata.get("subflow_id", "")
                         if _sf:
                             _st = conn.execute("SELECT status, created_at FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
-                            if not _st or _st['status'] not in ('completed', 'step_done_ready'):
+                            if not _st:
+                                # 子链不存在（创建失败）→ 直接阻止主链完成，等重试创建，
+                                # 防"子链从未执行却完成"掩盖产出缺失（原 _st=None 时跳过宽限期直接完成）
+                                _all_subs_done = False
+                                break
+                            if _st['status'] not in ('completed', 'step_done_ready'):
                                 # 子链未完成：已超宽限期（5 分钟）→ 强制完成主链，不无限等待
                                 # （2026-08-10 观测：lr 子链未跑完导致主链 s7 永远卡在收尾）
-                                _sub_created = (_st['created_at'] or 0) if _st else 0
-                                if _st and time.time() - _sub_created < 300:
+                                _sub_created = _st['created_at'] or 0
+                                if time.time() - _sub_created < 300:
                                     _all_subs_done = False
                                     break
                                 # 超宽限期 → 一并关闭子链，不留孤儿 running
                                 # （codex P2：到期只关主链，子链继续通知角色/拉起 guard）
-                                if _st:
-                                    conn.execute(
-                                        "UPDATE workflow_instances SET status='cancelled' "
-                                        "WHERE instance_id=? AND status NOT IN ('completed')",
-                                        (_sf,))
+                                conn.execute(
+                                    "UPDATE workflow_instances SET status='cancelled' "
+                                    "WHERE instance_id=? AND status NOT IN ('completed')",
+                                    (_sf,))
                     if not _all_subs_done:
                         return
                     LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
