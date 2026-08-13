@@ -296,8 +296,9 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     # 从消息文本提取有意义的标题：取第一段或前 60 字符
                     _title = _raw.split("\n")[0] if _raw else ""
                     _title = _title[:80]
-                    if len(_title) < 4:
-                        LOGGER.debug("Skipping workflow create: title too short (%d chars) role=%s", len(_title), role_name)
+                    # 阈值与 route_all 对齐（len<8 或 无内容词）: 同消息两路径判定一致
+                    if len(_title) < 8 or not _has_content_words(_title):
+                        LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_title), role_name)
                     else:
                         _wf = WorkflowClient(role_name)
                         _wf.create_task_v2(_title, assignee=role_name, initiator_role="",
