@@ -476,7 +476,9 @@ class WorkflowLifecycleMixin:
                 # CAS 写回（P2 并发修复）：WHERE 带上旧 step_results，行数=0 说明
                 # 并发调用已改过（含我们刚创建的 rework）→ 重读合并，防后写覆盖
                 if _new_reworks:
-                    _new_sr = dict(_sr)
+                    # 深拷贝: 浅拷贝 dict(_sr) 时 setdefault 返回同一嵌套 dict,
+                    # 修改会污染 _sr → CAS WHERE 恒相等 → 并发防重分支永不触发
+                    _new_sr = json.loads(json.dumps(_sr))
                     _existing = _review_sdata.get("rework_ids", []) if isinstance(_review_sdata, dict) else []
                     _merged = list(dict.fromkeys(_existing + _new_reworks))
                     _new_sr.setdefault(review_step.id, {})["rework_ids"] = _merged
