@@ -207,14 +207,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             # 结构校验：watch 必须是字符串数组，否则遍历字符会拉起不存在的角色
                             if isinstance(_g, dict) and isinstance(_g.get("watch"), list) \
                                     and all(isinstance(r, str) for r in _g.get("watch", [])):
-                                _clean["guard"] = _g
+                                # 深拷贝注入: _g 是 persona 缓存引用, 运行期修改会污染缓存
+                                _clean["guard"] = json.loads(json.dumps(_g))
                             else:
                                 LOGGER.warning("collab guard 结构非法，跳过注入: %s", _tr)
                         if not _clean.get("track") and _rc.get("track"):
                             _t = _rc["track"]
                             if isinstance(_t, dict) and isinstance(_t.get("bus_category"), str) \
                                     and _t.get("bus_category"):
-                                _clean["track"] = _t
+                                _clean["track"] = json.loads(json.dumps(_t))
                             else:
                                 LOGGER.warning("collab track 结构非法，跳过注入: %s", _tr)
                     # 统一结构校验（覆盖模板显式声明 + persona 注入两来源）：
