@@ -296,7 +296,7 @@ class WorkflowClient:
         row = self._conn.execute(
             "SELECT wi.*, t.priority FROM workflow_instances wi "
             "JOIN tasks t ON wi.task_id = t.task_id "
-            "WHERE wi.assignee=? AND wi.status IN ('pending', 'running') "
+            "WHERE wi.assignee=? AND wi.status IN ('pending', 'running', 'step_done_ready') "
             "ORDER BY t.priority DESC, wi.created_at ASC LIMIT 1", (self.role,)
         ).fetchone()
         return dict(row) if row else None
