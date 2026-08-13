@@ -87,6 +87,8 @@ class SurvivalMonitor:
     def __init__(self):
         self._cache: dict[str, dict[str, Any]] = {}
         self._role_targets: dict[str, list[str]] = {}
+        # 修复: _state 原未定义，R3 idle 回收每次抛 AttributeError 被外层吞掉（从未生效）
+        self._state: dict[str, dict[str, Any]] = {}
 
     # ── L1: 进程存活 ──
 
@@ -106,6 +108,7 @@ class SurvivalMonitor:
         if alive and has_sentinel:
             status = "ALIVE"
         elif has_sentinel and not alive:
+            # 单次 tmux 检查失败不立即判 ORPHAN（3 次连续失败才 kill，红线）
             status = "ORPHAN"
         elif not has_sentinel:
             status = "UNKNOWN"
@@ -238,6 +241,9 @@ class SurvivalMonitor:
         if l1.get("status") == "DEAD":
             return "dead"
         if l1.get("status") == "ORPHAN":
+            # ORPHAN 但最近有 bus 产出 → 进程可能刚重启/检查瞬断，宽容为 idle 待观察
+            if l3.get("producing") is True:
+                return "idle"
             return "orphan"
         if l1.get("status") != "ALIVE":
             return "unknown"
@@ -378,16 +384,21 @@ class SurvivalMonitor:
                     evidence=f"{l2.get('detail','')} | {l3.get('detail','')}")
                 result["last_report_ts"] = _now_report_ts
 
-            # 僵尸清理
+            # 僵尸清理（仅 overall=orphan 且连续 3 次判定才 kill，防 tmux 瞬时故障误杀；
+            # ORPHAN 但有产出降级 idle 时不走清理）
             prev_dead_checks = prev.get("dead_checks_since", 0)
             if overall == "dead" and l1.get("status") != "ORPHAN":
                 dead_checks = prev_dead_checks + 1
                 result["dead_checks_since"] = dead_checks
                 self._cleanup_dead(role, dead_checks)
-            elif l1.get("status") == "ORPHAN":
-                self._cleanup_orphan(role)
+            elif overall == "orphan" and l1.get("status") == "ORPHAN":
+                orphan_n = prev.get("orphan_checks_since", 0) + 1
+                result["orphan_checks_since"] = orphan_n
+                if orphan_n >= 3:
+                    self._cleanup_orphan(role)
             else:
                 result["dead_checks_since"] = 0
+                result["orphan_checks_since"] = 0
 
         stalled = [r for r, h in results.items() if h["overall"] in ("stale", "dead")]
         orphaned = [r for r, h in results.items() if h.get("overall") == "orphan"]
@@ -425,7 +436,7 @@ class SurvivalMonitor:
                 if _idle_n >= 6:
                     LOGGER.info("角色回收: %s 连续 %d 次 idle（ondemand），kill session", _ir, _idle_n)
                     try:
-                        _sp.run(["tmux", "kill-session", "-t", f"ccs-{_ir}"],
+                        subprocess.run(["tmux", "kill-session", "-t", f"ccs-{_ir}"],
                                 capture_output=True, timeout=5)
                         self._write_bus("notice",
                             f"@ccs-monitor [回收] {_ir} 连续 idle 6 次 → session 已回收",
