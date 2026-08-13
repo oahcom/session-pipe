@@ -514,63 +514,6 @@ class StepHandlerMixin:
                     _integ_interval = ec.get("integrity_interval_sec", 30)
                     _integ_activate(run.step_results, step.id, interval_sec=_integ_interval)
                     return  # 完整性阶段接管：下 tick 发 dim01/dim02，等回复后推进
-
-            # bus 未匹配 → 检查 completion_check 文件判据（handoff/gate 通用）
-            # 防止角色完成产出文件但忘了写 bus 导致工作流永久卡死（2026-08-09 观测：
-            # scout 写了 SCOUT_REPORT.md 但未写 evolution_report bus → pm 步骤永远等不到）
-            _cc = getattr(step, 'completion_check', None) or ec.get('completion_check')
-            if _cc and _cc.get("file"):
-                # 支持 glob（与 exit_schema 一致，工程 P1-6）：含 * 时用 glob 匹配，否则 exists()
-                _cc_file = _cc["file"]
-                _min = _cc.get("min_size", 0)
-                _fp = pathlib.Path(_cc_file).expanduser()
-                if "*" in _cc_file:
-                    _matches = sorted(_fp.parent.glob(_fp.name))
-                    _fp_ok = bool(_matches) and _matches[0].stat().st_size >= _min
-                else:
-                    _fp_ok = _fp.exists() and _fp.stat().st_size >= _min
-                if _fp_ok:
-                    LOGGER.info("completion_check: %s 文件存在且 ≥%d 字节 → 推进 %s",
-                                _fp.name, _min, step.id)
-                    if step.dual_node:
-                        # dual_node：文件存在 = 第一节点完成，注入第二节点审查指令
-                        _sdata = run.step_results.get(step.id, {}) or {}
-                        if not _sdata.get("node1_done"):
-                            _sdata["node1_done"] = True
-                            _sdata["node1_at"] = time.time()
-                            _sdata["ts"] = time.time()
-                            # 发 codex CLI 审查指令（第二节点）+ 设 node2_sent 阻断 complete_step
-                            _codex_prompt = (
-                                "/goal\n## codex CLI 三方审查\n"
-                                f"对 {run.workflow_name}/{step.id} 的产出执行 codex review --uncommitted：\n"
-                                "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
-                                "2. 若发现问题修复后重跑，直到连续两次零问题\n"
-                                "3. 通过后写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved\n"
-                                "## 完成\n"
-                                "写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved。"
-                            )
-                            _sdata["node2_sent"] = True
-                            _sdata["node2_sent_at"] = time.time()
-                            run.step_results[step.id] = _sdata
-                            self._sync_step_results(run.id, run.step_results)
-                            try:
-                                self._send_to_role(step.target_role, _codex_prompt,
-                                                   wf_id=run.id, step_id=step.id, force=True)
-                                LOGGER.info("双节点: %s/%s 第一节点完成，codex 审查指令已发送", run.workflow_name, step.id)
-                            except Exception as _send_err:
-                                LOGGER.exception("双节点: %s/%s 审查指令发送失败: %s", run.workflow_name, step.id, _send_err)
-                            return
-                    # bypass 补发完整性提醒（不阻塞完成）：
-                    # completion_check 文件判据直接推进，跳过 dual_node 审查流程。
-                    _integ_send_bypass(run, step, "completion_check",
-                                       send_to_role=self._send_to_role,
-                                       sync_step_results=self._sync_step_results)
-                    try:
-                        self._lifecycle.complete_step(run.id, step.id)
-                    except Exception as _e:
-                        LOGGER.debug("completion_check complete_step 失败: %s", _e)
-                    return
-
         # track 消费：步骤执行期间的轮次追踪（旧 --bus-track 收编）
         # exit_condition 是一次性退出匹配，track 是步骤执行期间的持续轮询
         if step.track:
@@ -739,6 +682,63 @@ class StepHandlerMixin:
             "poll_since": _new_poll,
         }
         self._sync_step_results(run.id, run.step_results)
+        # bus 未匹配 → 检查 completion_check 文件判据（handoff/gate 通用）
+        # 防止角色完成产出文件但忘了写 bus 导致工作流永久卡死（2026-08-09 观测：
+        # scout 写了 SCOUT_REPORT.md 但未写 evolution_report bus → pm 步骤永远等不到）
+        _cc = getattr(step, 'completion_check', None) or ec.get('completion_check')
+        if _cc and _cc.get("file"):
+            # 支持 glob（与 exit_schema 一致，工程 P1-6）：含 * 时用 glob 匹配，否则 exists()
+            _cc_file = _cc["file"]
+            _min = _cc.get("min_size", 0)
+            _fp = pathlib.Path(_cc_file).expanduser()
+            if "*" in _cc_file:
+                _matches = sorted(_fp.parent.glob(_fp.name))
+                _fp_ok = bool(_matches) and _matches[0].stat().st_size >= _min
+            else:
+                _fp_ok = _fp.exists() and _fp.stat().st_size >= _min
+            if _fp_ok:
+                LOGGER.info("completion_check: %s 文件存在且 ≥%d 字节 → 推进 %s",
+                            _fp.name, _min, step.id)
+                if step.dual_node:
+                    # dual_node：文件存在 = 第一节点完成，注入第二节点审查指令
+                    _sdata = run.step_results.get(step.id, {}) or {}
+                    if not _sdata.get("node1_done"):
+                        _sdata["node1_done"] = True
+                        _sdata["node1_at"] = time.time()
+                        _sdata["ts"] = time.time()
+                        # 发 codex CLI 审查指令（第二节点）+ 设 node2_sent 阻断 complete_step
+                        _codex_prompt = (
+                            "/goal\n## codex CLI 三方审查\n"
+                            f"对 {run.workflow_name}/{step.id} 的产出执行 codex review --uncommitted：\n"
+                            "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
+                            "2. 若发现问题修复后重跑，直到连续两次零问题\n"
+                            "3. 通过后写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved\n"
+                            "## 完成\n"
+                            "写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved。"
+                        )
+                        _sdata["node2_sent"] = True
+                        _sdata["node2_sent_at"] = time.time()
+                        run.step_results[step.id] = _sdata
+                        self._sync_step_results(run.id, run.step_results)
+                        try:
+                            self._send_to_role(step.target_role, _codex_prompt,
+                                               wf_id=run.id, step_id=step.id, force=True)
+                            LOGGER.info("双节点: %s/%s 第一节点完成，codex 审查指令已发送", run.workflow_name, step.id)
+                        except Exception as _send_err:
+                            LOGGER.exception("双节点: %s/%s 审查指令发送失败: %s", run.workflow_name, step.id, _send_err)
+                        return
+                # bypass 补发完整性提醒（不阻塞完成）：
+                # completion_check 文件判据直接推进，跳过 dual_node 审查流程。
+                _integ_send_bypass(run, step, "completion_check",
+                                   send_to_role=self._send_to_role,
+                                   sync_step_results=self._sync_step_results)
+                try:
+                    self._lifecycle.complete_step(run.id, step.id)
+                except Exception as _e:
+                    LOGGER.debug("completion_check complete_step 失败: %s", _e)
+                return
+
+
         return
 
     def _sync_step_results(self, wf_id: str, step_results: dict):
