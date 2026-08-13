@@ -110,10 +110,11 @@ class SurvivalMonitor:
         elif has_sentinel and not alive:
             # 单次 tmux 检查失败不立即判 ORPHAN（3 次连续失败才 kill，红线）
             status = "ORPHAN"
-        elif not has_sentinel:
-            status = "UNKNOWN"
-        else:
+        elif alive and not has_sentinel:
+            # tmux 会话在但哨兵缺失: 状态丢失, 需重建（DEAD 分支, 走 _cleanup_dead 删残留）
             status = "DEAD"
+        else:
+            status = "UNKNOWN"
         return {"status": status, "tmux_alive": alive, "has_sentinel": has_sentinel}
 
     # ── L2: 思考存活 ──
@@ -410,12 +411,23 @@ class SurvivalMonitor:
             _last_rescue = getattr(self, "_last_rescue_ts", 0)
             if now_ts - _last_rescue > 600:
                 try:
-                    from pipeflow.daemon import _ensure_role_alive as _rescue
+                    # 用 --drive infinite 拉起: daemon 版 _ensure_role_alive 缺该参数,
+                    # ondemand 角色恢复后只写哨兵不建 tmux → 下轮 L1=ORPHAN 恢复循环
+                    _ccs_cli = Path(os.environ.get("CCS_CLI",
+                        str(Path.home() / "session-launcher" / "src" / "ccs.py")))
                     for _r in stalled[:2]:
-                        if _rescue(_r):
-                            LOGGER.info("存活恢复: %s 已重新拉起", _r)
-                        else:
-                            LOGGER.warning("存活恢复失败: %s", _r)
+                        try:
+                            _rr = subprocess.run(
+                                [sys.executable, str(_ccs_cli), "start", _r,
+                                 "--no-attach", "--drive", "infinite"],
+                                capture_output=True, timeout=30)
+                            if _rr.returncode == 0:
+                                LOGGER.info("存活恢复: %s 已重新拉起", _r)
+                            else:
+                                LOGGER.warning("存活恢复失败 %s: %s",
+                                               _r, _rr.stderr[:200])
+                        except Exception as _re:
+                            LOGGER.warning("存活恢复异常 %s: %s", _r, _re)
                     self._last_rescue_ts = now_ts
                 except Exception as _re:
                     LOGGER.warning("存活恢复动作异常（跳过本轮）: %s", _re)
@@ -438,8 +450,12 @@ class SurvivalMonitor:
                     try:
                         subprocess.run(["tmux", "kill-session", "-t", f"ccs-{_ir}"],
                                 capture_output=True, timeout=5)
+                        # 删哨兵: 否则下轮 L1=ORPHAN 或降级 idle → idle_count 重新累积 → 无限 kill 循环
+                        _sent = SENTINEL_DIR / f"{_ir}.json"
+                        if _sent.exists():
+                            _sent.unlink()
                         self._write_bus("notice",
-                            f"@ccs-monitor [回收] {_ir} 连续 idle 6 次 → session 已回收",
+                            f"@ccs-monitor [回收] {_ir} 连续 idle 6 次 → session+哨兵已回收",
                             evidence="ondemand 角色空转超时自动停止（R3 治理）")
                     except Exception as _ke:
                         LOGGER.warning("角色回收 kill 失败 %s: %s", _ir, _ke)
