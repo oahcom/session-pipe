@@ -232,12 +232,18 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     # DB 查询失败 → 降级为无忙检测（返回 None，与旧行为一致），不阻断路由。
     wf_busy = None
     if running:
+        _wf_probe = None
         try:
             _wf_probe = WorkflowClient(role_name)
             wf_busy = _wf_probe.check_task() is not None
-            _wf_probe.close()
         except Exception:
             wf_busy = None  # DB 不可用 → 不检测，避免误杀路由
+        finally:
+            if _wf_probe is not None:
+                try:
+                    _wf_probe.close()
+                except Exception:
+                    pass  # 关闭失败不掩盖主逻辑
     body_facts: list[dict] = []
 
     for msg in messages:
