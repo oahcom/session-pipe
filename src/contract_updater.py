@@ -79,7 +79,14 @@ def _apply_suggestion(suggestion: dict) -> bool:
     }
 
     try:
-        target_path.write_text(json.dumps(target, ensure_ascii=False, indent=2) + "\n")
+        # 备份原文件
+        if target_path.exists():
+            backup = target_path.with_suffix(".json.bak")
+            target_path.replace(backup)
+        # 原子写（tempfile + rename）
+        tmp = target_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(target, ensure_ascii=False, indent=2) + "\n")
+        tmp.replace(target_path)
         return True
     except Exception:
         return False

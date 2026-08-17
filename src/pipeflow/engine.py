@@ -270,6 +270,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 )
             except Exception as e:
                     LOGGER.warning("[wf] 加载 %s 失败: %s", f.name, e)
+        # 将内存中的 JSON 模板 upsert 到 DB（供 lifecycle manager 查询）。
+        # 这解决了 subflow 模板未注册到 live DB 的问题（bus #288866 根因）。
+        # 只在默认目录且非测试 DB 时执行，避免测试污染生产 DB。
+        # hasattr 兼容测试手动构造的实例（未执行 __init__）。
+        if (self.workflows_dir == _WORKFLOWS_DIR
+                and getattr(self, '_db_path', None) is None):
+            try:
+                for name, wf in self._workflows.items():
+                    # 使用 workflow_id 作为 template_id（与 DB 约定一致）
+                    tid = wf.workflow_id or f"WF-{name}"
+                    self._upsert_template(tid, wf)
+            except Exception as e:
+                LOGGER.warning("[wf] 启动时 upsert JSON 模板到 DB 失败: %s", e)
+
         # 也从 SQLite 加载模板（仅默认目录时）
         if self.workflows_dir != _WORKFLOWS_DIR:
             return

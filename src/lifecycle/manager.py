@@ -182,11 +182,16 @@ class LifecycleManager:
         wf = self.get_wf(wf_id)
         if not wf:
             return None
-        template = self._get_template(wf.get("template_id"))
+        template_id = wf.get("template_id")
+        template = self._get_template(template_id)
+        # 兼容：实例存 name (如 reviewer_pr_review)，模板存 workflow_id (WF-reviewer_pr_review)
+        if not template and template_id and not template_id.startswith("WF-"):
+            template = self._get_template(f"WF-{template_id}")
         if not template:
             return None
         for step in template.get("steps", []):
-            if step.get("step_id") == step_id:
+            # DB 存储时用 id，但 legacy 可能存 step_id —— 两者都兼容
+            if step.get("id") == step_id or step.get("step_id") == step_id:
                 return step
         return None
 
@@ -795,12 +800,13 @@ class LifecycleManager:
 
     def _complete_subflow_unsafe(self, wf_id, step_id, step, task_id, results):
         """创建子工作流 + 启动，返回 step_done_ready（等 confirm 时检查子状态）。"""
-        sub_tpl_id = step.get("subflow_template_id", "")
-        sub_assignee = step.get("subflow_assignee", "")
+        sub_tpl_id = step.get("subflow_template", "")
+        # target_role 即为子工作流的 assignee
+        sub_assignee = step.get("subflow_assignee", "") or step.get("target_role", "")
         if not sub_tpl_id or not sub_assignee:
             self._set_step_result_unsafe(wf_id, step_id, "failed", results)
             self._log_unsafe(wf_id, task_id, "subflow_failed",
-                             detail="missing subflow_template_id or subflow_assignee")
+                             detail="missing subflow_template or subflow_assignee/target_role")
             return "failed"
 
         # 构建子任务描述：父 prompt + 步骤上下文

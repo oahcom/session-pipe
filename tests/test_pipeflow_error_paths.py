@@ -34,6 +34,8 @@ def _build_eng() -> WorkflowEngine:
     eng = WorkflowEngine.__new__(WorkflowEngine)
     eng.workflows_dir = Path(tempfile.mkdtemp())
     eng.runs_dir = eng.workflows_dir / "runs"
+    # 设置 _db_path 避免 AttributeError（engine.py 新增逻辑访问 self._db_path）
+    eng._db_path = str(eng.workflows_dir / "test_workflows.db")
     eng._workflows = {}
     eng._lm = MagicMock()
     eng._bb = MagicMock()

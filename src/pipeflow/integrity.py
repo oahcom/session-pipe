@@ -195,7 +195,7 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
         except Exception:
             LOGGER.debug("integrity: bypass %s send %d/%d failed for %s",
                          path, i, len(_questions), step.id)
-            return  # 任一条失败则不标 bypass flag，下 tick 重试
+            continue  # 单条失败不阻塞后续，继续发下一条
     step_results.setdefault(step.id, {})["integrity_reminder_sent_bypass"] = True
     if sync_step_results:
         sync_step_results(run.id, run.step_results)

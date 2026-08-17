@@ -38,6 +38,7 @@ CCS_INTERVAL = 300  # route-all-to-ccs 间隔
 EVAL_INTERVAL = 600 # eval_criteria 检查间隔（每 10 分钟）
 DRIFT_INTERVAL = 3600  # 角色输出漂移检测间隔（每 1 小时）
 SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
+P0_CHECK_INTERVAL = 1800  # P0 超时检测间隔（每 30 分钟）
 CRON_SCHEDULE_TRACKER = Path.home() / ".hermes" / "run" / "cron_schedule_triggered.json"  # 去重跟踪
 
 
@@ -136,6 +137,7 @@ def main():
     last_survival = 0
     last_drift = 0
     last_metrics = 0
+    last_p0_check = 0
 
     # ── 单实例 PID 锁 ──
     _pid_file = Path.home() / ".hermes" / "run" / "routing_daemon.pid"
@@ -265,6 +267,22 @@ def main():
                     LOGGER.error("eval_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_eval = now
+
+            # P0 豁免超时检测（每 30 分钟）
+            if now - last_p0_check >= P0_CHECK_INTERVAL:
+                try:
+                    from p0_exemption import P0Exemption
+                    _p0 = P0Exemption("coordinator")
+                    violations = _p0.check_timeouts()
+                    if violations:
+                        LOGGER.warning("P0 超时违规: %d 个任务", len(violations))
+                        for v in violations:
+                            LOGGER.info("  P0 violation: %s (%s) elapsed %.1fh",
+                                        v["task_id"], v["title"], v["elapsed_hours"])
+                except Exception as e:
+                    LOGGER.error("P0 超时检测异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
+                last_p0_check = now
 
             # 定时角色输出漂移检测（每小时）
             if now - last_drift >= DRIFT_INTERVAL:

@@ -8,6 +8,7 @@ Conversation Monitor — 对话增量监控模块
 
 所有信号都是 bus-based exit_condition 的补充，不替代现有逻辑。
 """
+from pathlib import Path
 
 import hashlib
 import logging
@@ -19,13 +20,18 @@ from dataclasses import dataclass, field
 
 LOGGER = logging.getLogger("conversation_monitor")
 
-# ── 角色禁区：运行时从 session-launcher 加载，不硬编码 ──
+# ── 角色禁区：运行时从 session-launcher 加载，缓存到文件避免重复 import ──
 _FORBIDDEN_OPS: dict[str, list[str]] = {}
 _DEFAULT_FORBIDDEN = ["run_tests", "edit_config", "deploy",
                       "start_ccs", "edit_persona_json"]
 
-def _load_forbidden_ops() -> dict:
-    """从 session-launcher 的 routing.roles 拉取禁区定义"""
+# 缓存文件路径
+_FORBIDDEN_CACHE = Path.home() / ".hermes" / "run" / "forbidden_ops_cache.json"
+_forbidden_ops_loaded = False
+_forbidden_ops_lock = threading.Lock()
+
+def _load_forbidden_ops_from_launcher() -> dict:
+    """从 session-launcher 的 routing.roles 拉取禁区定义（仅用于首次生成缓存）"""
     try:
         from pathlib import Path
         import importlib.util
@@ -38,21 +44,39 @@ def _load_forbidden_ops() -> dict:
         return dict(mod._FORBIDDEN_MAP)
     except Exception as e:
         LOGGER.warning("failed to load forbidden_ops from roles.py: %s", e)
-        return {}  # fallback 为空 dict，调用方走 _DEFAULT_FORBIDDEN
-
-# 懒初始化：首次调用时加载一次，结果缓存（线程安全）
-_forbidden_ops_loaded = False
-_forbidden_ops_lock = threading.Lock()
+        return {}
 
 def _ensure_forbidden_ops():
     global _forbidden_ops_loaded, _FORBIDDEN_OPS
     if _forbidden_ops_loaded:
         return
     with _forbidden_ops_lock:
-        if _forbidden_ops_loaded:  # double-check
+        if _forbidden_ops_loaded:
             return
-        _FORBIDDEN_OPS = _load_forbidden_ops()
+        # 优先读缓存文件
+        if _FORBIDDEN_CACHE.exists():
+            try:
+                import json
+                cache_data = json.loads(_FORBIDDEN_CACHE.read_text())
+                _FORBIDDEN_OPS = cache_data.get("forbidden_ops", {})
+                _forbidden_ops_loaded = True
+                LOGGER.debug("forbidden_ops loaded from cache (%d roles)", len(_FORBIDDEN_OPS))
+                return
+            except Exception:
+                pass  # 缓存损坏，回退到重新生成
+        # 无缓存或损坏 → 从 launcher 读取并写缓存
+        ops = _load_forbidden_ops_from_launcher()
+        _FORBIDDEN_OPS = ops
         _forbidden_ops_loaded = True
+        # 原子写缓存
+        try:
+            _FORBIDDEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            tmp = _FORBIDDEN_CACHE.with_suffix(".tmp")
+            tmp.write_text(_json.dumps({"forbidden_ops": ops, "version": 1}))
+            tmp.replace(_FORBIDDEN_CACHE)
+        except Exception:
+            pass
 
 
 @dataclass
