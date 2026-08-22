@@ -23,7 +23,9 @@ log = logging.getLogger("drift-detector")
 # 系统分类，所有角色始终允许
 # R4 drift P0 修复: monitor_audit 是 tracker/watchdog 审计产物，不应被漂移检测误报
 # （漂移分析发现 maintainer 36 条 + archivist 20 条误报根因）
-_ALWAYS_ALLOWED = {"notice", "architecture", "monitor_audit", "monitor_wf_health"}
+# workflow 是引擎内部信道（审批/步骤推送经 ccs.py send 回写 src 归因于角色，cat=workflow），
+# 属角色消费而非产出，所有角色都收，故放行（bus[301357] engineer 误报根因）。
+_ALWAYS_ALLOWED = {"notice", "architecture", "monitor_audit", "monitor_wf_health", "workflow"}
 
 
 def _load_role_config(role: str) -> Optional[dict]:
@@ -42,19 +44,25 @@ def _load_role_config(role: str) -> Optional[dict]:
     return None
 
 
-def _parse_allowed_categories(output_targets: list) -> set:
-    """从 output_targets 列表解析允许的 category 集合。
+def _parse_allowed_categories(targets: list) -> set:
+    """从 output_targets/input_signals 列表解析允许的 category 集合。
 
-    兼容两种条目格式：
+    兼容三种条目格式：
       - 旧式字符串: "bus cat=architecture 新发现"
       - 新式 dict:   {"bus_cat": "architecture", "label": ...}
+      - input_signals dict: {"spec": {"category": "task_spec"}, ...}  # 角色消费的分类也算合法
     """
     cats = set()
-    for entry in output_targets:
+    for entry in targets:
         if isinstance(entry, dict):
             bc = entry.get("bus_cat")
             if isinstance(bc, str):
                 cats.add(bc)
+            else:
+                # input_signals 用 spec.category 声明角色消费的分类
+                spec = entry.get("spec")
+                if isinstance(spec, dict) and isinstance(spec.get("category"), str):
+                    cats.add(spec["category"])
             continue
         m = re.search(r"cat=(\S+)", entry)
         if m:
@@ -70,6 +78,9 @@ def detect_drift(role: str, limit: int = 50) -> List[dict]:
         return []
 
     allowed = _parse_allowed_categories(config.get("output_targets", []))
+    # 角色消费的分类（input_signals.spec.category）也放行：审批/步骤推送经 ccs.py send
+    # 回写时 src 归因于角色，category 为 workflow/task_spec 等——那是输入信道，非产出漂移。
+    allowed |= _parse_allowed_categories(config.get("input_signals", []))
     bb = Blackboard()
     facts = bb.read(src=role, limit=limit)
     drift = []

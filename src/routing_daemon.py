@@ -229,7 +229,7 @@ def main():
                         _run_eval = lambda: {"checked": 0}
                 # ponytail: 检测 eval_checker.py 变更，热重载无需重启 daemon
                 eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
-                if _eval_checker_mtime < eval_checker_mtime:
+                if _eval_checker_mtime != eval_checker_mtime:
                     try:
                         # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）
                         for _key in list(sys.modules):

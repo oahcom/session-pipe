@@ -60,6 +60,16 @@ class WorkflowLifecycleMixin:
                 _st = d.get("status", "running")
                 _global_limit_h = 72 if _st == "step_done_ready" else 24
 
+                # 食链循环工作流豁免：loop.enabled 的长跑工作流跨轮次间隙可能静默 >24h，
+                # 用 72h 回收阈值（与 step_done_ready 一致）防误杀。loop 配置仅存内存
+                # `_workflows` 中，DB templates 表无此列。
+                # ponytail: 72h 天花板；升级路径→加 loop.max_duration_hours 覆盖模板级阈值
+                _loop_wf = self._workflows.get(tpl) if hasattr(self, "_workflows") else None
+                if _loop_wf is not None:
+                    _loop_cfg = _loop_wf.loop or {} if isinstance(_loop_wf.loop, dict) else {}
+                    if _loop_cfg.get("enabled", True):
+                        _global_limit_h = 72
+
                 _auto_cancel_at = 6
                 reason = ""
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
