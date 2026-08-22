@@ -563,6 +563,19 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 elif step_status == "notified" and inst.get("status") == "step_done_ready":
                     step_status = "step_done_ready"
 
+                # Fix 2: 立即 sync 行 status → step_results JSON，寫回 DB
+                # 避免 results 過時導致後續判斷使用 stale 值
+                if step_status and step_status != results.get(step_id, {}).get("status"):
+                    _existing_sr = results.get(step_id, {}) or {}
+                    results[step_id] = {
+                        **_existing_sr,
+                        "status": step_status,
+                    }
+                    lm.execute(
+                        "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                        (json.dumps(results, ensure_ascii=False), inst["instance_id"])
+                    )
+
                 # 步骤尚未开始（首次检测到）→ 发初始提示词给角色
                 if not step_status:
                     task_rows = lm.query(

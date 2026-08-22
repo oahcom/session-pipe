@@ -233,6 +233,10 @@ class CircuitBreaker:
     recovery_timeout: float = 30.0  # 秒
     half_open_max_calls: int = 3
 
+    def __post_init__(self):
+        # ponytail: 強制 minimum=3，單次成功恢復過於脆弱（單次誤騰健康為真）
+        self.half_open_max_calls = max(self.half_open_max_calls or 1, 3)
+
     _state: str = field(default=CircuitState.CLOSED, init=False)
     _failure_count: int = field(default=0, init=False)
     _last_failure_time: float = field(default=0.0, init=False)

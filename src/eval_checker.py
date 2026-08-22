@@ -10,7 +10,7 @@ eval_checker.py — eval_criteria 运行时执行器。
     run_eval_check()  # 每 300s 调一次
 """
 
-import json, logging, os, random, re, subprocess, sys
+import ast, json, logging, os, random, re, subprocess, sys
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -185,6 +185,42 @@ def _inner_cmd_ok(cmd: str) -> bool:
     return True
 
 
+def _validate_python_inline(code: str) -> bool:
+    """AST 深度驗證 python3 -c '...' 內部代碼，阻攔危險 API。
+
+    阻攔: import os/subprocess, __import__, open, exec, eval,
+    os.system, subprocess.run 等危險函數調用。
+    """
+    _BLOCKED_IMPORTS = {"os", "subprocess", "pty", "commands", "pickle", "marshal"}
+    _BLOCKED_ATTRS = frozenset({
+        "system", "popen", "execv", "execvp", "execvpe", "spawn",
+        "Popen", "run", "call", "check_call", "check_output",
+    })
+    _BLOCKED_CALLS = {"__import__", "exec", "eval", "open", "globals", "locals",
+                      "getattr", "setattr", "compile", "input"}
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _BLOCKED_IMPORTS:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module in _BLOCKED_IMPORTS:
+                return False
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _BLOCKED_CALLS:
+                return False
+            if isinstance(func, ast.Attribute) and func.attr in _BLOCKED_ATTRS:
+                return False
+    return True
+
+
 def _run(cmd: str, timeout: int = 30) -> dict:
     """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
     first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
@@ -206,6 +242,13 @@ def _run(cmd: str, timeout: int = 30) -> dict:
     _is_loop_skeleton = first_word in ("for", "while")
     _is_py_inline = first_word == "python3" and "-c" in cmd.split()[1:3]
     _is_var_assign = "=" in cmd.split()[0] if cmd.split() else False
+
+    # P0: python3 -c 沙箱 — AST 深度驗證內部代碼，阻攔 import os/subprocess 等
+    if _is_py_inline:
+        _py_code = cmd.split(None, 2)[-1].strip("'\"")
+        if not _validate_python_inline(_py_code):
+            return {"ok": False, "stdout": "", "stderr": "python3 -c 內部代碼含阻斷 API",
+                    "returncode": -4}
     for _pat in ("`", "$("):
         if _pat in cmd and not _is_var_assign:
             return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
