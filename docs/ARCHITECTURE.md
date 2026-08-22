@@ -19,27 +19,27 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 580 | Data-driven workflow execution engine (core) |
-| **pipeflow/step_handler.py** | 471 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 421 | 角色生命周期 mixin：存活检查/通知/发送 (from engine.py split) |
-| **pipeflow/task_generator.py** | 400 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 469 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
-| **lifecycle/manager.py** | 1114 | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **template_registry.py** | 764 | 模板注册中心 |
-| **eval_checker.py** | 536 | 安全白名单命令执行检查 |
-| **workflow/client.py** | 497 | High-level API for CCS roles to interact with workflow DB |
-| **reliability_core.py** | 460 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
+| **pipeflow/engine.py** | 895 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/step_handler.py** | 977 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 443 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/task_generator.py** | 406 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 903 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **lifecycle/manager.py** | 1200 | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **template_registry.py** | 837 | 模板注册中心 |
+| **eval_checker.py** | 602 | 安全白名单命令执行检查 |
+| **workflow/client.py** | 496 | High-level API for CCS roles to interact with workflow DB |
+| **reliability_core.py** | 465 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
 | **reliability.py** | 444 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 409 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
-| **routing/router.py** | 391 | Route table: derive produce/consume from roles_export.json, priority routing |
-| **routing/survival_monitor.py** | 373 | 存活监测 |
-| **routing/rdb.py** | 299 | Route table SQLite persistence + audit log |
-| **routing/auto.py** | 299 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
-| **routing_daemon.py** | 281 | 路由守护进程 |
-| **task_evidence.py** | 294 | 任务证据链 |
-| **contract_updater.py** | 233 | 合约同步 |
-| **conversation_monitor.py** | 203 | 对话监控 |
-| **config_loader.py** | 187 | YAML config loading with env override and hot-reload |
+| **routing/routes.py** | 472 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/router.py** | 374 | Route table: derive produce/consume from roles_export.json, priority routing |
+| **routing/survival_monitor.py** | 492 | 存活监测 |
+| **routing/rdb.py** | 298 | Route table SQLite persistence + audit log |
+| **routing/auto.py** | 290 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
+| **routing_daemon.py** | 354 | 路由守护进程 |
+| **task_evidence.py** | 317 | 任务证据链 |
+| **contract_updater.py** | 240 | 合约同步 |
+| **conversation_monitor.py** | 228 | 对话监控 |
+| **config_loader.py** | 184 | YAML config loading with env override and hot-reload |
 | **workflow/gateway.py** | 193 | 工作流网关门禁 |
 | **dispatch_tasks.py** | 145 | 任务分发 |
 | **drift_detector.py** | 143 | 架构漂移检测 |

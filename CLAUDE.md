@@ -50,31 +50,36 @@ python3 src/pipeflow/health_check.py
 - ❌ 重启 gateway（SIGKILL 中断长连接）
 - ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` "running 且 sr 空>1h" 静默误杀（bus #728c6e4307c1 根因）。
 
-## 代码布局
+## 代码布局（行数 2026-08-23 实测 `wc -l`）
 ```
 src/
   routing/
-    router.py         ── 路由表 + produce/consume 推导（391 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（409 行）
-    auto.py           ── 自动路由消费 + investigator 分派（299 行）
+    router.py         ── 路由表 + produce/consume 推导（374 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（472 行）
+    auto.py           ── 自动路由消费 + investigator 分派（290 行）
     polling.py        ── 消息轮询 + cursor（87 行）
-    rdb.py            ── 路由表 SQLite 持久化 + 审计（299 行）
-    survival_monitor.py ── 存活监测（373 行）
-    consistency.py    ── 路由一致性检查（120 行）
+    rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
+    survival_monitor.py ── 存活监测（492 行）
+    consistency.py    ── 路由一致性检查（124 行，生长接入 daemon）
 
-  pipeflow/
-    engine.py         ── 工作流执行引擎（2171 行）
-    daemon.py         ── 工作流守护 while 循环（108 行）
-    db.py             ── 工作流三层 SQLite 持久化（328 行）
-    health_check.py   ── 健康检查（67 行）
+  pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
+    engine.py         ── 编排 + CLI（895 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（977 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（443 行）
+    task_generator.py ── 任务生成（406 行）
+    wf_lifecycle.py   ── 工作流生命周期（903 行）
+    daemon.py         ── 工作流守护 while 循环（263 行）
+    db.py             ── 工作流三层 SQLite 持久化（327 行）
+    health_check.py   ── 健康检查（65 行）
+    integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1090 行）
+    manager.py        ── 工作流状态机（1200 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（497 行）
+    client.py         ── CCS 角色工作流客户端（496 行）
     gateway.py        ── 工作流网关门禁（193 行）
-    db.py             ── 工作流数据访问（92 行）
+    db.py             ── 工作流数据访问（96 行）
     sync.py           ── 工作流同步（55 行）
 
   p0_exemption.py     ── P0 豁免通道（coordinator/lr/pm）
@@ -82,18 +87,20 @@ src/
   eval_checker.py     ── 安全白名单命令执行检查
   eval_consistency.py ── 评估一致性
   output_validator.py ── 输出格式验证
-  contract_updater.py ── 合约同步
+  contract_updater.py ── 合约同步（自改进闭环，见 grow-unused-logic 需求）
   conversation_monitor.py ── 对话监控
   cron_scheduler.py   ── cron 调度器
   drift_detector.py   ── 架构漂移检测
   routing_daemon.py   ── 路由守护进程
-  role_validator.py   ── 角色校验
   reliability.py      ── 熔断/重试/心跳/TTL/Metrics
   reliability_core.py ── 可靠性核心实现
   template_registry.py── 模板注册中心
   task_evidence.py    ── 任务证据链
   workflow_metrics.py ── 工作流指标
   paths.py            ── 路径常量
+
+注：step 终态含 `delivery_blocked`（投递达上限暂停，engine.py close_wf 收敛行级 status）。
+```
 ```
 
 ### P0 豁免快速操作
@@ -103,6 +110,21 @@ PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; e=P0Exemption(r
 
 # 审计扫描
 PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption().p0_audit_scan()"
+```
+
+## SQLite 运维
+生产 DB 位于 `~/.hermes/data/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
+
+- **监测阈值**：`freelist_count / page_count > 0.5` 或单一 DB > 50MB 视为膨胀。
+- **恢复**：`VACUUM;`（会新建事务写整个 DB，期间 daemon 应停。VACUUM 前 `cp` 备份）。
+- **检查命令**：
+```bash
+python3 - <<'EOF'
+import sqlite3, os
+c=sqlite3.connect(os.path.expanduser("~/.hermes/data/state/workflows.db"))
+pc=c.execute("PRAGMA page_count").fetchone()[0]; fl=c.execute("PRAGMA freelist_count").fetchone()[0]
+print("freelist ratio=%.1f%%"%(fl/pc*100))
+EOF
 ```
 
 ## 测试
