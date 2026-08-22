@@ -269,14 +269,22 @@ def propose_governance_action(role: str) -> dict:
     return {"idle": sig.idle_complaint, "violation": sig.violation_found, "proposed": True}
 
 
+# 非生产测试/垃圾 persona 過濾（CCS 审计 #324584 發現，避免 G3 對不存在角色產出無效提案）
+_NON_PRODUCTION_ROLES = frozenset({
+    "dead_role", "e2e_test", "t", "t2", "test_role", "workflow_engine",
+    "test", "test2",
+})
+
+
 def scan_and_propose(roles: list[str] | None = None) -> int:
     """对所有（或指定）角色扫描对话信号并写治理提案。供 routing_daemon 轮询调用。
 
-    返回提案数量。
+    返回提案数量。會過濾非生产 persona。
     """
     if roles is None:
         roles = [p.stem.replace("persona_", "") for p in
                  Path.home().joinpath("hermes-session-roles", "personas", "session-roles").glob("persona_*.json")]
+    roles = [r for r in roles if r not in _NON_PRODUCTION_ROLES]
     proposed = 0
     for role in roles:
         try:

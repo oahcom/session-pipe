@@ -198,3 +198,29 @@ def test_propose_no_signal_no_bus_write():
         assert result["proposed"] is False
         assert not m_run.called
 
+
+# ── G3: scan_and_propose — daemon 接入点的单例扫描 ──
+from conversation_monitor import scan_and_propose
+
+
+def test_scan_and_propose_counts_proposals():
+    """scan_and_propose 対指定角色列表掃描並返回提案數"""
+    idle_text = "No change, idle"
+    normal_text = "s1 已完成，等待确认"
+    with mock.patch("conversation_monitor.capture_role_pane",
+                    side_effect=[idle_text, normal_text]), \
+         mock.patch("conversation_monitor.subprocess.run") as m_run:
+        n = scan_and_propose(["engineer", "maintainer"])
+        assert n == 1, f"期望 1 个提案，得到 {n}"
+        assert m_run.call_count == 1
+
+
+def test_scan_and_propose_skips_test_persona():
+    """过濾非生产 persona (dead_role / e2e_test 等)"""
+    with mock.patch("conversation_monitor.capture_role_pane",
+                    return_value="No change, idle"), \
+         mock.patch("conversation_monitor.subprocess.run") as m_run:
+        n = scan_and_propose(["dead_role", "e2e_test", "t"])
+        assert n == 0, "测试 persona 不应產出治理提案"
+        assert not m_run.called
+
