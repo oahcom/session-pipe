@@ -93,8 +93,11 @@ class SurvivalMonitor:
     # ── L1: 进程存活 ──
 
     def _l1_check(self, role: str) -> dict:
+        """L1: 进程存活。红线3 — 单次 tmux 探测失败(超时/socket抖动)不立即翻转状态,
+        连续3次失败才降级判活/不活, 抑制 ccs_health 0↔9 全天噪声(bus#302580/#323191)。"""
         tmux_name = f"ccs-{role}"
         alive = False
+        probe_ok = True
         try:
             r = subprocess.run(
                 ["tmux", "has-session", "-t", tmux_name],
@@ -102,7 +105,21 @@ class SurvivalMonitor:
             )
             alive = r.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            LOGGER.debug("tmux has-session check failed for %s", role)
+            probe_ok = False
+        prev = self._cache.get(role, {})
+        prev_fail = prev.get("l1_fail_streak", 0)
+        if not probe_ok:
+            fail_streak = prev_fail + 1
+            # socket 瞬时抖动: 沿用上一轮"存活"结论, 不把9角色整体判死
+            if fail_streak < 3 and prev.get("tmux_alive") is True:
+                sentinel = SENTINEL_DIR / f"{role}.json"
+                has_sentinel = sentinel.exists()
+                status = "ALIVE" if has_sentinel else prev.get("status", "UNKNOWN")
+                return {"status": status, "tmux_alive": True,
+                        "has_sentinel": has_sentinel, "l1_fail_streak": fail_streak}
+            alive = False  # 连续3次失败: 正常判活/不活
+        else:
+            fail_streak = 0
         sentinel = SENTINEL_DIR / f"{role}.json"
         has_sentinel = sentinel.exists()
         if alive and has_sentinel:
@@ -115,7 +132,8 @@ class SurvivalMonitor:
             status = "DEAD"
         else:
             status = "UNKNOWN"
-        return {"status": status, "tmux_alive": alive, "has_sentinel": has_sentinel}
+        return {"status": status, "tmux_alive": alive,
+                "has_sentinel": has_sentinel, "l1_fail_streak": fail_streak}
 
     # ── L2: 思考存活 ──
 

@@ -92,6 +92,43 @@ class TestL1Check:
         assert "tmux_alive" in result
         assert result["has_sentinel"] is True
 
+    def test_l1_transient_probe_failure_keeps_alive(self, monitor, monkeypatch):
+        """红线3: socket 瞬时抖动(连续<3次失败)沿用前态存活, 不翻转 → 抑制0↔9噪声。"""
+        def raise_error(*a, **kw):
+            raise FileNotFoundError("tmux socket 抖动")
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        # 前态: 存活
+        monitor._cache["qa"] = {"tmux_alive": True, "status": "ALIVE", "l1_fail_streak": 0}
+
+        r1 = monitor._l1_check("qa")
+        assert r1["status"] == "ALIVE"          # 第1次失败, 沿用存活
+        assert r1["tmux_alive"] is True
+        assert r1["l1_fail_streak"] == 1
+        monitor._cache["qa"] = r1               # tick() 会写回 cache, 模拟之
+
+        r2 = monitor._l1_check("qa")
+        assert r2["status"] == "ALIVE"          # 第2次失败, 仍沿用
+        assert r2["l1_fail_streak"] == 2
+        monitor._cache["qa"] = r2
+
+        # 第3次连续失败 → 降级判 ORPHAN(有哨兵但tmux不可达)
+        r3 = monitor._l1_check("qa")
+        assert r3["status"] == "ORPHAN"
+        assert r3["l1_fail_streak"] == 3
+
+    def test_l1_transient_failure_no_prior_alive_not_suppressed(self, monitor, monkeypatch):
+        """无前态存活记录时, 探测失败按原逻辑判(不掩盖真死亡)。"""
+        def raise_error(*a, **kw):
+            raise FileNotFoundError("tmux not found")
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        # 前态无 tmux_alive=True 记录 → 不抑制
+
+        r1 = monitor._l1_check("qa")
+        assert r1["status"] == "ORPHAN"          # 无前态存活, 正常判
+        assert r1["tmux_alive"] is False
+
 
 class TestL2Check:
     """L2: 思考存活"""
