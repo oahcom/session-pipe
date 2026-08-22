@@ -110,14 +110,20 @@ class SurvivalMonitor:
         prev_fail = prev.get("l1_fail_streak", 0)
         if not probe_ok:
             fail_streak = prev_fail + 1
-            # socket 瞬时抖动: 沿用上一轮"存活"结论, 不把9角色整体判死
-            if fail_streak < 3 and prev.get("tmux_alive") is True:
-                sentinel = SENTINEL_DIR / f"{role}.json"
-                has_sentinel = sentinel.exists()
-                status = "ALIVE" if has_sentinel else prev.get("status", "UNKNOWN")
-                return {"status": status, "tmux_alive": True,
-                        "has_sentinel": has_sentinel, "l1_fail_streak": fail_streak}
-            alive = False  # 连续3次失败: 正常判活/不活
+            # socket 瞬时抖动/隔离: 探测命令本身异常(非returncode判定), 保留前态不翻转
+            if fail_streak < 3:
+                if prev.get("tmux_alive") is True:
+                    # 前态存活: 沿用 ALIVE 结论, 不把9角色整体判死
+                    has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
+                    status = "ALIVE" if has_sentinel else prev.get("status", "UNKNOWN")
+                    return {"status": status, "tmux_alive": True,
+                            "has_sentinel": has_sentinel, "l1_fail_streak": fail_streak}
+                if prev.get("status"):
+                    # 前态非存活但有记录: 沿用前态(异常=无法探测, 非确认死亡), 抑制 ORPHAN 噪声
+                    return {"status": prev["status"], "tmux_alive": None,
+                            "has_sentinel": prev.get("has_sentinel", False),
+                            "l1_fail_streak": fail_streak}
+            alive = False  # 连续3次失败或无前态: 正常判活/不活
         else:
             fail_streak = 0
         sentinel = SENTINEL_DIR / f"{role}.json"

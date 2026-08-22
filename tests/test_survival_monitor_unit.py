@@ -11,6 +11,7 @@ test_survival_monitor_unit.py — SurvivalMonitor 三层存活检测单元测试
 """
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -128,6 +129,34 @@ class TestL1Check:
         r1 = monitor._l1_check("qa")
         assert r1["status"] == "ORPHAN"          # 无前态存活, 正常判
         assert r1["tmux_alive"] is False
+
+    def test_l1_probe_exception_keeps_prior_orphan_not_flip(self, monitor, monkeypatch):
+        """探测异常(socket隔离/抖动)且前态为 ORPHAN → 保留前态, 不刷 ORPHAN 噪声。"""
+        def raise_error(*a, **kw):
+            raise FileNotFoundError("tmux socket 隔离")
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        # 前态: ORPHAN (已存在但 tmux 不可达)
+        monitor._cache["qa"] = {"tmux_alive": False, "status": "ORPHAN",
+                                 "has_sentinel": True, "l1_fail_streak": 0}
+
+        r1 = monitor._l1_check("qa")
+        assert r1["status"] == "ORPHAN"          # 沿用前态, 不翻转
+        assert r1["tmux_alive"] is None          # 探测异常=无法判定, 非 False
+        assert r1["l1_fail_streak"] == 1
+
+    def test_l1_probe_exception_keeps_prior_unknown(self, monitor, monkeypatch):
+        """探测异常且前态为 UNKNOWN → 保留 UNKNOWN, 不误判 ORPHAN/DEAD。"""
+        def raise_error(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="tmux", timeout=3)
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+        # 前态: UNKNOWN, 无哨兵
+        monitor._cache["qa"] = {"tmux_alive": False, "status": "UNKNOWN",
+                                 "has_sentinel": False, "l1_fail_streak": 0}
+
+        r1 = monitor._l1_check("qa")
+        assert r1["status"] == "UNKNOWN"          # 沿用前态
+        assert r1["tmux_alive"] is None
 
 
 class TestL2Check:
