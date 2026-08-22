@@ -112,6 +112,36 @@ PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; e=P0Exemption(r
 PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption().p0_audit_scan()"
 ```
 
+
+### P0_draft 阶梯机制
+
+P0_draft 是工程师等角色可标记的预备 P0 任务，通过自动化阶梯机制防止遗漏：
+
+**角色权限**：
+- `ALLOWED_P0_ROLES = {"coordinator", "lr"}` — 可标记正式 P0（全天候）
+- `ALLOWED_DRAFT_ROLES = {"engineer", "pg", "qa", "devops", "reviewer", "scout", "writer"}` — 可标记 P0_draft
+- `pm` 仅在 08:00–22:00 工作时段可标记 P0_draft（`_check_pm_work_hours`）
+
+**状态机** (`p0_state` 列：`NULL / draft / escalated / confirmed / downgraded`)：
+- `mark_p0_draft()` — 仅允许角色可标记，`reason ≥15` 字符，task 非 completed
+- `confirm_p0()` — coordinator/lr 将 `draft/escalated → confirmed`
+- `downgrade_p0()` — coordinator/lr/system 将 P0_draft → P1（`priority=1`）
+- `extend_deadline()` — 单次 ≤30min、累计 ≤2h，修改 `p0_marked_at` 后移窗口，审计结构化记录防预算绕过
+
+**阶梯扫描 `p0_audit_scan()`** (每 30 分钟 daemon 调用)：
+- 1h 未确认 → `p0_state='escalated'`（blocker 通知 supervisor 介入）
+- 50min（窗口 -10min）发预警，5min 窗口 + 30min 幂等去重防重复
+- 4h 超时（draft 或 escalated）→ `downgrade_p0()` 自动降级为 P1
+
+**升级链 `_check_escalation_chain()`** (on-demand / 手动触发)：
+- 6h+ → 通知 supervisor（blocker 分类）
+- 12h+ → `@everyone`
+- 跳过 `confirmed / downgraded / completed`
+
+**运行时接线**：
+- `routing_daemon.py` 每 30 分钟 (`P0_CHECK_INTERVAL=1800`) 调用 `p0_audit_scan()`，自动驱动阶梯机制
+- 如需手动触发升级链：`PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption()._check_escalation_chain()`"
+
 ## SQLite 运维
 生产 DB 位于 `~/.hermes/data/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
 
