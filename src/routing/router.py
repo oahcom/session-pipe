@@ -202,11 +202,9 @@ class Router:
         3. consume="*"（通吃一切）的角色排最后
         """
         consumers = self.get_consumers(category)
-        cat_prio = priority(category)
-        # 先按分类优先级，通吃角色排后
+        # 通吃角色排后；同一 category 消费，cat_prio 恒等无排序贡献（已删）
         consumers.sort(key=lambda r: (
-            self._routing.get(r, {}).get("consume", []).count("*"),  # 通吃角色排后
-            cat_prio,  # 同类按分类优先级
+            self._routing.get(r, {}).get("consume", []).count("*"),
         ))
         return consumers
 
@@ -271,16 +269,6 @@ class Router:
             lines.append(f"  {role}: 产出={produce}  消费={consume}")
 
         return "\n".join(lines)
-
-    def consume_linkage(self, category: str) -> list[str]:
-        """消费一条消息后，返回其他受影响的消费者列表。
-
-        消费联动逻辑：
-        角色 A consume 了分类 X 的消息后，
-        其他也消费分类 X 的角色计数自动递减（由 caller 实现标记）。
-        """
-        consumers = self.get_consumers(category)
-        return consumers
 
 
 # ── 全局单例（懒加载） ──

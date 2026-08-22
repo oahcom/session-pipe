@@ -217,10 +217,15 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         return {"success": r.returncode == 0, "sent_chars": len(msg), "error": err}
 
     def _is_running(role):
-        import subprocess as _sp
+        import subprocess as _sp, json as _json
         r = _sp.run([sys.executable, str(_CCS_CLI), "status-role", role],
                      capture_output=True, text=True, timeout=10, env=_launcher_env)
-        return "未运行" not in r.stdout
+        # status-role 输出 JSON("alive": false)，不再含字面串"未运行"；
+        # 原字符串匹配恒为 True → 离线角色被误判存活 → 每周期写 fallback 通知死循环。
+        try:
+            return bool(_json.loads(r.stdout).get("alive", False))
+        except (_json.JSONDecodeError, ValueError):
+            return "未运行" not in r.stdout  # 兼容旧输出格式
 
     running = _is_running(role_name) if not dry_run else None
     details = []

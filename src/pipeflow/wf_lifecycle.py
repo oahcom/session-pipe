@@ -82,10 +82,17 @@ class WorkflowLifecycleMixin:
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
                 elif age_h > _global_limit_h:
                     reason = f"{_st} 运行{age_h:.0f}h > {_global_limit_h}h全局阈值"
-                # 条件4: running 但 step_results 为空且 >1h（从未推进）
-                elif _st == "running" and age_h > 1 and not sr:
-                    _step = d.get("current_step_id", "")
-                    reason = f"running 状态 {_step} 无推进记录 {age_h:.1f}h"
+                # 条件4: running 但当前步骤确已超时（step 级 timeout_count 真增长）且 >1h
+                # 关键修正：仅空 step_results 不足以判 stale——长任务 /goal 步骤完成前 step_results
+                # 本就为空，1h 墙钟误杀正常推进中的角色（bus #728c6e430 误报根因）。
+                # 故要求当前步骤 timeout_count >= 1（引擎 step_handler 真实超时标记）再判 stale。
+                elif _st == "running" and age_h > 1:
+                    _cur = d.get("current_step_id", "")
+                    _cur_sr = sr.get(_cur, {}) if isinstance(sr, dict) else {}
+                    _cur_tc = _cur_sr.get("timeout_count", 0) if isinstance(_cur_sr, dict) else 0
+                    if _cur_tc >= 1:
+                        _reason_step = _cur_sr.get("step", _cur) if isinstance(_cur_sr, dict) else _cur
+                        reason = f"running 状态 {_reason_step} 超时无推进记录 {age_h:.1f}h (timeout_count={_cur_tc})"
 
                 if reason:
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)

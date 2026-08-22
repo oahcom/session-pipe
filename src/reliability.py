@@ -102,7 +102,6 @@ def reconfigure() -> None:
 # ── 配置热加载 ──────────────────────────────────────────────────────
 
 # 记录上次加载时 config.yaml 的 mtime，变化时才重建全局实例
-_CONFIG_MTIME: float = 0.0
 
 
 _CONFIG_FILE = Path(os.environ.get(
@@ -111,25 +110,6 @@ _CONFIG_FILE = Path(os.environ.get(
 ))
 
 
-def _config_mtime() -> float:
-    """返回 config.yaml 的修改时间戳，文件不存在返回 0。"""
-    try:
-        return os.path.getmtime(_CONFIG_FILE)
-    except OSError:
-        LOGGER.warning("[reliability] config.yaml 不可读")
-        return 0.0
-
-
-def reload_config() -> bool:
-    """基于 mtime 对比决定是否重载。返回 True 表示实际发生了重载。"""
-    global _CONFIG_MTIME
-    mtime = _config_mtime()
-    if mtime == _CONFIG_MTIME:
-        return False
-    _CONFIG_MTIME = mtime
-    reconfigure()
-    LOGGER.info("Config reloaded (mtime changed)", extra=with_trace_id())
-    return True
 
 
 # ── 优雅关闭 ────────────────────────────────────────────────────────
@@ -231,20 +211,6 @@ def health_check() -> dict:
         },
         "timestamp": time.time(),
     }
-
-
-# ── 便捷函数 ────────────────────────────────────────────────────────
-
-def start_background_services():
-    """启动所有后台服务（TTL pruner 等）。"""
-    TTL_PRUNER.start()
-    LOGGER.info("Background services started", extra=with_trace_id())
-
-
-def stop_background_services():
-    """停止所有后台服务。"""
-    TTL_PRUNER.stop()
-    LOGGER.info("Background services stopped", extra=with_trace_id())
 
 
 # ── 幂等消费 + 乐观锁 claim ────────────────────────────────────────
@@ -465,7 +431,6 @@ ACK_TRACKER = AckTracker()
 
 # 模块导入时从 config 初始化全局实例
 reconfigure()
-_CONFIG_MTIME = _config_mtime()
 
 
 if __name__ == "__main__":

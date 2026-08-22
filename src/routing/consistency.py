@@ -62,9 +62,11 @@ def check_routing_links(
     返回 {"orphaned": [分类], "zombies": [分类], "ok": bool}
     """
     all_consume: set[str] = set()
+    _has_wildcard = False
     for data in routing.values():
         cats = data.get("consume", [])
         if "*" in cats:
+            _has_wildcard = True
             all_consume.update(all_categories)
         else:
             all_consume.update(cats)
@@ -73,7 +75,10 @@ def check_routing_links(
     for data in routing.values():
         all_produce.update(data.get("produce", []))
 
-    orphaned = [c for c in sorted(all_consume) if c not in all_produce and c != "*"]
+    # "*" 消费者 = "我处理任何分类"，故无生产者的分类不算孤儿（wildcard 会兜底）。
+    # 仅当 all_categories 为空（"*" 展开为空）时才可能误判，此时不强依赖展开。
+    orphaned = [c for c in sorted(all_consume)
+                if c not in all_produce and c != "*" and not _has_wildcard]
     zombies = [c for c in sorted(all_produce) if c not in all_consume]
 
     return {

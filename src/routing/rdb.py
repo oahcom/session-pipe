@@ -28,11 +28,6 @@ def _get_db_path() -> Path:
 DB_PATH = _get_db_path()
 
 
-def get_db_path() -> Path:
-    """获取当前数据库路径。"""
-    return DB_PATH
-
-
 class RoutingDB:
     """路由表 SQLite 数据库。"""
 

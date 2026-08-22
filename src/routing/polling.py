@@ -41,7 +41,8 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
     def _do_poll():
         effective_limit = min(limit, max_per_poll) if limit else max_per_poll
         # ponytail: passing cat filter would reduce overhead; use _consume_cats if available
-        return [f for f in bb.unconsumed() if f.id > since_id][:effective_limit]
+        # 关键修复: 必须传 consumer 参数，否则 unconsumed() 返回从未被任何人消费的事实(即 0)
+        return [f for f in bb.unconsumed(consumer=consumer) if f.id > since_id][:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)

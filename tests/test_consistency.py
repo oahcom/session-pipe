@@ -176,7 +176,11 @@ def test_routing_links_zombies():
 
 
 def test_routing_links_wildcard_expands():
-    """consume: * 展开为全量分类。"""
+    """consume: * 展开为全量分类；且 * 消费者兜底任何分类 → 无生产者不算孤儿。
+
+    修正前（旧 bug）：* 展开后 architecture/code_fix 无生产者会被判孤儿。
+    修正后：* = "我处理任何分类"，wildcard 消费者会兜底，故不报孤儿（见 consistency.py 边界修复）。
+    """
     from routing.consistency import check_routing_links
 
     routing = {
@@ -184,11 +188,9 @@ def test_routing_links_wildcard_expands():
     }
     all_cats = {"security", "architecture", "code_fix"}
     result = check_routing_links(routing, all_cats)
-    # maintainer 消费了全部 -> 全部有消费
-    # maintainer 生产了 security -> security 有生产
-    # architecture 和 code_fix 被 maintainer 消费但无生产者 -> orphaned
-    assert "architecture" in result["orphaned"]
-    assert result["ok"] is False
+    # * 消费者兜底 → architecture/code_fix 无生产者也不算孤儿
+    assert result["orphaned"] == []
+    assert result["ok"] is True
 
 
 def test_routing_links_empty():
@@ -266,3 +268,41 @@ def test_bh_mapping_missing_from_routing_gaps(tmp_path):
     result = check_bh_mapping(bh_map, {"engineer"})
     assert result["ok"] is False
     assert "ghost_role" in result["missing_roles"]
+
+
+# ── check_routing_links tests (incl. * wildcard boundary fix) ──
+
+def test_routing_links_consistent():
+    from routing.consistency import check_routing_links
+    routing = {"a": {"produce": ["code_fix"], "consume": ["architecture"]},
+               "b": {"produce": ["architecture"], "consume": ["code_fix"]}}
+    res = check_routing_links(routing, {"code_fix", "architecture"})
+    assert res["ok"] is True
+    assert res["orphaned"] == [] and res["zombies"] == []
+
+
+def test_routing_links_orphaned():
+    from routing.consistency import check_routing_links
+    routing = {"a": {"produce": [], "consume": ["security"]},
+               "b": {"produce": ["code_fix"], "consume": []}}
+    res = check_routing_links(routing, {"code_fix", "security"})
+    assert res["ok"] is False
+    assert "security" in res["orphaned"]  # 消费无生产
+
+
+def test_routing_links_zombie():
+    from routing.consistency import check_routing_links
+    routing = {"a": {"produce": ["blocker"], "consume": []},
+               "b": {"produce": [], "consume": ["code_fix"]}}
+    res = check_routing_links(routing, {"code_fix", "blocker"})
+    assert res["ok"] is False
+    assert "blocker" in res["zombies"]  # 生产无消费
+
+
+def test_routing_links_wildcard_covers_orphan():
+    """* 消费者 = 兜底处理任何分类 → 无生产者的分类不应判孤儿（边界修复）。"""
+    from routing.consistency import check_routing_links
+    routing = {"a": {"produce": ["x"], "consume": ["*"]}, "b": {"produce": [], "consume": ["y"]}}
+    res = check_routing_links(routing, {"x", "y", "z"})
+    assert res["ok"] is True  # y/z 无生产者，但 * 兜底
+    assert res["orphaned"] == [] and res["zombies"] == []

@@ -175,12 +175,14 @@ class TaskGeneratorMixin:
                     _mr = _sf.max_retries if _sf else 0
                     if _tc >= _mr + 1:
                         timed_out_steps += 1
-                if timed_out_steps >= 2 and not _escalated:
+                # ZOMBIE 模板（test/retry_test/prompt_test 等）超时不 escalate → 过滤 95% stress-test blocker 噪音
+                _is_zombie = inst.get("template_id") in _engine_mod.ZOMBIE_TEMPLATES
+                if timed_out_steps >= 2 and not _escalated and not _is_zombie:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
                             f"工作流多步骤超时: {i['instance_id'][:12]}",
                             f"{timed_out_steps} 个步骤已耗尽重试次数，当前步骤={i.get('current_step_id','?')} 角色={i.get('assignee','?')}"))
-                if timed_out_steps >= 3:
+                if timed_out_steps >= 3 and not _is_zombie:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
                             f"工作流多步骤超限自愈: {i['instance_id'][:12]}",

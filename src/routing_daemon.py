@@ -37,6 +37,8 @@ INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔
 EVAL_INTERVAL = 600 # eval_criteria 检查间隔（每 10 分钟）
 DRIFT_INTERVAL = 3600  # 角色输出漂移检测间隔（每 1 小时）
+CONSISTENCY_INTERVAL = 3600  # 路由一致性校验间隔（每 1 小时），生长 consistency.py
+CONTRACT_INTERVAL = 3600  # 合约自改进闭环间隔（每 1 小时），生长 contract_updater.py
 SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
 P0_CHECK_INTERVAL = 1800  # P0 超时检测间隔（每 30 分钟）
 CRON_SCHEDULE_TRACKER = Path.home() / ".hermes" / "run" / "cron_schedule_triggered.json"  # 去重跟踪
@@ -59,6 +61,8 @@ def _check_cron_schedules() -> int:
 
     使用 croniter 做时间匹配，/tmp/cron_schedule_triggered.json 做去重。
     返回触发次数。各 daemon 调用：routing_daemon 每 300s。
+    
+    增强版：增加死角色检测，防止盲发导致 ccs_send_fallback 风暴。
     """
     try:
         import croniter
@@ -90,6 +94,30 @@ def _check_cron_schedules() -> int:
     triggered_count = 0
     launcher = _paths_mod.CCS_CLI
 
+    def _is_role_alive(role: str) -> bool:
+        """检查角色是否存活（alive=true），防止盲发死角色。"""
+        try:
+            _sr = subprocess.run(
+                [sys.executable, str(launcher), "status-role", role],
+                capture_output=True, text=True, timeout=10,
+            )
+            if _sr.returncode != 0:
+                LOGGER.debug("status-role 返回非零: role=%s, rc=%d", role, _sr.returncode)
+                return False
+            import json
+            try:
+                status = json.loads(_sr.stdout)
+                return status.get("alive", False) is True
+            except json.JSONDecodeError:
+                LOGGER.warning("status-role 返回非 JSON: role=%s, stdout=%s", role, _sr.stdout[:200])
+                return False
+        except subprocess.TimeoutExpired:
+            LOGGER.warning("status-role 超时: role=%s", role)
+            return False
+        except Exception as e:
+            LOGGER.warning("status-role 检查异常: role=%s, err=%s", role, e)
+            return False
+
     for f in sorted(roles_dir.glob("persona_*.json")):
         try:
             data = json.loads(f.read_text())
@@ -109,9 +137,12 @@ def _check_cron_schedules() -> int:
                     last = triggered.get(key, 0)
                     if now - last > 60:
                         triggered[key] = now
+                        # 强化死角色检测：防止盲发导致 ccs_send_fallback 刷屏
+                        if not _is_role_alive(role):
+                            LOGGER.info("cron_schedule 跳过死角色: %s (not running)", role)
+                            continue
                         LOGGER.info("cron_schedule 触发: %s (%s)", role, cron_exp)
-                        subprocess_run = __import__("subprocess").run
-                        subprocess_run(
+                        subprocess.run(
                             [sys.executable, str(launcher), "send", role,
                              f"定时任务触发 (cron: {cron_exp})"],
                             capture_output=True, timeout=10,
@@ -129,7 +160,6 @@ def _check_cron_schedules() -> int:
         LOGGER.info("cron_schedule: 本次触发 %d 个角色", triggered_count)
     return triggered_count
 
-
 def main():
     LOGGER.info("routing_daemon 启动 PID=%d", os.getpid())
     last_ccs = 0
@@ -137,6 +167,8 @@ def main():
     last_survival = 0
     last_drift = 0
     last_metrics = 0
+    last_consistency = 0
+    last_contract = 0
     last_p0_check = 0
     last_g3_scan = 0
 
@@ -280,8 +312,10 @@ def main():
                         for v in violations:
                             LOGGER.info("  P0 violation: %s (%s) elapsed %.1fh",
                                         v["task_id"], v["title"], v["elapsed_hours"])
+                    # P0_draft 阶梯扫描：1h 升级、4h 降级、50min 预警
+                    _p0.p0_audit_scan()
                 except Exception as e:
-                    LOGGER.error("P0 超时检测异常: %s", e)
+                    LOGGER.error("P0 超时/阶梯检测异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_p0_check = now
 
@@ -320,6 +354,62 @@ def main():
                     LOGGER.error("drift 检测异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_drift = now
+
+            # 路由一致性校验（每小时，生长 consistency.py — 防路由漂移）
+            # 复用 D6 生长接入范式：延迟导入 + try/except 不阻塞 daemon + bus 写 architecture。
+            # 仅检查 in-memory 已信任路由表，不扩大 trust boundary（安全审查确认）。
+            if now - last_consistency >= CONSISTENCY_INTERVAL:
+                try:
+                    from routing.router import get_router, CATEGORY_PRIORITY
+                    from routing.consistency import (
+                        check_routing_links, check_category_consistency)
+                    _rt = get_router()
+                    _routing = _rt._routing  # 已加载的路由表（route_all 同源）
+                    _cats = set(CATEGORY_PRIORITY.keys())
+                    _link_res = check_routing_links(_routing, _cats)
+                    _cat_res = check_category_consistency(
+                        str(Path.home() / "hermes-session-roles" / "personas" / "session-roles"),
+                        _cats)
+                    if not _link_res["ok"] or _cat_res:
+                        _msg = (f"[routing] 一致性异常: links={_link_res} "
+                                f"undef_cat={_cat_res[:3]}")
+                        import subprocess as _sp
+                        _sp.run(
+                            [sys.executable, str(Path.home() / ".hermes/scripts/bus_client.py"),
+                             "write", "architecture", _msg,
+                             "--evidence", _msg, "--src", "routing_daemon"],
+                            capture_output=True, timeout=10)
+                        LOGGER.warning("路由一致性异常: %s", _msg)
+                    else:
+                        LOGGER.info("路由一致性校验通过 ✓")
+                except Exception as _ce:
+                    LOGGER.warning("路由一致性校验异常（不阻塞）: %s", _ce)
+                last_consistency = now
+
+            # 复用 D6 生长接入范式：subprocess 调用 contract_updater（避免循环导入），
+            # 抽取最近 review_gate history 喂入自改进闭环，异常 LOG warning 不阻塞 daemon。
+            if now - last_contract >= CONTRACT_INTERVAL:
+                try:
+                    import subprocess as _sp
+                    _hist_dir = Path.home() / ".hermes" / "review_gate" / "history"
+                    _feed = []
+                    if _hist_dir.exists():
+                        _files = sorted(_hist_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+                        for _hf in _files:
+                            for _line in _hf.read_text(errors="replace").splitlines()[-5:]:
+                                try: _feed.append(json.loads(_line))
+                                except: pass
+                    if _feed:
+                        _feed_path = Path("/tmp/contract_feed.json")
+                        _feed_path.write_text(json.dumps(_feed, ensure_ascii=False))
+                        _cu = _sp.run(
+                            [sys.executable, str(Path(__file__).resolve().parent / "contract_updater.py"),
+                             "--from-file", str(_feed_path)],
+                            capture_output=True, text=True, timeout=60)
+                        LOGGER.info("contract_updater 自改进: rc=%s %s", _cu.returncode, _cu.stdout[:200])
+                except Exception as _cu_e:
+                    LOGGER.warning("contract_updater 接入异常（不阻塞）: %s", _cu_e)
+                last_contract = now
 
             # 存活检测 tick（L1 进程存活 + 哨兵状态）
             if now - last_survival >= SURVIVAL_INTERVAL:

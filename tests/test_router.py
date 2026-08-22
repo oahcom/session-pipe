@@ -211,16 +211,6 @@ def test_unconsumed_by_role_parsing():
     print("  ✓ unconsumed_by_role structured output")
 
 
-def test_consume_linkage():
-    """consume_linkage 返回正确的影响角色列表。"""
-    from routing.router import Router
-
-    router = Router()
-    linked = router.consume_linkage("code_fix")
-    assert isinstance(linked, list), "应返回列表"
-    print("  ✓ consume_linkage")
-
-
 def test_category_desc_complete():
     """CATEGORY_DESC 包含所有路由中出现的分类。"""
     from routing.router import CATEGORY_DESC, Router
@@ -308,7 +298,6 @@ if __name__ == "__main__":
         test_router_fallback,
         test_get_producers_consumers,
         test_unconsumed_by_role_parsing,
-        test_consume_linkage,
         test_category_desc_complete,
         test_status_format,
         test_poll_unconsumed_sorted_by_priority,

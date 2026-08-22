@@ -173,13 +173,6 @@ def get_config() -> Config:
     return _CONFIG
 
 
-def reload_config(path: Optional[Path] = None):
-    """重新加载配置（热更新）。"""
-    global _CONFIG
-    _CONFIG = load_config(path)
-    return _CONFIG
-
-
 if __name__ == "__main__":
     cfg = get_config()
     print(json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2))

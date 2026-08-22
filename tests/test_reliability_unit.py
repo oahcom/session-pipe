@@ -150,24 +150,6 @@ class TestReconfigure:
         assert ValueError in reliability.DEFAULT_RETRY.retry_exceptions
 
 
-# ── config_mtime / reload_config ────────────────────────────────────
-
-class TestReloadConfig:
-    def test_mtime_unchanged_no_reload(self):
-        reliability._CONFIG_MTIME = 1.0
-        with patch.object(reliability, "_config_mtime", return_value=1.0):
-            assert reliability.reload_config() is False
-
-    def test_mtime_changed_triggers_reload(self):
-        reliability._CONFIG_MTIME = 0.0
-        with patch.object(reliability, "_config_mtime", return_value=2.0), \
-             patch.object(reliability, "reconfigure"):
-            assert reliability.reload_config() is True
-
-    def test_config_mtime_file_missing_returns_zero(self):
-        with patch("os.path.getmtime", side_effect=OSError("no file")):
-            assert reliability._config_mtime() == 0.0
-
 
 # ── GracefulShutdown ────────────────────────────────────────────────
 
@@ -542,28 +524,6 @@ class TestHealthCheckConfigFallback:
             finally:
                 _fake_config_loader.get_config = MagicMock(return_value=_mock_config)
             assert result["status"] == "healthy"
-
-
-class TestBackgroundServices:
-    """start_background_services / stop_background_services。"""
-
-    def test_start_stop_background(self):
-        """启停后台服务不抛异常。"""
-        # 确保线程不在运行
-        reliability.TTL_PRUNER.stop()
-        reliability.TTL_PRUNER._thread = None
-        reliability.start_background_services()
-        assert reliability.TTL_PRUNER._thread is not None
-        assert reliability.TTL_PRUNER._thread.is_alive()
-        reliability.stop_background_services()
-        assert not reliability.TTL_PRUNER._thread.is_alive()
-
-    def test_start_already_running(self):
-        """TTL pruner 已在运行 → start 不抛 (静默返回)。"""
-        reliability.start_background_services()
-        reliability.start_background_services()
-        assert reliability.TTL_PRUNER._thread.is_alive()
-        reliability.stop_background_services()
 
 
 if __name__ == "__main__":

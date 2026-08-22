@@ -40,10 +40,6 @@ def _load_role_registry() -> list[str]:
     return _ROLE_REGISTRY
 
 
-def get_role_registry() -> list[str]:
-    return _load_role_registry()
-
-
 # ── 10 字段 JSON Schema ──────────────────────────
 
 # JSON 工作流模板必填元数据字段（_load_workflows 加载时校验）

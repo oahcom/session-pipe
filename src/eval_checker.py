@@ -225,7 +225,12 @@ def _validate_python_inline(code: str) -> bool:
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.module in _BLOCKED_IMPORTS:
                 return False
-            # 拦截 `from os import system` 等绕过调用级拦截的危险成员导入
+            # 拦截 `from os import *` / `from subprocess import *` 等星号导入——
+            # 星号导入会把危险成员直接引入当前命名空间（如 system, run），
+            # 绕过属性访问拦截和 _DANGEROUS_FROM 成员名检查。
+            if node.module in _DANGEROUS_FROM and any(a.name == '*' for a in node.names):
+                return False
+            # 拦截 `from os import system` 这类绕过调用级拦截的危险成员导入
             if node.module in _DANGEROUS_FROM and any(
                 a.name in _DANGEROUS_FROM[node.module] for a in node.names
             ):

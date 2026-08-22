@@ -36,7 +36,6 @@ ZOMBIE_TEMPLATES = frozenset({
     "single_wf", "two_step", "handoff_wf", "reject_wf", "cancel_wf",
     "alpha", "beta", "ok", "quick", "valid", "empty",
 })
-_ZOMBIE_TEMPLATES = ZOMBIE_TEMPLATES  # 兼容别名
 
 _POLL_SLEEP = 5
 _REMINDER_INTERVAL = 120
@@ -44,7 +43,6 @@ _REMINDER_INTERVAL = 120
 # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用它作
 # StopHook 条件时 bool([]) 为 False → 死循环
 UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
-_UNMATCHED_VAR_RE = UNMATCHED_VAR_RE  # 兼容别名
 
 
 @dataclass
@@ -279,8 +277,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 and getattr(self, '_db_path', None) is None):
             try:
                 for name, wf in self._workflows.items():
-                    # 使用 workflow_id 作为 template_id（与 DB 约定一致）
-                    tid = wf.workflow_id or f"WF-{name}"
+                    # 使用 workflow_id 作为 template_id（与 DB 约定一致）。
+                    # 规范化去除所有连续 WF- 前缀（防 DB 回读后多次 upsert 叠加 WF-
+                    # 导致 WF-WF-...-WL-... 非收敛死循环，实测 4335 行污染）。
+                    tid = re.sub(r'^(?:WF-)+', '', wf.workflow_id or name)
+                    if not tid.startswith(('WL-', 'WF-')):
+                        tid = 'WF-' + tid
                     self._upsert_template(tid, wf)
             except Exception as e:
                 LOGGER.warning("[wf] 启动时 upsert JSON 模板到 DB 失败: %s", e)
@@ -335,6 +337,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 self._workflows[tid] = WorkflowDef(
                     name=tid, title=t.get("name", tid),
                     description=t.get("description", ""), steps=steps,
+                    workflow_id=t.get("template_id", tid),
                     trigger_scene=json.loads(t.get("trigger_scene") or "[]") if isinstance(t.get("trigger_scene"), str) else (t.get("trigger_scene") or []),
                     allowed_initiators=json.loads(t.get("allowed_initiators") or "[]") if isinstance(t.get("allowed_initiators"), str) else (t.get("allowed_initiators") or []),
                     allowed_executors=json.loads(t.get("allowed_executors") or "[]") if isinstance(t.get("allowed_executors"), str) else (t.get("allowed_executors") or []),
@@ -515,6 +518,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
 
+        # 恢复 delivery_blocked：若目标角色已恢复在线，重置 step_results 允许重试
+        # 修复：Round 2 修复后 delivery_blocked 正确停止重刷，但角色恢复后无自动重试机制
+        # 现在每 tick 检查 delivery_blocked 步骤，若目标角色已在线 → 重置 step_results 允许重试
+        try:
+            self._recover_delivery_blocked()
+        except Exception as e:
+            LOGGER.debug("delivery_blocked recovery failed: %s", e)
+
         # 先清理僵尸 workflow
         try:
             self._cleanup_stale_workflows(self._lifecycle)
@@ -621,9 +632,47 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
                     # 进而触发 _cleanup_stale_workflows 的"running 且 sr 空>1h"静默误杀
                     if not _delivered:
-                        LOGGER.warning("run_once: %s/%s 投递未成功，保持未通知状态待重试",
-                                       inst["instance_id"][:12], step_id)
-                        step_status = ""  # 不进入 notified/超时分支，下轮 run_once 重新尝试
+                        # 幂等护栏：已 notified 的 step 不再重复计数。
+                        # 根因：_send_to_role 在 goal 过短等路径返回 None（falsy），
+                        # 已成功盖戳 notified 的 step 每 tick 重走本分支 → delivery_fail_count
+                        # 从旧值继续涨（观测 wf_sub_06b9e/s1 count=35 且 status=notified），
+                        # 且把 status 覆盖回 "" 制造"未通知"假象。已通知则跳过，仅真未通知才计数。
+                        _cur_sr = results.get(step_id, {}) or {}
+                        if _cur_sr.get("status") == "notified":
+                            LOGGER.debug("run_once: %s/%s 已 notified，跳过投递失败计数",
+                                         inst["instance_id"][:12], step_id)
+                            continue
+                        # 记录投递失败次数，防止静默无限重试
+                        _fail_count = _cur_sr.get("delivery_fail_count", 0) + 1
+                        # 达阈值设终态 delivery_blocked，停止每 tick 重刷 blocker
+                        # （旧文案"已停止重试"失真：continue 仅跳本 tick，下 tick 仍重刷）
+                        _reached_cap = _fail_count >= 3
+                        results[step_id] = {
+                            **_cur_sr,
+                            "delivery_fail_count": _fail_count,
+                            "status": "delivery_blocked" if _reached_cap else "",
+                        }
+                        lm.execute(
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(results, ensure_ascii=False), inst["instance_id"])
+                        )
+                        if _reached_cap:
+                            self._bb.write("blocker",
+                                f"[workflow] {inst['instance_id'][:12]}/{step_id} 投递连续失败 {_fail_count} 次，已达上限暂停重试",
+                                src="workflow_engine")
+                            LOGGER.error("run_once: %s/%s 投递失败达上限，暂停重试",
+                                         inst["instance_id"][:12], step_id)
+                            # 收敛行级 status 列：否则实例永久计为 running，
+                            # has_active_template/cancel 扫描据此永远拦重建、且不接受 cancel
+                            # （需 completed/cancelled/failed）。step_results 终态已置 delivery_blocked，
+                            # 此处把行级列也收口，消除软泄漏（三方审查 WARN-15）。
+                            try:
+                                self._lifecycle.close_wf(inst["instance_id"], status="delivery_blocked")
+                            except Exception:
+                                LOGGER.debug("close_wf delivery_blocked 失败: %s", inst["instance_id"][:12])
+                        else:
+                            LOGGER.warning("run_once: %s/%s 投递失败 %d/3 次，保持未通知状态待重试",
+                                           inst["instance_id"][:12], step_id, _fail_count)
                         continue
                     # 标记已通知（若已有旧状态如 node1_done，必须合并保留——2026-08-10 观测：
                     # 状态机对 status 缺失时重建覆盖，丢失 exit_messages/node1_done）
@@ -735,11 +784,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         来源: assignee + target_role + guard.watch + wait_roles。
         wait_roles 也收集（2026-08-11 codex P0）——协作门角色不存活 →
         门永远不通过 → 工作流死锁；拉起后角色可产出消息开门。
+
+        过滤掉内部标识符（如 'workflow_engine'），仅保留有效的 CCS 角色名。
         """
         _alive_roles: set[str] = set()
+        _INTERNAL_ROLES = {"workflow_engine"}  # 内部标识，非 CCS 角色
+        _ROLE_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
         try:
             for _wf_row in self._lifecycle.query("SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"):
-                if _wf_row["assignee"]:
+                if _wf_row["assignee"] and _wf_row["assignee"] not in _INTERNAL_ROLES:
                     _alive_roles.add(_wf_row["assignee"])
             for _wf_row in self._lifecycle.query("SELECT instance_id, template_id, current_step_id FROM workflow_instances WHERE status IN ('running','pending')"):
                 _wf = self._workflows.get(_wf_row["template_id"])
@@ -747,16 +800,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     continue
                 _step = next((s for s in _wf.steps if s.id == _wf_row["current_step_id"]), None)
                 if _step:
-                    _alive_roles.add(_step.target_role)
+                    _tr = _step.target_role
+                    if _tr and _tr not in _INTERNAL_ROLES and _ROLE_NAME_RE.match(_tr):
+                        _alive_roles.add(_tr)
                     if _step.guard:
                         for _g_role in _step.guard.get("watch", []):
-                            if _step.guard.get("auto_restart", True):
+                            if _step.guard.get("auto_restart", True) and _g_role not in _INTERNAL_ROLES and _ROLE_NAME_RE.match(_g_role):
                                 _alive_roles.add(_g_role)
                     # 协作门角色也要守护：wait_roles 角色不产出 → 门永远不通过
                     # ponytail: 仅守护 running/pending 的 workflow；step_done_ready（等待审批）
                     # 不拉起 —— 审批阶段角色状态不归引擎管，拉起反而干扰人工审批流程
                     if _step.wait_roles:
-                        _alive_roles.update(_step.wait_roles)
+                        for _wr in _step.wait_roles:
+                            if _wr not in _INTERNAL_ROLES and _ROLE_NAME_RE.match(_wr):
+                                _alive_roles.add(_wr)
         except Exception as e:
             LOGGER.debug("guard 收集异常（非致命，返回已收集的角色）: %s", e)
         return _alive_roles
@@ -768,6 +825,61 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             self._ensure_role_alive(_role)
         return _alive_roles
 
+    def _recover_delivery_blocked(self) -> None:
+        """恢复 delivery_blocked：若目标角色已恢复在线，重置 step_results 允许重试。
+
+        修复：Round 2 修复后 delivery_blocked 正确停止重刷 blocker，但角色恢复后无自动重试机制。
+        现在每 tick 检查 delivery_blocked 步骤，若目标角色已在线 → 重置 step_results 允许重试。
+        """
+        try:
+            lm = self._lifecycle
+            # 查找所有 delivery_blocked 步骤
+            rows = lm.query(
+                "SELECT instance_id, step_results FROM workflow_instances "
+                "WHERE status IN ('running','pending') AND step_results LIKE '%delivery_blocked%'"
+            )
+            for row in rows:
+                inst_id = row["instance_id"]
+                sr = json.loads(row["step_results"] or "{}")
+                for step_id, step_sr in sr.items():
+                    if step_sr.get("status") != "delivery_blocked":
+                        continue
+                    # 获取目标角色
+                    wf_row = lm.query(
+                        "SELECT template_id, current_step_id FROM workflow_instances WHERE instance_id=?",
+                        (inst_id,)
+                    )
+                    if not wf_row:
+                        continue
+                    wf_name = wf_row[0]["template_id"]
+                    cur_step_id = wf_row[0]["current_step_id"]
+                    if cur_step_id != step_id:
+                        continue
+                    # 获取目标角色
+                    wf = self._workflows.get(wf_name)
+                    if not wf:
+                        continue
+                    step = next((s for s in wf.steps if s.id == step_id), None)
+                    if not step:
+                        continue
+                    target_role = step.target_role
+                    # 检查目标角色是否已在线
+                    if self._ensure_role_alive(target_role):
+                        # 角色已在线 → 重置 step_results 允许重试
+                        LOGGER.info("recover: %s/%s delivery_blocked → 角色 %s 已在线，重置重试",
+                                    inst_id[:12], step_id, target_role)
+                        new_sr = dict(sr)
+                        new_sr[step_id] = {
+                            **sr[step_id],
+                            "status": "",
+                            "delivery_fail_count": 0,
+                        }
+                        lm.execute(
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(new_sr, ensure_ascii=False), inst_id)
+                        )
+        except Exception as e:
+            LOGGER.debug("delivery_blocked recovery scan failed: %s", e)
 
 def main():
     import argparse, sys, os, signal

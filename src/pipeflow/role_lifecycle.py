@@ -228,11 +228,16 @@ class RoleLifecycleMixin:
 
         # 拉起 CCS（infinite 模式，agent 常驻执行任务）
         # ponytail: ondemand 模式只写哨兵不创建 tmux 会话，必须用 infinite 让 agent 持续运行
+        # 关键修复: 增加超时到 60s，并移除 VIRTUAL_ENV 以加速启动（从 30s 超时优化）
+        import os as _os
+        _env = _os.environ.copy()
+        _env.pop("VIRTUAL_ENV", None)
+        _env.pop("CONDA_PREFIX", None)
         try:
             _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "start", role, "--no-attach",
-                 "--drive", "infinite"],
-                capture_output=True, timeout=30,
+                 "--drive", "infinite", "--no-auto-send"],
+                capture_output=True, timeout=60, env=_env,
             )
             for _ in range(30):
                 time.sleep(1)
@@ -342,7 +347,7 @@ class RoleLifecycleMixin:
             self._bb.write("blocker",
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
-            return
+            return False  # 投递未发生：明确语义，避免返回 None 被 engine 计数为失败
         # 双要素第二关：goal 应含完成形态动词（输出/报告/修复/设计/实现/审查），
         # 缺少则 warning + bus notice 但不阻断（CrewAI expected_output 模式启发）
         _ACTION_VERBS = ("输出", "报告", "修复", "设计", "实现", "审查", "创建", "更新", "完成", "分析", "验证",

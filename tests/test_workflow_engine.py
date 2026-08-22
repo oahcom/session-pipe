@@ -568,3 +568,39 @@ if __name__ == "__main__":
 
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
+
+
+# ── 投递失败计数幂等护栏（fix-delivery-fail-count）─────────────────
+def test_delivery_fail_count_idempotent_when_notified():
+    """已盖戳 notified 的 step，即使 _send_to_role 返回 None/False，
+    delivery_fail_count 也不应续涨、status 不被覆盖回空。
+    复现根因：wf_sub_06b9e/s1 count=35 且 status=notified。"""
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "幂等护栏"})
+    lm = eng._lifecycle
+    # 手动把 s1 置为已 notified + 已有计数
+    lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+               (json.dumps({"s1": {"status": "notified", "delivery_fail_count": 5}}, ensure_ascii=False), rid))
+    # 模拟 _send_to_role 返回 None（goal 过短路径历史行为）
+    with patch.object(eng, "_send_to_role", return_value=None):
+        eng.run_once()
+    sr = json.loads(lm.get_wf(rid)["step_results"])
+    assert sr["s1"]["delivery_fail_count"] == 5, f"已 notified 不应续涨计数: {sr['s1']}"
+    assert sr["s1"]["status"] == "notified", f"status 不应被覆盖: {sr['s1']}"
+
+
+def test_delivery_fail_count_accumulates_when_unnotified():
+    """真未通知的 step 才累加计数，达阈值设 delivery_blocked 终态。"""
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "真失败累计"})
+    lm = eng._lifecycle
+    with patch.object(eng, "_send_to_role", return_value=False):
+        for _ in range(3):
+            eng.run_once()
+    sr = json.loads(lm.get_wf(rid)["step_results"])
+    assert sr["s1"]["delivery_fail_count"] == 3, f"未通知应累计到 3: {sr['s1']}"
+    assert sr["s1"]["status"] == "delivery_blocked", f"达阈值应置 delivery_blocked: {sr['s1']}"

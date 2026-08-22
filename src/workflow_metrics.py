@@ -3,14 +3,13 @@
 
 用法:
   python3 workflow_metrics.py              # 当前快照
-  python3 workflow_metrics.py --trend 10   # 最近 10 条历史记录
   python3 workflow_metrics.py --by-role    # 按角色统计
+  python3 workflow_metrics.py --fail-rate  # 任务失败率
 """
 import sqlite3, json, sys, time
 from pathlib import Path
 
 DB = Path.home() / ".hermes" / "state" / "workflows.db"
-METRICS = Path.home() / ".hermes" / "state" / "workflow-metrics.jsonl"
 
 
 def snapshot():
@@ -48,22 +47,6 @@ def snapshot():
         for tc in sorted(tc_dist):
             print(f"  timeout_count={tc}: {tc_dist[tc]} 步")
         print()
-
-
-def trend(n=10):
-    if not METRICS.exists():
-        print("无历史指标，等待 daemon 首次运行")
-        return
-    lines = METRICS.read_text().strip().split("\n")[-n:]
-    print(f"=== 最近 {len(lines)} 条指标 ===")
-    print(f"{'时间':<20} {'总数':>5} {'完成':>5} {'运行':>5} {'完成率':>7}")
-    print("-" * 48)
-    for line in lines:
-        try:
-            m = json.loads(line)
-            t = time.strftime("%m-%d %H:%M", time.localtime(m["ts"]))
-            print(f"{t:<20} {m['total']:>5} {m['completed']:>5} {m.get('running','?'):>5} {m['rate']:>6.1f}%")
-        except Exception: continue
 
 
 def by_role():
@@ -117,13 +100,7 @@ def fail_rate():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--trend" in args:
-        n = 10
-        idx = args.index("--trend")
-        if idx + 1 < len(args):
-            n = int(args[idx + 1])
-        trend(n)
-    elif "--by-role" in args:
+    if "--by-role" in args:
         by_role()
     elif "--fail-rate" in args:
         fail_rate()
