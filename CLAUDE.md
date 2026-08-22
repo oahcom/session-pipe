@@ -48,6 +48,7 @@ python3 src/pipeflow/health_check.py
 - ❌ 直接调 launcher 的 API（只能用 subprocess ccs.py send）
 - ❌ 修改角色定义（那是 session-roles 的事）
 - ❌ 重启 gateway（SIGKILL 中断长连接）
+- ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` "running 且 sr 空>1h" 静默误杀（bus #728c6e4307c1 根因）。
 
 ## 代码布局
 ```

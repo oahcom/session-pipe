@@ -241,6 +241,31 @@ PYTHONPATH=src python3 -c "from pipeflow.engine import WorkflowEngine; WorkflowE
 
 `validate-all` 会检测这种不一致。
 
+#### `require_wf: true` 的死锁陷阱（强制）
+
+若步骤 `exit_condition` 含 `"require_wf": true`，引擎（`step_handler._check_exit` 的 `strict_wf`）**硬性要求**总线消息标题正文含当前实例 id（如 `wf_728c6e4307c1`）才匹配退出。此时模板的 `## 完成` 指令**必须让角色把实例 id 写入消息标题**，否则即使产出也永久匹配不到 → 死锁。
+
+```json
+{
+  "exit_condition": {
+    "bus_category": "user_story", "source_contains": "pm",
+    "text_contains": "s2-complete", "require_wf": true
+  },
+  "prompt_template": "/goal\n...\n## 完成\n写 bus cat=user_story，标题必须同时含 s2-complete 与本实例 id（wf_xxxx 格式，引擎在 task_spec 标题中给出）。缺少实例 id 会导致 require_wf 硬校验永久匹配不到，工作流卡死。"
+}
+// ✅ 模板要求写实例 id → 角色产出标题含 wf_xxx → 匹配成功
+```
+
+```json
+{
+  "exit_condition": { "...", "require_wf": true },
+  "prompt_template": "/goal\n...\n## 完成\n写 bus cat=user_story，标题含 s2-complete。"
+}
+// ❌ 模板未要求写实例 id → 角色产出标题只有 s2-complete → strict_wf 永不匹配 → 死锁
+```
+
+> **根因**：`_check_exit` 比对的是 `Fact.t`（消息标题），非正文。扫描发现 `food_chain_loop/s2` 与 `WL-09_doc_driven_5stage/s1` 曾缺此约束，已修。新增 `require_wf: true` 步骤时必须同步在 `## 完成` 段加实例 id 约束。
+
 ### 7.2 分类选用原则
 
 | 情况 | 推荐分类 | 不要用 |
