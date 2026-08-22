@@ -157,3 +157,44 @@ def test_combined_with_waiting_exclude():
     sig = parse_conversation_signals(text, "lr")
     assert sig.step_completed
     assert not sig.idle_complaint  # 因为含"等待 coordinator"
+
+
+# ── G3: 信号 → 治理提案 (propose_governance_action) ──
+import subprocess as _sp
+from unittest import mock
+from conversation_monitor import propose_governance_action
+
+
+def test_propose_idle_signal_writes_bus():
+    """idle_complaint 命中 → 写 bus architecture 提案"""
+    with mock.patch("conversation_monitor.capture_role_pane", return_value="No change, idle, same generic template"), \
+         mock.patch("conversation_monitor.subprocess.run") as m_run:
+        result = propose_governance_action("engineer")
+        assert result["idle"] is True
+        assert result["proposed"] is True
+        assert m_run.called
+        cmd = m_run.call_args[0][0]
+        assert "write" in cmd and "architecture" in cmd
+        m_run.reset_mock()
+
+
+def test_propose_violation_signal_writes_bus():
+    """violation 命中 → 写 bus architecture 提案"""
+    pane = "kubectl apply -f prod.yaml\nsystemctl restart hermes-gateway"
+    with mock.patch("conversation_monitor.capture_role_pane", return_value=pane), \
+         mock.patch("conversation_monitor.subprocess.run") as m_run:
+        result = propose_governance_action("engineer")
+        assert result["violation"] is True
+        assert result["proposed"] is True
+        assert m_run.called
+        m_run.reset_mock()
+
+
+def test_propose_no_signal_no_bus_write():
+    """无 idle/violation → 不写 bus"""
+    with mock.patch("conversation_monitor.capture_role_pane", return_value="正在分析代码，无异常"), \
+         mock.patch("conversation_monitor.subprocess.run") as m_run:
+        result = propose_governance_action("engineer")
+        assert result["proposed"] is False
+        assert not m_run.called
+
