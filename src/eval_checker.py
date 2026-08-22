@@ -191,7 +191,20 @@ def _validate_python_inline(code: str) -> bool:
     阻攔: import os/subprocess, __import__, open, exec, eval,
     os.system, subprocess.run 等危險函數調用。
     """
-    _BLOCKED_IMPORTS = {"os", "subprocess", "pty", "commands", "pickle", "marshal"}
+    # 安全红线针对的是危险*操作*（os.system/subprocess.run/pickle.loads 等 RCE 路径），
+    # 而非惰性 import 语句本身。os/subprocess 仅 import 无害，其危险成员调用已由下方
+    # _BLOCKED_ATTRS / _BLOCKED_CALLS 拦截。pickle/marshal 的 loads 自身即可触发 RCE，仍需禁 import。
+    _BLOCKED_IMPORTS = {"pickle", "marshal"}
+    # 允许 `import os`，但拦截 `from os import system` 这类从危险模块导入危险成员（绕过调用级拦截）
+    _DANGEROUS_FROM = {
+        "os": {"system", "popen", "execv", "execve", "execvp", "execvpe",
+               "execl", "execlp", "execlpe", "spawnl", "spawnle", "spawnlp",
+               "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+               "remove", "unlink", "rmdir", "rename", "kill"},
+        "subprocess": {"Popen", "run", "call", "check_call", "check_output",
+                       "getoutput", "getstatusoutput"},
+        "pty": {"spawn", "fork"},
+    }
     _BLOCKED_ATTRS = frozenset({
         "system", "popen", "execv", "execvp", "execvpe", "spawn",
         "Popen", "run", "call", "check_call", "check_output",
@@ -211,6 +224,11 @@ def _validate_python_inline(code: str) -> bool:
                     return False
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.module in _BLOCKED_IMPORTS:
+                return False
+            # 拦截 `from os import system` 等绕过调用级拦截的危险成员导入
+            if node.module in _DANGEROUS_FROM and any(
+                a.name in _DANGEROUS_FROM[node.module] for a in node.names
+            ):
                 return False
         elif isinstance(node, ast.Call):
             func = node.func

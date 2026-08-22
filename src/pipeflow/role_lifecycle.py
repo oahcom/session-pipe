@@ -314,7 +314,7 @@ class RoleLifecycleMixin:
         if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=False):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
-            return
+            return False  # 投递未发生：调用方据此不可盖戳 notified，避免"未投递却标记已通知"掩盖死锁
         # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用
         # 这些内容作 StopHook 条件时 bool([]) 为 False → 死循环
         from pipeflow.engine import UNMATCHED_VAR_RE as _UNMATCHED_VAR_RE
@@ -325,7 +325,7 @@ class RoleLifecycleMixin:
             self._bb.write("blocker",
                 f"[workflow] {role} prompt 含未替换变量: {unmatched}",
                 evidence=prompt[:500], src="workflow_engine")
-            return
+            return False  # 投递未发生
         self._ensure_role_alive(role)
         # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
         import re as _re
@@ -435,3 +435,4 @@ class RoleLifecycleMixin:
                                    evidence=str(_e)[:200], src="pipeflow")
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail after fallback CCS send")
+        return True  # 投递链路已执行（无论 ccs send 内部是否抛异常，调用方应视为"已尝试投递"）

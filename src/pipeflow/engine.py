@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from paths import ensure_paths
 ensure_paths()
 from paths import HERMES_WORKFLOWS as _WORKFLOWS_DIR
+from paths import SESSION_ROLES_PERSONAS
 
 from bus_protocol import Blackboard
 
@@ -169,7 +170,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 直接读 JSON 避免跨项目 import（pipeline 不依赖 launcher 的 routing）
         # 按目录 mtime 缓存：persona 变更频率远低于模板，避免每 tick 重读 29 个 JSON
         _role_collab: dict[str, dict] = {}
-        _roles_dir = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+        _roles_dir = SESSION_ROLES_PERSONAS
         if _roles_dir.exists():
             _dir_mtime = _roles_dir.stat().st_mtime
             if (getattr(self, "_collab_mtime", None) != _dir_mtime
@@ -615,7 +616,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     tasks_file = ws_dir / "TASKS.md"
                     tasks_file.write_text(f"# 当前任务\n\n## 标题\n{task_title}\n\n## 描述\n{task_desc or task_title}\n\n## 工作流\n{wf_name} — 步骤 {step.id}: {step.title}\n", encoding="utf-8")
                     prompt = prompt.replace("{workspace_summary}", self._collect_workspace_summary(Path.home() / "ccs-workspaces" / step.target_role) if hasattr(self,'_collect_workspace_summary') else "")
-                    self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
+                    _delivered = self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
+                    # 仅当真实投递成功才盖戳 notified；投递被并发守卫/变量校验拦截时
+                    # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
+                    # 进而触发 _cleanup_stale_workflows 的"running 且 sr 空>1h"静默误杀
+                    if not _delivered:
+                        LOGGER.warning("run_once: %s/%s 投递未成功，保持未通知状态待重试",
+                                       inst["instance_id"][:12], step_id)
+                        step_status = ""  # 不进入 notified/超时分支，下轮 run_once 重新尝试
+                        continue
                     # 标记已通知（若已有旧状态如 node1_done，必须合并保留——2026-08-10 观测：
                     # 状态机对 status 缺失时重建覆盖，丢失 exit_messages/node1_done）
                     _existing_sr = results.get(step_id, {}) or {}
