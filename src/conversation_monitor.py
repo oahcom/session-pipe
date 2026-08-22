@@ -226,3 +226,71 @@ def get_conversation_signal(role: str) -> ConversationSignal:
     """一站式接口：capture → parse → 返回信号"""
     pane = capture_role_pane(role)
     return parse_conversation_signals(pane, role)
+
+
+# ── 信号 → 治理提案（闭合"对话驱动问题察觉→治理动作"环的第一步）──
+# ponytail: 当前仅"只读提案"写 bus architecture 待审查，不自动执行；
+# 安全边界：自动执行先限 ccs.py stop 僵尸回收，角色生长仍人工 merge。
+# 后续由 routing_daemon 长驻轮询调用 scan_and_propose() 驱动端到端闭环。
+_BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
+
+
+def propose_governance_action(role: str) -> dict:
+    """从角色对话信号提取 idle/violation，写 bus architecture 治理提案（只读，不执行）。
+
+    返回 {idle: bool, violation: bool, proposed: bool}。
+    任何异常静默降级（写 bus 失败不阻塞监控）。
+    """
+    try:
+        sig = get_conversation_signal(role)
+    except Exception as e:
+        LOGGER.debug("信号提取失败 role=%s: %s", role, e)
+        return {"idle": False, "violation": False, "proposed": False}
+
+    actions = []
+    if sig.idle_complaint:
+        actions.append(f"idle 空转: {sig.idle_evidence}")
+    if sig.violation_found:
+        actions.append(f"violation 越界: {'; '.join(sig.violation_commands[:3])}")
+
+    if not actions:
+        return {"idle": sig.idle_complaint, "violation": sig.violation_found, "proposed": False}
+
+    title = f"[治理提案] {role}: " + "; ".join(actions)[:80]
+    evidence = f"role={role} idle={sig.idle_complaint} violation={sig.violation_found}"
+    try:
+        subprocess.run(
+            [str(_BUS_CLIENT), "write", "architecture", title,
+             "--evidence", evidence, "--src", "conversation_monitor"],
+            capture_output=True, timeout=5)
+        LOGGER.info("治理提案已写 bus: %s", title)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # 写 bus 失败不阻塞
+    return {"idle": sig.idle_complaint, "violation": sig.violation_found, "proposed": True}
+
+
+# 非生产测试/垃圾 persona 過濾（CCS 审计 #324584 發現，避免 G3 對不存在角色產出無效提案）
+_NON_PRODUCTION_ROLES = frozenset({
+    "dead_role", "e2e_test", "t", "t2", "test_role", "workflow_engine",
+    "test", "test2",
+})
+
+
+def scan_and_propose(roles: list[str] | None = None) -> int:
+    """对所有（或指定）角色扫描对话信号并写治理提案。供 routing_daemon 轮询调用。
+
+    返回提案数量。會過濾非生产 persona。
+    """
+    if roles is None:
+        roles = [p.stem.replace("persona_", "") for p in
+                 Path.home().joinpath("hermes-session-roles", "personas", "session-roles").glob("persona_*.json")]
+    roles = [r for r in roles if r not in _NON_PRODUCTION_ROLES]
+    proposed = 0
+    for role in roles:
+        try:
+            if propose_governance_action(role).get("proposed"):
+                proposed += 1
+        except Exception as e:
+            LOGGER.debug("scan_and_propose 角色失败 %s: %s", role, e)
+    return proposed
+

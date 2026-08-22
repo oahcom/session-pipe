@@ -138,6 +138,7 @@ def main():
     last_drift = 0
     last_metrics = 0
     last_p0_check = 0
+    last_g3_scan = 0
 
     # ── 单实例 PID 锁 ──
     _pid_file = Path.home() / ".hermes" / "run" / "routing_daemon.pid"
@@ -283,6 +284,27 @@ def main():
                     LOGGER.error("P0 超时检测异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_p0_check = now
+
+            # G3 治理提案扫描（每 30 分钟，与 P0 同频，避免新增定时器）
+            if now - last_g3_scan >= P0_CHECK_INTERVAL:
+                try:
+                    # 采用后台线程执行，避免 tmux capture-pane 同步阻塞主循环
+                    # 参考 daemon 既有 _survival_monitor 缓存范式：仅提交任务，不等待结果
+                    import threading
+                    def _run_g3_scan():
+                        try:
+                            from conversation_monitor import scan_and_propose
+                            n = scan_and_propose()
+                            if n:
+                                LOGGER.info("G3 治理提案扫描: %d 个提案", n)
+                        except Exception as e:
+                            LOGGER.error("G3 扫描异常: %s", e)
+                            METRICS.inc("daemon_errors_total")
+                    threading.Thread(target=_run_g3_scan, daemon=True).start()
+                except Exception as e:
+                    LOGGER.error("G3 任务提交异常: %s", e)
+                    METRICS.inc("daemon_errors_total")
+                last_g3_scan = now
 
             # 定时角色输出漂移检测（每小时）
             if now - last_drift >= DRIFT_INTERVAL:
