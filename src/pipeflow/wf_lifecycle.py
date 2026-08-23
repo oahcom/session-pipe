@@ -752,19 +752,31 @@ class WorkflowLifecycleMixin:
                     return
 
                 # 价值门禁：审计角色产出文件标记 FAIL → 停止循环
+                # 支持逗号分隔多文件（如 "VALUE_AUDIT.md,delivery_chain_summary.txt"）
+                # 任一 gate 文件缺失 → 视为审计未完成，停止循环防无限空转（P1 修复）
                 _vg = loop_cfg.get("value_gate") or {}
-                _vg_file = _vg.get("file", "")
+                _vg_files = [f.strip() for f in (_vg.get("file", "") or "").split(",") if f.strip()]
                 _vg_ws = _vg.get("workspace", "")
-                if _vg_file and _vg_ws:
-                    _audit_path = _CCS_WORKSPACES / _vg_ws / _vg_file
-                    if _audit_path.exists():
-                        _text = _audit_path.read_text(encoding="utf-8", errors="ignore")
-                        if "FAIL" in _text.upper() or "REJECT" in _text.upper():
-                            LOGGER.info("wf %s loop: 价值审计 FAIL，停止循环", wf_id[:8])
-                            self._bb.write("workflow",
-                                f"[workflow] {wf.name} 循环停止: 价值审计未达标",
-                                src="workflow_engine")
-                            return
+                if _vg_files and _vg_ws:
+                    _missing = [f for f in _vg_files
+                                if not (_CCS_WORKSPACES / _vg_ws / f).exists()]
+                    if _missing:
+                        LOGGER.warning("wf %s loop: 价值门禁文件缺失 %s，停止循环防空转",
+                                       wf_id[:8], _missing)
+                        self._bb.write("workflow",
+                            f"[workflow] {wf.name} 循环停止: 价值门禁文件缺失 {_missing}",
+                            src="workflow_engine")
+                        return
+                    _text = ""
+                    for _f in _vg_files:
+                        _text += (_CCS_WORKSPACES / _vg_ws / _f).read_text(
+                            encoding="utf-8", errors="ignore")
+                    if "FAIL" in _text.upper() or "REJECT" in _text.upper():
+                        LOGGER.info("wf %s loop: 价值审计 FAIL，停止循环", wf_id[:8])
+                        self._bb.write("workflow",
+                            f"[workflow] {wf.name} 循环停止: 价值审计未达标",
+                            src="workflow_engine")
+                        return
 
                 # 创建新迭代：新任务 + 新工作流实例（同一模板）——锁内 DB 写
                 _task_id = f"task_loop_{uuid.uuid4().hex[:8]}"
