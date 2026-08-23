@@ -244,6 +244,17 @@ class TestL4Stepping(unittest.TestCase):
         self.assertTrue(s["busy"])
         conn.close()
 
+    def test_cache_miss_falls_back_to_db(self):
+        conn = self._conn()
+        conn.execute("INSERT INTO workflow_templates VALUES('tpl2',"
+                     "?)", (json.dumps([{"id": "s1", "target_role": "qa"}]),))
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_2','tpl2',?,'engineer',NULL,'running')",
+                     (json.dumps({"s1": {"status": "running", "timeout_count": 0}}),))
+        # workflows 已提供但 tpl2 不在其中 → 必须回退 DB 加载 steps，否则漏判 busy
+        s = _s4_stepping("qa", conn, workflows={"other": object()})
+        self.assertTrue(s["busy"])
+        conn.close()
+
 
 class TestRoleLiveness(unittest.TestCase):
     def setUp(self):

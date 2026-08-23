@@ -185,7 +185,14 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                     # 否则角色真在干活的 running 实例被漏判 → 上层 delivery_blocked 早关真任务。
                     steps = _load_steps_json(template_id, db_conn)
                 else:
-                    steps = [{"id": s.id, "target_role": s.target_role} for s in getattr(wf_def, "steps", [])]
+                    # wf_def 可能是 dict（TemplateRegistry.get 返回 dict）或对象（engine WorkflowDef）
+                    _raw_steps = wf_def.get("steps") if isinstance(wf_def, dict) else getattr(wf_def, "steps", [])
+                    steps = []
+                    for s in (_raw_steps or []):
+                        if isinstance(s, dict):
+                            steps.append({"id": s.get("step_id"), "target_role": s.get("target_role")})
+                        else:  # 对象：WorkflowDef step（.id/.target_role）
+                            steps.append({"id": getattr(s, "id", None), "target_role": getattr(s, "target_role", None)})
             else:
                 steps = _load_steps_json(template_id, db_conn)
             if not steps:
@@ -208,7 +215,7 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                     if _q >= 6 and exclude_wf_id and inst_id == exclude_wf_id:
                         LOGGER.info("liveness: %s queued=%d 同一工作流 → 豁免 busy", role, _q)
                         continue
-                    if _sdata.get("timeout_count", 0) < 3:
+                    if (_sdata.get("timeout_count") or 0) < 3:
                         LOGGER.info("liveness: skip %s busy with %s/%s (step=%s)",
                                     role, inst_id[:8], _s.get("id"), _sdata.get("status"))
                         return {"available": True, "busy": True,
