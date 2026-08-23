@@ -28,10 +28,10 @@ _paths_mod = importlib.util.module_from_spec(_paths_spec)
 _paths_spec.loader.exec_module(_paths_mod)
 SENTINEL_DIR = _paths_mod.CCS_SENTINEL_DIR
 
-from routing.auto import route_all, route_all_to_ccs
+from routing.auto import route_all, route_all_to_ccs, consume_with_linkage
 from reliability import LOGGER, METRICS
 
-__all__ = ["route_all", "route_all_to_ccs", "LOGGER", "METRICS"]
+__all__ = ["route_all", "route_all_to_ccs", "consume_with_linkage", "LOGGER", "METRICS"]
 
 INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔
@@ -205,7 +205,14 @@ def main():
                             LOGGER.info("route → [%s] #%d %s → %s",
                                         d.get("category", "?"), d.get("id", 0),
                                         d.get("title", "")[:50], ",".join(roles))
-                    LOGGER.info("route_all: %d/%d routed", routed_n, total_n)
+                            # 新增：消费联动 (G3 生长) - 熔断保护 + 自动联动消费
+                            try:
+                                from routing.auto import consume_with_linkage
+                                consume_with_linkage(d.get("id"), d.get("category", ""))
+                            except Exception as e:
+                                LOGGER.error(f"consume_with_linkage 失败: {e}")
+                                METRICS.inc("daemon_errors_total")
+                        LOGGER.info("route_all: %d/%d routed", routed_n, total_n)
                 elif total_n:
                     LOGGER.debug("route_all: 0/%d 无可消费消息或无匹配消费者", total_n)
                 error_backoff = 0

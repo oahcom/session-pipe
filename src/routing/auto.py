@@ -62,6 +62,69 @@ def status() -> dict:
 
 
 # ── 路由分发（从 routes 导入）──
+
+def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") -> dict:
+    """消费一条消息，自动标记其他应消费该分类的角色为已消费。
+
+    消费联动（P1 修复）：
+    - 主消费者 consume（幂等 + 熔断）
+    - 其他应消费该分类的角色自动标记 consume（联动更新 rc）
+    - 记录 ACK + metrics + 心跳
+    """
+    from bus_protocol import Blackboard
+
+    bb = Blackboard()
+    router = _rt_mod.get_router()
+    tid = fact_id
+
+    # 获取所有应消费该分类的角色
+    all_consumers = router.get_consumers(category)
+    # 排除主消费者自己
+    linked = [r for r in all_consumers if r != consumer]
+
+    # 熔断器保护消费操作
+    def _do_consume():
+        bb.mark_consumed(fact_id, consumer)
+
+    try:
+        CIRCUIT_BREAKER.call(_do_consume)
+        # 联动：自动标记其他角色已消费
+        for linked_role in linked:
+            try:
+                bb.mark_consumed(fact_id, linked_role)
+            except Exception as exc:
+                LOGGER.warning("auto-link consume failed for fact=%s linked_role=%s: %s", fact_id, linked_role, exc)
+                METRICS.inc("consume_errors_total", labels={"consumer": linked_role})
+    except Exception as e:
+        LOGGER.error(f"consume #{tid} failed: {e}", extra={"trace_id": str(tid)})
+        METRICS.inc("consume_errors_total", labels={"consumer": consumer})
+        return {
+            "consumed": fact_id,
+            "by": consumer,
+            "category": category,
+            "error": str(e),
+        }
+
+    HEARTBEAT.beat(consumer)
+    METRICS.inc("consume_count", labels={"consumer": consumer})
+
+    ACK_TRACKER.record_ack(fact_id, consumer, "consumed", category=category)
+
+    LOGGER.info(
+        f"Consumed #{fact_id} [{category}] by {consumer}, auto-linked: {linked}",
+        extra={"trace_id": str(tid)}
+    )
+
+    return {
+        "consumed": fact_id,
+        "by": consumer,
+        "category": category,
+        "auto_linked": linked,
+    }
+
+
+
+
 from routing.routes import route_all, route_to_ccs, route_all_to_ccs, dispatch_investigator
 
 
