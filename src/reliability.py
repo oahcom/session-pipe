@@ -249,29 +249,36 @@ class IdempotentConsume:
         """
         with self._lock:
             try:
-                # 注意：bb._conn() 的 with 块已开启事务，不可再嵌套 BEGIN IMMEDIATE
-                # （否则 "cannot start a transaction within a transaction"）。
-                # 由外层 with 在退出时自动 commit（无异常）/rollback（有异常）。
                 with bb._conn() as conn:
-                    _done = conn.execute(
-                        "SELECT 1 FROM log WHERE fid = ? AND typ = 'consume' AND cat = ? LIMIT 1",
-                        (fact_id, consumer),
-                    ).fetchone()
-                    if _done:
-                        LOGGER.debug(f"Idempotent skip: #{fact_id} already consumed by {consumer}",
-                                   extra=with_trace_id(str(fact_id)))
-                        return {
-                            "status": "skipped",
-                            "fact_id": fact_id,
-                            "consumer": consumer,
-                            "reason": "already_consumed",
-                        }
-                    # mark_consumed 写入逻辑（log 表 cat 列存 consumer 名）
-                    # INSERT OR IGNORE: unique index (fid,cat) WHERE typ=consume 冲突时静默跳过
-                    conn.execute(
-                        "INSERT OR IGNORE INTO log (fid, cat, typ, ts) VALUES (?, ?, 'consume', ?)",
-                        (fact_id, consumer, time.time()),
-                    )
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        _done = conn.execute(
+                            "SELECT 1 FROM log WHERE fid = ? AND typ = 'consume' AND cat = ? LIMIT 1",
+                            (fact_id, consumer),
+                        ).fetchone()
+                        if _done:
+                            conn.execute("COMMIT")
+                            LOGGER.debug(f"Idempotent skip: #{fact_id} already consumed by {consumer}",
+                                       extra=with_trace_id(str(fact_id)))
+                            return {
+                                "status": "skipped",
+                                "fact_id": fact_id,
+                                "consumer": consumer,
+                                "reason": "already_consumed",
+                            }
+                        # mark_consumed 写入逻辑（log 表 cat 列存 consumer 名）
+                        # INSERT OR IGNORE: unique index (fid,cat) WHERE typ=consume 冲突时静默跳过
+                        conn.execute(
+                            "INSERT OR IGNORE INTO log (fid, cat, typ, ts) VALUES (?, ?, 'consume', ?)",
+                            (fact_id, consumer, time.time()),
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
                 LOGGER.info(f"Consumed #{fact_id} by {consumer}",
                            extra=with_trace_id(str(fact_id)))
                 return {

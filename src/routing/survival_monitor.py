@@ -84,11 +84,14 @@ def _load_role_lifecycles() -> dict[str, str]:
 class SurvivalMonitor:
     """三层存活检测器。"""
 
-    def __init__(self):
+    def __init__(self, engine: Any = None):
         self._cache: dict[str, dict[str, Any]] = {}
         self._role_targets: dict[str, list[str]] = {}
         # 修复: _state 原未定义，R3 idle 回收每次抛 AttributeError 被外层吞掉（从未生效）
         self._state: dict[str, dict[str, Any]] = {}
+        # 复用 engine._ensure_role_alive（实现 B：tmux 双验证 + 僵尸重启 + --drive infinite）
+        # 而非内联 subprocess；无引擎则惰性构造单例（monitor 每 10min 才用到一次）
+        self._engine = engine
 
     # ── L1: 进程存活 ──
 
@@ -429,29 +432,23 @@ class SurvivalMonitor:
         orphaned = [r for r, h in results.items() if h.get("overall") == "orphan"]
         if stalled:
             LOGGER.warning("存活告警 stale/dead: %s", stalled)
-            # D4 修复: 检测到 stale/dead 时尝试恢复（复用 daemon._ensure_role_alive 拉起），
-            # 冷却 600s 防重启风暴；不依赖人工介入
+            # D4 修复: 检测到 stale/dead 时尝试恢复（复用 engine._ensure_role_alive 拉起），
+            # 冷却 600s 防重启风暴；不依赖人工介入。
+            # 统一到实现 B（tmux 双验证 + 僵尸重启 + --drive infinite），不再内联 subprocess。
             now_ts = time.time()
             _last_rescue = getattr(self, "_last_rescue_ts", 0)
             if now_ts - _last_rescue > 600:
                 try:
-                    # 用 --drive infinite 拉起: daemon 版 _ensure_role_alive 缺该参数,
-                    # ondemand 角色恢复后只写哨兵不建 tmux → 下轮 L1=ORPHAN 恢复循环
-                    _ccs_cli = Path(os.environ.get("CCS_CLI",
-                        str(Path.home() / "session-launcher" / "src" / "ccs.py")))
+                    _eng = self._engine
+                    if _eng is None:
+                        from pipeflow.engine import WorkflowEngine
+                        _eng = WorkflowEngine()
+                        self._engine = _eng
                     for _r in stalled[:2]:
-                        try:
-                            _rr = subprocess.run(
-                                [sys.executable, str(_ccs_cli), "start", _r,
-                                 "--no-attach", "--drive", "infinite"],
-                                capture_output=True, timeout=30)
-                            if _rr.returncode == 0:
-                                LOGGER.info("存活恢复: %s 已重新拉起", _r)
-                            else:
-                                LOGGER.warning("存活恢复失败 %s: %s",
-                                               _r, _rr.stderr[:200])
-                        except Exception as _re:
-                            LOGGER.warning("存活恢复异常 %s: %s", _r, _re)
+                        if _eng._ensure_role_alive(_r):
+                            LOGGER.info("存活恢复: %s 已重新拉起", _r)
+                        else:
+                            LOGGER.warning("存活恢复失败 %s", _r)
                     self._last_rescue_ts = now_ts
                 except Exception as _re:
                     LOGGER.warning("存活恢复动作异常（跳过本轮）: %s", _re)

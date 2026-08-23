@@ -85,9 +85,9 @@ def test_starve_signal_real_engine_pipeline():
         eng = _make_engine(tmp)
         state_path = Path(tmp) / "starve_state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch("subprocess.run") as mock_run:
             mock_run.return_value.returncode = 0
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
         # 状态文件记录了 last_wf 且 DB 有对应实例
         saved = json.loads(state_path.read_text())
@@ -97,8 +97,8 @@ def test_starve_signal_real_engine_pipeline():
         assert rows[0]["cnt"] == 1, "应恰好创建 1 个实例"
         # 冷却期内第二次调用 → 不创建新实例
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch("subprocess.run"):
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
         rows = eng._lifecycle.query(
             "SELECT COUNT(*) AS cnt FROM workflow_instances WHERE template_id='food_chain_loop'")
@@ -118,8 +118,8 @@ def test_race_guard_real_engine():
         # 状态文件模拟冷却已过
         state_path.write_text(json.dumps({"last_fire": 0}))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch("subprocess.run"):
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
         rows = eng._lifecycle.query(
             "SELECT COUNT(*) AS cnt FROM workflow_instances WHERE template_id='food_chain_loop'")

@@ -57,7 +57,6 @@ from paths import BUS_CLIENT, CCS_CLI, STARVE_STATE
 
 _BUS_SCRIPT = BUS_CLIENT
 _STARVE_STATE = STARVE_STATE
-_CCS_PY = CCS_CLI
 
 
 def _safe_write_state(state: dict) -> None:
@@ -69,24 +68,6 @@ def _safe_write_state(state: dict) -> None:
         tmp.replace(_STARVE_STATE)
     except OSError as e:
         LOGGER.warning("starve 状态写入失败: %s", e)
-
-
-def _ensure_role_alive(role: str) -> bool:
-    """通过 ccs.py start 拉起未运行的角色 session（幂等，已运行则跳过）。"""
-    try:
-        result = subprocess.run(
-            [sys.executable, str(_CCS_PY), "start", role,
-             "--no-attach", "--no-auto-send"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            LOGGER.info("_ensure_role_alive: %s 已就绪", role)
-            return True
-        LOGGER.warning("_ensure_role_alive %s 失败: %s", role, result.stderr[:200])
-        return False
-    except Exception as e:
-        LOGGER.warning("_ensure_role_alive %s 异常: %s", role, e)
-        return False
 
 
 def _active_count(eng: WorkflowEngine) -> int:
@@ -140,9 +121,9 @@ def _starve_signal(eng: WorkflowEngine) -> None:
             return
 
     # 1) 确保首步角色（scout）session 已启动
-    _ensure_role_alive("scout")
+    eng._ensure_role_alive("scout")
     # reviewer 作为审批方需常驻以接收 code_review/architecture 消息（bus #336293 缺口修复）
-    _ensure_role_alive("reviewer")
+    eng._ensure_role_alive("reviewer")
 
     # 2) 创建食物链工作流（确定性触发，不依赖 coordinator 转发）
     try:

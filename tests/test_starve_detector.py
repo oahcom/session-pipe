@@ -62,6 +62,7 @@ def test_cooldown_blocks_refire():
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             with patch.object(daemon, "subprocess"):
                 daemon._starve_signal(eng)
             # eng.start 不应被调用（冷却期内）
@@ -76,15 +77,18 @@ def test_cooldown_expired_fires():
             "last_fire": time.time() - daemon._STARVE_COOLDOWN - 1,  # 已过冷却
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess") as mock_sub:
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.return_value = "wf_new123"
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
             eng.start.assert_called_once_with(
                 "food_chain_loop",
                 context={"source": "starve_detector", "reason": "连续6分钟无活跃工作流"},
             )
+            eng._ensure_role_alive.assert_any_call("scout")
+            eng._ensure_role_alive.assert_any_call("reviewer")
             # bus 写入也触发了
             mock_sub.run.assert_called()
 
@@ -94,12 +98,15 @@ def test_first_fire_without_state_file():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"  # 不存在
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.return_value = "wf_first"
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
             eng.start.assert_called_once()
+            eng._ensure_role_alive.assert_any_call("scout")
+            eng._ensure_role_alive.assert_any_call("reviewer")
             assert state_path.exists()
             saved = json.loads(state_path.read_text())
             assert saved["last_wf"] == "wf_first"
@@ -110,10 +117,11 @@ def test_workflow_create_failure_writes_failure_count():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.side_effect = Exception("模板不存在")
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
             # 失败时写入 consecutive_failures（用于退避计算）
             assert state_path.exists()
@@ -164,10 +172,11 @@ def test_end_to_end_starve_creates_workflow():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.return_value = "wf_e2e_test"
+            eng._ensure_role_alive.return_value = True
             daemon._starve_signal(eng)
             saved = json.loads(state_path.read_text())
             assert saved["last_wf"] == "wf_e2e_test"
@@ -177,16 +186,20 @@ def test_end_to_end_starve_creates_workflow():
             assert eng.start.call_count == 1  # 仍是 1 次
 
 
-# ── 10. _ensure_role_alive 调用 ccs.py ──
-def test_ensure_role_alive_calls_ccs():
-    with patch.object(daemon, "subprocess") as mock_sub:
-        mock_sub.run.return_value = MagicMock(returncode=0, stderr="")
-        ok = daemon._ensure_role_alive("scout")
-        assert ok is True
-        call_args = mock_sub.run.call_args[0][0]
-        # [python3, ccs.py, start, scout, --no-attach, --no-auto-send]
-        assert "ccs.py" in call_args[1]
-        assert "scout" in call_args
+# ── 10. engine._ensure_role_alive 调用 ccs.py （通过 engine mock 验证调用） ──
+def test_ensure_role_alive_via_engine():
+    """验证 starve 触发时会调用 engine._ensure_role_alive(scout/reviewer)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
+            eng.start.return_value = "wf_test"
+            eng._ensure_role_alive.return_value = True
+            daemon._starve_signal(eng)
+            eng._ensure_role_alive.assert_any_call("scout")
+            eng._ensure_role_alive.assert_any_call("reviewer")
 
 
 if __name__ == "__main__":
@@ -214,9 +227,9 @@ def test_backoff_after_consecutive_failures():
             "consecutive_failures": fails,
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.return_value = "wf_backoff"
             daemon._starve_signal(eng)
             # 6 次失败 + 最近失败在 24h 内 → 退避，不创建
@@ -231,9 +244,9 @@ def test_normal_cooldown_below_threshold():
             "consecutive_failures": 3,
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.return_value = "wf_ok"
             daemon._starve_signal(eng)
             # 3 次失败 < 5 → 冷却 6h，100 秒前不够 → 不触发
@@ -244,9 +257,9 @@ def test_failure_increments_counter():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.side_effect = Exception("模板不存在")
             daemon._starve_signal(eng)
             saved = json.loads(state_path.read_text())
@@ -261,9 +274,9 @@ def test_success_resets_failures():
             "consecutive_failures": 3,
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.return_value = "wf_success"
             daemon._starve_signal(eng)
             saved = json.loads(state_path.read_text())
@@ -295,9 +308,9 @@ def test_race_guard_skips_when_active():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = _StubEngine(active=True)  # 已有活跃实例
+            eng._ensure_role_alive = MagicMock(return_value=True)
             daemon._starve_signal(eng)
             assert eng.start_calls == []  # 不应创建新工作流
 
@@ -306,9 +319,9 @@ def test_race_guard_error_skips():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = _StubEngine(active="error")  # 查询抛异常
+            eng._ensure_role_alive = MagicMock(return_value=True)
             daemon._starve_signal(eng)
             assert eng.start_calls == []  # 查询失败时保守跳过
 
@@ -317,9 +330,9 @@ def test_race_guard_no_active_fires():
     with tempfile.TemporaryDirectory() as tmp:
         state_path = Path(tmp) / "state.json"
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = _StubEngine(active=False)  # 无活跃实例
+            eng._ensure_role_alive = MagicMock(return_value=True)
             daemon._starve_signal(eng)
             assert len(eng.start_calls) == 1
             assert eng.start_calls[0][0] == "food_chain_loop"
@@ -344,9 +357,9 @@ def test_backoff_engages_with_only_failure_ts():
             "last_wf": None
         }))
         with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(daemon, "_ensure_role_alive", return_value=True), \
              patch.object(daemon, "subprocess"):
             eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
             eng.start.side_effect = Exception("模板不存在")
             daemon._starve_signal(eng)
             # 冷却 = 24h = 86400s，距失败仅 100s → 应跳过，不重试
