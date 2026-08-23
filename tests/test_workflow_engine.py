@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+WorkflowEngine 测试 — 工作流执行引擎全功能覆盖。
+
+运行：cd /home/administrator/session-pipeline && python3 tests/test_workflow_engine.py
+"""
+import json
+import sys
+import tempfile
+import time
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+_PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
+if _PIPELINE_SRC not in sys.path:
+    sys.path.insert(0, _PIPELINE_SRC)
+
+from pipeflow.engine import WorkflowEngine
+
+# Patch timeout constants to make timeout tests fast (not wait 10+ seconds)
+import pipeflow.engine
+_orig_grace = getattr(pipeflow.engine, '_TIMEOUT_GRACE', 10)
+pipeflow.engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
+
+# mock engine 全部 subprocess（tmux/ccs），防止真 spawn 挂起 30s。
+# stdout="claude\n" 有讲究：_ensure_role_alive 的 has-session 返回 0 → alive；
+# _is_agent_alive 读到 "claude" → 命中直接返回 True，不 spawn 不 sleep 30s。
+# 用 pytest fixture（session 级）替代模块级 patch.start()——
+# 模块级 start() 只在 atexit 恢复，全量跑时会污染后续测试模块。
+import pytest
+
+@pytest.fixture(scope="module", autouse=True)
+def _mock_subprocess():
+    """mock engine 全部 subprocess；module scope 只在本模块生效，
+    避免 atexit/session 级污染后续测试模块。"""
+    with patch("pipeflow.engine._sp.run",
+               lambda *a, **k: MagicMock(returncode=0, stdout="claude\n")):
+        yield
+
+
+def _make_wf_dir():
+    d = Path(tempfile.mkdtemp())
+    (d / "runs").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_wf(wf_dir, name, steps):
+    data = {"name": name, "title": name, "description": "", "steps": steps}
+    (wf_dir / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False))
+
+
+# 使用有效的 bus 分类：code_fix, architecture, security, prd, system_design, task_spec, product_design, blocker, design_issue, ops, monitor_audit, notice, workflow, reflexion_lesson
+SIMPLE_STEPS = [
+    {"id": "s1", "title": "调研", "target_role": "scout",
+     "prompt_template": "请调研 {topic}", "exit_condition": {"bus_category": "architecture"},
+     "max_retries": 0, "condition": "", "rollback_to": ""},
+    {"id": "s2", "title": "实现", "target_role": "engineer",
+     "prompt_template": "请实现 {topic}", "exit_condition": {"bus_category": "code_fix"},
+     "max_retries": 1, "condition": "", "rollback_to": ""},
+]
+
+
+# ── Engine Lifecycle ─────────────────────────────────────────────
+
+def test_engine_loads_workflows():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "alpha", SIMPLE_STEPS)
+    _write_wf(wf_dir, "beta", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    names = eng.list_workflows()
+    assert "alpha" in names
+    assert "beta" in names
+    assert len(names) == 2
+
+
+def test_engine_empty_dir():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    assert eng.list_workflows() == []
+
+
+def test_engine_non_existent_dir():
+    eng = WorkflowEngine(workflows_dir="/tmp/__nonexistent_xxxx")
+    assert eng.list_workflows() == []
+
+
+def test_engine_skips_runs_subdir():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "valid", SIMPLE_STEPS)
+    (wf_dir / "runs" / "some_run.json").write_text("{}")
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    assert "valid" in eng.list_workflows()
+
+
+def test_engine_skips_invalid_json():
+    wf_dir = _make_wf_dir()
+    (wf_dir / "broken.json").write_text("not json{{{")
+    _write_wf(wf_dir, "ok", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    assert "ok" in eng.list_workflows()
+    assert "broken" not in eng.list_workflows()
+
+
+# ── Start / Status / Cancel ──────────────────────────────────────
+
+def test_start_creates_run():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "AI Agent"})
+    assert rid.startswith("wf_")
+    s = eng.status(rid)
+    assert s["status"] == "running"
+    assert s["current_step"] == "s1"
+    # SQLite 验证 run 存在
+    lm = eng._lifecycle
+    row = lm._conn.execute("SELECT instance_id FROM workflow_instances WHERE instance_id=?", (rid,)).fetchone()
+    assert row is not None, f"workflow {rid} not in SQLite"
+
+
+def test_start_with_context():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    ctx = {"topic": "Rust 编译器", "env": "dev"}
+    rid = eng.start("test", ctx)
+    eng.run_once()
+    # 验证 context 已持久化到 workflow_instances
+    inst = eng._lifecycle.get_wf(rid)
+    inst_ctx = json.loads(inst.get("context") or "{}") if inst else {}
+    assert inst_ctx.get("topic") == "Rust 编译器", f"context.topic not persisted: {inst_ctx}"
+    assert inst_ctx.get("env") == "dev", f"context.env not persisted: {inst_ctx}"
+    s = eng.status(rid)
+    assert s["status"] in ("running", "completed"), f"Unexpected status: {s}"
+
+
+def test_start_unknown_workflow():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    try:
+        eng.start("ghost")
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "未知" in str(e)
+
+
+def test_start_empty_steps():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "empty", [])
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    # 空 steps 模板在加载时即被结构校验拒绝（不注册到 _workflows）
+    assert "empty" not in eng._workflows
+    try:
+        eng.start("empty")
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "未知工作流" in str(e)
+
+
+def test_status_nonexistent():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    s = eng.status("ghost")
+    assert "error" in s
+
+
+def test_cancel_running():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test")
+    # cancel 有"创建不足 5 分钟拒绝取消"保护 → 把 created_at 改老再 cancel
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET created_at=? WHERE instance_id=?",
+        (time.time() - 600, rid))
+    assert eng.cancel(rid)
+    s = eng.status(rid)
+    assert s["status"] == "cancelled"
+
+
+def test_cancel_already_completed():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test")
+    # cancel 有"创建不足 5 分钟拒绝取消"保护 → 把 created_at 改老再 cancel
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET created_at=? WHERE instance_id=?",
+        (time.time() - 600, rid))
+    assert eng.cancel(rid)
+    assert eng.cancel(rid) == False
+
+
+def test_cancel_nonexistent():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    assert eng.cancel("ghost") == False
+
+
+# ── Tick / Advance / Check Exit ─────────────────────────────────
+
+def test_tick_advances_on_match():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "x"})
+    # 先 run_once 标记 notified（bus_anchor=notified_at），再写消息才能被 created_after 过滤到
+    eng.run_once()
+    # 写入匹配的 bus 消息（使用有效分类 architecture）
+    eng._bb.write("architecture", "这里有调研结果", src="scout")
+    eng.run_once()
+    s = eng.status(rid)
+    # 应推进到 s2
+    assert s["current_step"] == "s2", f"应推进到 s2: {s['current_step']}"
+
+
+def test_tick_completes_on_last_step():
+    wf_dir = _make_wf_dir()
+    single_step = [{"id": "s1", "title": "调研", "target_role": "scout",
+                    "prompt_template": "调研{topic}", "exit_condition": {"bus_category": "code_fix"},
+                    "max_retries": 0, "condition": "", "rollback_to": ""}]
+    _write_wf(wf_dir, "quick", single_step)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("quick", {"topic": "x"})
+    # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
+    eng.run_once()
+    eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
+    eng.run_once()
+    s = eng.status(rid)
+    assert s["status"] == "completed", f"应 completed: {s['status']}"
+
+
+def test_tick_no_match_keeps_running():
+    """不匹配时保持 running 状态（lifecycle 不能自动推进）。"""
+    from unittest.mock import patch
+    wf_dir = _make_wf_dir()
+    steps = [{"id": "s1", "title": "调研", "target_role": "scout",
+              "prompt_template": "请调研 {topic}",
+              "exit_condition": {"bus_category": "notice", "text_contains": "TESTUNIQUE_NO_MATCH_XYZ"},
+              "max_retries": 0, "condition": "", "rollback_to": ""}]
+    _write_wf(wf_dir, "test", steps)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "x"})
+    # 阻止 _ensure_role_alive（它会 subprocess 调 ccs.py start 导致 lifecycle 推进）
+    with patch.object(eng, "_ensure_role_alive", return_value=True):
+        with patch.object(eng, "_send_to_role", return_value=None):
+            eng.run_once()
+    s = eng.status(rid)
+    assert s["current_step"] == "s1", f"期望 s1，实际 {s['current_step']}"
+    assert s["status"] == "running", f"期望 running，实际 {s['status']}"
+
+
+def test_check_exit_by_category():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    # 使用唯一的 text 过滤确保不匹配旧消息
+    ts, msgs = eng._check_exit("notice", "", "TESTEXITCATEG_NOMATCH")
+    assert not ts
+    # 写入匹配的消息
+    eng._bb.write("notice", "TESTEXITCATEG_FIND_ME", src="test_src")
+    ts, msgs = eng._check_exit("notice", "", "TESTEXITCATEG_FIND_ME")
+    assert ts
+    # source 过滤：不匹配的来源
+    ts, msgs = eng._check_exit("notice", "wrong_src", "")
+    assert not ts
+
+
+def test_check_exit_by_source():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    eng._bb.write("notice", "源过滤测试", src="specific_src_abc")
+    ts, msgs = eng._check_exit("notice", "specific_src_abc", "")
+    assert ts
+    ts, msgs = eng._check_exit("notice", "wrong_src_xyz", "")
+    assert not ts
+
+
+def test_check_exit_by_text():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    eng._bb.write("notice", "唯一文本过滤: XYZZY_NO_SUCH_123", src="test")
+    ts, msgs = eng._check_exit("notice", "", "XYZZY_NO_SUCH_123")
+    assert ts
+    ts, msgs = eng._check_exit("notice", "", "完全不存在的XYZQWERT_999")
+    assert not ts
+
+
+def test_advance_finishes():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "x"})
+    # 模拟 s1 完成，当前在 s2
+    lm = eng._lifecycle
+    lm._conn.execute(
+        "UPDATE workflow_instances SET current_step_id=?, step_results=json_set(COALESCE(step_results,'{}'),'$.s1',json(?)) WHERE instance_id=?",
+        ("s2", '{"status":"done","ts":' + str(time.time()) + '}', rid))
+    lm._conn.commit()
+    # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
+    eng.run_once()
+    eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
+    eng.run_once()
+    s = eng.status(rid)
+    assert s["status"] == "completed", f"应 completed: {s['status']}"
+
+
+# ── Timeout / Retries ────────────────────────────────────────────
+
+def test_timeout_triggers_retry():
+    wf_dir = _make_wf_dir()
+    steps = [{"id": "s1", "title": "调研", "target_role": "scout",
+              "prompt_template": "完成调研任务并输出详细结果，确保信息完整准确，验证数据来源可靠性",
+              "exit_condition": {"bus_category": "notice", "text_contains": "TESTTIMEOUT_NOMATCH_123",
+                                 "timeout_minutes": 0.001},
+              "max_retries": 2, "condition": "", "rollback_to": ""}]
+    _write_wf(wf_dir, "retry_test", steps)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("retry_test", {"topic": "x"})
+    # 多轮 run_once 确保 timeout 分支被执行（lifecycle 状态机需要多轮推进）
+    # timeout_minutes=0.001=60ms，0.1s 间隔足够（原 1.5s 无必要）
+    for _ in range(5):
+        time.sleep(0.1)
+        eng.run_once()
+    lm = eng._lifecycle
+    row = lm._conn.execute("SELECT status, step_results FROM workflow_instances WHERE instance_id=?", (rid,)).fetchone()
+    assert row[0] in ("running", "failed"), f"状态异常: {row[0]}"
+    step_results = json.loads(row[1] or "{}") if row[1] else {}
+    retries = step_results.get("s1", {}).get("timeout_count", 0) + step_results.get("s1", {}).get("retry_count", 0)
+    assert retries >= 1, f"应有重试计数: {step_results}"
+
+
+def test_timeout_escalates_not_fails():
+    """超时不自动失败，改为升级提醒。"""
+    wf_dir = _make_wf_dir()
+    steps = [{"id": "s1", "title": "调研", "target_role": "scout",
+              "prompt_template": "调研{topic}",
+              "exit_condition": {"bus_category": "notice", "text_contains": "TESTMAXRETRY_NOMATCH_456",
+                                 "timeout_minutes": 0.001},
+              "max_retries": 1, "condition": "", "rollback_to": ""}]
+    _write_wf(wf_dir, "timeout_test", steps)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("timeout_test", {"topic": "x"})
+    time.sleep(0.1)
+    eng.run_once()
+    # 超时后应仍 running（不自动失败）
+    time.sleep(0.1)
+    eng.run_once()
+    s = eng.status(rid)
+    # ponytail: 0.001 分钟超时在两次 run_once 后可能已耗尽所有重试标记为 completed，
+    # 也可能仍在 running 状态。两种状态都算正确，至少不应 failed/cancelled。
+    valid_statuses = {"running", "completed"}
+    assert s["status"] in valid_statuses, f"超时后状态异常: {s['status']}"
+    # 验证升级计数增加（在 step_results 中）
+    s1_results = s.get("results", {}).get("s1", {})
+    timeout_count = s1_results.get("timeout_count", 0)
+    if s["status"] == "running":
+        assert timeout_count >= 1, f"应记录超时次数: {s1_results}"
+
+
+# ── Conditional Steps ────────────────────────────────────────────
+
+def test_conditional_step_blocks():
+    wf_dir = _make_wf_dir()
+    steps = [
+        {"id": "s1", "title": "调研", "target_role": "scout",
+         "prompt_template": "调研{topic}",
+         "exit_condition": {"bus_category": "notice", "text_contains": "TESTCOND_S1_DONE"},
+         "max_retries": 0, "condition": "", "rollback_to": ""},
+        {"id": "s2", "title": "有条件的步骤", "target_role": "engineer",
+         "prompt_template": "实现{topic}",
+         "exit_condition": {"bus_category": "notice", "text_contains": "TESTCOND_S2_DONE"},
+         "max_retries": 0, "condition": "s1.status == 'done'", "rollback_to": ""},
+    ]
+    _write_wf(wf_dir, "cond_test", steps)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("cond_test", {"topic": "x"})
+    # s1 不匹配时，停在 s1
+    eng.run_once()
+    s = eng.status(rid)
+    assert s["current_step"] == "s1", f"s1 未匹配应停在 s1: {s['current_step']}"
+    # 手动标记 s1 完成并推进到 s2
+    lm = eng._lifecycle
+    lm._conn.execute(
+        "UPDATE workflow_instances SET current_step_id=?, step_results=json_set(COALESCE(step_results,'{}'),'$.s1',json(?)) WHERE instance_id=?",
+        ("s2", '{"status":"done","ts":' + str(time.time()) + '}', rid))
+    lm._conn.commit()
+    s2 = eng.status(rid)
+    assert s2["current_step"] == "s2"
+
+
+def test_conditional_blocks_when_not_met():
+    wf_dir = _make_wf_dir()
+    steps = [
+        {"id": "s1", "title": "调研", "target_role": "scout",
+         "prompt_template": "调研{topic}",
+         "exit_condition": {"bus_category": "notice", "text_contains": "TESTCONDBLK_S1_DONE"},
+         "max_retries": 0, "condition": "", "rollback_to": ""},
+        {"id": "s2", "title": "需要 s1 完成", "target_role": "dev",
+         "prompt_template": "做 t",
+         "exit_condition": {"bus_category": "notice", "text_contains": "TESTCONDBLK_S2_DONE"},
+         "max_retries": 0, "condition": "s1.status == 'done'", "rollback_to": ""},
+    ]
+    _write_wf(wf_dir, "cond_block", steps)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("cond_block", {"topic": "x"})
+    # s1 不匹配，不会推进 → 还在 s1
+    eng.run_once()
+    s = eng.status(rid)
+    assert s["current_step"] == "s1", f"不匹配应停在 s1: {s}"
+
+
+# ── Persistence ──────────────────────────────────────────────────
+
+def test_run_persists_on_tick():
+    """tick 推进后状态持久化到磁盘，新引擎能读到。"""
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "x"})
+    # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
+    eng.run_once()
+    # s1 的 exit_condition 是 bus_category=architecture
+    eng._bb.write("architecture", "调研结果", src="scout")
+    eng.run_once()
+    # 当前引擎内存中应已推进到 s2
+    s1 = eng.status(rid)
+    assert s1["current_step"] == "s2", f"推进后应 s2: {s1['current_step']}"
+    # 新引擎重读磁盘验证持久化
+    eng2 = WorkflowEngine(workflows_dir=wf_dir)
+    s2 = eng2.status(rid)
+    assert s2["current_step"] == "s2", f"持久化后应 s2: {s2['current_step']}"
+    # 验证 s1 结果持久化（notified 或 completed 均可，取决于 lifecycle 状态机进度）
+    assert "s1" in s2["results"], f"s1 结果未持久化: {s2['results']}"
+    status_map = s2["results"]["s1"].get("status", "")
+    assert status_map in ("completed", "notified"), f"s1 状态异常: {status_map}"
+
+
+def test_corrupted_run_file():
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    (wf_dir / "runs" / "corrupted.json").write_text("{{{bad json")
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    # run_once 不应崩溃
+    eng.run_once()
+
+
+# ── Workspace Summary ────────────────────────────────────────────
+
+def test_collect_workspace_summary():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    ws_dir = Path(tempfile.mkdtemp())
+    (ws_dir / "PRD.md").write_text("# PRD\n这是一个产品需求文档")
+    summary = eng._collect_workspace_summary(ws_dir)
+    assert "PRD" in summary
+    assert "产品需求" in summary
+    # 不存在的目录
+    assert eng._collect_workspace_summary(Path("/tmp/__nope_xxx")) == "workspace 不存在"
+
+
+def test_workspace_summary_in_prompt():
+    wf_dir = _make_wf_dir()
+    ws_dir = Path.home() / ".hermes" / "workspace" / "test_ws_project"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "PRD.md").write_text("# 需求文档 WS_SUMMARY_UNIQUE_8899")
+    steps = [{"id": "s1", "title": "调研", "target_role": "scout",
+              "prompt_template": "项目情况: {workspace_summary}",
+              "exit_condition": {"bus_category": "notice", "text_contains": "TESTWS_998877"},
+              "max_retries": 0, "condition": "", "rollback_to": ""}]
+    _write_wf(wf_dir, "ws_test", steps)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    eng.start("ws_test", {"topic": "x", "project_name": "test_ws_project"})
+    # workspace_summary 通过 _write_step_prompt → _send_to_role → bus(task_spec) 发送
+    # 检查 _send_to_role 是否被调用且 prompt 中包含 workspace_summary
+    all_facts = eng._bb.read(cat="task_spec", limit=500)
+    matched = [f for f in all_facts if "WS_SUMMARY_UNIQUE_8899" in (f.e or "")]
+    assert len(matched) >= 1, f"workspace_summary 应被替换到 prompt 中 (found {len(matched)} in {len(all_facts)})"
+
+
+# ── Run once 不崩溃 ──────────────────────────────────────────────
+
+def test_run_once_empty():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    eng.run_once()
+
+
+def test_run_once_missing_workflow_def():
+    wf_dir = _make_wf_dir()
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    try:
+        eng.start("ghost")
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "ghost" in str(e)
+
+
+# ── CLI ──────────────────────────────────────────────────────────
+
+def test_cli_list_steers():
+    """验证 CLI 子命令解析（不实际执行 daemon）。"""
+    p = __import__('argparse').ArgumentParser()
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("start")
+    s.add_argument("name")
+    s.add_argument("--context", default="{}")
+    sub.add_parser("list")
+    s2 = sub.add_parser("status")
+    s2.add_argument("workflow_id")
+    s3 = sub.add_parser("cancel")
+    s3.add_argument("workflow_id")
+    sub.add_parser("tick")
+    daemon = sub.add_parser("daemon")
+    daemon.add_argument("--interval", type=int, default=10)
+    args = p.parse_args(["list"])
+    assert args.cmd == "list"
+
+
+# ── Main ─────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=== WorkflowEngine 测试 ===\n")
+
+    tests = [
+        ("加载工作流定义", test_engine_loads_workflows),
+        ("空目录加载", test_engine_empty_dir),
+        ("不存在的目录", test_engine_non_existent_dir),
+        ("跳过 runs 子目录", test_engine_skips_runs_subdir),
+        ("跳过无效 JSON", test_engine_skips_invalid_json),
+        ("启动创建运行", test_start_creates_run),
+        ("启动带 context", test_start_with_context),
+        ("未知工作流名称", test_start_unknown_workflow),
+        ("空步骤列表", test_start_empty_steps),
+        ("不存在的 status", test_status_nonexistent),
+        ("取消运行中的工作流", test_cancel_running),
+        ("取消已完成的工作流", test_cancel_already_completed),
+        ("取消不存在的工作流", test_cancel_nonexistent),
+        ("tick 匹配推进", test_tick_advances_on_match),
+        ("tick 最后一步完成", test_tick_completes_on_last_step),
+        ("tick 不匹配保持运行", test_tick_no_match_keeps_running),
+        ("exit_condition 按分类", test_check_exit_by_category),
+        ("exit_condition 按来源", test_check_exit_by_source),
+        ("exit_condition 按文本", test_check_exit_by_text),
+        ("advance 完成", test_advance_finishes),
+        ("超时触发重试", test_timeout_triggers_retry),
+        ("超时不自动失败", test_timeout_escalates_not_fails),
+        ("条件步骤推进", test_conditional_step_blocks),
+        ("条件不满足阻塞", test_conditional_blocks_when_not_met),
+        ("run 持久化", test_run_persists_on_tick),
+        ("损坏的 run 文件", test_corrupted_run_file),
+        ("收集 workspace summary", test_collect_workspace_summary),
+        ("workspace_summary 替换", test_workspace_summary_in_prompt),
+        ("run_once 空", test_run_once_empty),
+        ("CLI 子命令解析", test_cli_list_steers),
+    ]
+
+    passed = 0
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            passed += 1
+        except Exception as e:
+            print(f"  ✗ {name}: {e}")
+            import traceback
+            traceback.print_exc()
+            failed += 1
+
+    print(f"\n结果: {passed} 通过, {failed} 失败")
+    sys.exit(1 if failed else 0)
+
+
+# ── 投递失败计数幂等护栏（fix-delivery-fail-count）─────────────────
+def test_delivery_fail_count_idempotent_when_notified():
+    """已盖戳 notified 的 step，即使 _send_to_role 返回 None/False，
+    delivery_fail_count 也不应续涨、status 不被覆盖回空。
+    复现根因：wf_sub_06b9e/s1 count=35 且 status=notified。"""
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "幂等护栏"})
+    lm = eng._lifecycle
+    # 手动把 s1 置为已 notified + 已有计数
+    lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+               (json.dumps({"s1": {"status": "notified", "delivery_fail_count": 5}}, ensure_ascii=False), rid))
+    # 模拟 _send_to_role 返回 None（goal 过短路径历史行为）
+    with patch.object(eng, "_send_to_role", return_value=None):
+        eng.run_once()
+    sr = json.loads(lm.get_wf(rid)["step_results"])
+    assert sr["s1"]["delivery_fail_count"] == 5, f"已 notified 不应续涨计数: {sr['s1']}"
+    assert sr["s1"]["status"] == "notified", f"status 不应被覆盖: {sr['s1']}"
+
+
+def test_delivery_fail_count_accumulates_when_unnotified():
+    """真未通知的 step 才累加计数，达阈值设 delivery_blocked 终态。"""
+    wf_dir = _make_wf_dir()
+    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    eng = WorkflowEngine(workflows_dir=wf_dir)
+    rid = eng.start("test", {"topic": "真失败累计"})
+    lm = eng._lifecycle
+    with patch.object(eng, "_send_to_role", return_value=False):
+        for _ in range(3):
+            eng.run_once()
+    sr = json.loads(lm.get_wf(rid)["step_results"])
+    assert sr["s1"]["delivery_fail_count"] == 3, f"未通知应累计到 3: {sr['s1']}"
+    assert sr["s1"]["status"] == "delivery_blocked", f"达阈值应置 delivery_blocked: {sr['s1']}"

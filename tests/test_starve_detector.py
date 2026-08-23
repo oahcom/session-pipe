@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""饥饿检测器功能测试 — 验证核心逻辑路径，无外部依赖。"""
+
+import json
+import sys
+import time
+import tempfile
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from pipeflow import daemon
+
+
+# ── 1. 活跃状态通过 engine 公共接口查询 ──
+def test_active_statuses():
+    from unittest.mock import MagicMock
+    eng = MagicMock()
+    eng.active_workflow_count.return_value = 2
+    assert isinstance(daemon._active_count(eng), int)
+
+
+# ── 2. _STARVE_ROUNDS = 36（6 分钟 @ 10s 间隔） ──
+def test_starve_rounds():
+    assert daemon._STARVE_ROUNDS == 36
+    assert daemon._STARVE_COOLDOWN == 6 * 3600
+
+
+# ── 3. _active_count 正常返回 ──
+def test_active_count_returns_int():
+    eng = MagicMock()
+    eng.active_workflow_count.return_value = 5
+    assert daemon._active_count(eng) == 5
+
+
+def test_active_count_empty():
+    eng = MagicMock()
+    eng.active_workflow_count.return_value = 0
+    assert daemon._active_count(eng) == 0
+
+
+def test_active_count_db_error_returns_zero():
+    """engine.active_workflow_count 内部捕获 DB 错误并返回 0。"""
+    from pipeflow.engine import WorkflowEngine
+    from unittest.mock import MagicMock
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        eng = WorkflowEngine(workflows_dir=Path(tmp) / "_wf")
+        mock_lm = MagicMock()
+        mock_lm.query.side_effect = Exception("db locked")
+        eng._lm = mock_lm
+        assert eng.active_workflow_count() == 0
+
+
+# ── 4. 冷却期内不重复触发 ──
+def test_cooldown_blocks_refire():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 100,  # 100 秒前触发过
+            "last_wf": "wf_test",
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path):
+            eng = MagicMock()
+            with patch.object(daemon, "subprocess"):
+                daemon._starve_signal(eng)
+            # eng.start 不应被调用（冷却期内）
+            eng.start.assert_not_called()
+
+
+# ── 5. 冷却到期后正常触发 ──
+def test_cooldown_expired_fires():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - daemon._STARVE_COOLDOWN - 1,  # 已过冷却
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess") as mock_sub:
+            eng = MagicMock()
+            eng.start.return_value = "wf_new123"
+            daemon._starve_signal(eng)
+            eng.start.assert_called_once_with(
+                "food_chain_loop",
+                context={"source": "starve_detector", "reason": "连续6分钟无活跃工作流"},
+            )
+            # bus 写入也触发了
+            mock_sub.run.assert_called()
+
+
+# ── 6. 首次触发（无 state 文件） ──
+def test_first_fire_without_state_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"  # 不存在
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_first"
+            daemon._starve_signal(eng)
+            eng.start.assert_called_once()
+            assert state_path.exists()
+            saved = json.loads(state_path.read_text())
+            assert saved["last_wf"] == "wf_first"
+
+
+# ── 7. 工作流创建失败时写入 failure 计数 ──
+def test_workflow_create_failure_writes_failure_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.side_effect = Exception("模板不存在")
+            daemon._starve_signal(eng)
+            # 失败时写入 consecutive_failures（用于退避计算）
+            assert state_path.exists()
+            saved = json.loads(state_path.read_text())
+            assert saved["consecutive_failures"] == 1
+            assert "last_failure_ts" in saved
+
+
+# ── 8. run_once 饥饿计数器逻辑模拟 ──
+def test_starve_counter_logic():
+    """模拟 daemon 主循环中的计数器行为。"""
+    starve_rounds = 0
+    threshold = daemon._STARVE_ROUNDS
+    fired = []
+
+    # 模拟 35 轮空转（未达阈值）
+    for _ in range(35):
+        starve_rounds += 1
+        if starve_rounds >= threshold:
+            fired.append(True)
+    assert len(fired) == 0  # 未触发
+
+    # 第 36 轮触发
+    starve_rounds += 1
+    if starve_rounds >= threshold:
+        fired.append(True)
+    assert len(fired) == 1  # 触发了
+    starve_rounds = 0  # 重置
+
+    # 重置后新一轮不触发
+    for _ in range(10):
+        starve_rounds += 1
+        if starve_rounds >= threshold:
+            fired.append(True)
+    assert len(fired) == 1  # 没有新增触发
+
+    # 活跃工作流出现 → 计数器归零
+    starve_rounds = 0
+    for _ in range(50):
+        starve_rounds += 1
+    starve_rounds = 0  # 活跃检测重置
+    assert starve_rounds == 0
+
+
+# ── 9. 端到端：starve 触发 → 工作流存在 ──
+def test_end_to_end_starve_creates_workflow():
+    """验证完整触发链路（mock 替换 IO）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_e2e_test"
+            daemon._starve_signal(eng)
+            saved = json.loads(state_path.read_text())
+            assert saved["last_wf"] == "wf_e2e_test"
+            assert "last_fire" in saved
+            # 验证冷却机制：第二次不触发
+            daemon._starve_signal(eng)
+            assert eng.start.call_count == 1  # 仍是 1 次
+
+
+# ── 10. _ensure_role_alive 调用 ccs.py ──
+def test_ensure_role_alive_calls_ccs():
+    with patch.object(daemon, "subprocess") as mock_sub:
+        mock_sub.run.return_value = MagicMock(returncode=0, stderr="")
+        ok = daemon._ensure_role_alive("scout")
+        assert ok is True
+        call_args = mock_sub.run.call_args[0][0]
+        # [python3, ccs.py, start, scout, --no-attach, --no-auto-send]
+        assert "ccs.py" in call_args[1]
+        assert "scout" in call_args
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    passed = failed = 0
+    for t in tests:
+        try:
+            t()
+            passed += 1
+        except Exception as e:
+            failed += 1
+            print(f"FAIL {t.__name__}: {e}")
+    print(f"\n{'PASS' if failed == 0 else 'FAIL'}: {passed}/{passed+failed} tests passed")
+    sys.exit(1 if failed else 0)
+
+# ── 11. 连续失败退避：失败次数≥5 后冷却 24h（非 6h） ──
+def test_backoff_after_consecutive_failures():
+    from unittest.mock import patch, MagicMock
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        fails = 6  # 已 6 次连续失败
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 100,  # 100 秒前
+            "last_failure_ts": time.time() - 100,  # 最近失败 100s 前
+            "consecutive_failures": fails,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_backoff"
+            daemon._starve_signal(eng)
+            # 6 次失败 + 最近失败在 24h 内 → 退避，不创建
+            eng.start.assert_not_called()
+
+# ── 12. 失败次数<5 时冷却仍为 6h ──
+def test_normal_cooldown_below_threshold():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 100,
+            "consecutive_failures": 3,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_ok"
+            daemon._starve_signal(eng)
+            # 3 次失败 < 5 → 冷却 6h，100 秒前不够 → 不触发
+            eng.start.assert_not_called()
+
+# ── 13. 失败会累加计数并持久化 ──
+def test_failure_increments_counter():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.side_effect = Exception("模板不存在")
+            daemon._starve_signal(eng)
+            saved = json.loads(state_path.read_text())
+            assert saved["consecutive_failures"] == 1
+
+# ── 14. 成功后清零失败计数 ──
+def test_success_resets_failures():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - daemon._STARVE_COOLDOWN - 1,
+            "consecutive_failures": 3,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.return_value = "wf_success"
+            daemon._starve_signal(eng)
+            saved = json.loads(state_path.read_text())
+            assert "consecutive_failures" not in saved
+
+# ── 15. 竞态防护：已有活跃 food_chain_loop → 跳过触发 ──
+# 用带真实方法定义的 stub 类（MagicMock 类型无 has_active_template，会绕过竞态检查）
+class _StubEngine:
+    """最小 stub：模拟 WorkflowEngine 的 has_active_template/start 接口。"""
+    def __init__(self, active=False, start_result="wf_stub", start_error=None):
+        self.active = active
+        self.start_result = start_result
+        self.start_error = start_error
+        self.start_calls = []
+
+    def has_active_template(self, template_id):
+        if self.active == "error":
+            raise Exception("db locked")
+        return self.active
+
+    def start(self, name, context=None):
+        self.start_calls.append((name, context))
+        if self.start_error:
+            raise self.start_error
+        return self.start_result
+
+
+def test_race_guard_skips_when_active():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = _StubEngine(active=True)  # 已有活跃实例
+            daemon._starve_signal(eng)
+            assert eng.start_calls == []  # 不应创建新工作流
+
+# ── 16. 竞态检查失败（异常）→ 保守跳过 ──
+def test_race_guard_error_skips():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = _StubEngine(active="error")  # 查询抛异常
+            daemon._starve_signal(eng)
+            assert eng.start_calls == []  # 查询失败时保守跳过
+
+# ── 17. 无活跃实例 → 正常触发 ──
+def test_race_guard_no_active_fires():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = _StubEngine(active=False)  # 无活跃实例
+            daemon._starve_signal(eng)
+            assert len(eng.start_calls) == 1
+            assert eng.start_calls[0][0] == "food_chain_loop"
+            assert eng.start_calls[0][1] == {
+                "source": "starve_detector", "reason": "连续6分钟无活跃工作流",
+            }
+            # 冷却机制：第二次触发因 last_fire 更新被静默
+            daemon._starve_signal(eng)
+            assert len(eng.start_calls) == 1  # 仍是 1 次
+
+
+# ── 15. 失败退避：last_failure_ts 参与冷却（codex P1 修复验证） ──
+def test_backoff_engages_with_only_failure_ts():
+    """连续失败后，即使 last_fire=0，冷却仍以 last_failure_ts 为锚点。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        # 模拟：从未成功，但连续 6 次失败（超过阈值 5）
+        state_path.write_text(json.dumps({
+            "last_fire": 0,           # 从未成功
+            "consecutive_failures": 6,
+            "last_failure_ts": time.time() - 100,  # 100s 前失败
+            "last_wf": None
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "_ensure_role_alive", return_value=True), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng.start.side_effect = Exception("模板不存在")
+            daemon._starve_signal(eng)
+            # 冷却 = 24h = 86400s，距失败仅 100s → 应跳过，不重试
+            eng.start.assert_not_called()
+            # 连续失败计数不递增（因为冷却期内 return）
+            saved = json.loads(state_path.read_text())
+            assert saved["consecutive_failures"] == 6

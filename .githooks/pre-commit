@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# pre-commit hook: py_compile all staged .py files
+echo "=== pre-commit: py_compile ==="
+for f in $(git diff --cached --name-only --diff-filter=ACM | grep '\.py$'); do
+  if [ -f "$f" ]; then
+    python3 -m py_compile "$f" && echo "  OK $f" || { echo "  FAIL $f"; exit 1; }
+  fi
+done
+echo "  all staged .py files OK"

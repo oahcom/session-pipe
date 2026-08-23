@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""workflow_metrics.py — CCS 工作流效率指标分析。
+
+用法:
+  python3 workflow_metrics.py              # 当前快照
+  python3 workflow_metrics.py --by-role    # 按角色统计
+  python3 workflow_metrics.py --fail-rate  # 任务失败率
+"""
+import sqlite3, json, sys, time
+from pathlib import Path
+
+DB = Path.home() / ".hermes" / "state" / "workflows.db"
+
+
+def snapshot():
+    db = sqlite3.connect(str(DB))
+    db.row_factory = sqlite3.Row
+    total = db.execute("SELECT COUNT(*) as c FROM workflow_instances").fetchone()["c"]
+    by_status = {
+        r["status"]: r["c"]
+        for r in db.execute("SELECT status, COUNT(*) as c FROM workflow_instances GROUP BY status").fetchall()
+    }
+    completed = by_status.get("completed", 0)
+    running = by_status.get("running", 0)
+    cancelled = by_status.get("cancelled", 0)
+
+    print("=== 当前快照 ===")
+    print(f"总计: {total} | 完成: {completed} | 运行中: {running} | 取消: {cancelled}")
+    print(f"完成率: {completed/max(total,1)*100:.1f}%")
+    print()
+
+    # 超时统计
+    rows = db.execute(
+        "SELECT step_results FROM workflow_instances WHERE status='running'"
+    ).fetchall()
+    tc_dist = {}
+    for r in rows:
+        try:
+            sr = json.loads(r["step_results"] or "{}")
+        except Exception: continue
+        for sdata in sr.values():
+            if isinstance(sdata, dict):
+                tc = sdata.get("timeout_count", 0)
+                tc_dist[tc] = tc_dist.get(tc, 0) + 1
+    if tc_dist:
+        print("=== 运行中步骤的 timeout_count 分布 ===")
+        for tc in sorted(tc_dist):
+            print(f"  timeout_count={tc}: {tc_dist[tc]} 步")
+        print()
+
+
+def by_role():
+    db = sqlite3.connect(str(DB))
+    db.row_factory = sqlite3.Row
+    rows = db.execute(
+        "SELECT assignee, status, COUNT(*) as c FROM workflow_instances "
+        "GROUP BY assignee, status ORDER BY assignee"
+    ).fetchall()
+    print("=== 按角色统计 ===")
+    by_role = {}
+    for r in rows:
+        role = r["assignee"] or "未分配"
+        if role not in by_role:
+            by_role[role] = {}
+        by_role[role][r["status"]] = r["c"]
+    for role in sorted(by_role):
+        s = by_role[role]
+        total = sum(s.values())
+        done = s.get("completed", 0)
+        print(f"  {role:<15} 总计={total:>3} 完成={done:>3} 取消={s.get('cancelled',0):>3} "
+              f"运行={s.get('running',0):>3} 完成率={done/max(total,1)*100:.0f}%")
+
+
+def fail_rate():
+    """失败率与超时统计：failed 任务数 / 总任务数（含 timeout 累计）。"""
+    db = sqlite3.connect(str(DB))
+    db.row_factory = sqlite3.Row
+    total = db.execute("SELECT COUNT(*) as c FROM tasks").fetchone()["c"]
+    by_status = {
+        r["status"]: r["c"]
+        for r in db.execute("SELECT status, COUNT(*) as c FROM tasks GROUP BY status").fetchall()
+    }
+    failed = by_status.get("failed", 0)
+    # timeout_count 存在 workflow_instances.step_results JSON 中（tasks 表无此列）
+    rows = db.execute("SELECT step_results FROM workflow_instances").fetchall()
+    timeout_sum = 0
+    for r in rows:
+        try:
+            sr = json.loads(r["step_results"] or "{}")
+        except Exception:
+            continue
+        for sdata in sr.values():
+            if isinstance(sdata, dict):
+                timeout_sum += int(sdata.get("timeout_count", 0))
+    print("=== 任务失败率 ===")
+    print(f"任务总数: {total} | 失败: {failed} | 失败率: {failed/max(total,1)*100:.1f}%")
+    print(f"超时累计: {timeout_sum} 次")
+    print()
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "--by-role" in args:
+        by_role()
+    elif "--fail-rate" in args:
+        fail_rate()
+    else:
+        snapshot()
+        fail_rate()
