@@ -15,31 +15,6 @@ from reliability import (
 )
 
 
-def _get_retry_policy():
-    import reliability as _rel
-    return _rel.DEFAULT_RETRY or _rel.RetryPolicy()
-
-
-def _get_shutdown():
-    """Lazy access to GRACEFUL_SHUTDOWN (needs _ensure_initialized first)."""
-    import reliability as _rel
-    return _rel.GRACEFUL_SHUTDOWN
-from routing import router as _rt_mod
-from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
-# 延迟导入 launcher.sentinel（避免模块级循环依赖）
-_list_sentinels = None
-def list_sentinels():
-    """读取 CCS 哨兵列表。延迟导入 sentinel（可能不存在于当前 sys.path）。"""
-    global _list_sentinels
-    if _list_sentinels is None:
-        import importlib
-        # 确保 session-launcher/src 在 sys.path 中
-        _launcher_src = str(_LAUNCHER_SRC)
-        if _launcher_src not in sys.path:
-            sys.path.insert(0, _launcher_src)
-        _sentinel_mod = importlib.import_module("sentinel")
-        _list_sentinels = getattr(_sentinel_mod, "list_sentinels", lambda: [])
-    return _list_sentinels()
 
 
 def poll_unconsumed(category: str | None = None, consumer: str | None = None, instance_id: str = "", limit: int = 100) -> list[dict]:
@@ -83,64 +58,6 @@ def status() -> dict:
     }
 
 
-def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") -> dict:
-    """消费一条消息，自动标记其他应消费该分类的角色为已消费。
-
-    消费联动（P1 修复）：
-    - 主消费者 consume（幂等 + 熔断）
-    - 其他应消费该分类的角色自动标记 consume（联动更新 rc）
-    - 记录 ACK + metrics + 心跳
-    """
-    from bus_protocol import Blackboard
-
-    bb = Blackboard()
-    router = _rt_mod.get_router()
-    tid = fact_id
-
-    # 获取所有应消费该分类的角色
-    all_consumers = router.get_consumers(category)
-    # 排除主消费者自己
-    linked = [r for r in all_consumers if r != consumer]
-
-    # 熔断器保护消费操作
-    def _do_consume():
-        bb.mark_consumed(fact_id, consumer)
-
-    try:
-        CIRCUIT_BREAKER.call(_do_consume)
-        # 联动：自动标记其他角色已消费
-        for linked_role in linked:
-            try:
-                bb.mark_consumed(fact_id, linked_role)
-            except Exception as exc:
-                LOGGER.warning("auto-link consume failed for fact=%s linked_role=%s: %s", fact_id, linked_role, exc)
-                METRICS.inc("consume_errors_total", labels={"consumer": linked_role})
-    except Exception as e:
-        LOGGER.error(f"consume #{tid} failed: {e}", extra={"trace_id": str(tid)})
-        METRICS.inc("consume_errors_total", labels={"consumer": consumer})
-        return {
-            "consumed": fact_id,
-            "by": consumer,
-            "category": category,
-            "error": str(e),
-        }
-
-    HEARTBEAT.beat(consumer)
-    METRICS.inc("consume_count", labels={"consumer": consumer})
-
-    ACK_TRACKER.record_ack(fact_id, consumer, "consumed", category=category)
-
-    LOGGER.info(
-        f"Consumed #{fact_id} [{category}] by {consumer}, auto-linked: {linked}",
-        extra={"trace_id": str(fact_id)}
-    )
-
-    return {
-        "consumed": fact_id,
-        "by": consumer,
-        "category": category,
-        "auto_linked": linked,
-    }
 
 
 
