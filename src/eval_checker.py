@@ -10,11 +10,8 @@ eval_checker.py — eval_criteria 运行时执行器。
     run_eval_check()  # 每 300s 调一次
 """
 
-import ast, json, logging, os, random, re, subprocess, sys, time
+import ast, json, logging, os, random, re, subprocess, sys
 from pathlib import Path
-
-PASS_RATE_LOG = Path(os.path.expanduser("~/.hermes/data/eval_passrate.jsonl"))
-PASS_RATE_KEEP = 50
 
 SRC_DIR = Path(__file__).resolve().parent
 # ponytail: 由 paths.py 统一管理路径；运行时可通过环境变量覆盖
@@ -442,38 +439,6 @@ def _write_bus(cat: str, text: str, *, evidence: str = "", src: str = "eval_chec
         LOGGER.warning("bus write fail: %s", e)
 
 
-def _record_pass_rate(summary: dict, role_filter: str | None, diag: str | None = None) -> None:
-    """把本轮 pass-rate append 到本地滚动 JSONL，作为后续参数反推的只读数据源。
-
-    diag: 失败诊断文本（TextGrad 范式的「文本梯度」原料）；为空时由 summary 数量字段合成。
-    """
-    try:
-        checked = summary["checked"]
-        pass_rate = round(summary["passed"] / checked, 4) if checked else 0.0
-        if not diag:
-            # 合成诊断: 只列异常字段, 全过则标 all_passed —— 为下游优化提供梯度源
-            diag = (f"failed={summary['failed']} notices={summary['notices']} "
-                    f"blockers={summary['blockers']}") if (summary["failed"] or summary["notices"] or summary["blockers"]) else "all_passed"
-        row = {
-            "ts": int(time.time()),
-            "checked": checked,
-            "passed": summary["passed"],
-            "failed": summary["failed"],
-            "pass_rate": pass_rate,
-            "role_filter": role_filter,
-            "diag": diag,
-        }
-        PASS_RATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with PASS_RATE_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        # ponytail: 仅保留最近 50 行，超出则截断；O(n) 重写，数据量小可接受
-        lines = PASS_RATE_LOG.read_text(encoding="utf-8").splitlines()
-        if len(lines) > PASS_RATE_KEEP:
-            PASS_RATE_LOG.write_text("\n".join(lines[-PASS_RATE_KEEP:]) + "\n", encoding="utf-8")
-    except Exception as e:
-        LOGGER.warning("pass-rate log fail: %s", e)
-
-
 def _is_critical(criterion: str) -> bool:
     """检查 criterion 是否为 critical 级别（severity: critical）。"""
     return bool(re.search(r'severity[:\s=]*critical', criterion, re.IGNORECASE))
@@ -494,11 +459,6 @@ def _load_roles() -> list | None:
         except Exception as e:
             LOGGER.warning("skip %s: %s", f.name, e)
     return roles
-
-
-def _find_unverified(roles: list) -> list:
-    """返回所有 criterion 均为自然语言（无可执行命令）的角色。"""
-    return [r for r in roles if not any("验证:" in c for c in r["eval_criteria"])]
 
 
 def run_eval_check(role_filter: str | None = None) -> dict:
@@ -582,86 +542,17 @@ def run_eval_check(role_filter: str | None = None) -> dict:
         summary["failed"], summary["skipped"],
         summary["notices"], summary["blockers"],
     )
-    _record_pass_rate(summary, role_filter)
     summary["avg_score"] = round(score_sum / score_n, 4) if score_n else 0.0
     return summary
-
-
-def precheck_all_personas() -> dict:
-    """离线预检: 扫描全部 persona 的 eval_criteria，验证命令提取 + 白名单。
-
-    返回 {roles: [{name, criteria: [{criterion, cmd, extracted_ok, will_run_ok, error}]}], summary: {...}}
-    """
-    roles = _load_roles()
-    if not roles:
-        return {"roles": [], "summary": {"total": 0}}
-    results = []
-    for role in roles:
-        items = []
-        for c in role.get("eval_criteria", []):
-            extracted = _extract_cmd(c)
-            if extracted is None:
-                items.append({"criterion": c[:80], "cmd": None,
-                              "extracted_ok": False, "will_run_ok": False,
-                              "error": "extract_cmd 返回 None"})
-                continue
-            cmd_raw, expected = extracted
-            is_shell = _is_shell_cmd(cmd_raw)
-            is_tool_err = False
-            run_ok = False
-            error = None
-            if not is_shell:
-                error = f"首词不在 _is_shell_cmd 关键字列表: {cmd_raw.split()[0] if cmd_raw else '?'}"
-            else:
-                r = _run(cmd_raw, timeout=5)
-                is_tool_err = _is_tool_error(r)
-                # 用 _check_passed 做完整判断（grep 无匹配 exit=1 + expected=0 → PASS）
-                if expected and not is_tool_err and r["returncode"] in (0, 1):
-                    passed, _detail = _check_passed(r, cmd_raw, expected)
-                    run_ok = passed
-                else:
-                    run_ok = r["ok"]
-                if not run_ok and not is_tool_err:
-                    error = f"exit={r['returncode']} stderr={r['stderr'][:60]}"
-            items.append({"criterion": c[:80], "cmd": cmd_raw,
-                          "extracted_ok": True, "will_run_ok": run_ok,
-                          "error": error})
-        results.append({"name": role["name"], "criteria": items})
-    bad_count = sum(1 for r in results for c in r["criteria"]
-                    if not c["extracted_ok"] or (c["extracted_ok"] and c["error"]))
-    return {"roles": results,
-            "summary": {"total": len(results), "bad_criteria": bad_count}}
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     import argparse
     parser = argparse.ArgumentParser(description="eval_criteria checker")
-    parser.add_argument("--report-unverified", action="store_true",
-                        help="输出无可执行 criterion 的角色（全自然语言）")
-    parser.add_argument("--precheck", action="store_true",
-                        help="离线预检全部 persona 的 eval_criteria 命令")
     parser.add_argument("--role", type=str, default=None,
                         help="只检查指定角色")
     args = parser.parse_args()
-
-    if args.precheck:
-        result = precheck_all_personas()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result["summary"]["bad_criteria"] == 0 else 1
-
-    if args.report_unverified:
-        roles = _load_roles()
-        if roles is None:
-            return 1
-        unverified = _find_unverified(roles)
-        if unverified:
-            print("未验证角色（全自然语言，无可执行 criterion）:")
-            for r in unverified:
-                print(f"  - {r['name']}")
-        else:
-            print("所有角色至少有一个可执行 criterion")
-        return 0
 
     s = run_eval_check(role_filter=args.role)
     print(json.dumps(s, ensure_ascii=False))
