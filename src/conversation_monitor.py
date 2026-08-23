@@ -85,10 +85,13 @@ class ConversationSignal:
     step_completed: bool = False
     completion_evidence: str = ""
     idle_complaint: bool = False
+    idle_count: int = 0          # 连续 N 轮 idle_complaint — 用于判断是否该回收僵尸
     idle_evidence: str = ""
     violation_found: bool = False
     violation_commands: list[str] = field(default_factory=list)
     violation_role: str = ""
+    content_void: bool = False
+    void_evidence: str = ""
 
 # ── Shell 命令特征 → 操作类型 ──
 _SHELL_SIGNATURES: dict[str, list[str]] = {
@@ -219,6 +222,28 @@ def parse_conversation_signals(pane_text: str, role: str) -> ConversationSignal:
         sig.violation_commands = found[:5]
         sig.violation_role = role
 
+    # ── 信号 4：内容空转（噪音循环）──
+    # 角色 pane 里只有治理/调度 ack 信号、无任何产出性动作证据时，判 content_void。
+    # 这是"用内容判断替代流程指标"的关键：pane 有输出变更 ≠ 角色在高质量产出。
+    _PRODUCTION_EVIDENCE = [
+        r"Goal achieved", r"产出完整|产出齐全", r"step_done_ready",
+        r"写[^了]*文件|创建.*\.py|创建.*\.md|写入.*文件",
+        r"\bpytest\b.*passed|\bpy_compile\b.*PASS",
+        r"commit|git push|git add",
+        r"修复|实现|重构|优化|设计|分析",
+    ]
+    _NOISE_SIGNS = [
+        r"调度脉冲", r"超时.*重推.*升级", r"\[notice\]", r"\[blocker\]",
+        r"Interrupted", r"monitor_audit", r"test_exit_schema",
+        r"无.*待办|保持.*待机|无待办", r"snap 已更新|轮次完成",
+    ]
+    _has_production = any(re.search(p, pane_text) for p in _PRODUCTION_EVIDENCE)
+    _noise_count = sum(1 for p in _NOISE_SIGNS if re.search(p, pane_text))
+    # 有治理噪音特征且没有任何产出性证据 → 空转（刷治理噪音而非真实产出）
+    if _noise_count >= 2 and not _has_production:
+        sig.content_void = True
+        sig.void_evidence = f"noise_signs={_noise_count}, no_production_evidence"
+
     return sig
 
 
@@ -252,12 +277,17 @@ def propose_governance_action(role: str) -> dict:
         actions.append(f"idle 空转: {sig.idle_evidence}")
     if sig.violation_found:
         actions.append(f"violation 越界: {'; '.join(sig.violation_commands[:3])}")
+    if sig.content_void:
+        actions.append(f"content_void: {sig.void_evidence}")
 
     if not actions:
-        return {"idle": sig.idle_complaint, "violation": sig.violation_found, "proposed": False}
+        return {"idle": sig.idle_complaint, "violation": sig.violation_found,
+                "content_void": sig.content_void, "proposed": False}
 
     title = f"[治理提案] {role}: " + "; ".join(actions)[:80]
-    evidence = f"role={role} idle={sig.idle_complaint} violation={sig.violation_found}"
+    evidence = (f"role={role} idle={sig.idle_complaint} "
+                f"violation={sig.violation_found} content_void={sig.content_void} "
+                f"void_evidence={sig.void_evidence}")
     try:
         subprocess.run(
             [str(_BUS_CLIENT), "write", "architecture", title,
@@ -266,7 +296,8 @@ def propose_governance_action(role: str) -> dict:
         LOGGER.info("治理提案已写 bus: %s", title)
     except (OSError, subprocess.TimeoutExpired):
         pass  # 写 bus 失败不阻塞
-    return {"idle": sig.idle_complaint, "violation": sig.violation_found, "proposed": True}
+    return {"idle": sig.idle_complaint, "violation": sig.violation_found,
+            "content_void": sig.content_void, "proposed": True}
 
 
 # 非生产测试/垃圾 persona 過濾（CCS 审计 #324584 發現，避免 G3 對不存在角色產出無效提案）
@@ -276,21 +307,29 @@ _NON_PRODUCTION_ROLES = frozenset({
 })
 
 
-def scan_and_propose(roles: list[str] | None = None) -> int:
+def scan_and_propose(roles: list[str] | None = None) -> list[dict]:
     """对所有（或指定）角色扫描对话信号并写治理提案。供 routing_daemon 轮询调用。
 
-    返回提案数量。會過濾非生产 persona。
+    返回提案列表，每个 {role, idle, violation, content_void, proposed, _action}。
+    _action ∈ {"idle","violation","content_void"} 供自动执行判定。
     """
     if roles is None:
         roles = [p.stem.replace("persona_", "") for p in
                  Path.home().joinpath("hermes-session-roles", "personas", "session-roles").glob("persona_*.json")]
     roles = [r for r in roles if r not in _NON_PRODUCTION_ROLES]
-    proposed = 0
+    proposals: list[dict] = []
     for role in roles:
         try:
-            if propose_governance_action(role).get("proposed"):
-                proposed += 1
+            r = propose_governance_action(role)
+            if r.get("proposed"):
+                action = ("idle" if r.get("idle") else
+                          "violation" if r.get("violation") else
+                          "content_void")
+                r2 = dict(r)
+                r2["role"] = role
+                r2["_action"] = action
+                proposals.append(r2)
         except Exception as e:
             LOGGER.debug("scan_and_propose 角色失败 %s: %s", role, e)
-    return proposed
+    return proposals
 

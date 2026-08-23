@@ -166,7 +166,6 @@ def main():
     last_eval = 0
     last_survival = 0
     last_drift = 0
-    last_metrics = 0
     last_consistency = 0
     last_contract = 0
     last_p0_check = 0
@@ -263,6 +262,7 @@ def main():
                 # ponytail: 检测 eval_checker.py 变更，热重载无需重启 daemon
                 eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
                 if _eval_checker_mtime != eval_checker_mtime:
+                    _old_mtime = 0.0  # Fix: initialize to avoid UnboundLocalError on exception path
                     try:
                         # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）
                         for _key in list(sys.modules):
@@ -289,6 +289,8 @@ def main():
                             LOGGER.info("eval_checker 强制重新 import 成功")
                         except Exception as _e2:
                             LOGGER.error("eval_checker 强制重新 import 也失败: %s", _e2)
+                        # Fix: ensure _old_mtime is defined even on fallback failure
+                        _old_mtime = 0.0
                 try:
                     r = _run_eval()
                     if r.get("failed", 0):
@@ -330,9 +332,24 @@ def main():
                     def _run_g3_scan():
                         try:
                             from conversation_monitor import scan_and_propose
-                            n = scan_and_propose()
-                            if n:
-                                LOGGER.info("G3 治理提案扫描: %d 个提案", n)
+                            proposals = scan_and_propose()
+                            if proposals:
+                                LOGGER.info("G3 治理提案扫描: %d 个提案", len(proposals))
+                                # 自动执行层：仅对 idle/violation 调用 ccs.py stop (僵尸回收)，
+                                # content_void 仅提醒不杀 (安全边界: content_void 噪音风险 > 僵尸)
+                                for p in proposals:
+                                    action = p.get("_action")
+                                    role = p.get("role")
+                                    if action in ("idle", "violation") and role:
+                                        try:
+                                            subprocess.run(
+                                                [sys.executable, str(_paths_mod.CCS_CLI), "stop", role],
+                                                capture_output=True, timeout=30)
+                                            LOGGER.warning("G3 治理自动执行 stop: %s (%s)", role, action)
+                                        except Exception as _e:
+                                            LOGGER.error("G3 stop 失败 %s: %s", role, _e)
+                            elif proposals == []:
+                                LOGGER.debug("G3 治理提案扫描: 无提案")
                         except Exception as e:
                             LOGGER.error("G3 扫描异常: %s", e)
                             METRICS.inc("daemon_errors_total")
@@ -398,10 +415,18 @@ def main():
                     if _hist_dir.exists():
                         _files = sorted(_hist_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:3]
                         for _hf in _files:
+                            _bad = 0
                             for _line in _hf.read_text(errors="replace").splitlines()[-5:]:
                                 try: _feed.append(json.loads(_line))
-                                except: pass
+                                except (json.JSONDecodeError, ValueError):
+                                    _bad += 1
+                            if _bad:
+                                LOGGER.warning("contract_updater: %d malformed review_gate history lines skipped", _bad)
                     if _feed:
+                        # GROW: 闭合自改进循环 — 生成建议后立即应用 (Reflexion self-improve pattern)。
+                        # contract_updater --from-file 输出 suggestion 列表 (list[dict]) 到 stdout,
+                        # --apply 直接消费同格式 stdin → apply_all_suggestions 原子写 persona JSON(.bak)
+                        # WHY: 仅生成不应用 = 开环（Agent audit #ade36c43 证实 --apply 零生产调用方）。
                         _feed_path = Path("/tmp/contract_feed.json")
                         _feed_path.write_text(json.dumps(_feed, ensure_ascii=False))
                         _cu = _sp.run(
@@ -409,6 +434,14 @@ def main():
                              "--from-file", str(_feed_path)],
                             capture_output=True, text=True, timeout=60)
                         LOGGER.info("contract_updater 自改进: rc=%s %s", _cu.returncode, _cu.stdout[:200])
+                        # GROW: 将建议应用回 persona JSON — 失败不阻塞 daemon (log + continue)
+                        if _cu.returncode == 0 and _cu.stdout.strip():
+                            _apply = _sp.run(
+                                [sys.executable, str(Path(__file__).resolve().parent / "contract_updater.py"),
+                                 "--apply"],
+                                input=_cu.stdout.strip(),
+                                capture_output=True, text=True, timeout=60)
+                            LOGGER.info("contract_updater apply: rc=%s %s", _apply.returncode, _apply.stdout[:200])
                 except Exception as _cu_e:
                     LOGGER.warning("contract_updater 接入异常（不阻塞）: %s", _cu_e)
                 last_contract = now
@@ -431,29 +464,6 @@ def main():
                     LOGGER.error("survival_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_survival = now
-
-            # R2-4 生长接入: workflow_metrics 快照写 bus（每小时一次）
-            # 8.6MB workflow-metrics.jsonl 长期无消费者（D6 发现），
-            # 由 task_generator heal 写入，这里消费输出供监控审计
-            if now - last_metrics >= 3600:
-                try:
-                    from workflow_metrics import snapshot as _wf_snapshot
-                    import io, contextlib
-                    _buf = io.StringIO()
-                    with contextlib.redirect_stdout(_buf):
-                        _wf_snapshot()
-                    _snap_text = _buf.getvalue()
-                    _rate_line = next((l for l in _snap_text.splitlines() if "完成率" in l), "完成率: N/A")
-                    import subprocess as _sp
-                    _sp.run(
-                        [sys.executable, str(Path.home() / ".hermes/scripts/bus_client.py"), "write", "monitor_wf_health",
-                         f"[wf-metrics] {_rate_line.strip()}",
-                         "--evidence", _snap_text[:800],
-                         "--src", "routing_daemon"],
-                        capture_output=True, timeout=10)
-                except Exception as _me:
-                    LOGGER.debug("workflow_metrics 快照写 bus 失败（可选组件）: %s", _me)
-                last_metrics = now
 
             time.sleep(INTERVAL + error_backoff)
     finally:

@@ -210,8 +210,10 @@ def test_scan_and_propose_counts_proposals():
     with mock.patch("conversation_monitor.capture_role_pane",
                     side_effect=[idle_text, normal_text]), \
          mock.patch("conversation_monitor.subprocess.run") as m_run:
-        n = scan_and_propose(["engineer", "maintainer"])
-        assert n == 1, f"期望 1 个提案，得到 {n}"
+        out = scan_and_propose(["engineer", "maintainer"])
+        assert len(out) == 1, f"期望 1 个提案，得到 {len(out)}"
+        assert out[0]["role"] == "engineer"
+        assert out[0]["_action"] == "idle"
         assert m_run.call_count == 1
 
 
@@ -220,7 +222,7 @@ def test_scan_and_propose_skips_test_persona():
     with mock.patch("conversation_monitor.capture_role_pane",
                     return_value="No change, idle"), \
          mock.patch("conversation_monitor.subprocess.run") as m_run:
-        n = scan_and_propose(["dead_role", "e2e_test", "t"])
-        assert n == 0, "测试 persona 不应產出治理提案"
+        out = scan_and_propose(["dead_role", "e2e_test", "t"])
+        assert out == [], "测试 persona 不应產出治理提案"
         assert not m_run.called
 
