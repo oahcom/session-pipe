@@ -288,7 +288,7 @@ class TaskGeneratorMixin:
                 )
                 _has_demand = bool(_demand_text) and _role_hits and _demand_text.strip() != ""
                 # loop 类型工作流由 food_chain_loop 循环驱动，不以 task_spec 信号为种子强校验
-                _is_loop = bool((getattr(_wf, 'loop', None) or {}).get('enabled', False))
+                _is_loop = bool((getattr(_wf, 'loop', None) or {}).get('enabled', True))
                 if not _has_demand and not _is_loop:
                     continue
             except Exception:
