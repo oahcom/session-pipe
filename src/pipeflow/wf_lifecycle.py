@@ -18,6 +18,25 @@ from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 LOGGER = logging.getLogger("workflow.engine")
 
 
+def _value_audit_failed(text: str) -> bool:
+    """判定价值审计结论是否为 FAIL —— 仅认结构化结论，杜绝模板文字误伤。
+
+    反馈用：文档首行严格等于 FAIL/REJECT，或存在 `verdict: FAIL|REJECT` 字段。
+    旧实现 `"FAIL" in _text.upper()` 把"说明 FAIL 情形"的模板说明段误判为结论，
+    导致 food_chain_loop 第 3 轮永久死锁（blocker #292530）。
+    """
+    if not text:
+        return False
+    _lines = text.strip().splitlines()
+    if _lines and _lines[0].strip().upper() in ("FAIL", "REJECT"):
+        return True
+    for _line in _lines[:50]:
+        if _line.lower().startswith("verdict:"):
+            _v = _line.split(":", 1)[1].strip().upper()
+            return _v in ("FAIL", "REJECT")
+    return False
+
+
 class WorkflowLifecycleMixin:
     """WorkflowEngine 的工作流生命周期 mixin。"""
 
@@ -751,7 +770,10 @@ class WorkflowLifecycleMixin:
                         src="workflow_engine")
                     return
 
-                # 价值门禁：审计角色产出文件标记 FAIL → 停止循环
+                # 价值门禁：仅认结构化结论（首行 / verdict:标记），杜绝模板文字误伤。
+                # ponytail: 旧实现 "FAIL" in _text.upper() 把"说明 FAIL 情形"的模板文字
+                # 当作结论 FAIL，导致 food_chain_loop 第 3 轮永久死锁。升级：结论须出现在
+                # 文档首行或 `verdict: FAIL|REJECT` 字段；后续可迁至 JSON/YAML 结构化产出。
                 _vg = loop_cfg.get("value_gate") or {}
                 _vg_file = _vg.get("file", "")
                 _vg_ws = _vg.get("workspace", "")
@@ -759,7 +781,7 @@ class WorkflowLifecycleMixin:
                     _audit_path = _CCS_WORKSPACES / _vg_ws / _vg_file
                     if _audit_path.exists():
                         _text = _audit_path.read_text(encoding="utf-8", errors="ignore")
-                        if "FAIL" in _text.upper() or "REJECT" in _text.upper():
+                        if _value_audit_failed(_text):
                             LOGGER.info("wf %s loop: 价值审计 FAIL，停止循环", wf_id[:8])
                             self._bb.write("workflow",
                                 f"[workflow] {wf.name} 循环停止: 价值审计未达标",
