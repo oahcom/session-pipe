@@ -52,7 +52,8 @@ def test_role_filter():
     ):
         s = ec.run_eval_check(role_filter="维护者")
 
-    assert s == {"checked": 1, "passed": 1, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0, "avg_score": 1.0}
+    # leverage_count 可能由新检查器产生，不强制为 0
+    assert s["checked"] == 1 and s["passed"] == 1 and s["failed"] == 0 and s["skipped"] == 0 and s["notices"] == 0 and s["blockers"] == 0 and s["avg_score"] == 1.0
 
 
 def test_role_filter_nonexistent():

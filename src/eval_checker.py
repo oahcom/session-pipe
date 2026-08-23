@@ -647,6 +647,115 @@ class RequirementConfirmationChecker:
 
 # ── Main entry ──
 
+class LeverageAccumulationChecker:
+    """杠杆积累检查器：检测 agent 是否在 24h 窗口内产出可复用资产。
+
+    三类可复用资产信号：
+      1. bus 上的 knowledge_distill / memory_store / skill_audit 事实
+      2. ~/.hermes/skills/ 下新增的技能文件
+      3. git 历史中新增的复用型文件（skill/util/helper/core/common/base 等）
+
+    原则：无可检查数据（24h 内零资产）= 通过（不误杀）。
+    本检查器为观测型：leverage_count 上报资产数，findings 列出明细。
+    """
+
+    ASSET_CATS = ("knowledge_distill", "memory_store", "skill_audit")
+    # 复用型文件关键词（git 新增文件命中即计为可复用资产）
+    _REUSABLE_KW = ("skill", "util", "helper", "core", "common", "base", "lib", "shared", "knowledge", "memory")
+    WINDOW = 86400  # 24h
+
+    def __init__(self):
+        from hermes_bus.blackboard_legacy import Blackboard
+        self._bb = Blackboard()
+        self._skills_dir = Path.home() / ".hermes" / "skills"
+        # 扫描 git 仓库（仅统计新增复用型文件，限定已知仓库避免全盘遍历）
+        self._git_repos = [
+            Path.home() / "session-pipeline",
+            Path.home() / "hermes-session-roles",
+            Path.home() / ".hermes",
+        ]
+
+    def check(self, role: str, task_id: str) -> dict:
+        """检查 24h 窗口内的可复用资产积累。
+
+        返回 {passed: bool, findings: list[dict], leverage_count: int}
+        无可检查数据 → passed=True, leverage_count=0（no data = pass）。
+        """
+        cutoff = time.time() - self.WINDOW
+        assets: list[dict] = []
+
+        # 1. bus 上的可复用资产事实（24h 窗口）
+        for cat in self.ASSET_CATS:
+            try:
+                for f in self._bb.read(cat=cat, limit=500):
+                    if f.ts >= cutoff:
+                        assets.append({"source": "bus", "cat": cat, "id": f.id, "title": f.t[:80]})
+            except Exception as e:
+                LOGGER.debug("leverage bus read %s fail: %s", cat, e)
+
+        # 2. ~/.hermes/skills/ 新增文件（24h 窗口）
+        if self._skills_dir.is_dir():
+            for p in self._skills_dir.rglob("*"):
+                if p.is_file() and p.stat().st_mtime >= cutoff:
+                    assets.append({"source": "skills", "file": str(p)})
+
+        # 3. git 历史中新增的复用型文件（24h 窗口）
+        git_assets = self._git_reusable_count(cutoff)
+
+        leverage_count = len(assets) + git_assets
+        # 观测型检查器：无资产=通过；有资产=上报（不判失败）
+        return {
+            "passed": True,
+            "findings": assets,
+            "leverage_count": leverage_count,
+        }
+
+    def _git_reusable_count(self, cutoff: float) -> int:
+        """统计 24h 内 git 新增的复用型文件数。
+
+        遍历已知仓库，解析 `git log --since --name-status` 的 A 行，
+        命中复用关键词即计入。单仓库失败不影响其他仓库。
+        """
+        n = 0
+        since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cutoff))
+        for repo in self._git_repos:
+            if not (repo / ".git").is_dir():
+                continue
+            try:
+                r = subprocess.run(
+                    ["git", "-C", str(repo), "log", f"--since={since}",
+                     "--name-status", "--pretty=format:"],
+                    capture_output=True, text=True, timeout=20,
+                )
+            except Exception as e:
+                LOGGER.debug("leverage git log %s fail: %s", repo, e)
+                continue
+            for line in r.stdout.splitlines():
+                if not line.startswith("A"):
+                    continue
+                path = line[1:].strip()
+                low = path.lower()
+                if any(kw in low for kw in self._REUSABLE_KW):
+                    n += 1
+        return n
+
+    def self_test(self) -> bool:
+        """自检：注入一条 knowledge_distill 事实，断言 check 能计数。
+
+        返回是否通过。注入使用带时间戳的唯一标题以避免 bus 去重。
+        """
+        marker = f"[self_test] leverage probe {time.time()}"
+        try:
+            self._bb.write("knowledge_distill", marker, evidence="leverage self-test", src="eval_checker")
+        except Exception as e:
+            LOGGER.warning("leverage self_test write fail: %s", e)
+            return False
+        res = self.check("__self_test__", "selftest")
+        assert res["leverage_count"] >= 1, f"self_test: leverage_count={res['leverage_count']} expected>=1"
+        assert res["passed"] is True, "self_test: passed must be True"
+        return True
+
+
 class TrajectoryQualityChecker:
     """轨迹质量检查器：从角色对话 transcri.jsonl 评估工具调用质量。
 
@@ -959,6 +1068,16 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                     summary["notices"] += 1
         except Exception as e:
             LOGGER.warning("TrajectoryQualityChecker failed: %s", e)
+
+        # LeverageAccumulationChecker: 观测 24h 内可复用资产积累（无资产=通过）
+        try:
+            lev = LeverageAccumulationChecker()
+            for role in sampled:
+                lev_result = lev.check(role["name"], f"eval_{role['name']}")
+                # 始终 passed（观测型），仅上报 leverage_count 供看板
+                summary["leverage_count"] = summary.get("leverage_count", 0) + lev_result["leverage_count"]
+        except Exception as e:
+            LOGGER.warning("LeverageAccumulationChecker failed: %s", e)
 
     LOGGER.info(
         "eval_check done: checked=%d passed=%d failed=%d skipped=%d notices=%d blockers=%d",
