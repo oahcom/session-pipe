@@ -9,6 +9,7 @@ import sys
 import time
 import logging
 import threading
+import os as _os
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
@@ -229,7 +230,6 @@ class RoleLifecycleMixin:
         # 拉起 CCS（infinite 模式，agent 常驻执行任务）
         # ponytail: ondemand 模式只写哨兵不创建 tmux 会话，必须用 infinite 让 agent 持续运行
         # 关键修复: 增加超时到 60s，并移除 VIRTUAL_ENV 以加速启动（从 30s 超时优化）
-        import os as _os
         _env = _os.environ.copy()
         _env.pop("VIRTUAL_ENV", None)
         _env.pop("CONDA_PREFIX", None)
