@@ -9,6 +9,7 @@ import time
 import uuid
 import logging
 import threading
+import re  # 修复: _scan_tasks 用 re.match 但漏 import, 导致每 tick NameError 使任务生成静默死亡
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
@@ -200,12 +201,19 @@ class TaskGeneratorMixin:
                         timed_out_steps += 1
                 # ZOMBIE 模板（test/retry_test/prompt_test 等）超时不 escalate → 过滤 95% stress-test blocker 噪音
                 _is_zombie = inst.get("template_id") in _engine_mod.ZOMBIE_TEMPLATES
-                if timed_out_steps >= 2 and not _escalated and not _is_zombie:
+                # 测试 harness 模板（test_*/exit_schema 等验收仅 grep 关键词）在生产环境
+                # 反复运行 → 派发 phantom 角色 → ondemand 回收 → 无限重推 → bus 噪音循环。
+                # 与 ZOMBIE 同一处理：超时不重推，直接 cancel，让活着的角色注意力回到真实产出。
+                _is_test_harness = bool(re.match(
+                    r"^(test_|.*_test|exit_schema|role_interact|drill)",
+                    inst.get("template_id", "") or "",
+                ))
+                if timed_out_steps >= 2 and not _escalated and not _is_zombie and not _is_test_harness:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
                             f"工作流多步骤超时: {i['instance_id'][:12]}",
                             f"{timed_out_steps} 个步骤已耗尽重试次数，当前步骤={i.get('current_step_id','?')} 角色={i.get('assignee','?')}"))
-                if timed_out_steps >= 3 and not _is_zombie:
+                if timed_out_steps >= 3 and not _is_zombie and not _is_test_harness:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
                             f"工作流多步骤超限自愈: {i['instance_id'][:12]}",
@@ -219,6 +227,19 @@ class TaskGeneratorMixin:
                             # 锁外执行：投递成功才盖戳 last_heal（投递失败不下轮重试，不误标已自愈）
                             _deferred.append(lambda role=_role, p=_prompt, i=inst, s=_sid:
                                 self._heal_send(role, p, i["instance_id"], s))
+                # 测试 harness 实例超时达阈值 → 直接 cancel，不再无限重推喂噪音。
+                # 这是堵死 phantom 回环的关键：保留 running 会让下一轮继续 timeout→重推→升级，
+                # 把测试噪音广播给所有活着的角色。
+                if _is_test_harness and timed_out_steps >= 3:
+                    try:
+                        conn.execute(
+                            "UPDATE workflow_instances SET status='cancelled', completed_at=? "
+                            "WHERE instance_id=?",
+                            (time.time(), inst["instance_id"]))
+                        LOGGER.info("test-harness instance cancelled (no re-push): %s",
+                                    inst["instance_id"][:12])
+                    except Exception as _e:
+                        LOGGER.debug("cancel test-harness instance failed: %s", _e)
                 conn.commit()
             # ── 指标持久化（JSONL）──
             try:
@@ -272,6 +293,11 @@ class TaskGeneratorMixin:
             if not _wf.steps or not _wf.allowed_executors:
                 continue
             if _wf.is_subflow:
+                continue
+            # 测试 harness 模板（test_*/exit_schema 等验收仅 grep 关键词）禁止自动派发：
+            # 反复生成 → 喂饱 production 角色做无意义的测试任务 → 真实需求被淹没。
+            # 与 _check_anomalies 的 _is_test_harness 同一判据，避免测试噪音回环。
+            if re.match(r"^(test_|.*_test|exit_schema|role_interact|drill)", _wf_name or ""):
                 continue
             # 取第一个 executor 作为目标角色
             _role = _wf.allowed_executors[0]

@@ -8,12 +8,14 @@ import json
 import os
 import re
 import time
+import subprocess
 import logging
 import pathlib
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.engine import Step, WorkflowRun
+from pipeflow.wf_lifecycle import _value_audit_failed
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 from conversation_monitor import get_conversation_signal
 from pipeflow.integrity import (
@@ -45,7 +47,7 @@ def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role
 
 
 class StepHandlerMixin:
-    """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _eval_cond / _check_exit。"""
+    """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _check_exit。"""
 
     def _tick(self, run: WorkflowRun, step: Step):
         """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
@@ -162,7 +164,10 @@ class StepHandlerMixin:
         _start_ts = run.step_results.get(step.id, {}).get("ts", run.created_at)
         # None 守卫：ts 或 created_at 缺失时不能相减（TypeError），按未开始处理
         elapsed = time.time() - _start_ts if _start_ts is not None else 0.0
-        _auto_cancel_at = max(max_retries + 3, 4)
+        # 超时自动回收阈值: 默认 4 次超时后 cancel，防无限重推写 monitor_audit 噪音。
+        # delivery_blocked 的子流（投递连败/角色无响应）4 次×timeout 太长（实测 ~40min 刷 bus），
+        # 收紧到 2 次即回收——角色 2 个 timeout 窗口无响应即可判定卡死，断死循环。
+        _auto_cancel_at = 2 if run.status == "delivery_blocked" else max(max_retries + 3, 4)
         if elapsed >= timeout:
             # 角色忙（有其他任务执行中）→ 排队语义：不递增 timeout_count，
             # 仅延长响应窗口（避免"忙时被塞任务→未响应→超时回收"的假阳性）
@@ -230,6 +235,25 @@ class StepHandlerMixin:
                 "ts": time.time(),  # 重置计时器，给角色响应窗口
             }
             self._sync_step_results(run.id, run.step_results)
+            # 末位值门禁对齐：最后一步（如 food_chain_loop/s7）的真实完成证据是角色写进
+            # workspace 的审计文件（lr 写 VALUE_AUDIT.md），而非 bus。exit_condition 等 bus
+            # 时角色只写文件 → 步骤永远 step_done_ready 卡死。此处超时后读值门禁文件，
+            # PASS 即直接收尾 close（与 _handle_wf_loop 同逻辑），避免 17h 死锁。
+            _steps = self._workflows.get(run.workflow_name)
+            _is_last = bool(_steps and _steps.steps and _steps.steps[-1].id == step.id)
+            if _is_last:
+                _vg = (_steps.loop or {}).get("value_gate") or {} if _steps else {}
+                _vg_file, _vg_ws = _vg.get("file", ""), _vg.get("workspace", "")
+                if _vg_file and _vg_ws:
+                    _audit = _CCS_WORKSPACES / _vg_ws / _vg_file
+                    if _audit.exists() and not _value_audit_failed(
+                            _audit.read_text(encoding="utf-8", errors="ignore")):
+                        LOGGER.info("tick 末位值门禁 PASS %s/%s，直接收尾", run.id[:8], step.id)
+                        try:
+                            self._lifecycle.complete_step(run.id, step.id)
+                            self._lifecycle.close_wf(run.id, status="completed")
+                        except Exception as _e:
+                            LOGGER.warning("tick 末位收尾失败 %s/%s: %s", run.id[:8], step.id, _e)
             # 超限 → 自动 cancel，阻止死循环升级
             if timeout_count >= _auto_cancel_at:
                 try:
@@ -494,6 +518,13 @@ class StepHandlerMixin:
                         }
                         self._sync_step_results(run.id, run.step_results)
                         LOGGER.info("双节点: %s/%s 第一节点完成，已发 codex 审查指令", run.workflow_name, step.id)
+                        # R5: 自动执行 codex review --uncommitted (三方20维审查自动化)
+                        _codex_result = self._run_codex_review(run, step, cat)
+                        if _codex_result.get("success"):
+                            LOGGER.info("双节点: %s/%s codex review 通过，等待 node2 消息", run.workflow_name, step.id)
+                        else:
+                            LOGGER.warning("双节点: %s/%s codex review 失败: %s，仍发提示让角色人工审查",
+                                           run.workflow_name, step.id, _codex_result.get("error", "未知错误"))
                         self._send_to_role(step.target_role, _codex_prompt,
                                            wf_id=run.id, step_id=step.id, force=True)
                         return
@@ -743,6 +774,39 @@ class StepHandlerMixin:
 
         return
 
+    def _run_codex_review(self, run, step, bus_cat: str) -> dict:
+        """自动执行 codex review --uncommitted (三方20维审查自动化，R5 增长).
+
+        在 dual_node 第一节点完成后，自动运行 codex review --uncommitted
+        代替手动提示角色执行。成功时返回 success=True，失败时返回 error 信息。
+
+        R5 增长点: step_handler.py 原来只发 prompt 让角色手动跑 codex review；
+        现在由引擎自动调用 codex CLI (codex review --uncommitted -c model=9router_hermes)。
+        """
+        try:
+            # 运行 codex review --uncommitted -c model=9router_hermes
+            # timeout 300s (5 min) 防卡死
+            result = subprocess.run(
+                ["codex", "review", "--uncommitted", "-c", "model=9router_hermes"],
+                capture_output=True, text=True, timeout=300, cwd=run.workspace
+            )
+            if result.returncode == 0:
+                # 解析输出：若有 "No issues" 或 "0 issues" 视为通过
+                out = result.stdout + result.stderr
+                if "No issues" in out or "0 issues" in out or "0 problems" in out:
+                    return {"success": True, "output": out[:500]}
+                # 有问题输出
+                return {"success": False, "error": f"codex 发现问题: {out[:300]}", "output": out[:500]}
+            else:
+                return {"success": False, "error": f"codex 返回码 {result.returncode}: {result.stderr[:300]}"}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "codex review 超时 (300s)"}
+        except FileNotFoundError:
+            return {"success": False, "error": "codex CLI 未找到 (请确认已安装)"}
+        except Exception as e:
+            return {"success": False, "error": f"codex review 异常: {e}"}
+
+
     def _sync_step_results(self, wf_id: str, step_results: dict):
         """将步骤结果持久化到 DB（事务内更新 step_results 列）。"""
         try:
@@ -888,19 +952,6 @@ class StepHandlerMixin:
                             errs.append(f"{m} 文件过旧 ({age_min:.0f}min > {props['maxAgeMinutes']}min)，疑似非本任务产出")
 
         return (len(errs) == 0, errs)
-
-    def _eval_cond(self, expr: str, run: WorkflowRun) -> bool:
-        """简朴条件求值: s1.status == 'done' 格式。"""
-        import re as _re
-        m = _re.match(r"s(\d+)\.status\s*==\s*'(\w+)'", expr.strip())
-        if not m:
-            return False
-        step_id = f"s{m.group(1)}"
-        expected = m.group(2)
-        sr = run.step_results.get(step_id)
-        if not sr:
-            return False
-        return sr.get("status") == expected
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
                     wf_id: str = "", strict_wf: bool = False, wait_roles: list = None) -> tuple:

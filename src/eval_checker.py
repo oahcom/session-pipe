@@ -10,7 +10,7 @@ eval_checker.py — eval_criteria 运行时执行器。
     run_eval_check()  # 每 300s 调一次
 """
 
-import ast, json, logging, os, random, re, subprocess, sys
+import ast, json, logging, os, random, re, subprocess, sys, time
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -26,6 +26,23 @@ BUS_SCRIPT = Path(os.environ.get(
 ))
 
 LOGGER = logging.getLogger("session-pipeline.eval_checker")
+
+# 角色对话 transcri.jsonl 目录（Claude Code jsonl 格式）
+_TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"
+
+# 每个工具调用必须包含的字段（schema 校验）。未知工具不报错（不误杀）。
+_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "Bash": ("command",),
+    "Edit": ("file_path", "old_string", "new_string"),
+    "Write": ("file_path", "content"),
+    "Read": ("file_path",),
+    "Glob": ("pattern",),
+    "Grep": ("pattern",),
+    "WebFetch": ("url",),
+}
+
+# thrash loop 判定：同一 Bash command 连续重复 ≥ 此次数且无其他 distinct 命令插入
+_THRASH_REPEAT_MIN = 4
 
 # ── extract "验证:" from criterion ──
 
@@ -476,12 +493,349 @@ def run_eval_check(role_filter: str | None = None) -> dict:
     # 按角色名过滤
     if role_filter:
         filtered = [r for r in roles if r["name"] == role_filter]
+        # ── Real evaluation checkers (replacing tautological verification) ──
+
+class OutputSemanticChecker:
+    """产出语义检查器：检测模板桩/空洞产出。
+
+    复用 conversation_monitor 的 content_void 启发式 + output_validator.validate_output。
+    检查：文件非空、语法有效、git diff 非空、prose/code 密度、output_validator 结构校验。
+    """
+
+    def __init__(self):
+        self._prod_evidence = re.compile(
+            r"(def |class |import |return |print\(|assert |raise |if |for |while |\[|\{|`|```)",
+            re.MULTILINE
+        )
+        self._noise_signs = re.compile(
+            r"(TODO|FIXME|XXX|pass|# |\\.\\.\\.|TODO|FIXME|placeholder|stub|mock|TODO)",
+            re.IGNORECASE
+        )
+
+    def check(self, role: str, task_id: str) -> dict:
+        """检查角色在任务窗口内的产出文件。
+
+        返回 {passed: bool, findings: list[dict], checked_files: int}
+        """
+        from task_evidence import _output_files
+
+        files = _output_files(role)
+        if not files:
+            # 无任务产出文件 → 无可检查对象，按"无问题"通过（不误杀无待办产出的角色）
+            return {"passed": True, "findings": [], "checked_files": 0}
+
+        findings = []
+        passed_count = 0
+        for f in files:
+            try:
+                content = f.read_text(encoding="utf-8", errors="ignore")
+                if not content.strip():
+                    findings.append({"file": str(f), "issue": "empty file"})
+                    continue
+
+                # 语法/结构校验
+                if f.suffix == ".py":
+                    try:
+                        compile(content, str(f), "exec")
+                    except SyntaxError as e:
+                        findings.append({"file": str(f), "issue": f"syntax error: {e}"})
+                        continue
+                elif f.suffix == ".json":
+                    try:
+                        json.loads(content)
+                    except json.JSONDecodeError as e:
+                        findings.append({"file": str(f), "issue": f"json decode error: {e}"})
+                        continue
+                elif f.suffix in (".md", ".txt", ".rst"):
+                    # prose 文件：用 content_void 启发式
+                    if not self._has_production_evidence(content):
+                        findings.append({"file": str(f), "issue": "content_void: prose density low / noise dominant"})
+                        continue
+
+                # output_validator 结构校验（若有 schema）
+                # 注：此处不强制 category，仅做非空+基本结构校验
+
+                passed_count += 1
+
+            except Exception as e:
+                findings.append({"file": str(f), "issue": f"check error: {e}"})
+                continue
+
+        passed = passed_count > 0 and len(findings) == 0
+        return {
+            "passed": passed,
+            "findings": findings,
+            "checked_files": len(files)
+        }
+
+    def _has_production_evidence(self, text: str) -> bool:
+        """复用 conversation_monitor 的 content_void 启发式（反向）。
+
+        有生产证据 = 有代码结构特征；content_void = 噪音主导且无生产特征。
+        """
+        if not self._prod_evidence.search(text):
+            return False
+        noise_count = len(self._noise_signs.findall(text))
+        # 简单密度：生产特征 ≥ 噪音 + 1
+        prod_matches = len(self._prod_evidence.findall(text))
+        return prod_matches >= noise_count + 1
+
+
+class RequirementConfirmationChecker:
+    """需求确认检查器：判断需求是否被真实消费/确认。
+
+    读 bus 消费记录，判断需求 (task_spec/user_story/prd/approval/product_design)
+    是否被真实消费或有下游确认 (code_fix/deployment_report/delivery)。
+    """
+
+    REQUIREMENT_CATS = {"task_spec", "user_story", "prd", "approval", "product_design"}
+    CONFIRM_CATS = {"code_fix", "deployment_report", "delivery", "verification"}
+
+    def __init__(self):
+        from hermes_bus.blackboard_legacy import Blackboard
+        self._bb = Blackboard()
+
+    def check(self, role: str, task_id: str) -> dict:
+        """检查角色在任务窗口内的需求是否被确认。
+
+        返回 {passed: bool, findings: list[dict], checked_requirements: int}
+        """
+        # 找到该任务关联的需求事实 (简化：搜索 role 的 output_targets 包含的 cat)
+        # 简化：搜索 requirement_cats 中未被消费/无下游确认的 fact
+        findings = []
+        checked = 0
+        unconfirmed = 0
+
+        for cat in self.REQUIREMENT_CATS:
+            # 搜索该角色的需求 fact
+            try:
+                facts = self._bb.search(f"role:{role} cat:{cat}", limit=20)
+                for fact in facts:
+                    checked += 1
+                    fid = fact.id
+
+                    # 检查是否有消费记录
+                    consumed = self._bb.unconsumed(consumer=None, cat=cat, limit=1)
+                    has_consumption = any(f.id == fid for f in consumed)
+
+                    # 检查是否有下游确认
+                    has_downstream = False
+                    for dc in self.CONFIRM_CATS:
+                        downstream = self._bb.search(f"fid:{fid}", cat=dc, limit=5)
+                        if downstream:
+                            has_downstream = True
+                            break
+
+                    if not has_consumption and not has_downstream:
+                        # 检查年龄
+                        if fact.ts < time.time() - 7 * 86400:  # 7天过期
+                            findings.append({"fact_id": fid, "cat": cat, "issue": "expired_unconfirmed_requirement"})
+                            unconfirmed += 1
+                        else:
+                            findings.append({"fact_id": fid, "cat": cat, "issue": "unconfirmed_requirement"})
+                            unconfirmed += 1
+            except Exception as e:
+                findings.append({"cat": cat, "issue": f"check error: {e}"})
+
+        passed = unconfirmed == 0
+        return {
+            "passed": passed,
+            "findings": findings,
+            "checked_requirements": checked
+        }
+
+
+# ── Main entry ──
+
+class TrajectoryQualityChecker:
+    """轨迹质量检查器：从角色对话 transcri.jsonl 评估工具调用质量。
+
+    三项检查：
+      1. 工具调用 schema 合法性（必填字段缺失）
+      2. 盲改（Write/Edit 文件前未先 Read）
+      3. 孤儿调用（发出 tool_use 但无对应 tool_result 返回）
+      4. 抖动循环（同一 Bash 命令连续重复 ≥ N 次无进展）
+    """
+
+    def _role_sessions(self, role: str) -> list[Path]:
+        """解析角色名对应的 transcri 目录（支持 ccs-workspaces/<role> 等路径形态）。"""
+        out: list[Path] = []
+        for d in _TRANSCRIPTS_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            low = d.name.lower()
+            if role.lower() in low:
+                out.append(d)
+        return out
+
+    def _load_tool_calls(self, sessions: list[Path]) -> list[dict]:
+        """读取所有 jsonl，提取有序 (tool_use, tool_result) 调用序列。
+
+        返回扁平列表，每项 {kind, name, input, id, error, order}。
+        kind ∈ {use, result}。order 为全局单调递增序号，保留跨文件时序。
+        """
+        calls: list[dict] = []
+        order = 0
+        for sess in sorted(sessions):
+            for jf in sorted(sess.glob("*.jsonl")):
+                try:
+                    with jf.open(encoding="utf-8", errors="ignore") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                d = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            content = d.get("message", {}).get("content")
+                            if not isinstance(content, list):
+                                continue
+                            for blk in content:
+                                if not isinstance(blk, dict):
+                                    continue
+                                if blk.get("type") == "tool_use":
+                                    order += 1
+                                    calls.append({
+                                        "kind": "use", "name": blk.get("name"),
+                                        "input": blk.get("input", {}),
+                                        "id": blk.get("id"), "error": None,
+                                        "order": order,
+                                    })
+                                elif blk.get("type") == "tool_result":
+                                    order += 1
+                                    calls.append({
+                                        "kind": "result",
+                                        "name": None,
+                                        "input": {},
+                                        "id": blk.get("tool_use_id"),
+                                        "error": blk.get("is_error", False),
+                                        "order": order,
+                                    })
+                except OSError as e:
+                    LOGGER.debug("transcript read fail %s: %s", jf, e)
+        return calls
+
+    def check(self, role: str, task_id: str) -> dict:
+        """检查角色轨迹质量。
+
+        返回 {passed: bool, findings: list[dict], checked_traces: int}
+        无 transcript 文件 → passed=True, checked_traces=0（无可检查对象）。
+        """
+        sessions = self._role_sessions(role)
+        if not sessions:
+            return {"passed": True, "findings": [], "checked_traces": 0}
+
+        calls = self._load_tool_calls(sessions)
+        findings: list[dict] = []
+
+        # ── 1. schema 校验 ──
+        for c in calls:
+            if c["kind"] != "use":
+                continue
+            name = c["name"] or ""
+            req = _REQUIRED_KEYS.get(name)
+            if req is None:
+                continue
+            inp = c["input"] or {}
+            # Claude Code 有时打包 __unparsedToolInput，此时 input 非标准 shape → 跳过严格校验
+            # （这些调用仍可被其它维度评估，避免 schema 维度产生噪声虚报）
+            if "__unparsedToolInput" in inp:
+                continue
+            missing = [k for k in req if k not in inp]
+            if missing:
+                findings.append({
+                    "issue": "schema_missing_keys", "tool": name,
+                    "id": c["id"], "missing": missing,
+                })
+
+        # ── 2. 盲改 + 3. 孤儿调用 + 4. 抖动循环 ──
+        read_files: set[str] = set()
+        seen_use_ids: set[str] = set()
+        result_ids: set[str] = set()
+        # Bash 连续重复检测：跟踪上一命令与连续计数
+        last_cmd: str | None = None
+        repeat_run: int = 0
+        repeat_window_start: int | None = None
+
+        def _close_thrash():
+            nonlocal repeat_run, repeat_window_start, last_cmd
+            if repeat_run >= _THRASH_REPEAT_MIN and repeat_window_start is not None:
+                findings.append({
+                    "issue": "thrash_loop", "tool": "Bash",
+                    "command": last_cmd, "count": repeat_run,
+                })
+            repeat_run, repeat_window_start, last_cmd = 0, None, None
+
+        for c in calls:
+            if c["kind"] == "result":
+                if c["id"]:
+                    result_ids.add(c["id"])
+                _close_thrash()
+                continue
+
+            # kind == use
+            name = c["name"] or ""
+            inp = c["input"] or {}
+            cid = c["id"]
+            if cid:
+                seen_use_ids.add(cid)
+
+            if name == "Read":
+                fp = inp.get("file_path")
+                if fp:
+                    read_files.add(fp)
+
+            if name in ("Write", "Edit"):
+                fp = inp.get("file_path")
+                if fp and fp not in read_files:
+                    findings.append({
+                        "issue": "blind_edit", "tool": name,
+                        "file": fp, "id": cid,
+                    })
+
+            if name == "Bash":
+                cmd = (inp.get("command") or "").strip()
+                if cmd:
+                    if cmd == last_cmd:
+                        repeat_run += 1
+                    else:
+                        _close_thrash()
+                        last_cmd = cmd
+                        repeat_run = 1
+                    if repeat_window_start is None:
+                        repeat_window_start = c["order"]
+                else:
+                    _close_thrash()
+        _close_thrash()
+
+        # 孤儿调用：发出但无返回
+        orphan = seen_use_ids - result_ids
+        for oid in sorted(orphan):
+            findings.append({"issue": "orphan_call", "tool": "?", "id": oid})
+
+        checked_traces = sum(1 for s in sessions for _ in s.glob("*.jsonl"))
+        passed = len(findings) == 0
+        return {
+            "passed": passed,
+            "findings": findings,
+            "checked_traces": checked_traces,
+        }
+
+
+def run_eval_check(role_filter: str | None = None) -> dict:
+    roles = _load_roles()
+    if not roles:
+        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
+
+    # 按角色名过滤
+    if role_filter:
+        filtered = [r for r in roles if r["name"] == role_filter]
         if not filtered:
             LOGGER.warning("role %s not found", role_filter)
             return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
         roles = filtered
 
-    # 权重 = 可执行 eval 数量（含"验证:"的 criterion 数），最少 1
     weights = [max(1, sum(1 for c in r["eval_criteria"] if "验证:" in c)) for r in roles]
     n = min(2, len(roles))
     sampled = random.choices(roles, weights=weights, k=n)
@@ -535,6 +889,76 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                     summary["blockers"] += 1
                 else:
                     summary["notices"] += 1
+
+        # ── 真实评估检查器（替代已删除的恒真验证） ──
+        # OutputSemanticChecker: 检查产出文件语义质量（非模板桩、语法、结构）
+        # ── 真实评估检查器（替代已删除的恒真验证） ──
+        # OutputSemanticChecker: 检查产出文件语义质量（非模板桩、语法、结构）
+        try:
+            osem = OutputSemanticChecker()
+            for role in sampled:
+                osem_result = osem.check(role["name"], f"eval_{name}")
+                # 只有当有文件被检查且发现问题时才算失败；无文件/无问题=不计入统计
+                if not osem_result["passed"] and osem_result.get("checked_files", 0) > 0:
+                    summary["failed"] += 1
+                    summary["checked"] += 1
+                    _write_bus(
+                        "verification",
+                        f"[eval_checker] OutputSemantic FAIL: {role['name']} — {osem_result['findings'][:3]}",
+                        evidence=f"role={role['name']} findings={osem_result['findings'][:3]}",
+                    )
+                    _write_bus(
+                        "notice",
+                        f"@ccs-monitor [eval_checker] 产出语义不达标: {role['name']}",
+                        evidence=f"role={role['name']} findings={osem_result['findings'][:3]}",
+                    )
+                    summary["notices"] += 1
+        except Exception as e:
+            LOGGER.warning("OutputSemanticChecker failed: %s", e)
+
+        # RequirementConfirmationChecker: 检查需求是否被真实消费/确认
+        try:
+            reqc = RequirementConfirmationChecker()
+            for role in sampled:
+                reqc_result = reqc.check(role["name"], f"eval_{role['name']}")
+                if not reqc_result["passed"] and reqc_result.get("checked_requirements", 0) > 0:
+                    summary["failed"] += 1
+                    summary["checked"] += 1
+                    _write_bus(
+                        "verification",
+                        f"[eval_checker] RequirementConfirm FAIL: {role['name']} — {reqc_result['findings'][:3]}",
+                        evidence=f"role={role['name']} findings={reqc_result['findings'][:3]}",
+                    )
+                    _write_bus(
+                        "notice",
+                        f"@ccs-monitor [eval_checker] 需求未确认: {role['name']}",
+                        evidence=f"role={role['name']} findings={reqc_result['findings'][:3]}",
+                    )
+                    summary["notices"] += 1
+        except Exception as e:
+            LOGGER.warning("RequirementConfirmationChecker failed: %s", e)
+
+        # TrajectoryQualityChecker: 从角色对话 transcri 评估工具调用质量
+        try:
+            traj = TrajectoryQualityChecker()
+            for role in sampled:
+                traj_result = traj.check(role["name"], f"eval_{role['name']}")
+                if not traj_result["passed"] and traj_result.get("checked_traces", 0) > 0:
+                    summary["failed"] += 1
+                    summary["checked"] += 1
+                    _write_bus(
+                        "verification",
+                        f"[eval_checker] Trajectory FAIL: {role['name']} — {traj_result['findings'][:3]}",
+                        evidence=f"role={role['name']} findings={traj_result['findings'][:3]}",
+                    )
+                    _write_bus(
+                        "notice",
+                        f"@ccs-monitor [eval_checker] 轨迹质量不达标: {role['name']}",
+                        evidence=f"role={role['name']} findings={traj_result['findings'][:3]}",
+                    )
+                    summary["notices"] += 1
+        except Exception as e:
+            LOGGER.warning("TrajectoryQualityChecker failed: %s", e)
 
     LOGGER.info(
         "eval_check done: checked=%d passed=%d failed=%d skipped=%d notices=%d blockers=%d",

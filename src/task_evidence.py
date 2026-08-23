@@ -67,6 +67,30 @@ def _output_summary(files):
     return len(files), total, names
 
 
+def _append_role_feedback(role: str, title: str, task_id: str) -> bool:
+    """把 negative 评分回写到 role TASKS.md「历史教训」节。
+
+    WHY: 评分信号收集在 bus 却不回写 role prompt —— 角色无法从模板任务教训学习
+   （GEPA rounds memory 要求评分回写 persona/prompt）。补全闭环。
+    仅记录 negative，positive 不回写（防噪）。幂等：同 task_id 不重复。
+    CLAUDE.md 红线：绝不回写 CLAUDE.md（inject 管理），仅 TASKS.md。
+    """
+    try:
+        p = WORKSPACES / role / "TASKS.md"
+        if not p.exists():
+            return False
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        # 幂等：匹配 `({task_id})` 边界，避免 task_123 被 task_1234 子串误杀
+        if f"({task_id})" in txt:
+            return False
+        line = f"\n- [negative] 任务《{title}》({task_id}) → 评分回写：无产出/无证据/模板残留。参考 bus feedback + code_fix 自省。"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line)
+        return True
+    except Exception:
+        return False  # 回写失败不影响主流程
+
+
 def evaluate_and_feedback():
     """提取已完成任务证据 → 写质量反馈到 bus，供 coordinator/workflow_engine 消费。
 
@@ -141,12 +165,15 @@ def evaluate_and_feedback():
         #   4. 有产出文件但量小 → 疑似模板残留
         #   5. 无产出但有 bus 证据 → 进行中
         #   6. 无产出、无证据 → 纯模板任务（无收益）
+        # 存在性 ≠ 质量：exit_messages/summary 仅证明"角色回了话/引擎记了摘要"，
+        # 不证明"做对了"。按 CLAUDE.md 红线，不可用文件存在替代人读判断 → 仅判 neutral。
+        # positive 必须建在真实外部产物（≥1KB 非系统产出文件）上（见下方 _n 分支）。
         if _evidence == "exit_messages":
-            _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — exit_messages 证据存在，有实际产出"
+            _quality = "neutral"
+            _detail = f"task《{_title[:40]}》by {_role} — exit_messages 存在（回复≠产出），待真实产物确认"
         elif _evidence == "summary":
-            _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — summary 证据存在，有实际产出"
+            _quality = "neutral"
+            _detail = f"task《{_title[:40]}》by {_role} — summary 存在（摘要≠产出），待真实产物确认"
         elif _n >= 3 or (_n >= 1 and _size > 2048):
             _quality = "positive"
             _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），有实质产出"
@@ -205,6 +232,10 @@ def evaluate_and_feedback():
                      "--evidence", json.dumps(_reflect, ensure_ascii=False),
                      "--src", "task_evidence"],
                     capture_output=True, timeout=10)
+                # 回写评分信号到 role TASKS.md（闭环补全 —— 评分→prompt学习）
+                # WHY: evaluate_and_feedback 原仅写 bus，role 无法从 negative 教训学习。
+                # CLAUDE.md 禁止回写 CLAUDE.md，仅 TASKS.md 足矣。
+                _append_role_feedback(a["role"], a["title"][:60], a["task_id"])
             except Exception:
                 pass
 

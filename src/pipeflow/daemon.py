@@ -141,6 +141,8 @@ def _starve_signal(eng: WorkflowEngine) -> None:
 
     # 1) 确保首步角色（scout）session 已启动
     _ensure_role_alive("scout")
+    # reviewer 作为审批方需常驻以接收 code_review/architecture 消息（bus #336293 缺口修复）
+    _ensure_role_alive("reviewer")
 
     # 2) 创建食物链工作流（确定性触发，不依赖 coordinator 转发）
     try:

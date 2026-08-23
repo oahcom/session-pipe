@@ -20,6 +20,8 @@ session-roles（定义层） ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
 
 pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 通信。
 
+> **唯一真实优化标的**：角色对话质量、思考质量、动作质量，不是管道吞吐量。路由/工作流/守护进程都在转 ≠ 系统在工作——近 3 小时零条真实角色产出就是"转而不活"。本项目的所有指标（路由数、running 工作流数、存活角色数）只证明"管道通"，**不可作为角色在高质量产出的证据**。
+
 ## 关键规则
 
 ### 路由策略
@@ -48,6 +50,8 @@ python3 src/pipeflow/health_check.py
 - ❌ 直接调 launcher 的 API（只能用 subprocess ccs.py send）
 - ❌ 修改角色定义（那是 session-roles 的事）
 - ❌ 重启 gateway（SIGKILL 中断长连接）
+- ❌ 用流程指标代理质量判断：路由数、workflow running 数、存活角色数、bus stats 条数只能证明"管道通"，**不可证明角色在高质量产出**。声称优化完成前，必须亲自打开一个角色的对话逐轮读、亲手判断思考与动作质量。禁止用质量分/看板/automated checker 替代"人读对话做判断"——那会让开发者去刷指标而非去想内容。
+- ❌ 把"消息送达"等同于"任务完成"：角色收到 prompt 且回了话，不等于它想对了、做对了；step 盖戳 success 必须基于产出内容成立，不能只看投递成功。
 - ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` "running 且 sr 空>1h" 静默误杀（bus #728c6e4307c1 根因）。
 
 ## 代码布局（行数 2026-08-23 实测 `wc -l`）
@@ -56,19 +60,19 @@ src/
   routing/
     router.py         ── 路由表 + produce/consume 推导（375 行）
     routes.py         ── 路由表定义 + route_all + route_to_ccs（472 行）
-    auto.py           ── 自动路由消费 + investigator 分派（290 行）
+    auto.py           ── 自动路由消费 + investigator 分派（281 行）
     polling.py        ── 消息轮询 + cursor（87 行）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
     survival_monitor.py ── 存活监测（492 行）
     consistency.py    ── 路由一致性检查（124 行，生长接入 daemon）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（895 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（986 行）
+    engine.py         ── 编排 + CLI（1024 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（1050 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（452 行）
-    task_generator.py ── 任务生成（418 行）
-    wf_lifecycle.py   ── 工作流生命周期（903 行）
-    daemon.py         ── 工作流守护 while 循环（263 行）
+    task_generator.py ── 任务生成（444 行）
+    wf_lifecycle.py   ── 工作流生命周期（991 行）
+    daemon.py         ── 工作流守护 while 循环（265 行）
     pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
     health_check.py   ── 健康检查（65 行）
     integrity.py      ── 完整性提醒（旁路提醒）

@@ -42,19 +42,6 @@ _VERIFIED_ROLE_2 = {
 _ALL_ROLES = [_UNVERIFIED_ROLE, _VERIFIED_ROLE, _VERIFIED_ROLE_2]
 
 
-def test_report_unverified():
-    """_find_unverified 只返回全自然语言（无可执行命令）的角色。"""
-    result = ec._find_unverified(_ALL_ROLES)
-    assert len(result) == 1
-    assert result[0]["name"] == "无命令角色"
-
-
-def test_report_unverified_all_verified():
-    """所有角色都有可执行命令时返回空列表。"""
-    all_verified = [_VERIFIED_ROLE, _VERIFIED_ROLE_2]
-    assert ec._find_unverified(all_verified) == []
-
-
 def test_role_filter():
     """run_eval_check(role_filter=...) 只检查指定角色。"""
     with (

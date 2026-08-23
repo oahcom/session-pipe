@@ -258,6 +258,72 @@ class RoleLifecycleMixin:
             LOGGER.debug("CCS role alive check failed for %s", role)
         return False
 
+    def _wait_for_role_ready(self, role: str, wf_id: str = "", step_id: str = "",
+                              max_wait: int = 90, check_interval: int = 5) -> bool:
+        """等待角色真正就绪：tmux 存活 + claude 进程存活 + 不在 busy 状态。
+
+        这是 dispatch 前的关键检查，确保角色真正就绪才发送任务。
+        """
+        import time
+        deadline = time.time() + max_wait
+        check_interval = 5
+        while time.time() < deadline:
+            # 1. tmux session 存活
+            try:
+                alive = _engine_mod._sp.run(
+                    ["tmux", "has-session", "-t", f"ccs-{role}"],
+                    capture_output=True, timeout=5
+                ).returncode == 0
+            except Exception:
+                alive = False
+
+            if not alive:
+                # 拉起角色
+                LOGGER.info("_wait_for_role_ready: role %s not alive, starting...", role)
+                try:
+                    _env = _os.environ.copy()
+                    _env.pop("VIRTUAL_ENV", None)
+                    _env.pop("CONDA_PREFIX", None)
+                    _engine_mod._sp.run(
+                        ["python3", str(_CCS_CLI), "start", role, "--no-attach",
+                         "--drive", "infinite", "--no-auto-send"],
+                        capture_output=True, timeout=60, env=_env
+                    )
+                    # 等待 tmux session 启动
+                    for _ in range(10):
+                        time.sleep(1)
+                        if _engine_mod._sp.run(
+                            ["tmux", "has-session", "-t", f"ccs-{role}"],
+                            capture_output=True, timeout=5
+                        ).returncode == 0:
+                            time.sleep(3)
+                            break
+                except Exception as e:
+                    LOGGER.warning("Failed to start role %s: %s", role, e)
+                    time.sleep(check_interval)
+                    continue
+
+            # 2. 检查 claude 进程是否存活
+            if not self._is_agent_alive(role):
+                LOGGER.info("Role %s tmux alive but no claude process, waiting...", role)
+                time.sleep(5)
+                continue
+
+            # 3. 检查是否 busy（如果 busy 说明正在处理其他任务，这其实是好的）
+            busy = self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=True)
+            if busy:
+                LOGGER.info("Role %s is busy (processing other work), ready to queue", role)
+                return True  # busy 说明角色在工作，可以排队
+
+            # 角色空闲且存活，可以发送任务
+            LOGGER.info("Role %s is ready (idle & alive)", role)
+            return True
+
+            time.sleep(5)
+
+        LOGGER.warning("_wait_for_role_ready: role %s not ready after %ds", role, max_wait)
+        return False
+
     def _is_role_busy(self, role: str, exclude_wf_id: str = "", pane_fallback: bool = True) -> bool:
         """检查角色是否真的在工作。
 
@@ -331,7 +397,13 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} prompt 含未替换变量: {unmatched}",
                 evidence=prompt[:500], src="workflow_engine")
             return False  # 投递未发生
-        self._ensure_role_alive(role)
+        # 关键修复：确保角色存活并就绪，不只是 tmux 存活
+        # 1. 先确保 tmux session 存活（如不存在则拉起）
+        # 2. 等待角色真正就绪（有 claude 进程且非 busy）
+        if not self._wait_for_role_ready(role, wf_id=wf_id, step_id=step_id):
+            LOGGER.warning("_send_to_role %s: role not ready after wait, skipping", role)
+            return False
+
         # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
         import re as _re
         if not prompt.startswith(("/goal", "/GOAL", "/Goal")):

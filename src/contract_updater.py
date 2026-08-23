@@ -138,6 +138,9 @@ _ROLE_DRIFT_PATCH = {
     "运维": "maintainer",
     "开发者": "engineer",
 }
+# ponytail: 已知詞彙漂移補丁。天花板=硬編碼違反 D3(config>hardcode); 升級路徑=將映射移入
+# config.yaml (角色別稱表), 並由 _detect_drift 在發現未映射中文 title 時自動報 bus notice
+# (已實作), 不在此手動維護。當 persona title 變動時, 舊稱會被 drift notice 捕獲而非靜默失效。
 
 
 def _build_role_alias_map() -> dict[str, str]:
@@ -179,6 +182,10 @@ def _resolve_role_for_suggestion(entry: dict) -> str:
     target = str(entry.get("target", "") or "")
     leaf = target.rstrip("/").split("/")[-1]
     if leaf and leaf not in ("src", "engine.py", "manager.py", "daemon.py"):
+        # review_gate 真实角色在 dims[].parties, 优先提取再回退文件名(避免误告警+漏映射)
+        p = _parties_role(entry)
+        if p:
+            return p
         _detect_drift(rf, leaf=leaf)  # 文件名回退 → 告警缺 file→persona mapping
         return leaf
     return ""  # 無法解析 → 空 (調用方跳過, 不產生 unknown 垃圾建議)
@@ -227,31 +234,30 @@ def _assert_role_coverage(feed: list[dict]) -> int:
     return unmapped
 
 
-def _extract_role(entry: dict) -> str:
-    """从单条历史记录提取角色名。
+def _parties_role(entry: dict) -> str:
+    """从 review_gate 的 dims[].parties 提取首个可映射 persona 的角色。
 
-    review_gate 真实 schema 无 role 字段，只有 target(文件路径)/parties(dims 内)。
-    旧实现读 entry.get('role') 永远得 'unknown'，导致建议失效。
-    修复: 优先用 target 路径末段（persona 名常等于路径末段），
-    其次从 dims[].parties 取首个非空角色，最后回退 target 末段。
+    review_gate 真实 schema 无 role 字段, 角色真值在 dims 的 parties 里。
+    优先用 parties 而非文件名回退, 避免文件→persona 映射缺失导致误告警+漏判。
+    返回 "" 表示无可行角色(调用方继续文件名回退)。
     """
-    target = str(entry.get("target", "") or "")
-    # target 末段可能是角色名 (coordinator / session-pipeline/src/pipeflow/engine.py)
-    leaf = target.rstrip("/").split("/")[-1]
-    if leaf and leaf != "src" and leaf not in ("engine.py", "manager.py", "daemon.py"):
-        return leaf
-    # 从 dims 的 parties 提取
     try:
         dims = entry.get("dims", "[]")
         if isinstance(dims, str):
             dims = json.loads(dims)
+        alias = _build_role_alias_map()
         for d in dims:
             for p in (d.get("parties") or []):
-                if p and p != "unknown":
-                    return p
+                if not p or p == "unknown":
+                    continue
+                if p in alias:
+                    return alias[p]
+                for k, v in alias.items():  # 双向部分匹配 ('codex'↔'codex-dev')
+                    if k and (k in p or p in k):
+                        return v
     except Exception:
         pass
-    return leaf or "unknown"
+    return ""
 
 
 def suggest_improvements(check_history: list[dict]) -> list[dict]:
@@ -302,7 +308,16 @@ def suggest_improvements(check_history: list[dict]) -> list[dict]:
                 "type": "review_root_cause",
             })
 
-        # 规则 3: output_schema 不存在（始终检查，不依赖历史格式）
+        # 规则 3: 近期 check 存在 skipped>0 → 建议补驗證指令 (grow-unused-logic: skipped 信号曾为 eval_checker.schema, suggest 遗漏未落地)
+        if any(e.get("skipped", 0) > 0 for e in recent):
+            suggestions.append({
+                "role": role,
+                "criterion": "eval_criteria",
+                "suggestion": f"角色 {role} 最近有 skipped>0 的审查，建议补充验证指令 (add_verification_cmd) 以降低跳过率",
+                "type": "add_verification_cmd",
+            })
+
+        # 规则 4: output_schema 不存在（始终检查，不依赖历史格式）
         if not _has_output_schema(role):
             suggestions.append({
                 "role": role,

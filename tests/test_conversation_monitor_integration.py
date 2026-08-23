@@ -22,6 +22,7 @@ class FakeEngine(StepHandlerMixin):
         self._is_role_busy = MagicMock(return_value=False)
         self._consumed_exit_ids = set()
         self._bb = MagicMock()  # Blackboard mock（timeout 路径依赖）
+        self._workflows = MagicMock()  # step_handler 末位值门禁访问 self._workflows
 
 
 class _FakeStep:

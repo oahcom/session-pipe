@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-exit_condition 匹配逻辑专项测试 — _check_exit / _validate_exit_schema / _eval_cond / _tick 组合。
+exit_condition 匹配逻辑专项测试 — _check_exit / _validate_exit_schema / _tick 组合。
 
 覆盖范围:
   _check_exit: 空 facts、分类/来源/文本/时间戳、多过滤器组合、无 cat fallback
   _validate_exit_schema: 文件缺失、minLength、mustContain、mustExist、checksum、minFiles、minCount、空 schema
-  _eval_cond: 各类正则匹配、不存在的步骤、畸形表达式、空步骤状态
   _tick 组合: exit_schema 失败阻塞推进、verify 命令失败阻塞推进
 
 运行: cd ~/session-pipeline && python3 -m pytest tests/test_exit_condition.py -v
@@ -339,38 +338,6 @@ class TestValidateExitSchema(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(d, ignore_errors=True)
-
-
-class TestEvalCond(unittest.TestCase):
-    def test_match_done(self):
-        eng = _make_eng()
-        r = _run(step_results={"s1": {"status": "done"}})
-        self.assertTrue(eng._eval_cond("s1.status == 'done'", r))
-
-    def test_mismatch_status(self):
-        eng = _make_eng()
-        r = _run(step_results={"s1": {"status": "running"}})
-        self.assertFalse(eng._eval_cond("s1.status == 'done'", r))
-
-    def test_nonexistent_step(self):
-        eng = _make_eng()
-        r = _run()
-        self.assertFalse(eng._eval_cond("s1.status == 'done'", r))
-
-    def test_step_num_parsing(self):
-        eng = _make_eng()
-        r = _run(step_results={"s42": {"status": "done"}})
-        self.assertTrue(eng._eval_cond("s42.status == 'done'", r))
-
-    def test_malformed_expr(self):
-        eng = _make_eng()
-        r = _run()
-        self.assertFalse(eng._eval_cond("nonsense", r))
-
-    def test_empty_step_results(self):
-        eng = _make_eng()
-        r = _run(step_results={})
-        self.assertFalse(eng._eval_cond("s1.status == 'completed'", r))
 
 
 class TestTickExitSchemaBlocked(unittest.TestCase):

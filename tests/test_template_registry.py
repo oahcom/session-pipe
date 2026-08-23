@@ -87,14 +87,15 @@ def test_legacy_shape_registers():
 
 # ── 5. register 双写：JSON 文件出现 ──
 def test_register_writes_json_and_db():
-    """注册后 {name}.json 出现且内容含 workflow_id；DB 有行。"""
+    """注册后 {template_id}.json 出现且内容含 workflow_id；DB 有行。"""
     with tempfile.TemporaryDirectory() as tmp:
         wf_dir = Path(tmp) / "workflows"
         reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=wf_dir)
-        tid = reg.register(_valid_template(), workflows_dir=wf_dir)
+        template = _valid_template()
+        tid = reg.register(template, workflows_dir=wf_dir)
         reg.close()
-        # JSON 文件
-        jf = wf_dir / "test_wf.json"
+        # JSON 文件: 以 template_id 命名 (避免同名不同 ID 碰撞)
+        jf = wf_dir / f"{tid}.json"
         assert jf.exists(), "JSON 文件应被写出"
         data = json.loads(jf.read_text())
         assert data["workflow_id"] == "WF-test_wf"
@@ -111,7 +112,7 @@ def test_register_refuses_existing_file():
     with tempfile.TemporaryDirectory() as tmp:
         wf_dir = Path(tmp) / "workflows"
         wf_dir.mkdir()
-        (wf_dir / "test_wf.json").write_text(json.dumps({"old": True}))
+        (wf_dir / "WF-test_wf.json").write_text(json.dumps({"old": True}))
         reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=wf_dir)
         try:
             reg.register(_valid_template(), workflows_dir=wf_dir)
@@ -121,7 +122,7 @@ def test_register_refuses_existing_file():
         finally:
             reg.close()
         # 原文件未被覆盖
-        assert json.loads((wf_dir / "test_wf.json").read_text()) == {"old": True}
+        assert json.loads((wf_dir / "WF-test_wf.json").read_text()) == {"old": True}
 
 
 # ── 7. 路径穿越拒绝 ──
@@ -203,7 +204,7 @@ def test_upsert_rejects_bad_structure():
 
 # ── 10. 双节点端到端闭环（完整推进链） ──
 def test_dual_node_full_cycle():
-    """start → run_once → complete×2 → 引擎推进。验证完整生命周期。"""
+    """start → run_once → complete_step(s0) → run_once(s1 dual_node) → complete_step(s1) → run_once → 引擎推进。验证完整生命周期。"""
     import sys as _sys, logging as _logging, json as _json
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     _logging.disable(_logging.CRITICAL)
@@ -220,18 +221,29 @@ def test_dual_node_full_cycle():
         mock_result.returncode = 0
         mock_result.stdout = b"pid=123"
         mock_result.stderr = b""
-        with patch("subprocess.run", return_value=mock_result), \
-             patch.object(eng, "_ensure_role_alive", return_value=True):
+        with patch("subprocess.run", return_value=mock_result),              patch.object(eng, "_ensure_role_alive", return_value=True):
             wf_id = eng.start("food_chain_loop", {"source": "test", "loop_iteration": 1})
-            eng.run_once()  # run_once 已内置 dual_node 推进: 标记 notified + node1_done + node2_sent
-            # 验证 run_once 已完成第一步（node1）并发送第二步指令
+            # 第一次 run_once: 处理 s0 (非 dual_node)，标记 notified
+            eng.run_once()
             _sr0 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
-            assert _sr0.get("s1", {}).get("node1_done") is True, "run_once 应完成 dual_node 第一步"
-            assert _sr0.get("s1", {}).get("node2_sent") is True, "run_once 应发送第二节点指令"
-            # 第二步消息到 → complete_step 完成并推进
+            assert _sr0.get("s0", {}).get("status") == "notified", "第一次 run_once 应完成 s0 并标记 notified"
+
+            # 完成 s0，推进到 s1 (dual_node)
+            r0 = eng._lifecycle.complete_step(wf_id, "s0")
+            assert r0 in ("step_done_ready", "completed_and_advanced"), f"s0 应完成并推进: {r0}"
+
+            # 第二次 run_once: 处理 s1 (dual_node)，标记 node1_done + 发送 codex review
+            eng.run_once()
+            _sr1 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
+            assert _sr1.get("s1", {}).get("node1_done") is True, "第二次 run_once 应完成 dual_node 第一步 node1_done"
+            assert _sr1.get("s1", {}).get("node2_sent") is True, "第二次 run_once 应发送 codex review 指令"
+
+            # 完成 s1
             r2 = eng._lifecycle.complete_step(wf_id, "s1")
             assert r2 in ("step_done_ready", "completed_and_advanced"), f"第二步应完成: {r2}"
             eng.run_once()
             rows = eng._lifecycle.query(
                 "SELECT current_step_id FROM workflow_instances WHERE instance_id=?", (wf_id,))
             assert rows[0]["current_step_id"] in ("s2", "s1"), f"应推进: {rows[0]['current_step_id']}"
+
+

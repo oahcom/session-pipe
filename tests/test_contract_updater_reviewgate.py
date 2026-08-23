@@ -28,14 +28,20 @@ def _make_history(target: str, with_schema: bool) -> dict:
     }
 
 
-def test_extract_role_from_target():
-    # 角色名能从 persona JSON 反查: 用 real persona 名做 target 影射
-    # 简化: 直接验证 _extract_role 不再返回 unknown
-    hist = _make_history("/home/administrator/session-pipeline/src/pipeflow/engine.py", False)
-    role = cu._extract_role(hist)
-    assert role != "unknown", f"角色提取失败, 仍得 unknown: {role}"
-    # 至少应回退到路径有意义的标识, 而非字面 unknown
-    print(f"  [ok] _extract_role -> {role}")
+def test_parties_role_resolves():
+    # review_gate 真实角色在 dims[].parties, 应优先解析而非文件名回退
+    hist = _make_history("/home/administrator/session-launcher/src/user_intent_reminder.py", False)
+    role = cu._parties_role(hist)
+    assert role == "codex-dev", f"parties[codex] 应部分匹配 codex-dev, 得 {role}"
+    print(f"  [ok] _parties_role -> {role}")
+
+
+def test_resolve_role_prefers_parties_over_filename():
+    # 文件 target 无 persona 归属, 但 parties 有真角色 → 不应误告警为文件映射缺失
+    hist = _make_history("session-launcher/src/user_intent_reminder.py", False)
+    role = cu._resolve_role_for_suggestion(hist)
+    assert role == "codex-dev", f"应取 parties 角色而非文件名, 得 {role}"
+    print(f"  [ok] _resolve_role_for_suggestion -> {role}")
 
 
 def test_suggest_from_reviewgate_schema():
@@ -48,6 +54,7 @@ def test_suggest_from_reviewgate_schema():
 
 
 if __name__ == "__main__":
-    test_extract_role_from_target()
+    test_parties_role_resolves()
+    test_resolve_role_prefers_parties_over_filename()
     test_suggest_from_reviewgate_schema()
     print("ALL PASS")
