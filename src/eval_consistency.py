@@ -69,25 +69,22 @@ def _check_cmd(cmd: str) -> list[str]:
     return issues
 
 
+from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd
+
 def _load_role_criteria(personas_dir: Path) -> list[dict]:
     """加载所有 persona 的 eval_criteria，返回 [{name, criteria, issues}]。"""
     results = []
-    for f in sorted(personas_dir.glob("persona_*.json")):
-        try:
-            d = json.loads(f.read_text())
-        except Exception:
-            continue
-        name = d.get("name", f.stem)
-        criteria = d.get("eval_criteria", [])
+    roles = _load_roles(personas_dir)
+    for r in roles:
         role_issues = []
-        for c in criteria:
+        for c in r["eval_criteria"]:
             cmd = _extract_cmd(c)
             if cmd is None:
                 continue
             issues = _check_cmd(cmd)
             if issues:
                 role_issues.append({"criterion": c[:120], "issues": issues})
-        results.append({"name": name, "criteria_count": len(criteria),
+        results.append({"name": r["name"], "criteria_count": len(r["eval_criteria"]),
                         "incompatible": role_issues})
     return results
 

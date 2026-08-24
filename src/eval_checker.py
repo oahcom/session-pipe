@@ -461,21 +461,7 @@ def _is_critical(criterion: str) -> bool:
     return bool(re.search(r'severity[:\s=]*critical', criterion, re.IGNORECASE))
 
 
-def _load_roles() -> list | None:
-    """加载所有角色 JSON，返回含 eval_criteria 的角色列表。"""
-    if not PERSONAS_DIR.is_dir():
-        LOGGER.warning("personas dir not found: %s", PERSONAS_DIR)
-        return None
-    roles = []
-    for f in sorted(PERSONAS_DIR.glob("persona_*.json")):
-        try:
-            d = json.loads(f.read_text())
-            ec = d.get("eval_criteria", [])
-            if ec:
-                roles.append({"name": d.get("name", f.stem), "eval_criteria": ec})
-        except Exception as e:
-            LOGGER.warning("skip %s: %s", f.name, e)
-    return roles
+from eval_shared_loader import _load_roles
 
 
 def run_eval_check(role_filter: str | None = None) -> dict:
@@ -508,7 +494,8 @@ class OutputSemanticChecker:
             re.MULTILINE
         )
         self._noise_signs = re.compile(
-            r"(TODO|FIXME|XXX|pass|# |\\.\\.\\.|TODO|FIXME|placeholder|stub|mock|TODO)",
+            r"(\bTODO\b|\bFIXME\b|\bXXX\b|\bpass\b|\bplaceholder\b|"
+            r"\bstub\b|\bmock\b|# |\.\.\.)",
             re.IGNORECASE
         )
 
@@ -547,8 +534,8 @@ class OutputSemanticChecker:
                         findings.append({"file": str(f), "issue": f"json decode error: {e}"})
                         continue
                 elif f.suffix in (".md", ".txt", ".rst"):
-                    # prose 文件：用 content_void 启发式
-                    if not self._has_production_evidence(content):
+                    # prose 文件：用 prose 专属启发式（非代码符号判定）
+                    if not self._has_prose_content(content):
                         findings.append({"file": str(f), "issue": "content_void: prose density low / noise dominant"})
                         continue
 
@@ -568,17 +555,26 @@ class OutputSemanticChecker:
             "checked_files": len(files)
         }
 
-    def _has_production_evidence(self, text: str) -> bool:
-        """复用 conversation_monitor 的 content_void 启发式（反向）。
+    def _has_prose_content(self, text: str) -> bool:
+        """prose 文件（.md/.txt/.rst）的生产证据判定。
 
-        有生产证据 = 有代码结构特征；content_void = 噪音主导且无生产特征。
+        原 _has_production_evidence 用代码符号（def/class/`）判"产出"，
+        纯散文文档（设计文档/会议沉淀/ADR）无代码符号 → 恒判 content_void，
+        误杀真实高质量文档（bus#lr session沉淀 误报根因）。
+        prose 专属：去噪音后仍有实质文本体量 + 结构标记（标题/列表/段落）。
         """
-        if not self._prod_evidence.search(text):
+        stripped = self._noise_signs.sub("", text).strip()
+        if len(stripped) < 200:  # 去噪音后仍不足 200 字 → 空洞
             return False
-        noise_count = len(self._noise_signs.findall(text))
-        # 简单密度：生产特征 ≥ 噪音 + 1
-        prod_matches = len(self._prod_evidence.findall(text))
-        return prod_matches >= noise_count + 1
+        # 结构证据：标题(#)/RST 下划线(=) /列表(-/*/1.) /代码围架(```) /RST 块指令(.. )
+        _struct = re.compile(r"^\s{0,3}#{1,6}\s|^\s{0,3}={3,}\s*$|"
+                             r"^\s{0,3}[-*+]\s|^\s{0,3}\d+\.\s|^\s{0,3}-{3,}\s*$|```|"
+                             r"^\s{0,3}\.\.\s", re.M)
+        if _struct.search(text):
+            return True
+        # 无结构标记但体量充足（≥500 非噪音字）：覆盖纯 .txt / RST 下划线标题
+        # 的散文文档，避免因缺 markdown 标记而误杀实质内容。
+        return len(stripped) >= 500
 
 
 class RequirementConfirmationChecker:
