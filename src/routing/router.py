@@ -261,16 +261,6 @@ class Router:
             }
         return result
 
-    def format_pipeline(self) -> str:
-        """格式化流水线图（人类可读）。"""
-        lines = ["=== Session 角色产出流水线（自动生成）===\n"]
-        for role, r in self._routing.items():
-            produce = r.get("produce", [])
-            consume = r.get("consume", [])
-            lines.append(f"  {role}: 产出={produce}  消费={consume}")
-
-        return "\n".join(lines)
-
 
 # ── 全局单例（懒加载） ──
 _router: Optional[Router] = None
@@ -308,15 +298,6 @@ def unconsumed_by_role(role: str, limit: int = 20) -> list[dict]:
 
 def routing_summary() -> dict:
     return get_router().routing_summary()
-
-
-def format_pipeline() -> str:
-    return get_router().format_pipeline()
-
-
-def category_priority(cat: str) -> int:
-    """返回分类的优先级分数（数字越小越优先）。"""
-    return priority(cat)
 
 
 def main():

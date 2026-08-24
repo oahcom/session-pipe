@@ -261,18 +261,6 @@ def test_poll_unconsumed_sorted_by_priority():
     print("  ✓ poll_unconsumed priority sorted")
 
 
-def test_pipeline_format():
-    """format_pipeline 输出包含所有角色。"""
-    from routing.router import Router
-
-    router = Router()
-    text = router.format_pipeline()
-    assert "=== Session 角色产出流水线（自动生成）===" in text
-    # 至少应有角色信息
-    assert len(router.routing) >= 0
-    print("  ✓ format_pipeline")
-
-
 def test_routing_summary():
     """routing_summary 返回正确的消费者映射。"""
     from routing.router import Router
@@ -301,7 +289,6 @@ if __name__ == "__main__":
         test_category_desc_complete,
         test_status_format,
         test_poll_unconsumed_sorted_by_priority,
-        test_pipeline_format,
         test_routing_summary,
     ]
 
