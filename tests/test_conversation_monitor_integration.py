@@ -24,6 +24,15 @@ class FakeEngine(StepHandlerMixin):
         self._bb = MagicMock()  # Blackboard mock（timeout 路径依赖）
         self._workflows = MagicMock()  # step_handler 末位值门禁访问 self._workflows
 
+    def _fill_prompt_vars(self, prompt, step, wf_name, title, desc, results,
+                          prev_step_id=""):
+        """桩：真实实现在 WorkflowLifecycleMixin（本类只继承 StepHandlerMixin）。
+
+        超时重推路径会调它做 {title}/{description} 等变量替换；此处只需原样返回，
+        让本测试聚焦 tmux 信号分支。
+        """
+        return prompt
+
 
 class _FakeStep:
     """真实类替代 MagicMock：exit_condition 必须是真 dict 才能被 .get() 正确访问。"""
