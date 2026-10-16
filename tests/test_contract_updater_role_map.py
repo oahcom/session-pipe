@@ -30,6 +30,20 @@ def test_resolve_role_from_eval_passrate():
     print(f"  [ok] _resolve_role_from_eval_passrate -> {r}, {r2}")
 
 
+def test_assert_role_coverage_does_not_flag_resolved_identity():
+    # 鎖定回歸: 判據曾寫作 `not resolved or resolved == rf` —— role_filter 本身
+    # 就是 persona name 時(engineer/qa/lr, 佔絕大多數)解析結果天然等於輸入,
+    # 於是合法輸入被計入 unmapped, 每小時刷一條假 notice 淹沒真漂移。
+    assert cu._assert_role_coverage([{"role_filter": "engineer"}]) == 0, \
+        "engineer 已解析成功, 不應計入 unmapped"
+    assert cu._assert_role_coverage([{"role_filter": "qa"}]) == 0
+    assert cu._assert_role_coverage([{"role_filter": "lr"}]) == 0
+    # 真未解析仍須被抓(不能為了消噪音把檢測一併廢掉)
+    assert cu._assert_role_coverage([{"role_filter": "nonexistent_xyz"}]) == 1
+    # None 是合法(無角色標記的統計行)
+    assert cu._assert_role_coverage([{"role_filter": None}]) == 0
+    print("  [ok] _assert_role_coverage 只報真未解析")
+
 def test_add_output_schema_reaches_persona():
     # 映射後 add_output_schema 建議應對真實 persona 生效(不再 unknown/文件名)
     hist = [{"role_filter": "维护者"}]
@@ -43,5 +57,6 @@ def test_add_output_schema_reaches_persona():
 if __name__ == "__main__":
     test_resolve_role_from_filename()
     test_resolve_role_from_eval_passrate()
+    test_assert_role_coverage_does_not_flag_resolved_identity()
     test_add_output_schema_reaches_persona()
     print("ALL PASS")

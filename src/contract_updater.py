@@ -222,7 +222,10 @@ def _assert_role_coverage(feed: list[dict]) -> int:
         if rf is None:
             continue  # None 是合法 (無角色標記的統計行)
         resolved = _resolve_role_for_suggestion(e)
-        if not resolved or resolved == rf:
+        # 仅"解析不出角色"算未解析。不可写作 `or resolved == rf`：role_filter 本身
+        # 就是 persona name 时（engineer/qa/lr… 占绝大多数）解析结果天然等于输入，
+        # 旧判据把"解析成功"判成"未解析" → 每小时刷假 notice，真漂移被淹没。
+        if not resolved:
             unmapped += 1
             _write_bus("notice",
                        f"[contract_updater] role_filter 未解析: {rf!r}",
