@@ -431,25 +431,39 @@ def main():
                             if _bad:
                                 LOGGER.warning("contract_updater: %d malformed review_gate history lines skipped", _bad)
                     if _feed:
-                        # GROW: 闭合自改进循环 — 生成建议后立即应用 (Reflexion self-improve pattern)。
-                        # contract_updater --from-file 输出 suggestion 列表 (list[dict]) 到 stdout,
-                        # --apply 直接消费同格式 stdin → apply_all_suggestions 原子写 persona JSON(.bak)
-                        # WHY: 仅生成不应用 = 开环（Agent audit #ade36c43 证实 --apply 零生产调用方）。
+                        # 生成建议 → 写 bus 待 session-roles 处置。**不在此自动 --apply。**
+                        # 原因：--apply 直接改写 hermes-session-roles/personas/*.json，
+                        # 而本项目 CLAUDE.md:51 明令「❌ 修改角色定义（那是 session-roles 的事）」。
+                        # 原实现每轮都跑 --apply 且恒失败（applied:0 failed:3，实测每小时复现），
+                        # 根因是 suggest_improvements 从不产出 verification_command 而
+                        # _apply_suggestion 要求它非空——即便补上，闭环也会变成"越界改角色定义"，
+                        # 是把一条红线违规做成自动化。故改为把建议交给有权的角色。
                         _feed_path = Path("/tmp/contract_feed.json")
                         _feed_path.write_text(json.dumps(_feed, ensure_ascii=False))
                         _cu = _sp.run(
                             [sys.executable, str(Path(__file__).resolve().parent / "contract_updater.py"),
                              "--from-file", str(_feed_path)],
                             capture_output=True, text=True, timeout=60)
-                        LOGGER.info("contract_updater 自改进: rc=%s %s", _cu.returncode, _cu.stdout[:200])
-                        # GROW: 将建议应用回 persona JSON — 失败不阻塞 daemon (log + continue)
-                        if _cu.returncode == 0 and _cu.stdout.strip():
-                            _apply = _sp.run(
-                                [sys.executable, str(Path(__file__).resolve().parent / "contract_updater.py"),
-                                 "--apply"],
-                                input=_cu.stdout.strip(),
-                                capture_output=True, text=True, timeout=60)
-                            LOGGER.info("contract_updater apply: rc=%s %s", _apply.returncode, _apply.stdout[:200])
+                        _sug = _cu.stdout.strip()
+                        LOGGER.info("contract_updater 自改进建议: rc=%s %s",
+                                    _cu.returncode, _sug[:200])
+                        if _cu.returncode == 0 and _sug:
+                            try:
+                                _items = json.loads(_sug)
+                                _summary = "; ".join(
+                                    f"{s.get('role')}/{s.get('type')}"
+                                    for s in (_items if isinstance(_items, list) else []))[:300]
+                            except (json.JSONDecodeError, ValueError):
+                                _summary = _sug[:300]
+                            _sp.run(
+                                [sys.executable, str(Path.home() / ".hermes/scripts/bus_client.py"),
+                                 "write", "architecture",
+                                 f"[contract_updater] {len(_feed)} 条 review 记录 → 自改进建议待处置",
+                                 "--evidence",
+                                 f"建议: {_summary}\n"
+                                 f"（本项属 session-roles 职责，pipeline 不自动改角色定义）",
+                                 "--src", "routing_daemon"],
+                                capture_output=True, timeout=10)
                 except Exception as _cu_e:
                     LOGGER.warning("contract_updater 接入异常（不阻塞）: %s", _cu_e)
                 last_contract = now
