@@ -97,9 +97,14 @@ class RoleLifecycleMixin:
             output = r.stdout or ""
 
             # 信号匹配：Context limit reached / Context low / Context (数字% remaining)
+            # "Prompt is too long" 是实测最高频的溢出措辞（全库 18 次 vs
+            # Context limit reached 13 / Context low 10），此前漏检导致角色
+            # 溢出后无人 compact（maintainer/scout/closer 各 1 次，closer 的
+            # transcript 累积到 4MB 才爆）。措辞由 Claude Code 版本决定，故一并匹配。
             has_overflow = (
                 "Context limit reached" in output
                 or "Context low" in output
+                or "Prompt is too long" in output
                 or ("Context" in output and "remaining" in output and "compact" in output.lower())
             )
 
