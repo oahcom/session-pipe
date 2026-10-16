@@ -59,6 +59,14 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
 
+# 3b. CCS_WORKSPACES 隔离：_send_to_role 会写 <workspace>/<role>/TASKS.md。
+#     不隔离则每个跑到的用例都写进生产 ~/ccs-workspaces/，实测已污染
+#     scout/engineer 的真实 TASKS.md（2026-10-16 16:22，fixture 的 "test"
+#     任务覆盖真实任务）。同 WORKFLOWS_DB 走 env + 属性重绑双保险。
+_TEST_WS_DIR = os.path.join(_TEST_STATE_DIR, "ccs-workspaces")
+os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
+_paths_mod.CCS_WORKSPACES = Path(_TEST_WS_DIR)
+
 # 4. BUS_DB 隔离：重定向 Blackboard 到临时 DB，测试不再写生产 blackboard.db。
 #    Blackboard.__init__ 默认用 blackboard_legacy 模块导入时的 BLACKBOARD_DB 快照，
 #    因此需 patch 快照值本身（blackboard_legacy.BLACKBOARD_DB + hermes_bus.config.BLACKBOARD_DB）。

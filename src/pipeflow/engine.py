@@ -723,11 +723,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                 "{exception_info}", "{project}", "{changes}",
                                 "{task_list}", "{assignments}"):
                         prompt = prompt.replace(var, fallback)
-                    # 写 TASKS.md 到 workspace，让模板中"读 TASKS.json"指令能找到任务
-                    ws_dir = Path.home() / "ccs-workspaces" / step.target_role
-                    ws_dir.mkdir(parents=True, exist_ok=True)
-                    tasks_file = ws_dir / "TASKS.md"
-                    tasks_file.write_text(f"# 当前任务\n\n## 标题\n{task_title}\n\n## 描述\n{task_desc or task_title}\n\n## 工作流\n{wf_name} — 步骤 {step.id}: {step.title}\n", encoding="utf-8")
+                    # 此处原为无守卫的 TASKS.md 写入，已删除：紧随其后的
+                    # _send_to_role 会走 role_lifecycle 的**带守卫**写入（角色已有其他
+                    # 活跃任务时不覆盖、只追加排队标记）。两处写同一文件，且无守卫者先执行
+                    # → 守卫形同虚设。实测 2026-10-16：pytest fixture 的 "test" 任务
+                    # 覆盖了 scout/engineer 的真实 TASKS.md（16:22:50/52）。
                     prompt = prompt.replace("{workspace_summary}", self._collect_workspace_summary(Path.home() / "ccs-workspaces" / step.target_role) if hasattr(self,'_collect_workspace_summary') else "")
                     _delivered = self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 仅当真实投递成功才盖戳 notified；投递被并发守卫/变量校验拦截时

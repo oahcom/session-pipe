@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 from paths import CCS_CLI as _CCS_CLI
+from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 
 LOGGER = logging.getLogger("workflow.engine")
 
@@ -467,7 +468,10 @@ class RoleLifecycleMixin:
         # 否则后写者覆盖先写者 → 角色执行错误任务。观测案例：测试风暴覆盖 scout 真实任务）。
         if wf_id:
             try:
-                ws_dir = Path.home() / "ccs-workspaces" / role
+                # 走 paths.CCS_WORKSPACES 而非硬编码 Path.home()：该常量支持
+                # SESSION_PIPELINE_CCS_WORKSPACES 覆盖，测试可隔离。硬编码会让
+                # 每个跑测试的用例都写进生产 workspace（实测污染 scout/engineer）。
+                ws_dir = _CCS_WORKSPACES / role
                 ws_dir.mkdir(parents=True, exist_ok=True)
                 task_rows = self._lifecycle.query(
                     "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",

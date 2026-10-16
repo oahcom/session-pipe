@@ -16,7 +16,11 @@ __all__ = ["BUS_CLIENT"]
 # ── 路径常量：由本项目自行管理，不依赖 bus config ──
 _SESSION_LAUNCHER_SRC = Path(_HOME / "session-launcher" / "src")
 SESSION_ROLES_ROOT = Path(_HOME / "hermes-session-roles")
-CCS_WORKSPACES = Path(_HOME / "ccs-workspaces")
+# env var 覆盖: 测试隔离用（同 WORKFLOWS_DB）。不隔离时测试写 TASKS.md 会
+# 覆盖生产 workspace —— 实测 pytest fixture 的 "test" 任务污染
+# scout/engineer 的真实 TASKS.md（2026-10-16 16:22）。
+CCS_WORKSPACES = Path(os.environ.get("SESSION_PIPELINE_CCS_WORKSPACES",
+                                     _HOME / "ccs-workspaces"))
 
 # ── 数据目录 ──
 HERMES_STATE = _HOME / ".hermes" / "state"

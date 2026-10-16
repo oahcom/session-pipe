@@ -23,6 +23,11 @@ if _PIPELINE_SRC not in sys.path:
 
 from pipeflow.engine import Step, WorkflowEngine, WorkflowRun
 
+# 与被测引擎同源：走 paths.CCS_WORKSPACES（conftest 已隔离到临时目录）。
+# 硬编码 Path.home() 会让测试写生产 workspace，且隔离后读写路径不一致导致误报。
+from paths import CCS_WORKSPACES as _CCSWS
+_WS_SCOUT = _CCSWS / "scout"
+
 _UNIQUE = f"EC_{int(time.time() * 1000) % 1_000_000:06d}"
 
 
@@ -132,7 +137,7 @@ class TestValidateExitSchema(unittest.TestCase):
         self.assertTrue(any("缺少产出" in e for e in errs))
 
     def test_min_length_pass(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"minlen_{_UNIQUE}.md"
         fpath.write_text("x" * 100)
@@ -148,7 +153,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_min_length_fail(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"short_{_UNIQUE}.md"
         fpath.write_text("hi")
@@ -165,7 +170,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_must_contain_pass(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"content_{_UNIQUE}.md"
         fpath.write_text("结论: 测试通过")
@@ -181,7 +186,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_must_contain_fail(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"nocon_{_UNIQUE}.md"
         fpath.write_text("nothing special here")
@@ -198,7 +203,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_must_contain_url_pass(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"urlok_{_UNIQUE}.md"
         fpath.write_text("参考: https://github.com/example/proj\n")
@@ -214,7 +219,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_must_contain_url_fail(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"nourl_{_UNIQUE}.md"
         fpath.write_text("本地调研结论，无外部链接")
@@ -231,7 +236,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_checksum_pass(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"cksum_{_UNIQUE}.md"
         content = f"checksum test {_UNIQUE}"
@@ -249,7 +254,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_checksum_fail(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         ws.mkdir(parents=True, exist_ok=True)
         fpath = ws / f"cksum2_{_UNIQUE}.md"
         fpath.write_text("some content")
@@ -266,7 +271,7 @@ class TestValidateExitSchema(unittest.TestCase):
             fpath.unlink(missing_ok=True)
 
     def test_min_files_pass(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         d = ws / f"pkg_{_UNIQUE}"
         d.mkdir(parents=True, exist_ok=True)
         for i in range(3):
@@ -284,7 +289,7 @@ class TestValidateExitSchema(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_min_files_fail(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         d = ws / f"pkg2_{_UNIQUE}"
         d.mkdir(parents=True, exist_ok=True)
         (d / "only.py").write_text("# one file")
@@ -302,7 +307,7 @@ class TestValidateExitSchema(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_min_count_pass(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         d = ws / f"mc_{_UNIQUE}"
         d.mkdir(parents=True, exist_ok=True)
         for i in range(3):
@@ -321,7 +326,7 @@ class TestValidateExitSchema(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_min_count_fail(self):
-        ws = Path.home() / "ccs-workspaces" / "scout"
+        ws = _WS_SCOUT
         d = ws / f"mc2_{_UNIQUE}"
         d.mkdir(parents=True, exist_ok=True)
         (d / "only.txt").write_text("x")
