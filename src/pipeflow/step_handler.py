@@ -792,11 +792,18 @@ class StepHandlerMixin:
             _cc_file = _cc["file"]
             _min = _cc.get("min_size", 0)
             _fp = pathlib.Path(_cc_file).expanduser()
+            # 新鲜度下限（与 _validate_exit_schema 同范式）：只查 exists()+size 会被
+            # workspace 里的历史产物永久满足 —— 实测 SCOUT_REPORT.md 停在 6 周前，
+            # s1 靠它虚假通过（bus 无 s1-complete 证据），下游全链空转。
+            _cc_floor = (getattr(run, 'created_at', 0) or 0) - 2
             if "*" in _cc_file:
                 _matches = sorted(_fp.parent.glob(_fp.name))
-                _fp_ok = bool(_matches) and _matches[0].stat().st_size >= _min
+                _fresh = [m for m in _matches
+                          if _cc_floor <= 0 or m.stat().st_mtime >= _cc_floor]
+                _fp_ok = bool(_fresh) and _fresh[0].stat().st_size >= _min
             else:
-                _fp_ok = _fp.exists() and _fp.stat().st_size >= _min
+                _fp_ok = (_fp.exists() and _fp.stat().st_size >= _min
+                          and (_cc_floor <= 0 or _fp.stat().st_mtime >= _cc_floor))
             if _fp_ok:
                 LOGGER.info("completion_check: %s 文件存在且 ≥%d 字节 → 推进 %s",
                             _fp.name, _min, step.id)

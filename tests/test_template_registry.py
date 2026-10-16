@@ -216,6 +216,20 @@ def test_dual_node_full_cycle():
         wf_dir = Path(tmp) / "wf"
         wf_dir.mkdir()
         _shutil.copy(_PROD_WF / "food_chain_loop.json", wf_dir / "food_chain_loop.json")
+        # s1 的 completion_check 指向生产 scout workspace 的 SCOUT_REPORT.md。
+        # 该文件必然早于本测试新建的工作流 → 新鲜度守卫正确拒绝它 → dual_node 不触发。
+        # 原测试是靠"陈旧文件也放行"的缺陷通过的（环境耦合）。改为指向测试沙箱内的
+        # 同名文件，显式构造本步产出。只改模板副本，不碰生产 JSON。
+        _doc = _json.loads((wf_dir / "food_chain_loop.json").read_text(encoding="utf-8"))
+        _report = Path(tmp) / "SCOUT_REPORT.md"
+        _report.write_text("## 发现\nx\n## 推荐\ny\n## 来源\nz\n" + "filler\n" * 100,
+                           encoding="utf-8")
+        for _s in _doc.get("steps", []):
+            _cc = (_s.get("exit_condition") or {}).get("completion_check")
+            if isinstance(_cc, dict) and _cc.get("file"):
+                _cc["file"] = str(_report)
+        (wf_dir / "food_chain_loop.json").write_text(
+            _json.dumps(_doc, ensure_ascii=False), encoding="utf-8")
         eng = WorkflowEngine(workflows_dir=wf_dir, db_path=str(Path(tmp) / "t.db"))
         mock_result = MagicMock()
         mock_result.returncode = 0

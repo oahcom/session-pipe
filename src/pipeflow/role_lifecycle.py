@@ -17,6 +17,12 @@ from paths import CCS_CLI as _CCS_CLI
 
 LOGGER = logging.getLogger("workflow.engine")
 
+# kick-stalled 重推冷却（秒）：原实现每个 daemon tick 都重推，实测 33 分钟
+# 398 次（约 5s 一次），把同一 prompt 灌满角色队列 —— pane 显示
+# "Press up to edit queued messages"，角色被自己的重复指令淹没。
+# 停滞是真实状态，但不该靠刷屏解决：同一 step 每 10 分钟最多重推 1 次。
+_KICK_COOLDOWN_SEC = 600
+
 
 class RoleLifecycleMixin:
     """WorkflowEngine 的角色管理 mixin。"""
@@ -161,6 +167,12 @@ class RoleLifecycleMixin:
                 # 导致停滞步骤永不重推（2026-08-10 观测 wf_cde32/s1 skip 30 分钟）
                 if self._is_role_busy(_role, exclude_wf_id=row["instance_id"]):
                     continue
+                # 冷却：同一 step 每 _KICK_COOLDOWN_SEC 最多重推一次。
+                # 时间戳存 step_results（跨 tick 持久化，daemon 重启仍有效），
+                # 与 track_notified_at / last_heal 同范式。
+                _last_kick = _sr.get("kick_stalled_at", 0)
+                if _last_kick and now - _last_kick < _KICK_COOLDOWN_SEC:
+                    continue
                 LOGGER.info("kick-stalled: %s/%s role=%s notified=%ds ago",
                             row["template_id"], row["instance_id"], _role, now - _notified_at)
                 # 重推用统一变量填充（任务上下文 + 上一步产出），与首推一致
@@ -185,6 +197,11 @@ class RoleLifecycleMixin:
                     continue
                 self._send_to_role(_role, _prompt,
                                    wf_id=row["instance_id"], step_id=_sid)
+                # 投递后立即落冷却戳。不落库则每 tick 重推（本函数每 tick 都跑，
+                # 而 run 每 tick 从 DB 重建 → 内存里的 _sr 改动下一轮即丢）。
+                _sr["kick_stalled_at"] = now
+                _results[_sid] = _sr
+                self._sync_step_results(row["instance_id"], _results)
         except Exception as _e:
             LOGGER.debug("kick_stalled error: %s", _e)
 
@@ -342,24 +359,22 @@ class RoleLifecycleMixin:
             return False
 
     def _recently_producing(self, role: str) -> bool:
-        """角色最近 180s 是否有 bus 产出（比 pane_active 可靠: 单 pane 恒 1）。"""
+        """角色最近 180s 是否有 bus 产出（比 pane_active 可靠: 单 pane 恒 1）。
+
+        原实现调 `bus_client.py read --src <role>`，而 read 子命令只接受
+        --cat/--limit/--consume/--watch/--json（无 --src）→ argparse 退出 2 →
+        异常被 except 吞 → 恒返回 False，停滞守卫形同虚设（实测 33 分钟内
+        kick-stalled 398 次）。且时间戳字段名取 created_at/timestamp，而
+        Fact 用 ts，双重取不到值。
+        Blackboard.read() 原生支持 src=，直接走进程内查询，免子进程。
+        """
         try:
-            import subprocess
-            r = subprocess.run(
-                [sys.executable, str(Path.home() / ".hermes" / "scripts" / "bus_client.py"),
-                 "read", "--src", role, "--limit", "5", "--json"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                facts = json.loads(r.stdout)
-                if isinstance(facts, list) and facts:
-                    recent_ts = max(
-                        float(f.get("created_at", 0) or f.get("timestamp", 0))
-                        for f in facts
-                    )
-                    return time.time() - recent_ts < 180
-        except Exception:
-            pass
+            facts = self._bb.read(src=role, limit=5)
+            if facts:
+                recent_ts = max(float(getattr(f, "ts", 0) or 0) for f in facts)
+                return time.time() - recent_ts < 180
+        except Exception as _e:
+            LOGGER.debug("_recently_producing(%s) failed: %s", role, _e)
         return False
 
     def _notify_role(self, role: str, title: str, evidence: str):
