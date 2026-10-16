@@ -81,6 +81,7 @@ class WorkflowLifecycleMixin:
         """
         from pipeflow.engine import ZOMBIE_TEMPLATES as _ZOMBIE_TEMPLATES
         now = time.time()
+        _recycled: list[tuple[str, str, str]] = []  # (template, wf_id, reason) —— 循环外汇总通知
         try:
             for row in lm.query(
                 # current_step_id 必须选：:137/:148 的 d.get("current_step_id", "")
@@ -234,19 +235,34 @@ class WorkflowLifecycleMixin:
                         LOGGER.debug("stale rescue failed for %s: %s", wf_id, _re)
                     try:
                         lm.execute(
-                            "UPDATE workflow_instances SET status='cancelled' WHERE instance_id=?",
-                            (wf_id,)
+                            "UPDATE workflow_instances SET status='cancelled', completed_at=? "
+                            "WHERE instance_id=?",
+                            (now, wf_id)
                         )
                         lm.execute(
                             "INSERT INTO workflow_logs (workflow_instance_id, task_id, action, actor, detail, ts) "
                             "VALUES (?, ?, 'cancelled', 'workflow_engine', ?, ?)",
                             (wf_id, "", f"僵尸回收: {reason}", time.time())
                         )
-                        self._notify_role("maintainer",
-                            f"僵尸工作流自动回收: {tpl}/{wf_id}",
-                            f"原因: {reason}\n请排查该工作流为何没有正常完成。")
+                        # 逐台留痕已在 workflow_logs（可查），但通知必须聚合：
+                        # 批量回收时逐台 _notify_role 会在同一秒写 N 条 blocker+ccs send，
+                        # 制造总线尖峰（实测 2026-10-17 06:30 一次回收 21 台 → 22 条同秒
+                        # blocker）。改为循环外汇总一条，各台原因按模板归并。
+                        _recycled.append((tpl, wf_id, reason))
                     except Exception as e:
                         LOGGER.debug("stale cleanup write failed: %s", e)
+            if _recycled:
+                _by_tpl: dict[str, list[str]] = {}
+                for _t, _w, _r in _recycled:
+                    _by_tpl.setdefault(_t, []).append(_w)
+                _summary = "; ".join(
+                    f"{_t}×{len(_ws)} ({_ws[0]}…)" for _t, _ws in sorted(_by_tpl.items()))
+                self._notify_role(
+                    "maintainer",
+                    f"僵尸工作流自动回收: {len(_recycled)} 台",
+                    f"按模板: {_summary}\n"
+                    f"首台原因示例: {_recycled[0][2]}\n"
+                    f"逐台明细见 workflow_logs(action=cancelled)。")
             LOGGER.info("stale cleanup done")
         except Exception as e:
             LOGGER.warning("stale cleanup error: %s", e)
