@@ -261,8 +261,32 @@ def _validate_python_inline(code: str) -> bool:
     return True
 
 
+# 恒真验证命令：输出与系统状态无关，永远 PASS，会伪造通过率看板。
+# 这类命令即使通过白名单也必须拒绝执行——"命令能跑通"不等于"检查了真实状态"。
+# 典型来源：persona eval_criteria 写成 echo PASS / python3 -c "print('PASS')"。
+_TAUTOLOGY_PATTERNS = (
+    "print(\"PASS\")", "print('PASS')", "print(\"pass\")", "print('pass')",
+    "echo \"PASS\"", "echo 'PASS'", "echo PASS",
+    "echo \"pass\"", "echo 'pass'", "echo pass",
+    "exit 0", "exit(0)", "import sys; print",
+)
+
+
+def _is_tautology(cmd: str) -> bool:
+    """判断命令是否恒真（与系统状态无关，必然 PASS）。"""
+    c = cmd.replace(" ", "")
+    return any(p.replace(" ", "") in c for p in _TAUTOLOGY_PATTERNS)
+
+
 def _run(cmd: str, timeout: int = 30) -> dict:
     """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
+    # 恒真检查必须放在最前：下方有"引号规范化"会把 eval_criteria 里
+    # `python3 -c "print("PASS")"` 这类笔误**修好**使其可执行——那是帮一个
+    # 恒真命令通过，而不是拒绝它。先拒绝，再谈白名单与规范化。
+    if _is_tautology(cmd):
+        return {"ok": False, "stdout": "",
+                "stderr": "恒真命令被拒（与系统状态无关，会伪造 PASS）",
+                "returncode": -3}
     first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
     # bash -c '...' 解包: 递归校验内部命令（for 循环巡检是白名单内命令的组合）
     if first_word == "bash":
@@ -784,8 +808,10 @@ class TrajectoryQualityChecker:
     def _load_tool_calls(self, sessions: list[Path]) -> list[dict]:
         """读取所有 jsonl，提取有序 (tool_use, tool_result) 调用序列。
 
-        返回扁平列表，每项 {kind, name, input, id, error, order}。
+        返回扁平列表，每项 {kind, name, input, id, error, order, src}。
         kind ∈ {use, result}。order 为全局单调递增序号，保留跨文件时序。
+        src 为该调用所属 jsonl 文件名——orphan_call 判据需要按 transcript
+        边界区分"会话到此为止"与"角色中途漏收结果"（见 check 内注释）。
         """
         calls: list[dict] = []
         order = 0
@@ -813,7 +839,7 @@ class TrajectoryQualityChecker:
                                         "kind": "use", "name": blk.get("name"),
                                         "input": blk.get("input", {}),
                                         "id": blk.get("id"), "error": None,
-                                        "order": order,
+                                        "order": order, "src": jf.name,
                                     })
                                 elif blk.get("type") == "tool_result":
                                     order += 1
@@ -823,7 +849,7 @@ class TrajectoryQualityChecker:
                                         "input": {},
                                         "id": blk.get("tool_use_id"),
                                         "error": blk.get("is_error", False),
-                                        "order": order,
+                                        "order": order, "src": jf.name,
                                     })
                 except OSError as e:
                     LOGGER.debug("transcript read fail %s: %s", jf, e)
@@ -864,12 +890,33 @@ class TrajectoryQualityChecker:
 
         # ── 2. 盲改 + 3. 孤儿调用 + 4. 抖动循环 ──
         read_files: set[str] = set()
+        bash_blob: list[str] = []
         seen_use_ids: set[str] = set()
         result_ids: set[str] = set()
         # Bash 连续重复检测：跟踪上一命令与连续计数
         last_cmd: str | None = None
         repeat_run: int = 0
         repeat_window_start: int | None = None
+
+        # 会话边界：每个 transcript **末尾连续未配对**的 tool_use 段。
+        # 同一轮里 Claude 会并行发多个 tool_use（实测 dfd563da 末尾连发 2 条），
+        # 故不能只取最后一条——要从后往前收，直到遇到一条已配对 result 的为止。
+        # 这些调用无 result 是会话在工具执行中结束所致（角色被杀/compact/换
+        # session），不是"漏收结果"。
+        # 保守性：角色真在中途漏收结果又继续调用时，那条不在末尾连续段内，
+        # 仍会被报出。
+        tail_use_ids: set[str] = set()
+        _by_src: dict[str, list[dict]] = {}
+        for c in calls:
+            _by_src.setdefault(c["src"], []).append(c)
+        for _src, _cs in _by_src.items():
+            _paired = {c["id"] for c in _cs if c["kind"] == "result" and c["id"]}
+            for c in reversed(_cs):
+                if c["kind"] != "use" or not c["id"]:
+                    continue
+                if c["id"] in _paired:
+                    break  # 已配对 → 边界到此为止
+                tail_use_ids.add(c["id"])
 
         def _close_thrash():
             nonlocal repeat_run, repeat_window_start, last_cmd
@@ -901,7 +948,14 @@ class TrajectoryQualityChecker:
 
             if name in ("Write", "Edit"):
                 fp = inp.get("file_path")
-                if fp and fp not in read_files:
+                # Bash 读取同样算「读过」：角色规范《Large File / Log Analysis》
+                # 明确要求大文件先 grep 定位、日志用 tail/grep，而非 Read 全文。
+                # 只认 Read 会把合规行为判成 blind_edit——实测 scout/engineer/lr
+                # 共 16 处命中，其目标文件全部已被 Bash 读过（basename 100% 命中，
+                # 绝对路径命中仅 2/16，故按 basename 匹配）。
+                bash_read = bool(fp) and any(
+                    os.path.basename(fp) in b for b in bash_blob)
+                if fp and fp not in read_files and not bash_read:
                     findings.append({
                         "issue": "blind_edit", "tool": name,
                         "file": fp, "id": cid,
@@ -910,6 +964,7 @@ class TrajectoryQualityChecker:
             if name == "Bash":
                 cmd = (inp.get("command") or "").strip()
                 if cmd:
+                    bash_blob.append(cmd)
                     if cmd == last_cmd:
                         repeat_run += 1
                     else:
@@ -922,9 +977,19 @@ class TrajectoryQualityChecker:
                     _close_thrash()
         _close_thrash()
 
-        # 孤儿调用：发出但无返回
+        # 孤儿调用：发出但无返回。
+        # WHY 要排除每个 transcript 的**末条** tool_use：会话在工具执行中结束
+        # （角色被杀/compact/换 session）时，那条 tool_use 不会有配对 result，
+        # 但它不是角色的违规——是会话边界。实测 scout 的 4 处 orphan_call
+        # **4/4 全是各自 jsonl 的末条 tool_use**（0/4 真阳性）。
+        # 判据不排除它，就会把"会话到此为止"永久报成"角色漏收结果"，
+        # 且这些历史条目会持续占据 bus 报告的 findings[:3] 三个名额，
+        # 把真正的违规挤出视野。排除"末条"是保守的：若角色真在中途漏收
+        # 结果又继续调用，那条就不是末条，仍会被报出。
         orphan = seen_use_ids - result_ids
         for oid in sorted(orphan):
+            if oid in tail_use_ids:
+                continue
             findings.append({"issue": "orphan_call", "tool": "?", "id": oid})
 
         checked_traces = sum(1 for s in sessions for _ in s.glob("*.jsonl"))

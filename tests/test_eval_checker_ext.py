@@ -115,3 +115,35 @@ def test_tool_error_skipped_not_failed():
     assert s["failed"] == 0
     assert s["skipped"] >= 1
     assert captured == []
+
+
+# ── 恒真命令护栏 ──
+
+def test_tautology_commands_rejected_before_whitelist():
+    """恒真命令必须被拒（而非被"修好"后放行）。
+
+    缺陷实证（2026-10-16）：eval_criteria 写 `python3 -c "print('PASS')"` 时，
+    旧实现走"引号规范化"把内层引号替换成单引号**使它能跑通**——即帮一个恒真
+    命令通过，而不是拒绝它。命令返回 0 就被记为 PASS，伪造通过率。
+    """
+    for cmd in ('echo "PASS"', "echo 'pass'", "echo PASS",
+                'python3 -c "print(\'PASS\')"',
+                "python3 -c 'import sys; print(\"PASS\")'",
+                "exit 0", "exit(0)"):
+        r = ec._run(cmd)
+        assert r["ok"] is False, f"恒真命令未拦截: {cmd}"
+        assert r["returncode"] == -3, f"应以 -3 拒绝: {cmd}"
+        assert "恒真" in r["stderr"], f"拒绝原因应说明是恒真: {cmd}"
+
+
+def test_real_readonly_checks_still_allowed():
+    """真实只读检查不得被新护栏误伤。"""
+    for cmd in ("journalctl --user -u session-pipeline-daemon -n 5", "ps aux"):
+        r = ec._run(cmd)
+        assert r["returncode"] != -3, f"真实检查被误拒: {cmd} -> {r.get('stderr')}"
+
+
+def test_is_tautology_normalizes_spaces():
+    """空格不影响判定（`echo    PASS` 也应拒）。"""
+    for cmd in ('echo    "PASS"', "python3 -c 'import sys; print(  \"PASS\"  )'"):
+        assert ec._is_tautology(cmd) is True, f"应判为恒真: {cmd}"
