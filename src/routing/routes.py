@@ -25,7 +25,11 @@ from output_validator import validate_output
 # _SYSTEM_CATEGORIES: 跳过 workflow 创建的分类（路由信号）
 # _NON_TASK_CATEGORIES: 跳过路由分发的分类（纯通知/心跳，无任务语义）
 _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker", "task_spec",
-                                       "feedback", "code_review", "verification"})
+                                       "feedback", "code_review", "verification",
+                                       # scheduler: 定时器心跳，206 条中 196 条同文（95% 重复），
+                                       # 建 workflow 只会产出同标题空任务。session_log: 角色
+                                       # 自述汇报，非工作请求。二者仍正常路由给角色，仅不建任务。
+                                       "scheduler", "session_log"})
 _NON_TASK_CATEGORIES = frozenset({"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"})
 SYSTEM_CATEGORIES = _NON_TASK_CATEGORIES  # 向后兼容别名
 
@@ -326,7 +330,11 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                                msg["id"], role_name, _mc)
             # 创建对应角色的工作流实例（按 bus 分类推荐模板）
             _cat = msg.get("category", "")
-            if _cat in _NON_TASK_CATEGORIES:
+            # 此处判定"是否建 workflow"，route_all 用 _SYSTEM_CATEGORIES。
+            # 原用 _NON_TASK_CATEGORIES（其职责是跳过路由分发）会漏掉
+            # architecture/ccs_health/verification 等 7 个纯信号分类；
+            # 但该集合独有 heartbeat/metrics/ccs_send_fallback 也须继续跳过，故取并集。
+            if _cat in (_SYSTEM_CATEGORIES | _NON_TASK_CATEGORIES):
                 LOGGER.debug("Skipping workflow creation for system category %s", _cat)
             else:
                 try:
