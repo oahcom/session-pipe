@@ -504,9 +504,16 @@ class LifecycleManager:
                     "cancelled_by": self.role,
                     "reason": "角色持续不响应（tmux 信号自动取消）",
                 }
+                # 同步关闭工作流：cancel_step 的语义是"中止等待"，步骤已终结则该实例
+                # 不会再推进。只写 step_results 会让行级 status 永远停在 running——
+                # 回收器（_cleanup_stale_workflows）按行级 status 取候选，而这些实例的
+                # 步骤级已是 cancelled，不会被任何条件命中 → 永久滞留。
+                # 实测 2026-10-17：WL-dev_with_collab 14 台 @s4 行级 running / 步骤级
+                # cancelled 达 5.5-6.1h，是 running 存量里最大的一块死重。
                 self._conn.execute(
-                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                    (json.dumps(results, ensure_ascii=False), wf_id)
+                    "UPDATE workflow_instances SET step_results=?, status='cancelled', "
+                    "completed_at=? WHERE instance_id=?",
+                    (json.dumps(results, ensure_ascii=False), time.time(), wf_id)
                 )
                 self._log_unsafe(wf_id, wf.get("task_id"), "step_cancelled",
                                  detail=f"{step_id}: 角色不响应自动取消")
@@ -810,7 +817,7 @@ class LifecycleManager:
         """
         # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token L648）
         safe_prompt = approval_prompt.replace(token, "***")
-        from blackboard import Blackboard
+        from hermes_bus.blackboard import Blackboard
         bb = Blackboard()
         bb.write(
             "workflow",
