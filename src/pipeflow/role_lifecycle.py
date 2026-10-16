@@ -438,13 +438,17 @@ class RoleLifecycleMixin:
                        wf_id: str = "", step_id: str = "", force: bool = False,
                        scheduler_noise: bool = False):
         """确保角色 CCS 存活，写完整 task_spec 到 bus，再 ccs send 推送全文。
+
+        返回: True=已投递；"busy"=角色忙（正常排队，非故障，调用方不应计失败）；
+              False=真失败（变量残留/角色未就绪/投递异常）。
         force=True 时跳过 pending/busy 检查，用于超时重推。"""
-        # 并发保护：角色已有另一个 workflow 的活跃步骤时，跳过推送
-        # pane_fallback=False：首次投递仅查 DB，不因 tmux 存活而阻塞
         if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=False):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
-            return False  # 投递未发生：调用方据此不可盖戳 notified，避免"未投递却标记已通知"掩盖死锁
+            # "角色忙" 是正常排队，不是故障：单角色串行而 N 个同角色实例并发时，
+            # 多数实例都会撞上此分支。调用方不可据此累计 delivery_fail_count
+            # （否则 3 次即判死，实测 227 条 delivery_blocked 中多数属此）。
+            return "busy"
         # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用
         # 这些内容作 StopHook 条件时 bool([]) 为 False → 死循环
         from pipeflow.engine import UNMATCHED_VAR_RE as _UNMATCHED_VAR_RE
