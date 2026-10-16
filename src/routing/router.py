@@ -96,16 +96,6 @@ class Router:
             print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
         return self._build_from_export()
 
-    def load_from_db(self) -> dict:
-        """重新从 DB 加载路由表，更新 self._routing。"""
-        try:
-            db_routing = routing_db.load_routing()
-            if self._db_ok(db_routing):
-                self._routing = db_routing
-        except Exception as _e:
-            print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
-        return self._routing
-
     def register_role(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
         """注册/更新角色路由（同时写入 DB 和内存）。"""
         self._routing[role] = {"produce": produce, "consume": consume}
@@ -313,11 +303,6 @@ def routing_summary() -> dict:
 def format_pipeline() -> str:
     """格式化为人类可读的路由拓扑图（供 AGENTS.md / PUBLIC_API.md 文档指令调用）。"""
     return get_router().format_pipeline()
-
-
-def category_priority(cat: str) -> int:
-    """返回分类的优先级分数（数字越小越优先）。兼容旧接口，等价 priority()。"""
-    return priority(cat)
 
 
 def main():
