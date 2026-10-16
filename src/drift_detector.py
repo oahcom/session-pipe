@@ -25,7 +25,19 @@ log = logging.getLogger("drift-detector")
 # （漂移分析发现 maintainer 36 条 + archivist 20 条误报根因）
 # workflow 是引擎内部信道（审批/步骤推送经 ccs.py send 回写 src 归因于角色，cat=workflow），
 # 属角色消费而非产出，所有角色都收，故放行（bus[301357] engineer 误报根因）。
-_ALWAYS_ALLOWED = {"notice", "architecture", "monitor_audit", "monitor_wf_health", "workflow"}
+# 引擎回写分类：routing_daemon/task_generator 经 ccs.py send 把任务/步骤推送
+# 以 src=角色 归因写回（cat=task_spec/scheduler 等），属输入信道而非角色产出。
+# L82 注释已声明 task_spec 为输入信道，但原 _ALWAYS_ALLOWED 只放了 workflow，
+# 导致 pm/knowledge_curator 等收到任务分配时被误报"产出越界"（PM 确认误报）。
+# 这里补全引擎回写分类，与 workflow 同列。
+_ENGINE_WRITEBACK_CATS = {"workflow", "task_spec", "scheduler", "monitor_wf_health"}
+# reflexion_lesson: prompts/base.md 的「违规后果」条款要求**所有角色**
+# 「首次违规 → 退回原角色 + 写 reflexion_lesson」，README 亦将其列为
+# consumer/archivist 的 output_targets。属被系统性要求的合法产出，但不在
+# persona 的 output_targets 里 → 4 角色 + watchdog 误报「产出越界」，
+# 且形成自指循环：写教训 → 被判漂移 → 再写教训。engineer #370527 取证确认。
+_ALWAYS_ALLOWED = ({"notice", "architecture", "monitor_audit", "reflexion_lesson"}
+                   | _ENGINE_WRITEBACK_CATS)
 
 
 def _load_role_config(role: str) -> Optional[dict]:
