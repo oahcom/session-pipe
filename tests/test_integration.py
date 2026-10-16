@@ -28,6 +28,12 @@ if _src_dir in sys.path:
     sys.path.remove(_src_dir)
 sys.path.insert(0, _src_dir)
 
+import tempfile
+# 隔离：集成测试写独立临时 bus DB，不污染生产 Sister Bus，且队列状态确定性
+os.environ["HERMES_BLACKBOARD_DB"] = os.path.join(
+    tempfile.mkdtemp(prefix="bus-test-"), "blackboard.db"
+)
+
 
 def test_bus_write_and_unconsumed():
     """bus 写入 → unconsumed 能读到。"""

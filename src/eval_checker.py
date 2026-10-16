@@ -10,7 +10,7 @@ eval_checker.py — eval_criteria 运行时执行器。
     run_eval_check()  # 每 300s 调一次
 """
 
-import ast, json, logging, os, random, re, subprocess, sys, time
+import ast, json, logging, os, random, re, shlex, subprocess, sys, time
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -285,7 +285,15 @@ def _run(cmd: str, timeout: int = 30) -> dict:
 
     # P0: python3 -c 沙箱 — AST 深度驗證內部代碼，阻攔 import os/subprocess 等
     if _is_py_inline:
-        _py_code = cmd.split(None, 2)[-1].strip("'\"")
+        # 用 shlex 而非 split(None,2)[-1].strip("'\"")：后者不处理内层 \" 转义，
+        # 传给 ast.parse 的代码含多余反斜杠 → SyntaxError("unexpected character
+        # after line continuation character")，判据【从未成功执行过】却被记成
+        # 角色 FAIL（实测 curator SKILL.md 判据，2026-10-16）。shlex 按 shell
+        # 规则还原出真正的 python 源码。切分失败时退回原取法（保守，不崩溃）。
+        try:
+            _py_code = shlex.split(cmd)[-1]
+        except ValueError:
+            _py_code = cmd.split(None, 2)[-1].strip("'\"")
         if not _validate_python_inline(_py_code):
             return {"ok": False, "stdout": "", "stderr": "python3 -c 內部代碼含阻斷 API",
                     "returncode": -4}
@@ -962,9 +970,10 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                 continue
 
             result = _run(cmd_raw)
-            # 白名单拒绝（-3）是检查器能力边界，非系统故障 → 记 skipped 不写 FAIL
+            # 白名单拒绝（-3）与 python 沙箱阻断（-4）都是检查器自身拒绝执行，
+            # 属能力边界而非角色故障 → 记 skipped 不写 FAIL。
             # 工具自身错误（grep 语法错/文件不存在）是 persona 命令写错，同样非系统故障
-            if result["returncode"] == -3 or _is_tool_error(result):
+            if result["returncode"] in (-3, -4) or _is_tool_error(result):
                 summary["skipped"] += 1
                 continue
             passed, detail = _check_passed(result, cmd_raw, expected)

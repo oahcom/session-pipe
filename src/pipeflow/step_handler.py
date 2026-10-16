@@ -179,6 +179,10 @@ class StepHandlerMixin:
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
                     LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次空闲", run.workflow_name, step.id, _idle_n)
+                    # 必须 return：cancel_step 直接写库，而本函数末尾的 _sync_step_results
+                    # 用的是本轮开头载入的内存快照，会把它覆盖回未取消状态 → 步骤复活，
+                    # 下 tick 再次 cancel，日志刷屏且计数无上限增长。
+                    return
                 except Exception as _e:
                     LOGGER.debug("tmux 空闲 cancel_step 失败: %s", _e)
                 _sig_state["idle_count"] = _idle_n
@@ -195,6 +199,9 @@ class StepHandlerMixin:
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
                     LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次越界", run.workflow_name, step.id, _viol_n)
+                    # 同上方 idle 分支：cancel_step 的写必须在此中止本轮，
+                    # 否则末尾 _sync_step_results 用陈旧快照覆盖回未取消状态。
+                    return
                 except Exception as _e:
                     LOGGER.debug("tmux 越界 cancel_step 失败: %s", _e)
             else:
@@ -872,9 +879,14 @@ class StepHandlerMixin:
         try:
             # 运行 codex review --uncommitted -c model=9router_hermes
             # timeout 300s (5 min) 防卡死
+            # cwd 取角色 workspace：WorkflowRun 无 workspace 字段，旧代码在此抛
+            # AttributeError 被下面 except Exception 吞掉 → codex 从未真正执行，
+            # 质量闸门形同虚设（实测 2026-10-16）。
+            _ws = _CCS_WORKSPACES / step.target_role
             result = subprocess.run(
                 ["codex", "review", "--uncommitted", "-c", "model=9router_hermes"],
-                capture_output=True, text=True, timeout=300, cwd=run.workspace
+                capture_output=True, text=True, timeout=300,
+                cwd=str(_ws) if _ws.exists() else None,
             )
             if result.returncode == 0:
                 # 解析输出：若有 "No issues" 或 "0 issues" 视为通过
@@ -964,7 +976,12 @@ class StepHandlerMixin:
                 # 无匹配且非目录、且非"通配符匹配到但全部是历史文件"：
                 # 所有内容检查均失败。历史文件场景跳过内容检查（无本次产出可校验），
                 # 但 minCount 计数仍会执行
-                for prop_key in ("minLength", "mustContain", "mustContainUrl", "checksum", "maxAgeMinutes"):
+                # 必须覆盖全部"内容判据"属性：漏掉任何一个，以它为唯一判据的
+                # exit_schema 在文件完全不存在时也会通过（mustContainAnyOf 实测
+                # 返回 ok=True，步骤直接盖戳完成）。
+                for prop_key in ("minLength", "mustContain", "mustContainAnyOf",
+                                 "mustContainUrl", "mustNotContain", "checksum",
+                                 "maxAgeMinutes"):
                     if prop_key in props:
                         errs.append(f"缺少产出: {fname}")
                         break

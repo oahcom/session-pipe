@@ -130,6 +130,7 @@ def test_send_to_role_primary_fails_fallback_succeeds():
     """主 CCS CLI subprocess 抛异常 -> fallback session-launcher 路径被调用。"""
     eng = _build_eng()
     eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)  # 避免真实 tmux 轮询阻塞 90s
     eng._is_role_busy = MagicMock(return_value=False)  # 避免占用 _sp.run 序列
 
     with patch.object(engine_mod._sp, "run") as mock_run:
@@ -146,6 +147,7 @@ def test_send_to_role_both_fail_no_crash():
     """主命令 + fallback 都失败 -> 不崩溃。"""
     eng = _build_eng()
     eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)  # 避免真实 tmux 轮询阻塞 90s
     eng._is_role_busy = MagicMock(return_value=False)
 
     with patch.object(engine_mod._sp, "run") as mock_run:
@@ -161,6 +163,7 @@ def test_send_to_role_creates_task_spec():
     """_send_to_role 应写入 task_spec 到 bus。"""
     eng = _build_eng()
     eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)  # 避免真实 tmux 轮询阻塞 90s
     eng._is_role_busy = MagicMock(return_value=False)
 
     with patch.object(engine_mod._sp, "run") as mock_run:

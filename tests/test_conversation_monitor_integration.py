@@ -30,6 +30,8 @@ class _FakeStep:
 
     def __init__(self, exit_condition: dict):
         self.exit_condition = exit_condition
+        self.exit_schema = None
+        self.type = "single"
         self.max_retries = 1
         self.id = "s1"
         self.target_role = "scout"

@@ -160,11 +160,14 @@ def capture_role_pane(role: str, lines: int = 80, timeout: float = 5.0) -> str:
             capture_output=True, text=True, timeout=timeout,
         )
         if r.returncode != 0:
-            LOGGER.debug("pane capture failed: role=%s returncode=%s", role, r.returncode)
+            # WARNING 而非 DEBUG：读失败与"无新内容"共用空串返回，
+            # DEBUG 级下运维无法区分"角色安静"与"tmux 读取故障"——
+            # 后者会让所有 pane 驱动的存活判定静默失效。
+            LOGGER.warning("pane capture failed: role=%s returncode=%s", role, r.returncode)
             return ""
         pane = r.stdout
     except Exception as e:
-        LOGGER.debug("pane capture exception: role=%s error=%s", role, e)
+        LOGGER.warning("pane capture exception: role=%s error=%s", role, e)
         return ""
 
     if not pane:

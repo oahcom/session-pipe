@@ -985,8 +985,26 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 上限 3 次：够覆盖"角色短暂离线后恢复"，又不会无限重刷 blocker。
                     _rc = step_sr.get("recover_count", 0)
                     if _rc >= 3:
-                        LOGGER.debug("recover skip: %s/%s 已达恢复上限 %d 次",
-                                     inst_id[:12], step_id, _rc)
+                        # 达上限 → 收敛终态。留 delivery_blocked 会让实例既不推进
+                        # 也不被回收（run_once 只查 pending/running/step_done_ready，
+                        # _cleanup_stale_workflows 只查 running/step_done_ready）
+                        # → 永久孤儿（实测 wf_sub_ee176a2b55a1 停在 s1）。
+                        # 记 blocker 供人介入，而非静默留下。
+                        LOGGER.warning("recover 上限已满，收敛为 failed: %s/%s (%d 次)",
+                                       inst_id[:12], step_id, _rc)
+                        lm.execute(
+                            "UPDATE workflow_instances SET status='failed' "
+                            "WHERE instance_id=? AND status='delivery_blocked'",
+                            (inst_id,))
+                        try:
+                            self._bb.write(
+                                "blocker",
+                                f"工作流投递恢复耗尽: {inst_id[:12]}/{step_id}",
+                                evidence=(f"角色 {target_role} 连续 {_rc} 次恢复后投递仍失败，"
+                                          f"已收敛为 failed，需人工介入（模板 {wf_name}）"),
+                                src="workflow_engine")
+                        except Exception as _be:
+                            LOGGER.warning("recover 耗尽写 blocker 失败: %s", _be)
                         continue
                     # 检查目标角色是否已在线
                     if self._ensure_role_alive(target_role):

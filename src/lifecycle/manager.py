@@ -19,6 +19,27 @@ from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to 
 
 
 
+# ── gate 判据路径工具（与 step_handler.py:817 的 glob 惯用法一致）──
+_PATH_CHARS = ("/", "\\", "~", ".", "*")
+
+
+def _is_checkable_path(p: str) -> bool:
+    """该 output_exists 条目是否像路径（而非 "变更代码文件" 这类描述）。
+
+    模板里混入描述性文字是既成事实（技术实现.json 的 "deploy_success"），
+    纯中文描述永远 exists()==False，照直判会让 gate 永久 blocked。
+    """
+    return bool(p) and any(c in p for c in _PATH_CHARS)
+
+
+def _output_present(p: str) -> bool:
+    """条目指向的文件是否存在；含 * 时按 glob 匹配（同 step_handler 的完成判据）。"""
+    fp = Path(p).expanduser()
+    if "*" in p:
+        return any(fp.parent.glob(fp.name))
+    return fp.exists()
+
+
 # ── 资源治理约束（agent-contracts 模式）──
 _RESOURCE_BUDGETS: dict[str, dict] = {}
 _DEFAULT_BUDGET = {"max_sessions": 3, "max_memory_mb": 2000, "max_calls_per_hour": 60, "cooldown_sec": 10}
@@ -917,7 +938,18 @@ class LifecycleManager:
             return (True, "no conditions")
         output_exists = check.get("output_exists", [])
         if output_exists:
-            missing = [p for p in output_exists if not Path(p).exists()]
+            checkable = [p for p in output_exists if _is_checkable_path(p)]
+            if not checkable:
+                # 全部是不可判定条目（如 "变更代码文件"、"deploy_success"）→ 无可校验。
+                # 放行而非永久 blocked：blocked 不在 STEP_STATUSES/_ACTIVE_STEP_STATUS
+                # 内，回收扫描覆盖不到，会让步骤与实例双双搁浅（仅 24h 全局阈值兜底）。
+                # 放行但留痕——模板需修正为真实路径。
+                import logging as _lg
+                _lg.getLogger("lifecycle.gate").warning(
+                    "gate 的 output_exists 无可用路径判据，跳过检查（请修正模板）: %s",
+                    output_exists)
+                return (True, "no checkable path in output_exists")
+            missing = [p for p in checkable if not _output_present(p)]
             if missing:
                 return (False, f"output not found: {', '.join(missing)}")
         return (True, "conditions satisfied")
@@ -992,11 +1024,16 @@ class LifecycleManager:
             for step in steps:
                 if step.get("type") != "gate":
                     continue
+                # 与 :194 同款兼容：DB 存 id，legacy 存 step_id。直接 step["step_id"]
+                # 在遇到 id 键模板时会 KeyError 并中断整轮 gate 超时扫描。
+                _sid = step.get("step_id") or step.get("id")
+                if not _sid:
+                    continue
                 timeout_hours = step.get("estimated_hours", 24)
                 rows = self._conn.execute(
                     "SELECT * FROM workflow_instances "
                     "WHERE template_id=? AND status='running' AND current_step_id=?",
-                    (tpl["template_id"], step["step_id"])
+                    (tpl["template_id"], _sid)
                 ).fetchall()
                 for row in rows:
                     inst = dict(row)
@@ -1004,7 +1041,7 @@ class LifecycleManager:
                     if elapsed > timeout_hours:
                         timeouts.append({
                             "wf_id": inst["instance_id"],
-                            "step_id": step["step_id"],
+                            "step_id": _sid,
                             "elapsed_hours": round(elapsed, 1),
                             "timeout_hours": timeout_hours,
                         })
@@ -1047,11 +1084,13 @@ class LifecycleManager:
             "steps": [],
         }
         for step in steps:
-            step_result = results.get(step["step_id"], {})
+            # 与 :194 同款兼容：DB 存 id，legacy 存 step_id
+            _sid = step.get("step_id") or step.get("id") or ""
+            step_result = results.get(_sid, {})
             context["steps"].append({
-                "step_id": step["step_id"],
-                "title": step["title"],
-                "type": step["type"],
+                "step_id": _sid,
+                "title": step.get("title", ""),
+                "type": step.get("type", ""),
                 "target_role": step.get("target_role"),
                 "status": step_result.get("status", "pending"),
                 "approval_prompt": step.get("approval_prompt", ""),
@@ -1073,14 +1112,16 @@ class LifecycleManager:
             "steps": [],
         }
         for i, step in enumerate(steps):
-            step_result = results.get(step["step_id"], {})
+            # 与 :194 同款兼容：DB 存 id，legacy 存 step_id
+            _sid = step.get("step_id") or step.get("id") or ""
+            step_result = results.get(_sid, {})
             progress["steps"].append({
                 "index": i + 1,
-                "step_id": step["step_id"],
-                "title": step["title"],
+                "step_id": _sid,
+                "title": step.get("title", ""),
                 "target_role": step.get("target_role"),
                 "status": step_result.get("status", "pending"),
-                "is_current": step["step_id"] == current_step,
+                "is_current": _sid == current_step,
                 "handoff_status": step_result.get("handoff_status", "N/A"),
             })
         return progress

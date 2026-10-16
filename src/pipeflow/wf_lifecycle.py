@@ -82,7 +82,10 @@ class WorkflowLifecycleMixin:
         now = time.time()
         try:
             for row in lm.query(
-                "SELECT instance_id, template_id, created_at, step_results, status "
+                # current_step_id 必须选：:137/:148 的 d.get("current_step_id", "")
+                # 依赖它，漏选则恒为 "" → 抢救已产出步骤的分支与条件4 双双恒不触发
+                "SELECT instance_id, template_id, created_at, step_results, status, "
+                "current_step_id "
                 "FROM workflow_instances WHERE status IN ('running', 'step_done_ready')"
             ):
                 d = dict(row)

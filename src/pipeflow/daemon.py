@@ -161,6 +161,9 @@ def _starve_signal(eng: WorkflowEngine) -> None:
 
     state["last_fire"] = now
     state["last_wf"] = wf_id
+    # last_active_ts 曾被遗留为 69 天前的陈旧值（无任何写入点），会被读成
+    # "引擎长期停摆"。这里显式维护为本次触发时刻。
+    state["last_active_ts"] = now
     state.pop("consecutive_failures", None)  # 成功 → 清零失败计数
     state.pop("last_failure_ts", None)
     _safe_write_state(state)
@@ -197,7 +200,9 @@ def daemon_loop(interval: int):
     shutdown = False
 
     def _handler(s, f):
-        nonlocal shutdown; shutdown = True
+        nonlocal shutdown
+        LOGGER.info("收到信号 %s，开始优雅关闭...", s)
+        shutdown = True
 
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _handler)
@@ -229,7 +234,12 @@ def daemon_loop(interval: int):
             except Exception as e:
                 LOGGER.warning("饥饿检测异常: %s", e)
             time.sleep(interval)
+    except KeyboardInterrupt:
+        LOGGER.info("收到 KeyboardInterrupt，正在关闭...")
+    except Exception as e:
+        LOGGER.error("Daemon 主循环异常: %s", e, exc_info=True)
     finally:
+        LOGGER.info("正在关闭 Workflow Daemon...")
         if _LOCK_FD is not None:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
             _LOCK_FD.close()

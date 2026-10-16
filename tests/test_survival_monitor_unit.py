@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 _SRC = str(Path.home() / "session-pipeline" / "src")
@@ -236,16 +237,17 @@ class TestL3Check:
     """L3: 产出存活"""
 
     def test_l3_recent_output(self, monitor, monkeypatch):
-        """最近有产出 → producing=True。"""
-        def fake_bus(*a, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = json.dumps([
-                {"cat": "code_fix", "src": "qa", "created_at": time.time() - 60},
-                {"cat": "test_report", "src": "qa", "created_at": time.time() - 120},
-            ])
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_bus)
+        """最近有产出 → producing=True。
+
+        L3 已从 bus CLI 子进程改为 Blackboard 进程内查询：read 子命令无 --src，
+        原调用必然 argparse 退出 2 → 恒 producing=False（角色被误判 idle 击杀）。
+        """
+        def fake_read(*, src=None, limit=5):
+            return [
+                SimpleNamespace(cat="code_fix", src="qa", ts=time.time() - 60),
+                SimpleNamespace(cat="test_report", src="qa", ts=time.time() - 120),
+            ]
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=fake_read))
 
         result = monitor._l3_check("qa")
         assert result["producing"] is True
@@ -254,21 +256,23 @@ class TestL3Check:
 
     def test_l3_no_output(self, monitor, monkeypatch):
         """无产出 → producing=False。"""
-        def fake_bus(*a, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = "[]"
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_bus)
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=lambda **kw: []))
 
         result = monitor._l3_check("qa")
         assert result["producing"] is False
 
     def test_l3_bus_error(self, monitor, monkeypatch):
-        """bus 命令异常 → producing=None。"""
-        def raise_error(*a, **kw):
+        """bus 查询异常 → producing=None（不可判，不得当成"没产出"）。"""
+        def raise_error(**kw):
             raise FileNotFoundError("bus not found")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=raise_error))
+
+        result = monitor._l3_check("qa")
+        assert result["producing"] is None
+
+    def test_l3_blackboard_unavailable(self, monitor, monkeypatch):
+        """Blackboard 不可用 → producing=None，不能误判为"没产出"。"""
+        monkeypatch.setattr(monitor, "_bb", None)
 
         result = monitor._l3_check("qa")
         assert result["producing"] is None

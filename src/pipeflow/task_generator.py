@@ -16,6 +16,17 @@ from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("
 
 LOGGER = logging.getLogger("workflow.engine")
 
+# 测试 harness 模板名前缀。**不用 `.*_test`**：它会命中 qa_test_* 等生产模板
+# （实测 qa_test_execute/qa_test_plan 被误判为 harness → 超时即静默 cancel，
+# 且被 full_dev_pipeline/architect_review/food_chain_loop 作为 subflow 引用）。
+# 新增测试模板请以 test_ 或 drill 开头，或加入本元组。
+_TEST_HARNESS_PREFIXES = ("test_", "exit_schema", "role_interact", "drill")
+
+
+def _is_test_harness_template(template_id: str | None) -> bool:
+    """该模板是否为测试 harness（不参与真实生产派发/超时取消）。"""
+    return bool(template_id) and template_id.startswith(_TEST_HARNESS_PREFIXES)
+
 
 class TaskGeneratorMixin:
     """WorkflowEngine 的任务生成 mixin。"""
@@ -112,12 +123,29 @@ class TaskGeneratorMixin:
         except Exception as _e:
             LOGGER.debug("task_evidence feedback failed: %s", _e)
 
+    _HEAL_COOLDOWN_SEC = 600
+
     def _heal_send(self, role: str, prompt: str, instance_id: str, step_id: str) -> None:
         """锁外自愈重投：投递成功才盖戳 last_heal（锁外独立事务）。
 
         投递失败（并发守卫/变量校验拦截）时返回 False，不盖戳 → 下轮重试，
         避免把"未投递却标记已自愈"掩盖死锁（bus #728c6e4307c1 同类根因）。
+
+        冷却：同一 step 每 _HEAL_COOLDOWN_SEC 最多重投一次。原先 last_heal 只写
+        不读（全仓无读取点），_check_anomalies 每 tick（10s）都重走本路径 →
+        同一 prompt 气温每 11s 重复注入角色 pane（实测近 24h 916 条同前缀投递）。
+        与 role_lifecycle 的 _KICK_COOLDOWN_SEC 同范式。
         """
+        try:
+            _row0 = self._lifecycle.query_one(
+                "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                (instance_id,))
+            _sr0 = json.loads((_row0["step_results"] if _row0 else None) or "{}")
+            _last_heal = (_sr0.get(step_id) or {}).get("last_heal", 0)
+            if _last_heal and time.time() - _last_heal < self._HEAL_COOLDOWN_SEC:
+                return
+        except Exception as _e:
+            LOGGER.debug("heal cooldown read failed: %s", _e)
         self._ensure_role_alive(role)
         _ok = bool(self._send_to_role(role, prompt, wf_id=instance_id, step_id=step_id))
         if not _ok:
@@ -204,10 +232,7 @@ class TaskGeneratorMixin:
                 # 测试 harness 模板（test_*/exit_schema 等验收仅 grep 关键词）在生产环境
                 # 反复运行 → 派发 phantom 角色 → ondemand 回收 → 无限重推 → bus 噪音循环。
                 # 与 ZOMBIE 同一处理：超时不重推，直接 cancel，让活着的角色注意力回到真实产出。
-                _is_test_harness = bool(re.match(
-                    r"^(test_|.*_test|exit_schema|role_interact|drill)",
-                    inst.get("template_id", "") or "",
-                ))
+                _is_test_harness = _is_test_harness_template(inst.get("template_id"))
                 if timed_out_steps >= 2 and not _escalated and not _is_zombie and not _is_test_harness:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
@@ -296,8 +321,8 @@ class TaskGeneratorMixin:
                 continue
             # 测试 harness 模板（test_*/exit_schema 等验收仅 grep 关键词）禁止自动派发：
             # 反复生成 → 喂饱 production 角色做无意义的测试任务 → 真实需求被淹没。
-            # 与 _check_anomalies 的 _is_test_harness 同一判据，避免测试噪音回环。
-            if re.match(r"^(test_|.*_test|exit_schema|role_interact|drill)", _wf_name or ""):
+            # 与 _check_anomalies 共用同一判据函数，避免测试噪音回环。
+            if _is_test_harness_template(_wf_name):
                 continue
             # 取第一个 executor 作为目标角色
             _role = _wf.allowed_executors[0]

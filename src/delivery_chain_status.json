@@ -1,0 +1,32 @@
+{
+  "PRD": {
+    "status": "pending",
+    "artifact": null,
+    "codex_review": null
+  },
+  "DESIGN": {
+    "status": "pending",
+    "artifact": null,
+    "codex_review": null
+  },
+  "IMPLEMENT": {
+    "status": "pending",
+    "artifact": null,
+    "codex_review": null
+  },
+  "TEST": {
+    "status": "pending",
+    "artifact": null,
+    "codex_review": null
+  },
+  "REVIEW": {
+    "status": "completed",
+    "artifact": null,
+    "codex_review": null
+  },
+  "DOC": {
+    "status": "pending",
+    "artifact": null,
+    "codex_review": null
+  }
+}

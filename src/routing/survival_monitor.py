@@ -92,6 +92,13 @@ class SurvivalMonitor:
         # 复用 engine._ensure_role_alive（实现 B：tmux 双验证 + 僵尸重启 + --drive infinite）
         # 而非内联 subprocess；无引擎则惰性构造单例（monitor 每 10min 才用到一次）
         self._engine = engine
+        # L3 走进程内 bus 查询（read 子命令无 --src，见 _l3_check 注释）
+        try:
+            from hermes_bus.blackboard import Blackboard
+            self._bb = Blackboard()
+        except Exception as _e:
+            LOGGER.warning("SurvivalMonitor: Blackboard 不可用，L3 产出检测降级: %s", _e)
+            self._bb = None
 
     # ── L1: 进程存活 ──
 
@@ -210,40 +217,46 @@ class SurvivalMonitor:
         targets = self._role_targets.get(role, None)
         now = time.time()
 
-        # 不指定分类逐个查
+        # Blackboard 不可用时不能返回 producing=False——那会让调用方把"查不到"
+        # 当成"没产出"从而误杀角色。返回 None 让 _overall 走"未知"分支。
+        if self._bb is None:
+            return {
+                "producing": None,
+                "age_seconds": None,
+                "recent_count": 0,
+                "categories_found": [],
+                "targets_coverage": "?",
+                "detail": "Blackboard 不可用，L3 不可判",
+            }
+
+        # 进程内查询 Blackboard：read 子命令无 --src（只有 --cat），走 CLI 必然
+        # argparse 退出 2 → 恒返回 producing=False → 角色被误判 idle 击杀
+        # （实测 2026-10-16）。Blackboard.read() 原生支持 src=，且 Fact.ts 是
+        # 真实时间戳字段（旧代码找 created_at/timestamp 双重取不到）。
+        # 同款修法见 role_lifecycle.py:374 _recently_producing。
         try:
-            # 查该角色最近 5 条产出消息
-            r = subprocess.run(
-                [sys.executable, str(BUS_SCRIPT), "read", "--src", role,
-                 "--limit", "5", "--json"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                facts = json.loads(r.stdout)
-                if isinstance(facts, list) and facts:
-                    recent_ts = max(
-                        float(f.get("created_at", 0) or f.get("timestamp", 0))
-                        for f in facts
-                    )
-                    age = now - recent_ts
-                    producing = age < 600
+            facts = self._bb.read(src=role, limit=5)
+            if facts:
+                recent_ts = max(float(getattr(f, "ts", 0) or 0) for f in facts)
+                age = now - recent_ts
+                producing = age < 600
 
-                    # 分类覆盖度
-                    found_cats = set(f.get("cat", "") for f in facts)
-                    if targets:
-                        covered = found_cats & set(targets)
-                        coverage = f"{len(covered)}/{len(targets)}"
-                    else:
-                        coverage = f"{len(found_cats)}/?"
+                # 分类覆盖度
+                found_cats = set(getattr(f, "cat", "") for f in facts)
+                if targets:
+                    covered = found_cats & set(targets)
+                    coverage = f"{len(covered)}/{len(targets)}"
+                else:
+                    coverage = f"{len(found_cats)}/?"
 
-                    return {
-                        "producing": producing,
-                        "age_seconds": age,
-                        "recent_count": len(facts),
-                        "categories_found": sorted(found_cats),
-                        "targets_coverage": coverage,
-                        "detail": f"最近产出 {age:.0f}s 前, {len(facts)} 条, 覆盖 {coverage}",
-                    }
+                return {
+                    "producing": producing,
+                    "age_seconds": age,
+                    "recent_count": len(facts),
+                    "categories_found": sorted(found_cats),
+                    "targets_coverage": coverage,
+                    "detail": f"最近产出 {age:.0f}s 前, {len(facts)} 条, 覆盖 {coverage}",
+                }
             return {
                 "producing": False,
                 "age_seconds": None,
@@ -254,6 +267,8 @@ class SurvivalMonitor:
             }
         except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError,
                 OSError, IndexError, ValueError) as e:
+            # WARNING 而非 debug：L3 是 idle 击杀的判据来源，异常必须可见
+            LOGGER.warning("L3 产出检测异常 (%s): %s", role, e)
             return {
                 "producing": None,
                 "age_seconds": None,
@@ -459,10 +474,23 @@ class SurvivalMonitor:
         # 10 个 ondemand 角色常驻空转占 2.8GB（角色治理审查发现）。
         # ondemand 语义 = 用完退出；连 idle 累计 N 次（默认 6 次 = 12 分钟）自动 kill。
         # infinite 角色不回收（daemon 依赖常驻），仅 stale/dead 走上面的恢复。
+        # FIX: 不回收有 pending 信号、L2 thinking 或 L3 producing 的角色——
+        # "idle" 定义必须是无信号、无思考、无产出三无。
         try:
             _idle_roles = [r for r, h in results.items()
                            if h["overall"] == "idle" and h.get("lifecycle") == "ondemand"]
             for _ir in _idle_roles:
+                _l1 = results[_ir].get("l1", {})
+                _l2 = results[_ir].get("l2", {})
+                _l3 = results[_ir].get("l3", {})
+                # 有 pending 信号（L1 status=ALIVE 但有 unread）、或 L2 thinking、或 L3 producing → 不回收
+                _has_pending = _l1.get("has_sentinel", False) and _l1.get("status") == "ALIVE"
+                _thinking = _l2.get("thinking") is True
+                _producing = _l3.get("producing") is True
+                if _has_pending or _thinking or _producing:
+                    # 有待处理工作 → 重置 idle_count，不回收
+                    self._state.setdefault(_ir, {})["idle_count"] = 0
+                    continue
                 _prev = self._state.get(_ir, {})
                 _idle_n = _prev.get("idle_count", 0) + 1
                 self._state.setdefault(_ir, {})["idle_count"] = _idle_n

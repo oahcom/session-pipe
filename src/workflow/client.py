@@ -338,6 +338,18 @@ class WorkflowClient:
                 self._conn.rollback()  # 同步失败不阻断主流程，日志必须落库
         self._log(wf_id=wf_id, action="completed", detail=f"summary={summary}")
 
+    def confirm(self, wf_id: str, step_id: str, token: str, approved: bool, reason: str = ""):
+        """角色侧审批入口：把 token 回传给 LifecycleManager 完成/驳回步骤。
+
+        self.role 即被指派审批人（由 _get_assigner_for_step 计算），
+        manager.py 的 only-assigner 校验依赖此值通过。
+        """
+        from lifecycle.manager import LifecycleManager
+        lm = LifecycleManager(role=self.role, db_path=self.db_path)
+        lm.confirm_step(wf_id, step_id, token=token, approved=approved, reason=reason)
+        self._log(wf_id=wf_id, action="step_confirmed" if approved else "step_rejected",
+                  detail=f"{step_id} by {self.role}: {reason}")
+
     def _sync_task_from_workflows(self, task_id: str):
         from workflow.sync import sync_task_status
         sync_task_status(self._conn, task_id)

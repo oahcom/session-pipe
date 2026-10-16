@@ -53,7 +53,10 @@ def test_has_active_template_true_after_start():
     """真实链路: start 后 has_active_template 返回 True（竞态防护的前置依赖）。"""
     with tempfile.TemporaryDirectory() as tmp:
         eng = _make_engine(tmp)
-        with patch("subprocess.run"):
+        # returncode 必须显式配置：未配置时是 MagicMock，与 0 比较为 False,
+        # 会被 _wait_for_role_ready 判为"角色没起来"而真去拉起 tmux，导致测试挂死。
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
             eng.start("food_chain_loop", context={"source": "starve_detector"})
         assert eng.has_active_template("food_chain_loop") is True
 
@@ -70,7 +73,8 @@ def test_has_active_template_false_after_complete():
     """实例完成后（cancelled）不再活跃。"""
     with tempfile.TemporaryDirectory() as tmp:
         eng = _make_engine(tmp)
-        with patch("subprocess.run"):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
             wf_id = eng.start("food_chain_loop", context={"source": "starve_detector"})
         assert eng.has_active_template("food_chain_loop") is True
         eng._lifecycle.close_wf(wf_id, status="cancelled")
@@ -113,7 +117,8 @@ def test_race_guard_real_engine():
         eng = _make_engine(tmp)
         state_path = Path(tmp) / "starve_state.json"
         # 先手动创建活跃实例（模拟 wf_loop 已创建）
-        with patch("subprocess.run"):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
             eng.start("food_chain_loop", context={"source": "wf_loop"})
         # 状态文件模拟冷却已过
         state_path.write_text(json.dumps({"last_fire": 0}))
