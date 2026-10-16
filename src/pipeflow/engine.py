@@ -793,8 +793,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 状态机对 status 缺失时重建覆盖，丢失 exit_messages/node1_done）
                     _existing_sr = results.get(step_id, {}) or {}
                     results[step_id] = {
+                        # queued 与 queued_since 一起清：二者是"本轮排队"的计价器，
+                        # 投递成功即本轮排队结束。若只清 queued_since 而留 queued，
+                        # 下一轮排队会带着旧计数（如 3+1=4）立即满足回收判据 queued>=3，
+                        # 使本该"重新排 3 次"的宽限被跳过（2026-10-17 推演确认）。
                         **{k: v for k, v in _existing_sr.items()
-                           if k not in ('status', 'queued_since')},
+                           if k not in ('status', 'queued_since', 'queued')},
                         "status": "notified", "ts": time.time(), "notified_at": time.time()
                     }
                     lm.execute(
