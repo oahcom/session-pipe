@@ -5,6 +5,7 @@
 """
 
 import json
+import re
 import sys
 import time
 import logging
@@ -486,7 +487,22 @@ class RoleLifecycleMixin:
                         # 精确边界匹配：只在 "工作流 wf_id /" 格式中匹配，防止 UUID 前缀碰撞
                         # （如 wf_abc123 不误匹配 wf_abc123def456）
                         _wf_in_existing = f"工作流 {wf_id} /" in _existing or wf_id in _existing.split("## 来源")[-1] if "## 来源" in _existing else False
-                        if _existing and "工作流任务" in _existing and not _wf_in_existing:
+                        # 僵尸主任务检测：现有 TASKS.md 的主 wf 若不在权威库，说明它早就
+                        # 被清理/从未落库（测试 fixture 残留等），不是"活跃占用"。
+                        # 不加此判据时守卫只追加 [排队] 永不覆盖，而**全库无排空代码** →
+                        # TASKS.md 无限增长、新任务标题/描述永不写入、模板"读 TASKS.md"
+                        # 拿不到正文（scout #372332 次生风险，实测 9 角色 19 条幽灵残留）。
+                        _main_wf = re.search(r"工作流 (wf_[0-9a-f]{12})", _existing)
+                        _stale_main = False
+                        if _main_wf:
+                            _mw = _main_wf.group(1)
+                            try:
+                                _stale_main = not self._lifecycle.query(
+                                    "SELECT 1 FROM workflow_instances WHERE instance_id=?", (_mw,))
+                            except Exception:
+                                _stale_main = False  # 查询失败 → 保守按活跃处理（不覆盖）
+                        if (_existing and "工作流任务" in _existing and not _wf_in_existing
+                                and not _stale_main):
                             # 已有其他工作流的任务文件 → 不覆盖，追加排队标记
                             LOGGER.info("TASKS.md 防污染: %s 已有其他任务，本任务 %s 排队（不覆盖）", role, wf_id)
                             tasks_file.write_text(
@@ -494,6 +510,9 @@ class RoleLifecycleMixin:
                                 f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",
                                 encoding="utf-8")
                             _skip_write = True
+                        elif _stale_main:
+                            LOGGER.info("TASKS.md 僵尸主任务 %s 不在权威库，覆盖为新任务 %s",
+                                        _main_wf.group(1), wf_id)
                     if not _skip_write:
                         tasks_file.write_text(
                             f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
