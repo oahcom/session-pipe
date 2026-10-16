@@ -4,7 +4,6 @@
 从 engine.py 拆出，方法签名和 self 访问完全不变。
 """
 
-import calendar
 import json
 import re
 import sys
@@ -25,6 +24,11 @@ LOGGER = logging.getLogger("workflow.engine")
 # "Press up to edit queued messages"，角色被自己的重复指令淹没。
 # 停滞是真实状态，但不该靠刷屏解决：同一 step 每 10 分钟最多重推 1 次。
 _KICK_COOLDOWN_SEC = 600
+# 角色拉起冷却（秒）：_ensure_role_alive 有 6 个调用点（含 engine.py:202 的
+# on_advance 回调，每个步骤推进都触发），且是 check-then-act 无锁 → 并发 tick
+# 各自判定"不存活"后同时拉起同一角色（实测 scout 建 116 个会话）。
+# 同一角色在冷却窗内不重复拉起。
+_RESTART_COOLDOWN_SEC = 300
 
 
 class RoleLifecycleMixin:
@@ -33,57 +37,20 @@ class RoleLifecycleMixin:
     _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
     _last_compact: dict[str, float] = {}
+    _last_restart: dict[str, float] = {}
+    _RESTART_LOCK = threading.Lock()
     # check-then-act 竞态防护：cooldown 检查与写入之间加锁
     _COMPACT_LOCK = threading.Lock()
-    # 角色 transcript 根目录（与 eval_checker._TRANSCRIPTS_DIR 同一处口子）
-    _TRANSCRIPTS_ROOT = Path.home() / ".claude" / "projects"
+    # bus task_spec 写入去重：同一 (wf_id, step_id) 在窗口内只写一条。
+    # WHY: 重推路径（step_handler timeout/kick-stalled）带 force=True 绕过了
+    # _is_role_busy 守卫，而 bus.write 的 UPSERT 会在 t 冲突时重置 ts=now，
+    # 使同一条消息永远"新鲜"、永远回到积压里 —— 实测 103 条重复
+    # "needs_implementation @product_architect ... wf_42c712fc21/s1"。
+    # ccs send 不受影响，仍每轮推送全文。
+    _BUS_WRITE_COOLDOWN = 1800
+    _last_bus_write: dict[str, float] = {}
+    _BUS_WRITE_LOCK = threading.Lock()
 
-    _OVERFLOW_ERR_MAX_AGE = 600.0   # API 错误多久内算"刚发生"（秒）
-
-    def _transcript_shows_overflow(self, role: str) -> bool:
-        """读角色最新 transcript 尾部，判断是否**最近**落过 API 错误（溢出）。
-
-        按**时间**而非距文件尾的字节数判断。实测错误行距文件尾 7.8KB~10.8MB
-        （35 个会话样本），且距末尾最多 4111 行 —— 任何固定字节/行数窗口都会漏。
-        错误事件自带 timestamp，故读尾部一段、取其中最新错误行的 ts 与 now 比。
-
-        任何异常返回 False —— 宁可不提醒，也不凭推测发 /compact。
-        """
-        try:
-            # 分隔符归一化：persona 角色名用下划线（product_architect），transcript
-            # 目录用连字符。不归一则该角色恒返回 False —— 溢出检测完全失效。
-            _needle = f"ccs-workspaces-{role}".replace("_", "-").lower()
-            dirs = [d for d in self._TRANSCRIPTS_ROOT.iterdir()
-                    if d.is_dir() and _needle in d.name.replace("_", "-").lower()]
-            files = [f for d in dirs for f in d.glob("*.jsonl")]
-            if not files:
-                return False
-            newest = max(files, key=lambda p: p.stat().st_mtime)
-            # 只读尾部 64KB：足够容纳最近若干轮，避免读 10MB+ 全文
-            with newest.open(encoding="utf-8", errors="replace") as fh:
-                fh.seek(max(0, newest.stat().st_size - 65536))
-                tail = fh.read()
-            newest_err = 0.0
-            for line in tail.splitlines():
-                if "isApiErrorMessage" not in line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if not ev.get("isApiErrorMessage"):
-                    continue
-                # transcript ts 为 UTC（形如 2026-10-16T14:23:31.358Z），
-                # 用 calendar.timegm 直接按 UTC 解析，避免 mktime 的本地时区偏移
-                ts = ev.get("timestamp", "")[:19]
-                try:
-                    epoch = calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
-                except (ValueError, TypeError):
-                    continue
-                newest_err = max(newest_err, epoch)
-            return bool(newest_err) and (time.time() - newest_err) <= self._OVERFLOW_ERR_MAX_AGE
-        except (OSError, ValueError):
-            return False
 
     def _check_context_overflow(self):
         """检测角色 tmux pane 中 Claude 的上下文溢出信号，自动发 /compact。
@@ -157,17 +124,6 @@ class RoleLifecycleMixin:
                 or "Prompt is too long" in output
                 or ("Context" in output and "remaining" in output and "compact" in output.lower())
             )
-
-            # 备用信号：transcript 尾部的 API 错误。pane 信号有结构性盲区 ——
-            # claude TUI 跑在备用屏（alternate_on=1），该屏**无 scrollback**：
-            # `-S -500` 与 `-S -5000` 实测返回完全相同的字节数（2026-10-16 实测
-            # curator/qa/pm 各 828/782/812 字符，两者逐字节相同）。故 pane 只能看到
-            # 当前视口，溢出错误一旦滚出视口或 agent 已死即永久不可见。
-            # 本检测每 10s 轮询，而 scout 实测在错误出现后 1s 才被检测到、此时
-            # agent 已终止，send-keys 无处可发（bus #361060）。
-            # transcript 是落盘事实，不受视口/进程存活影响，且只读文件尾 64KB。
-            if not has_overflow:
-                has_overflow = self._transcript_shows_overflow(role)
 
             if not has_overflow:
                 continue
@@ -274,14 +230,17 @@ class RoleLifecycleMixin:
             LOGGER.debug("kick_stalled error: %s", _e)
 
     @staticmethod
-    def _is_agent_alive(role: str) -> bool:
-        """检查 CCS tmux pane 是否存活。
+    def _is_agent_alive(role: str) -> bool | None:
+        """检查 CCS tmux pane 是否存活。三态：True=活 / False=判死 / None=探测失败。
 
         ponytail: 用 pane 存活判定而非进程名白名单——claude agent 执行 /goal 时
         pane_current_command 可能是子进程 wrapper（bash/sleep/node），不在
         白名单会误判"无 agent"→ kill-session 杀掉正在工作的角色（观测：pm
         工作时被杀 8 次，2026-08-09）。tmux 会话存在即视为 agent 存活，
         只有 pane 完全消失才判定失活。
+
+        None 与 False 必须区分：tmux 瞬时不可达（实测 578ms 抖动）时返回 False
+        会让调用方 kill 掉正在工作的活角色。宁可放过一次真死，不可误杀活角色。
         """
         try:
             r = _engine_mod._sp.run(
@@ -292,10 +251,7 @@ class RoleLifecycleMixin:
             # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
             return r.returncode == 0 and bool(r.stdout.strip())
         except (_engine_mod._sp.TimeoutExpired, OSError, ValueError, KeyError, TypeError):
-            # 探测失败 ≠ 角色死亡。返回 None 让调用方区分"判死"与"判不出"，
-            # 否则 tmux 瞬时不可达（实测存在 578ms 抖动）就会被当成失活。
-            return None
-
+            return None  # 探测失败 ≠ 判死
 
     def _ensure_role_alive(self, role: str) -> bool:
         """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。"""
@@ -304,17 +260,12 @@ class RoleLifecycleMixin:
             capture_output=True, timeout=5,
         ).returncode == 0
         if alive:
-            # _is_agent_alive 返回 None = 探测失败（非"判死"）。tmux 瞬时不可达
-            # 时若不区分，会 kill 掉正在工作的角色。宁可放过一次真死（下一 tick
-            # 重查），不可误杀一次活角色。
             agent = self._is_agent_alive(role)
             if agent is None or agent:
-                # 代码变更检测已禁用：workspace 的 .py 是角色自己的产出（正常开发），
-                # 全量 md5 扫描会误判"代码变更"→ 杀死正在工作的角色（2026-08-01 观测 8 次误杀）。
-                # 如需热替换 launcher 代码，由运维手动 ccs restart 完成。
+                # None=探测失败（不判死）；True=活。两种情况都不动它。
                 return True
-            # 二次确认：kill 是破坏性动作，首判可能因探测抖动/启动竞态假阴性
-            # （观测：scout 04:22-09:02 建 25+ 会话，含 1 秒即死实例）。
+            # 二次确认：kill 是破坏性动作，首判可能因启动竞态假阴性
+            # （观测：scout 建 25+ 会话，含 1 秒即死实例）。
             time.sleep(1)
             if self._is_agent_alive(role) is not False:
                 return True
@@ -322,7 +273,23 @@ class RoleLifecycleMixin:
             _engine_mod._sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
                     capture_output=True, timeout=5)
             alive = False
+        if alive:
+            # 代码变更检测已禁用：workspace 的 .py 是角色自己的产出（正常开发），
+            # 全量 md5 扫描会误判"代码变更"→ 杀死正在工作的角色（2026-08-01 观测 8 次误杀）。
+            # 如需热替换 launcher 代码，由运维手动 ccs restart 完成。
+            return True
 
+        # 拉起前加锁 + 冷却：check-then-act 的写入侧必须串行化。
+        # 锁内二次确认存活——等锁期间别的 tick 可能已拉起成功。
+        with self._RESTART_LOCK:
+            _now = time.time()
+            if _now - self._last_restart.get(role, 0.0) < _RESTART_COOLDOWN_SEC:
+                LOGGER.debug("CCS %s: 拉起冷却期内，跳过", role)
+                return False
+            if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
+                       capture_output=True, timeout=5).returncode == 0:
+                return True  # 等锁期间已被其他调用点拉起
+            self._last_restart[role] = _now
         # 拉起 CCS（infinite 模式，agent 常驻执行任务）
         # ponytail: ondemand 模式只写哨兵不创建 tmux 会话，必须用 infinite 让 agent 持续运行
         # 关键修复: 增加超时到 60s，并移除 VIRTUAL_ENV 以加速启动（从 30s 超时优化）
@@ -491,27 +458,6 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} prompt 含未替换变量: {unmatched}",
                 evidence=prompt[:500], src="workflow_engine")
             return False  # 投递未发生
-        # 幽灵 wf_id 检测：wf_id 声称是某个工作流实例，但权威库里查不到它。
-        # 此时后续的 TASKS.md 写入会以该假 ID 占位，防污染逻辑随即把**真实**
-        # 任务判为"角色已有其他任务"而排队 —— 角色于是永远收不到真任务。
-        # 实测（2026-10-16 21:16-21:17）：scout 收到 wf_97c7f6a8e0ee/s1（库中
-        # 零命中）后 35 分钟内零产出，真实实例 wf_6ff71a38016c 卡在 s1 直至超时。
-        # 不阻断（测试与 subflow 路径会传合成 ID），但必须留下可见痕迹。
-        if wf_id:
-            try:
-                _missing = not self._lifecycle.query_one(
-                    "SELECT 1 FROM workflow_instances WHERE instance_id=?", (wf_id,))
-            except Exception as _e:
-                LOGGER.debug("ghost-wf-id check failed: %s", _e)
-                _missing = False
-            if _missing:
-                LOGGER.error("send-to-role %s: wf_id %s 不在权威库（幽灵 ID），"
-                             "step=%s —— 投递将污染 TASKS.md 并可能使真实任务排队",
-                             role, wf_id, step_id)
-                self._bb.write("blocker",
-                    f"[workflow] 幽灵 wf_id: {wf_id}/{step_id} 不在权威库",
-                    evidence=f"role={role} prompt_head={prompt[:200]}",
-                    src="workflow_engine")
         # 关键修复：确保角色存活并就绪，不只是 tmux 存活
         # 1. 先确保 tmux session 存活（如不存在则拉起）
         # 2. 等待角色真正就绪（有 claude 进程且非 busy）
@@ -519,15 +465,18 @@ class RoleLifecycleMixin:
             LOGGER.warning("_send_to_role %s: role not ready after wait, skipping", role)
             return False
 
-        # ponytail: prompt_template 已含 /goal 前缀，避免重复叠加导致畸形
+        # 剥离 prompt 里已含的 /goal 前缀后再统一加一次。
+        # WHY: 早期"检测到就不动"的写法把模板自带的 `/goal\n## 产出` 原样投递，
+        # integrity.py 又把这个 prompt_template 截断填进「用户指令：{goal_text}」，
+        # 于是角色收到的"用户指令"字面就是 /goal（bus #374984/#374982 实证）。
         import re as _re
-        if not prompt.startswith(("/goal", "/GOAL", "/Goal")):
-            prompt = "/goal " + prompt
+        prompt = _re.sub(r"^/goal\s*", "", prompt, count=1, flags=_re.IGNORECASE)
+        prompt = "/goal " + prompt
         # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
         # 用正则剥掉 /goal 前缀（lstrip 字符集会误伤内容开头的 g/o/a/l）
         # 阈值 10→4：10 会误杀「请调研 Python」这类 6 字合法中文任务；
         # 4 仍能拦住空/占位符（[]、p、x），继续防 #141691 死循环
-        _goal_content = _re.sub(r"^/goal\s*", "", prompt, flags=_re.IGNORECASE).strip()
+        _goal_content = _re.sub(r"^/goal\s*", "", prompt, count=1, flags=_re.IGNORECASE).strip()
         if len(_goal_content) < 4:
             LOGGER.warning("send-to-role %s 拒绝: goal 内容过短 (len=%d, wf=%s step=%s)",
                           role, len(_goal_content), wf_id[:12] if wf_id else "?", step_id)
@@ -609,18 +558,8 @@ class RoleLifecycleMixin:
                                 encoding="utf-8")
                             _skip_write = True
                         elif _stale_main:
-                            # 不是简单的"覆盖掉就好"：TASKS.md 里出现权威库查不到的 wf，
-                            # 说明有别处用幽灵 ID 投递过（实测 2026-10-16 21:16-21:17
-                            # scout 收到 wf_97c7f6a8e0ee/s1、pm 收到 wf_d50ca8295b59/s1，
-                            # 四库零命中）。覆盖只治症状，投递方仍未被发现 —— 故升级为
-                            # blocker + ERROR，让"谁在发幽灵 ID"暴露出来而不是被静默清理。
-                            LOGGER.error("TASKS.md 僵尸主任务 %s 不在权威库（幽灵 ID），"
-                                         "覆盖为新任务 %s", _main_wf.group(1), wf_id)
-                            self._bb.write("blocker",
-                                f"[workflow] 幽灵 wf_id 污染 TASKS.md: {_main_wf.group(1)}"
-                                f"（角色 {role}），已覆盖为 {wf_id}",
-                                evidence=f"TASKS.md 原主任务 {_main_wf.group(1)} 不在权威库",
-                                src="workflow_engine")
+                            LOGGER.info("TASKS.md 僵尸主任务 %s 不在权威库，覆盖为新任务 %s",
+                                        _main_wf.group(1), wf_id)
                     if not _skip_write:
                         tasks_file.write_text(
                             f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
@@ -631,12 +570,22 @@ class RoleLifecycleMixin:
                 pass
         # 超时/告警通知走 blocker 而非 task_spec，防止 coordinator 误认为新任务
         _is_warning = any(kw in prompt for kw in ["持续超时", "异常", "超时自动回收"])
-        if _is_warning:
-            _title = f"[workflow] {role} 告警: {wf_id}/{step_id}" if wf_id else f"[workflow] {role} 告警"
-            self._bb.write("blocker", _title, evidence=prompt, src="workflow_engine")
-        else:
-            _title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
-            self._bb.write("task_spec", _title, evidence=prompt, src="workflow_engine")
+        # 去重：同一 (wf_id, step_id) 在冷却窗内只写一条，重推不再刷新 ts。
+        _dedup_key = f"{wf_id}/{step_id}"
+        _should_write = True
+        if wf_id and step_id:
+            with self._BUS_WRITE_LOCK:
+                _prev = self._last_bus_write.get(_dedup_key, 0)
+                _should_write = not _prev or (time.time() - _prev) >= self._BUS_WRITE_COOLDOWN
+                if _should_write:
+                    self._last_bus_write[_dedup_key] = time.time()
+        if _should_write:
+            if _is_warning:
+                _title = f"[workflow] {role} 告警: {wf_id}/{step_id}" if wf_id else f"[workflow] {role} 告警"
+                self._bb.write("blocker", _title, evidence=prompt, src="workflow_engine")
+            else:
+                _title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
+                self._bb.write("task_spec", _title, evidence=prompt, src="workflow_engine")
         # ccs send 推送全文（参数顺序：ccs.py send <target_role> <message> --from <source>）
         # 投递成功与否以子进程退出码为准：returncode != 0 视为投递失败，必须返回 False，
         # 否则 engine 会错盖 notified（违反红线：投递失败必须返回 False，下轮重试，
@@ -651,8 +600,7 @@ class RoleLifecycleMixin:
             try:
                 ccs_cli = _CCS_CLI
                 _result = _engine_mod._sp.run(
-                    ["python3", str(ccs_cli), "send", role, prompt[:2000],
-                     "--from", "workflow_engine"],
+                    ["python3", str(ccs_cli), "send", role, prompt[:2000]],
                     capture_output=True, timeout=10,
                 )
             except Exception as _e:

@@ -177,9 +177,27 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     两个核心问题分开发送（用户约束：分开提示词），发完标记 bypass flag。
     任一环节失败静默不阻塞完成（bypass 是旁路通知）。"""
     step_results = run.step_results
-    if step_results.get(step.id, {}).get("integrity_reminder_sent_bypass", False):
-        return  # 已发过
-    goal_text = getattr(step, 'prompt_template', '') or ''
+    # 幂等 + 节流：先落库再发送。
+    # 旧实现只写内存 flag，且在发送后才置位；而 11 处调用点各自持有 run 副本、
+    # complete_step 又在提醒之后才写库 → 下一 tick 读库看不到 flag，同一秒可重复
+    # 注入（实测 s1 被提醒 62 次 / s2 30 次，仅 4 个唯一 step）。
+    import time as _t
+    _srec = step_results.setdefault(step.id, {})
+    _last = float(_srec.get("integrity_reminder_sent_bypass_at", 0.0))
+    if _srec.get("integrity_reminder_sent_bypass") or (_t.time() - _last) < 60:
+        return  # 已发过（或 60s 节流窗内）
+    _srec["integrity_reminder_sent_bypass"] = True
+    _srec["integrity_reminder_sent_bypass_at"] = _t.time()
+    if sync_step_results:
+        sync_step_results(run.id, run.step_results)
+    # 剥离 /goal 前缀：模板存的 prompt_template 自带该前缀，直接截断填进
+    # 「用户指令：」会让角色收到字面的 /goal（bus #374984 实证）。
+    # 剥完为空时退回 step.title —— 至少是有语义的步骤名，而非空占位。
+    goal_text = _re.sub(r"^/goal\s*", "",
+                        getattr(step, 'prompt_template', '') or '',
+                        count=1, flags=_re.IGNORECASE).strip()
+    if not goal_text:
+        goal_text = getattr(step, 'title', '') or ''
     # 复用 CORE_QUESTIONS（与 DIMENSIONS 前两条同源，P1-1 统一）
     _questions = [
         f"步骤 {step.id} 即将完成（{path}），请回答：\n{CORE_QUESTIONS[0]}（简答）\n需求：{goal_text[:300]}",
@@ -196,9 +214,6 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
             LOGGER.debug("integrity: bypass %s send %d/%d failed for %s",
                          path, i, len(_questions), step.id)
             continue  # 单条失败不阻塞后续，继续发下一条
-    step_results.setdefault(step.id, {})["integrity_reminder_sent_bypass"] = True
-    if sync_step_results:
-        sync_step_results(run.id, run.step_results)
     LOGGER.info("integrity: bypass %s reminder sent for %s", path, step.id)
 
 
@@ -225,7 +240,10 @@ def make_full_prompt(run: object, step: object, step_results: dict) -> str:
     if hasattr(run, "context") and isinstance(run.context, dict):
         _title = run.context.get("title", "")
     if hasattr(step, "prompt_template"):
-        _goal = step.prompt_template or ""
+        # 剥离模板自带的 /goal 前缀：它是指令语法，不是需求原文。
+        # 原样输出会把字面的 /goal 混进「步骤目标：」喂给角色。
+        _goal = _re.sub(r"^/goal\s*", "", step.prompt_template or "",
+                        count=1, flags=_re.IGNORECASE).strip()
     parts = []
     if _title:
         parts.append(f"工作流目标：{_title}")

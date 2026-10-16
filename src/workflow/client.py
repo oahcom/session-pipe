@@ -119,6 +119,19 @@ class WorkflowClient:
         ).fetchone()
         if dup:
             raise ValueError(f"重复任务: assignee={assignee} title='{title[:40]}' 已在 5 分钟内创建过")
+        # 跨角色 fan-out 防御：同一条 bus 消息（同 title）已为**任一**角色建过，
+        # 就不再为其他角色建。原去重要求 assignee 相同才拦，于是同一条
+        # "s1-complete 复核通过" 消息在 0.5s 内给 6~9 个角色各建一个 workflow
+        # （实测 2026-10-17：单条消息 fan-out 到 closer/devops/pm/qa/engineer/coordinator）。
+        # 路由的语义是"通知相关角色"，不是"给每个角色派同一份任务"。
+        _cross = self._conn.execute(
+            "SELECT assignee FROM tasks WHERE title=? AND created_at > ? LIMIT 1",
+            (title, time.time() - 300)
+        ).fetchone()
+        if _cross:
+            raise ValueError(
+                f"跨角色重复任务: title='{title[:40]}' 已派给 {_cross[0]}，"
+                f"5 分钟内不再为 {assignee} 重复创建")
         # 自动选择模板: 未指定时按任务标题 + 发起角色 + bus 分类匹配
         if not template_id:
             from template_registry import TemplateRegistry
