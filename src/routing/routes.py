@@ -76,10 +76,15 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
         details: list[dict] = []
         # 构建分配计划
         assignments: list[dict] = []
+        import re as _re
         for msg in messages:
             if "error" in msg:
                 continue
             consumers = msg.get("consumers", [])
+            # @role 定向路由：@target 的消息只给 target，其他角色跳过
+            _tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", msg.get("text", ""))
+            if _tags:
+                consumers = [c for c in consumers if c in _tags]
             ordered = (
                 [c for c in consumers if "*" not in router.routing.get(c, {}).get("consume", [])]
                 + [c for c in consumers if "*" in router.routing.get(c, {}).get("consume", [])]
@@ -199,7 +204,14 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     category_limit = 10
 
     # 消费该角色未消费的消息
-    messages = _poll(consumer=role_name, limit=category_limit)
+    raw_msgs = _poll(consumer=role_name, limit=category_limit * 3)
+    # 定向过滤：@target_role 的消息只给 target role，其他角色跳过不消费
+    import re as _re
+    def _is_for_me(msg):
+        text = msg.get("text", "")
+        tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", text)
+        return not tags or role_name in tags
+    messages = [m for m in raw_msgs if _is_for_me(m)]
     if not messages or "error" in messages[0]:
         return {"role": role_name, "routed": 0, "total": 0, "dry_run": dry_run, "details": []}
 
@@ -297,6 +309,15 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         if result.get("success"):
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "routed", "sent_chars": result.get("sent_chars", 0)})
+            # 投递成功即标记已消费，防下轮重投同一批。
+            # route_all 走 cursor 推进，route_to_ccs 无 cursor，不标记则永久重复：
+            # 实测 15 条 P0 blocker 因 rc=0 被无限重投（每 5 分钟一轮）。
+            # 与 investigator dispatch 路径同模式（L453 mark_consumed 防重复分派）。
+            try:
+                _Blackboard().mark_consumed(msg["id"], consumer=role_name)
+            except Exception as _mc:
+                LOGGER.warning("route_to_ccs mark_consumed 失败 fid=%s role=%s: %s",
+                               msg["id"], role_name, _mc)
             # 创建对应角色的工作流实例（按 bus 分类推荐模板）
             _cat = msg.get("category", "")
             if _cat in _NON_TASK_CATEGORIES:
