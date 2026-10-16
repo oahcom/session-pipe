@@ -374,7 +374,6 @@ def test_routing_daemon_main_loop_components():
     from contract_updater import suggest_improvements, apply_all_suggestions
     from p0_exemption import P0Exemption
     from eval_consistency import main as ec_main
-    from workflow_metrics import snapshot as wf_snapshot
 
     # 验证常量定义
     assert rd.INTERVAL == 60

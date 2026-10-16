@@ -58,31 +58,31 @@ python3 src/pipeflow/health_check.py
 ```
 src/
   routing/
-    router.py         ── 路由表 + produce/consume 推导（375 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（472 行）
+    router.py         ── 路由表 + produce/consume 推导（376 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（515 行）
     auto.py           ── 自动路由消费 + investigator 分派（281 行）
     polling.py        ── 消息轮询 + cursor（87 行）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
-    survival_monitor.py ── 存活监测（492 行）
+    survival_monitor.py ── 存活监测（523 行）
     consistency.py    ── 路由一致性检查（124 行，生长接入 daemon）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
     engine.py         ── 编排 + CLI（1024 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1050 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（452 行）
-    task_generator.py ── 任务生成（444 行）
-    wf_lifecycle.py   ── 工作流生命周期（991 行）
-    daemon.py         ── 工作流守护 while 循环（265 行）
+    step_handler.py   ── 步骤处理（1146 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（562 行）
+    task_generator.py ── 任务生成（469 行）
+    wf_lifecycle.py   ── 工作流生命周期（1059 行）
+    daemon.py         ── 工作流守护 while 循环（256 行）
     pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
     health_check.py   ── 健康检查（65 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1211 行）
+    manager.py        ── 工作流状态机（1273 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（496 行）
-    gateway.py        ── 工作流网关门禁（193 行）
+    client.py         ── CCS 角色工作流客户端（508 行）
+    gateway.py        ── 工作流网关门禁（201 行）
     workflow/db.py    ── 工作流数据访问（96 行）
     sync.py           ── 工作流同步（55 行）
 

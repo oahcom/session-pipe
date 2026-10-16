@@ -20,6 +20,12 @@ try:
 except ImportError:
     SENTINEL_DIR = Path("~/.hermes/run/ccs-sentinels")
     _ROLES_ROOT = Path.home() / "hermes-session-roles"
+
+# 与 liveness.HEALTH_DIR 同一口子：测试/隔离场景可经 CCS_HEALTH_DIR 重定向。
+# 原先 _write_health 硬编码真实目录，导致单测把 survival_* 写进生产
+# ~/.hermes/run/ccs-health/{role}.json（实测 2026-10-16）。
+HEALTH_DIR = Path(os.environ.get(
+    "CCS_HEALTH_DIR", str(Path.home() / ".hermes" / "run" / "ccs-health")))
 PERSONAS_DIR = _ROLES_ROOT / "personas" / "session-roles"
 BUS_SCRIPT = Path(os.environ.get(
     "BUS_CLIENT",
@@ -320,7 +326,7 @@ class SurvivalMonitor:
 
     def _write_health(self, role: str, **kwargs):
         try:
-            health_dir = Path.home() / ".hermes" / "run" / "ccs-health"
+            health_dir = HEALTH_DIR
             health_dir.mkdir(parents=True, exist_ok=True)
             path = health_dir / f"{role}.json"
             health = {}
@@ -403,7 +409,7 @@ class SurvivalMonitor:
             self._cache[role] = result
             results[role] = result
 
-            # 写健康数据到 /tmp/ccs-health/（接轨 sentinel health 系统）
+            # 写健康数据到 HEALTH_DIR（默认 ~/.hermes/run/ccs-health/，可经 CCS_HEALTH_DIR 隔离）
             self._write_health(role,
                 survival_overall=overall,
                 survival_l2_thinking=l2.get("thinking"),

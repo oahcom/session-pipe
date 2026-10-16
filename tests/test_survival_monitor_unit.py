@@ -31,10 +31,18 @@ from routing import survival_monitor as sm
 
 @pytest.fixture(autouse=True)
 def isolate_state(tmp_path, monkeypatch):
-    """隔离哨兵目录 + 清除角色 target 缓存。"""
+    """隔离哨兵 + 健康目录，清除角色 target 缓存。
+
+    health 目录必须一并隔离：tick() 会调 _write_health()，原先它硬编码
+    真实路径，测试会把 survival_* 字段写进生产 ccs-health/{role}.json
+    （实测 2026-10-16，qa.json 被改写）。
+    """
     sentinel_dir = tmp_path / "ccs-sentinels"
     sentinel_dir.mkdir(parents=True, exist_ok=True)
+    health_dir = tmp_path / "ccs-health"
+    health_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(sm, "SENTINEL_DIR", sentinel_dir)
+    monkeypatch.setattr(sm, "HEALTH_DIR", health_dir)
     # Clear cache
     sm._ROLE_TARGETS_CACHE = {}
     sm._ROLE_TARGETS_TS = 0.0
