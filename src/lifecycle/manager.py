@@ -40,36 +40,6 @@ def _output_present(p: str) -> bool:
     return fp.exists()
 
 
-# ── 资源治理约束（agent-contracts 模式）──
-_RESOURCE_BUDGETS: dict[str, dict] = {}
-_DEFAULT_BUDGET = {"max_sessions": 3, "max_memory_mb": 2000, "max_calls_per_hour": 60, "cooldown_sec": 10}
-
-def set_role_budget(role: str, budget: dict) -> None:
-    merged = dict(_DEFAULT_BUDGET); merged.update(budget)
-    _RESOURCE_BUDGETS[role] = merged
-
-def get_role_budget(role: str) -> dict:
-    return _RESOURCE_BUDGETS.get(role, dict(_DEFAULT_BUDGET))
-
-def check_resource_constraints(role: str) -> dict:
-    import subprocess
-    budget = get_role_budget(role); violations = []; usage = {}
-    try:
-        r = subprocess.run(["tmux","ls"], capture_output=True, text=True, timeout=5)
-        usage["sessions"] = r.stdout.count(f"ccs-{role}")
-        if usage["sessions"] > budget["max_sessions"]:
-            violations.append(f"sessions {usage['sessions']}/{budget['max_sessions']}")
-    except Exception: usage["sessions"] = -1
-    try:
-        mem = subprocess.run(["free","-m"], capture_output=True, text=True, timeout=5)
-        for line in mem.stdout.split("\n"):
-            if line.startswith("Mem:"):
-                usage["memory_mb"] = int(line.split()[2])
-                if usage["memory_mb"] > budget["max_memory_mb"]:
-                    violations.append("mem %d > %dMB exceed" % (usage["memory_mb"], budget["max_memory_mb"]))
-    except Exception: usage["memory_mb"] = -1
-    return {"ok": len(violations)==0, "violations": violations, "usage": usage}
-
 class LifecycleManager:
     """生命周期管理器：状态机 + 步骤执行 + 推进逻辑。
 
@@ -79,7 +49,6 @@ class LifecycleManager:
     - 实例生命周期: start_wf/complete_step/fail_step/rollback_step/close_wf
     - 审批流: get_approval_token/confirm_step/_issue_approval_token/_notify_result
     - 内部工具: _get_wf_unsafe/_parse_results/_set_step_result_unsafe/_log_unsafe
-    - 资源治理: 见类外 set_role_budget/check_resource_constraints
     """
 
     WF_STATUSES = {"pending", "running", "completed", "failed", "cancelled"}
