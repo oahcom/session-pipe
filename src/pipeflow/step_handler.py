@@ -8,7 +8,6 @@ import json
 import os
 import re
 import time
-import hashlib
 import subprocess
 import logging
 import pathlib
@@ -732,11 +731,12 @@ class StepHandlerMixin:
                                 except Exception:
                                     LOGGER.debug("monitor_audit write failed for %s", run.workflow_name)
                                 # S3 fan-out 去重（DESIGN §2.3）：同一超时事件对同一目标角色
-                                # 24h 内只提醒一次。多 daemon/多 tick 并发时同一事件会遍历
-                                # notify_roles 多轮，每轮都 _send_to_role 一次 → 同角色收到
-                                # N 条相同 deadlock 提醒（实测 track 提醒放大是洪水主因之一）。
-                                # age 不入文案：它每秒 +1，使 _event_key 恒变 → 24h 去重
-                                # 形同虚设（实测 qa 单会话 215 条该提醒且助理文本为 0）。
+                                # 只提醒一次。notify_roles 含重复项时（如 ["qa","qa","devops"]），
+                                # 本次调用内遍历会重复投递 → _seen_events（**本次调用内**的
+                                # 局部 set）拦掉重复。跨 tick 的节流由上方 track_notified_at
+                                # （track_timeout 窗口，默认 300s）负责，与本 set 无关。
+                                # age 不入文案：它每秒 +1，使 _event_key 恒变 → 跨 tick
+                                # 节流失效（实测 qa 单会话 215 条该提醒且助理文本为 0）。
                                 _track_prompt = (f"[deadlock] {track_cat} 超时，请继续当前步骤 "
                                                  f"{step.id}（{step.title}）")
                                 _seen_events: set[str] = set()
