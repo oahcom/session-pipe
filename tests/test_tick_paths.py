@@ -202,6 +202,54 @@ def test_tick_escalation_every_third():
     assert len(coord_calls) >= 1, f"应有 coordinator 通知: calls={eng._send_to_role.call_args_list}"
 
 
+# ── 8b. tmux 信号推进必须过契约门 (exit_schema) ───────────────────
+
+def _fake_sig_step_completed():
+    from conversation_monitor import ConversationSignal
+    s = ConversationSignal()
+    s.step_completed = True
+    return s
+
+
+def test_tmux_signal_blocked_by_missing_schema_file():
+    """角色 pane 自称完成但契约文件没落盘 → 不得 complete_step。
+
+    实测 food_chain_loop/s7: 16:54:18 被 tmux 信号推进，而 VALUE_AUDIT.md
+    16:55:32 才落盘——盖戳时契约文件不存在，步骤被"半截子"确认。
+    """
+    eng = _build_eng()
+    eng._is_role_busy = MagicMock(return_value=False)
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_step_completed()):
+        step = _make_step(
+            exit_schema={"required": ["NO_SUCH_FILE_TMUX_XXXX"]},
+        )
+        run = _make_run()
+        eng._tick(run, step)
+
+    eng._lm.complete_step.assert_not_called()
+
+
+def test_tmux_signal_proceeds_when_schema_satisfied():
+    """契约文件已落盘 → tmux 信号正常推进（门不误伤正常路径）。"""
+    import tempfile
+    eng = _build_eng()
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    ws = Path(tempfile.mkdtemp())
+    (ws / "AUDIT_OK.md").write_text("FAIL\n" + "证据" * 60, encoding="utf-8")
+    with patch("pipeflow.step_handler._CCS_WORKSPACES", ws.parent), \
+         patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_step_completed()):
+        # _validate_exit_schema 用 _CCS_WORKSPACES / target_role 拼路径
+        step = _make_step(target_role=ws.name,
+                          exit_schema={"required": ["AUDIT_OK.md"]})
+        run = _make_run()
+        eng._tick(run, step)
+
+    eng._lm.complete_step.assert_called_once()
+
+
 # ── 9. 空 exit_condition ──────────────────────────────────────────
 
 def test_tick_empty_exit_condition():

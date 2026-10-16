@@ -148,7 +148,18 @@ class StepHandlerMixin:
             # wait_roles 协作门：tmux 信号不能绕过协作门控（2026-08-10 codex P1），
             # 等所有声明角色都产出匹配消息才允许推进
             _wr = getattr(step, "wait_roles", None)
-            if not _wr or set(_wr).issubset({m.get("src", "") for m in (run.step_results.get(step.id, {}) or {}).get("exit_messages", [])}):
+            _wr_ok = not _wr or set(_wr).issubset({m.get("src", "") for m in (run.step_results.get(step.id, {}) or {}).get("exit_messages", [])})
+            # 契约门：tmux 信号只证明角色「自称完成」，产出文件可能还没落盘。
+            # 实测 food_chain_loop/s7：16:54:18 被信号推进，而 VALUE_AUDIT.md
+            # 16:55:32 才落盘——盖戳时契约文件根本不存在。主路径的 bus 匹配分支
+            # 对 exit_schema 有同语义门，此处补齐。
+            _schema_ok = True
+            if step.exit_schema:
+                _schema_ok, _schema_errs = self._validate_exit_schema(step, run)
+                if not _schema_ok:
+                    LOGGER.info("tmux 信号暂缓 %s/%s: 契约未满足 %s",
+                                run.workflow_name, step.id, "; ".join(_schema_errs))
+            if _wr_ok and _schema_ok:
                 try:
                     self._lifecycle.complete_step(run.id, step.id)
                     LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
