@@ -141,6 +141,7 @@ class WorkflowDef:
     quality_standards: str = ""
     loop: Optional[dict] = None
     is_subflow: bool = False  # True = 仅限子工作流调用，不能独立 start
+    auto_advance: bool = False  # True = daemon 自动审批 handoff/review 步骤（自驱动模板）
 
 
 @dataclass
@@ -315,6 +316,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     quality_standards=data.get("quality_standards", ""),
                     loop=data.get("loop"),
                     is_subflow=data.get("is_subflow", False),
+                    auto_advance=data.get("auto_advance", False),
                 )
             except Exception as e:
                     LOGGER.warning("[wf] 加载 %s 失败: %s", f.name, e)
@@ -393,6 +395,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     max_duration_hours=t.get("max_duration_hours", 24),
                     quality_standards=t.get("quality_standards", ""),
                     is_subflow=t.get("is_subflow", False),
+                    auto_advance=t.get("auto_advance", False),
                 )
         except Exception as e:
             LOGGER.warning("[wf] SQLite 模板加载失败: %s", e)
@@ -425,7 +428,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("活跃模板查询失败 %s: %s", template_id, e)
             return True  # 查询失败时保守跳过（宁可少创建，不可重复创建）
 
-    def start(self, name: str, context: dict = None) -> str:
+    def start(self, name: str, context: dict = None, initiator: str = None) -> str:
         # 轮 9：eval 质量门禁软回退 —— 只在入口检查**新建** workflow，不读取运行实例状态，
         # 因此不会中断任何已在 running 的 workflow（红线）。blocked 且有 rollback_target
         # 时会 auto_rollback 到 last-known-good 参数并放行；其余情况返回 reason 拦截。
@@ -455,7 +458,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             self._upsert_template(name, wf)
             try:
                 self._lifecycle.start_wf(run.id, current_step_id=wf.steps[0].id,
-                                          template_id=name, context=context)
+                                          template_id=name, context=context,
+                                          initiator=initiator)
             except Exception as e:
                 LOGGER.error("[wf] LM start_wf 失败: %s", e)
             self._write_step_prompt(run, wf.steps[0])
@@ -496,6 +500,41 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             _existing = self._lifecycle.query(
                 "SELECT 1 FROM workflow_templates WHERE template_id=?", (name,))
             if _existing:
+                # DB 已有同名 → 不整体覆盖（防简化版覆盖完整 JSON 定义），
+                # 但必须补齐 JSON 后新增的步骤：complete_step → get_step 查 DB
+                # 模板，缺步骤时抛"步骤定义不存在"被 DEBUG 吞掉 → 引擎能投递
+                # 该步(从 JSON)却永远无法完成它 → 步骤永久卡死。
+                # 实测 food_chain_loop/s0：JSON 有 8 步，DB 只有 s1-s7，
+                # 8 次运行 6 次死于此步。仅追加缺失步骤，已有步骤保持 DB 版本。
+                try:
+                    _row = self._lifecycle.query(
+                        "SELECT steps_json FROM workflow_templates WHERE template_id=?",
+                        (name,))
+                    _db_steps = json.loads(_row[0][0]) if _row and _row[0][0] else []
+                    _have = {(_s.get("step_id") or _s.get("id"))
+                             for _s in _db_steps}
+                    _missing = [s for s in wf.steps if s.id not in _have]
+                    if _missing:
+                        LOGGER.warning("[wf] upsert 补齐 %s 缺失步骤: %s",
+                                       name, [s.id for s in _missing])
+                        _db_steps.extend({
+                            "step_id": s.id, "title": s.title, "type": s.type,
+                            "target_role": s.target_role,
+                            "prompt_template": s.prompt_template,
+                            "max_retries": s.max_retries, "verify": s.verify,
+                            "subflow_template": s.subflow_template,
+                            "dual_node": s.dual_node,
+                            "exit_condition": s.exit_condition,
+                            "exit_schema": s.exit_schema, "guard": s.guard,
+                            "track": s.track,
+                            "wait_roles": getattr(s, "wait_roles", None),
+                            "failure_patterns": getattr(s, "failure_patterns", None),
+                        } for s in _missing)
+                        self._lifecycle.execute(
+                            "UPDATE workflow_templates SET steps_json=? WHERE template_id=?",
+                            (json.dumps(_db_steps, ensure_ascii=False), name))
+                except Exception as _me:
+                    LOGGER.error("[wf] upsert 补齐缺失步骤失败 %s: %s", name, _me)
                 return
         except Exception:
             pass  # DB 查询失败时允许 upsert（兼容首次初始化）
@@ -896,19 +935,31 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         """
         try:
             lm = self._lifecycle
-            # 查找所有 delivery_blocked 步骤
-            # ponytail: close_wf 同 tick 把实例置为 delivery_blocked（终态收敛），
-            # 故恢复扫描必须含 'delivery_blocked' 状态，否则 blocked 实例永不被复位重试
+            # 以行级 status 为准选取候选，不用 step_results LIKE：
+            # 旧版恢复会先把 step 内 status 抹成 ""，标记随之消失 → LIKE 第二次
+            # 必失配（自致盲）。实测 15 条历史实例因此永久搁浅（8-27 的恢复日志
+            # 成功但行状态未变，10 秒后概况仍 delivery_blocked=12）。
+            # 行级 status='delivery_blocked' 是 close_wf 打的，恢复不改它，稳定可查。
             rows = lm.query(
-                "SELECT instance_id, step_results FROM workflow_instances "
-                "WHERE status IN ('running','pending','delivery_blocked') "
-                "AND step_results LIKE '%delivery_blocked%'"
+                "SELECT instance_id, step_results, current_step_id FROM workflow_instances "
+                "WHERE status = 'delivery_blocked'"
             )
             for row in rows:
                 inst_id = row["instance_id"]
                 sr = json.loads(row["step_results"] or "{}")
-                for step_id, step_sr in sr.items():
-                    if step_sr.get("status") != "delivery_blocked":
+                # 只检查当前步：历史步的遗留标记不应触发恢复
+                _cur = row["current_step_id"]
+                _cand = {_cur: sr[_cur]} if _cur in sr else {
+                    k: v for k, v in sr.items() if v.get("status") == "delivery_blocked"}
+                for step_id, step_sr in _cand.items():
+                    # 兼容两种签名：未被恢复过（status=delivery_blocked）与
+                    # 已被旧版恢复重置过（status='' 且 fail_count=0）
+                    _is_blocked_sig = (
+                        step_sr.get("status") == "delivery_blocked"
+                        or (step_sr.get("status") == ""
+                            and step_sr.get("delivery_fail_count") == 0)
+                    )
+                    if not _is_blocked_sig:
                         continue
                     # 获取目标角色
                     wf_row = lm.query(
@@ -940,8 +991,19 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             "status": "",
                             "delivery_fail_count": 0,
                         }
+                        # 必须同时把行级 status 还原为 running：
+                        # close_wf 打终态时置 delivery_blocked（行级），而主处理循环
+                        # 只查 status IN ('pending','running','step_done_ready')
+                        # （engine.py:648）→ 仅重置 step_results 的话实例对主循环
+                        # 永不可见，重置白做。
+                        # 另：本函数的扫描条件依赖 step_results LIKE '%delivery_blocked%'
+                        # （:944），而上面已把 step 内 status 改为 ""，标记随之消失 →
+                        # 第二次扫描必失配（自致盲，只能生效一次）。
+                        # 实测 2026-08-27 日志：5 条被恢复且日志成功，10 秒后概况仍是
+                        # delivery_blocked=12，行状态纹丝未动；8-27 后不再命中。
                         lm.execute(
-                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            "UPDATE workflow_instances SET step_results=?, status='running' "
+                            "WHERE instance_id=?",
                             (json.dumps(new_sr, ensure_ascii=False), inst_id)
                         )
         except Exception as e:
