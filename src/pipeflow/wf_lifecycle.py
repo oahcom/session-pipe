@@ -37,6 +37,20 @@ def _value_audit_failed(text: str) -> bool:
     return False
 
 
+def _resolve_value_gate_paths(vg_file: str, vg_ws: str) -> list:
+    """把 value_gate.file 解析为 (workspace, 文件名) 列表。
+
+    file 字段实际是逗号分隔的多文件名（food_chain_loop 配
+    "VALUE_AUDIT.md,delivery_chain_summary.txt"），旧代码直接当单个文件名拼路径，
+    拼出 "VALUE_AUDIT.md,delivery_chain_summary.txt" 这样的不存在路径 →
+    值门禁永远不通过 → 收尾判定退化到子链扫描分支。此处按逗号切分并去空白。
+    """
+    if not vg_file or not vg_ws:
+        return []
+    return [(_CCS_WORKSPACES / vg_ws, _fn.strip())
+            for _fn in str(vg_file).split(",") if _fn.strip()]
+
+
 def _resolve_loop_max_iter(max_iter: int, value_gate_file: str, wf_id: str, logger) -> int:
     """解循环迭代上限。
 
@@ -242,20 +256,23 @@ class WorkflowLifecycleMixin:
                     # exit_condition 等 bus 时角色只写文件 → 步骤永远 step_done_ready 卡死。
                     # 此处复用 _handle_wf_loop 的文件门禁判定：文件存在且非 FAIL → 允许 close。
                     _vg = (wf.loop or {}).get("value_gate") or {}
-                    _vg_file, _vg_ws = _vg.get("file", ""), _vg.get("workspace", "")
-                    if _vg_file and _vg_ws:
-                        _audit_path = _CCS_WORKSPACES / _vg_ws / _vg_file
+                    _vg_passed = False
+                    for _vg_dir, _vg_name in _resolve_value_gate_paths(
+                            _vg.get("file", ""), _vg.get("workspace", "")):
+                        _audit_path = _vg_dir / _vg_name
                         if _audit_path.exists() and not _value_audit_failed(
                                 _audit_path.read_text(encoding="utf-8", errors="ignore")):
-                            _all_subs_done = True
+                            _vg_passed = True
                             LOGGER.info("wf %s [%s] 末位值门禁 PASS（文件 %s），允许收尾",
                                         wf_id[:8], wf_name, _audit_path.name)
-                            # 直接跳到 close（跳过子链扫描——子链 cancelled 已在下面兼容）
-                            LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
-                            self._lifecycle.close_wf(wf_id, status='completed')
-                            conn.commit()
-                            completed_now = True
-                            return
+                            break
+                    if _vg_passed:
+                        # 直接跳到 close（跳过子链扫描——子链 cancelled 已在下面兼容）
+                        LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
+                        self._lifecycle.close_wf(wf_id, status='completed')
+                        conn.commit()
+                        completed_now = True
+                        return
                     _all_subs_done = True
                     for _sid, _sdata in (json.loads(_db_res["step_results"]) if _db_res and _db_res["step_results"] else {}).items():
                         if not isinstance(_sdata, dict):
@@ -859,8 +876,8 @@ class WorkflowLifecycleMixin:
                         f"[workflow] {wf.name} 循环结束: 达到最大迭代 {_max_iter}",
                         src="workflow_engine")
                     return
-                if _vg_file and _vg_ws:
-                    _audit_path = _CCS_WORKSPACES / _vg_ws / _vg_file
+                for _vg_dir, _vg_name in _resolve_value_gate_paths(_vg_file, _vg_ws):
+                    _audit_path = _vg_dir / _vg_name
                     if _audit_path.exists():
                         _text = _audit_path.read_text(encoding="utf-8", errors="ignore")
                         if _value_audit_failed(_text):
