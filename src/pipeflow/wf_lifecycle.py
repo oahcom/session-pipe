@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 from pipeflow.engine import Step, WorkflowDef
+import paths as _paths_mod
 from paths import CCS_CLI as _CCS_CLI
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 
@@ -1016,7 +1017,8 @@ class WorkflowLifecycleMixin:
     def _write_step_prompt(self, run, step: Step, extra_prompt: str = ""):
         ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
         if "{workspace_summary}" in step.prompt_template:
-            ws_dir = Path.home() / ".hermes" / "workspace" / ctx.get("project_name", "")
+            # 运行时读属性而非 import 期冻结：测试用 conftest monkeypatch 该常量隔离。
+            ws_dir = _paths_mod.ITERATION_WORKSPACES / ctx.get("project_name", "")
             ctx["workspace_summary"] = self._collect_workspace_summary(ws_dir)
         # 从 SQLite 补 task 上下文
         if "{title}" in step.prompt_template or "{description}" in step.prompt_template:

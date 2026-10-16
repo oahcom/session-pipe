@@ -460,7 +460,9 @@ def test_collect_workspace_summary():
 
 def test_workspace_summary_in_prompt():
     wf_dir = _make_wf_dir()
-    ws_dir = Path.home() / ".hermes" / "workspace" / "test_ws_project"
+    # 用 paths.ITERATION_WORKSPACES（conftest 已隔离到临时目录），不写死 ~/.hermes/workspace
+    import paths
+    ws_dir = paths.ITERATION_WORKSPACES / "test_ws_project"
     ws_dir.mkdir(parents=True, exist_ok=True)
     (ws_dir / "PRD.md").write_text("# 需求文档 WS_SUMMARY_UNIQUE_8899")
     steps = [{"id": "s1", "title": "调研", "target_role": "scout",

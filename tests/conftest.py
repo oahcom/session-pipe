@@ -67,6 +67,14 @@ _TEST_WS_DIR = os.path.join(_TEST_STATE_DIR, "ccs-workspaces")
 os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
 _paths_mod.CCS_WORKSPACES = Path(_TEST_WS_DIR)
 
+# 3c. ITERATION_WORKSPACES 隔离：_write_step_prompt 读 <根>/<project_name>/PRD.md
+#     生成 {workspace_summary}。不隔离则跑 pytest 会在生产 ~/.hermes/workspace/
+#     下建 test_ws_project 等目录并写 PRD.md（2026-10-16 实测残留
+#     ws_prj2/ws_prj3/test_ws_project）。
+_TEST_ITER_DIR = os.path.join(_TEST_STATE_DIR, "iteration-workspace")
+os.environ["SESSION_PIPELINE_ITERATION_WORKSPACES"] = _TEST_ITER_DIR
+_paths_mod.ITERATION_WORKSPACES = Path(_TEST_ITER_DIR)
+
 # 4. BUS_DB 隔离：重定向 Blackboard 到临时 DB，测试不再写生产 blackboard.db。
 #    Blackboard.__init__ 默认用 blackboard_legacy 模块导入时的 BLACKBOARD_DB 快照，
 #    因此需 patch 快照值本身（blackboard_legacy.BLACKBOARD_DB + hermes_bus.config.BLACKBOARD_DB）。

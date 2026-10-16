@@ -30,6 +30,12 @@ CURSOR_DB = HERMES_STATE / "pipeline_cursor.db"
 ROUTING_DB = HERMES_STATE / "routing.db"
 ACK_TRACKER_DB = HERMES_STATE / "ack_tracker.db"
 STARVE_STATE = Path.home() / ".hermes" / "run" / "wf_starve.json"
+# 迭代需求目录（每个需求一个子目录，存 PRD/DESIGN/TASKS 等迭代产物）。
+# env var 覆盖: 测试隔离用。不隔离时跑 pytest 会在生产根下建 test_ws_project
+# 等目录并写 PRD.md（2026-10-16 实测残留 ws_prj2/ws_prj3/test_ws_project）。
+ITERATION_WORKSPACES = Path(os.environ.get(
+    "SESSION_PIPELINE_ITERATION_WORKSPACES",
+    _HOME / ".hermes" / "workspace"))
 # ── 模板与配置 ──
 HERMES_TEMPLATES = _HOME / ".hermes" / "templates"
 HERMES_BACKUPS = _HOME / ".hermes" / "backups"

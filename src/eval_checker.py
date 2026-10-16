@@ -795,13 +795,18 @@ class TrajectoryQualityChecker:
     """
 
     def _role_sessions(self, role: str) -> list[Path]:
-        """解析角色名对应的 transcri 目录（支持 ccs-workspaces/<role> 等路径形态）。"""
+        """解析角色名对应的 transcri 目录（支持 ccs-workspaces/<role> 等路径形态）。
+
+        分隔符需归一化：persona 角色名用下划线（product_architect），transcript
+        目录用连字符（…-product-architect）。不归一则该角色恒匹配 0 目录，
+        check() 走「无可检查对象 → passed=True」的假验证分支（2026-10-16 实测）。
+        """
         out: list[Path] = []
+        needle = role.lower().replace("_", "-")
         for d in _TRANSCRIPTS_DIR.iterdir():
             if not d.is_dir():
                 continue
-            low = d.name.lower()
-            if role.lower() in low:
+            if needle in d.name.lower().replace("_", "-"):
                 out.append(d)
         return out
 
