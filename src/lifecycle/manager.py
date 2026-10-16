@@ -510,7 +510,7 @@ class LifecycleManager:
             _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
                 ["python3", _ccs_cli, "send", executor, msg,
-                 "--from", "cli"],
+                 "--from", "workflow_engine"],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
                 logger.warning("notify result failed for %s: %s", executor,
@@ -817,7 +817,7 @@ class LifecycleManager:
             _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
                 ["python3", _ccs_cli, "send", assigner, msg,
-                 "--from", "cli"],
+                 "--from", "workflow_engine"],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
                 logger.warning("ccs send failed for %s->%s: %s", self.role, assigner,
