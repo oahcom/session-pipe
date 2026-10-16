@@ -123,9 +123,19 @@ class WorkflowLifecycleMixin:
 
                 _auto_cancel_at = 6
                 reason = ""
+                # 条件0: 状态对账——当前步骤已是终态(cancelled/failed)但行级仍 running。
+                # 语义上该实例不会再推进，属"僵尸行"。这类残留由历史 cancel_step 缺陷造成
+                # （只写步骤级 status 不写行级，已修），但不修存量会永久占用 running 计数
+                # 并污染积压告警。实测 2026-10-17：21 台卡 5.5-6.1h，是全库 running 最大块。
+                _cur_id = d.get("current_step_id", "")
+                _cur_step = sr.get(_cur_id, {}) if isinstance(sr, dict) else {}
+                if (isinstance(_cur_step, dict)
+                        and _cur_step.get("status") in ("cancelled", "failed")):
+                    reason = (f"当前步骤 {_cur_id} 已终态"
+                              f"({_cur_step.get('status')})但行级仍 running")
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
-                if max_tc >= _auto_cancel_at:
+                elif max_tc >= _auto_cancel_at:
                     reason = f"timeout_count={max_tc}（已达自动回收阈值{_auto_cancel_at}）"
                 # 条件2: 测试/开发模板超2小时
                 elif tpl in _ZOMBIE_TEMPLATES and age_h > 2:
