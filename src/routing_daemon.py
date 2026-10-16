@@ -142,9 +142,15 @@ def _check_cron_schedules() -> int:
                             LOGGER.info("cron_schedule 跳过死角色: %s (not running)", role)
                             continue
                         LOGGER.info("cron_schedule 触发: %s (%s)", role, cron_exp)
+                        # 必须显式 --from：ccs.py 的 --from 默认值是 "cli"，
+                        # 而 core.send 把 "cli"/"user" 当人类来源 → 触发意图提醒注入
+                        # 并**刷新该角色的用户请求痕迹 ts**。痕迹是意图守护 daemon 的
+                        # 触发源（ts 即"最近一次用户请求"），被定时任务刷新后，同一请求
+                        # 会被当成"新一轮请求"→ 预算重置 → 提醒无限重复。
                         subprocess.run(
                             [sys.executable, str(launcher), "send", role,
-                             f"定时任务触发 (cron: {cron_exp})"],
+                             f"定时任务触发 (cron: {cron_exp})",
+                             "--from", "routing_daemon"],
                             capture_output=True, timeout=10,
                         )
                         triggered_count += 1
