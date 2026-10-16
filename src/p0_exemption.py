@@ -152,7 +152,7 @@ class P0Exemption:
         violations = []
         rows = self._conn.execute("""
             SELECT * FROM tasks
-            WHERE status != 'completed'
+            WHERE status NOT IN ('completed', 'failed', 'cancelled')
             ORDER BY created_at DESC
         """).fetchall()
 
@@ -401,7 +401,7 @@ class P0Exemption:
         p0_tasks = self._conn.execute(
             "SELECT task_id, title, created_at, p0_marked_at, p0_state FROM tasks "
             "WHERE p0_state IS NOT NULL AND p0_state NOT IN ('downgraded', 'confirmed') "
-            "AND status != 'completed'"
+            "AND status NOT IN ('completed', 'failed', 'cancelled')"
         ).fetchall()
 
         for row in p0_tasks:
