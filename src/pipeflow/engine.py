@@ -980,16 +980,25 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     if not step:
                         continue
                     target_role = step.target_role
+                    # 恢复次数护栏：同一实例反复 恢复→再blocked 会成死循环
+                    # （目标角色被主链/他链长期占用时，恢复后投递仍失败，3 次又 blocked）。
+                    # 上限 3 次：够覆盖"角色短暂离线后恢复"，又不会无限重刷 blocker。
+                    _rc = step_sr.get("recover_count", 0)
+                    if _rc >= 3:
+                        LOGGER.debug("recover skip: %s/%s 已达恢复上限 %d 次",
+                                     inst_id[:12], step_id, _rc)
+                        continue
                     # 检查目标角色是否已在线
                     if self._ensure_role_alive(target_role):
                         # 角色已在线 → 重置 step_results 允许重试
-                        LOGGER.info("recover: %s/%s delivery_blocked → 角色 %s 已在线，重置重试",
-                                    inst_id[:12], step_id, target_role)
+                        LOGGER.info("recover: %s/%s delivery_blocked → 角色 %s 已在线，重置重试 (第 %d 次)",
+                                    inst_id[:12], step_id, target_role, _rc + 1)
                         new_sr = dict(sr)
                         new_sr[step_id] = {
                             **sr[step_id],
                             "status": "",
                             "delivery_fail_count": 0,
+                            "recover_count": _rc + 1,
                         }
                         # 必须同时把行级 status 还原为 running：
                         # close_wf 打终态时置 delivery_blocked（行级），而主处理循环
