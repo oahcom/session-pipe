@@ -81,6 +81,124 @@ def test_cooldown_prevents_duplicate():
     print("✅ cooldown 300s 防重复 ✓")
 
 
+def _transcript(tmp_path, lines):
+    """写一个角色的 transcript 目录，返回 root。"""
+    root = tmp_path
+    d = root / "ccs-workspaces-ovf"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return root
+
+
+def _err_line(age_sec):
+    """构造一条 N 秒前的 API 错误行（transcript ts 为 UTC）。"""
+    import calendar
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - age_sec))
+    return '{"isApiErrorMessage": true, "error": "invalid_request", "timestamp": "%s"}' % ts
+
+
+def test_transcript_tail_error_triggers_compact(tmp_path):
+    """pane 无信号，但 transcript 尾部有近期 API 错误 → 仍应发 /compact。
+
+    pane 信号有结构性盲区：claude TUI 在备用屏（alternate_on=1）无 scrollback，
+    `-S -500` 与 `-S -5000` 返回相同的视口内容。scout 实测在错误后 1s 才被检测到，
+    此时 agent 已终止。transcript 是落盘事实，不受视口与进程存活影响。
+    """
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    eng._TRANSCRIPTS_ROOT = _transcript(tmp_path, [_err_line(60)])
+    send_keys = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-ovf\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="")   # pane 无任何溢出措辞
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    assert len([c for c in send_keys if "/compact" in c]) == 1, \
+        f"transcript 近期错误应触发 /compact, got {send_keys}"
+    print("✅ transcript 尾部近期错误 → /compact")
+
+
+def test_transcript_stale_error_does_not_trigger(tmp_path):
+    """transcript 里的错误已远超时效 → 不触发（旧错误不该无限期重发 /compact）。"""
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    eng._TRANSCRIPTS_ROOT = _transcript(tmp_path, [_err_line(7200)])  # 2 小时前
+    send_keys = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-ovf\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="")
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    assert len([c for c in send_keys if "/compact" in c]) == 0, \
+        f"过期错误不应触发, got {send_keys}"
+    print("✅ transcript 陈旧错误 → 不触发 ✓")
+
+
+def test_transcript_missing_dir_is_silent(tmp_path):
+    """角色无 transcript 目录 → 不报错、不触发（不能因读不到就发 /compact）。"""
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    eng._TRANSCRIPTS_ROOT = tmp_path / "nonexistent"
+    send_keys = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-ovf\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="")
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    assert send_keys == [], f"无 transcript 不应触发, got {send_keys}"
+    print("✅ 无 transcript 目录 → 静默 ✓")
+
+
+def test_transcript_overflow_falls_back_to_pane_signal(tmp_path):
+    """二分法守卫: pane 有信号 + transcript 无错误 → 仍触发（新增不削弱旧判据）。"""
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    eng._TRANSCRIPTS_ROOT = _transcript(tmp_path, ['{"type":"user","x":"y"}'])
+    send_keys = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-ovf\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="Prompt is too long")
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    assert len([c for c in send_keys if "/compact" in c]) == 1, \
+        f"pane 信号仍须生效, got {send_keys}"
+    print("✅ pane 信号未被削弱 ✓")
+
+
 def test_subflow_cannot_start():
     """is_subflow=True 的模板不能被独立 start()。"""
     eng = _get_test_eng()
