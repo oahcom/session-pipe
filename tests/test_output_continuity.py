@@ -55,9 +55,20 @@ def facts_last_n_days(n: int):
 
 
 def _reasoning_window_hours() -> float:
-    """过去 24h 内真实推理产出的时间窗跨度, 单位小时。"""
-    ts = [r[2] for r in facts_last_n_days(1)
-          if r[0] not in PULSE_CATS and r[1] not in DAEMON_SRCS]
+    """过去 24h 内真实推理产出的时间窗跨度, 单位小时。
+
+    必须在**无生产 DB** 时也能返回（返回 0.0）：本函数被模块级的
+    `pytest.mark.skipif` 调用，而它在 **collection 期**求值——抛异常会中断整个
+    套件的收集，不只是跳过本文件。CI 是全新 clone、没有 blackboard.db
+    （实测：三仓同级 clone 跑 pytest tests/ → 1 error during collection）。
+    """
+    if not DB_PATH.exists():
+        return 0.0
+    try:
+        ts = [r[2] for r in facts_last_n_days(1)
+              if r[0] not in PULSE_CATS and r[1] not in DAEMON_SRCS]
+    except (sqlite3.Error, OSError):
+        return 0.0  # DB 存在但不可读/无表：同样按"窗口不足"处理（走 skip）
     return (time.time() - min(ts)) / 3600 if ts else 0.0
 
 
@@ -100,7 +111,15 @@ class TestOutputContinuity(unittest.TestCase):
         self.assertTrue(all(b >= MIN_PER_6H for b in buckets),
                         f"24h 连续性断档: 6h 桶产出={buckets}, 应≥{MIN_PER_6H}/桶")
 
+    @_needs_full_day
     def test_real_roles_produce(self):
+        """至少 3 个真实角色在 24h 内有推理产出。
+
+        与 test_24h_real_reasoning_volume / test_6h_buckets_no_gap 同为"24h 窗口"
+        断言，故必须挂同一个 _needs_full_day 守卫——原实现漏挂，在产出窗口不满
+        24h 的环境（CI 全新 clone、或系统当日才拉起）里它以"产出过少"失败，
+        而它的两个同族用例此时正确 skip。缺守卫的后果不是漏报而是**误报**。
+        """
         rows = [r for r in facts_last_n_days(1) if r[1] in REAL_ROLES]
         producing = {r[1] for r in rows}
         # 至少 3 个真实角色在 24h 内有推理产出
