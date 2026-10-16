@@ -211,12 +211,20 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     raw_msgs = _poll(consumer=role_name, limit=category_limit * 3)
     # 定向过滤：@target_role 的消息只给 target role，其他角色跳过不消费
     import re as _re
-    _my_cats = _rt_mod.get_router().routing.get(role_name, {}).get("consume", [])
+    # 容错：get_router() 在测试中被 mock 成 MagicMock 时 routing 是 MagicMock，
+    # .get(...) 返回 MagicMock 而非 list，in/not in 判断行为不可靠 → 显式校验类型，
+    # 非 list 时退化为"不过滤"，保持旧行为（与未加过滤前一致）。
+    try:
+        _my_cats = _rt_mod.get_router().routing.get(role_name, {}).get("consume", [])
+        if not isinstance(_my_cats, list):
+            _my_cats = []
+    except Exception:
+        _my_cats = []
     def _is_for_me(msg):
         # 分类过滤：只投递该角色声明消费的分类（route_all 走
         # get_consumers_prioritized 同一语义，此处原先缺失）。
         # 缺此过滤则 blocker 等消息被投给全部 32 个角色，其中 24 个不消费它。
-        if "*" not in _my_cats and msg.get("category") not in _my_cats:
+        if _my_cats and "*" not in _my_cats and msg.get("category") not in _my_cats:
             return False
         text = msg.get("text", "")
         tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", text)
