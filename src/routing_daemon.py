@@ -248,8 +248,16 @@ def main():
                     import io, contextlib
                     _ec_buf = io.StringIO()
                     with contextlib.redirect_stdout(_ec_buf):
-                        _ec_main(["--json"])
-                    LOGGER.debug("eval_consistency 预检: %s", _ec_buf.getvalue()[:200])
+                        _ec_rc = _ec_main(["--json"])
+                    # 结果必须可见：曾用 LOGGER.debug，而运行期有效级别是 INFO
+                    # → 输出永不落盘（实测 30 天 journal 里 0 条），且 _ec_main 的
+                    # 返回值被丢弃。该预检的全部意义就是"发现不兼容项"，用不可见
+                    # 级别打印等于没做——正是它自己要防的那种静默。
+                    if _ec_rc:
+                        LOGGER.warning("eval_consistency 预检发现不兼容项 (rc=%s): %s",
+                                       _ec_rc, _ec_buf.getvalue()[:400])
+                    else:
+                        LOGGER.info("eval_consistency 预检通过")
                 except Exception as _ec:
                     LOGGER.warning("eval_consistency 预检异常（不阻塞 eval 执行）: %s", _ec)
                 if _run_eval is None:
