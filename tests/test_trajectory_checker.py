@@ -114,6 +114,184 @@ def test_blind_edit_only_flagged() -> None:
             pass
 
 
+def _make_bash_read_transcript(path: Path) -> None:
+    """角色先 Bash 读文件，再 Edit 它——不应判 blind_edit。
+
+    回归：原判据只认 Read 工具，而角色规范《Large File / Log Analysis》
+    要求大文件先 grep 定位、日志用 tail/grep。实测 scout/engineer/lr
+    共 16 处误杀，目标文件全部已被 Bash 读过。
+    """
+    lines = []
+    n = 0
+    for cid, cmd in (
+        ("b1", "grep -n 'TODO' /tmp/bashread.py | head -5"),
+        ("b2", "cat /tmp/bashread.py | tail -20"),
+    ):
+        lines.append(json.dumps({
+            "type": "assistant",
+            "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
+                {"type": "tool_use", "id": cid, "name": "Bash",
+                 "input": {"command": cmd}},
+            ]},
+        }))
+        n += 1
+        lines.append(json.dumps({
+            "type": "user",
+            "message": {"id": f"m{n}", "type": "message", "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": cid, "is_error": False, "content": "x=1"},
+            ]},
+        }))
+        n += 1
+    lines.append(json.dumps({
+        "type": "assistant",
+        "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "b3", "name": "Edit",
+             "input": {"file_path": "/tmp/bashread.py", "old_string": "x=1", "new_string": "x=2"}},
+        ]},
+    }))
+    n += 1
+    lines.append(json.dumps({
+        "type": "user",
+        "message": {"id": f"m{n}", "type": "message", "role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b3", "is_error": False, "content": "ok"},
+        ]},
+    }))
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_bash_read_not_flagged_as_blind_edit() -> None:
+    sess = _TRANSCRIPTS_DIR / "-home-administrator-ccs-workspaces-bashfixture-role"
+    sess.mkdir(parents=True, exist_ok=True)
+    jf = sess / "fixture_bash.jsonl"
+    try:
+        _make_bash_read_transcript(jf)
+        result = TrajectoryQualityChecker().check("bashfixture", "eval_bashfixture")
+        blind = [f for f in result["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"Bash 读过文件后 Edit 不应判 blind_edit，实际: {blind}"
+        assert "orphan_call" not in {f["issue"] for f in result["findings"]}
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def _make_tail_orphan_transcript(path: Path) -> None:
+    """会话在工具执行中结束：末尾连续多个 tool_use 无 result。
+
+    回归：orphan_call 原判据把这类"会话边界"报成"角色漏收结果"。
+    实测 scout 的 4 处 orphan_call 全部是各自 jsonl 末条 tool_use——
+    4/4 误判。且这些历史条目会持续占据 bus 报告的 findings[:3] 名额。
+
+    同一轮 Claude 会并行发多个 tool_use（实测 dfd563da 末尾连发 2 条），
+    故构造 3 条连续无 result 的 use，验证整个尾部段都被豁免。
+    """
+    lines = []
+    n = 0
+    # 1 条已配对的正常调用：它之前的一切都算"会话中"
+    lines.append(json.dumps({
+        "type": "assistant",
+        "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash",
+             "input": {"command": "ls"}},
+        ]},
+    }))
+    n += 1
+    lines.append(json.dumps({
+        "type": "user",
+        "message": {"id": f"m{n}", "type": "message", "role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": False, "content": "ok"},
+        ]},
+    }))
+    n += 1
+    # 末尾连续 3 条无 result（会话边界）
+    for cid in ("t2", "t3", "t4"):
+        lines.append(json.dumps({
+            "type": "assistant",
+            "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
+                {"type": "tool_use", "id": cid, "name": "Bash",
+                 "input": {"command": f"echo {cid}"}},
+            ]},
+        }))
+        n += 1
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_tail_orphans_not_flagged() -> None:
+    """transcript 末尾的未配对 tool_use 是会话边界，不应判 orphan_call。"""
+    sess = _TRANSCRIPTS_DIR / "-home-administrator-ccs-workspaces-tailfixture-role"
+    sess.mkdir(parents=True, exist_ok=True)
+    jf = sess / "fixture_tail.jsonl"
+    try:
+        _make_tail_orphan_transcript(jf)
+        result = TrajectoryQualityChecker().check("tailfixture", "eval_tailfixture")
+        orphans = [f for f in result["findings"] if f["issue"] == "orphan_call"]
+        assert not orphans, f"会话末尾的未配对调用不应判 orphan_call，实际: {orphans}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def _make_mid_orphan_transcript(path: Path) -> None:
+    """角色中途漏收结果后**继续调用**——这是真违规，必须仍被报出。"""
+    lines = []
+    n = 0
+    # 中途一条无 result 的调用
+    lines.append(json.dumps({
+        "type": "assistant",
+        "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "mid1", "name": "Bash",
+             "input": {"command": "echo dropped"}},
+        ]},
+    }))
+    n += 1
+    # 紧接着又有一次已配对的调用 → 证明会话没结束，mid1 是真漏收
+    lines.append(json.dumps({
+        "type": "assistant",
+        "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "t9", "name": "Bash",
+             "input": {"command": "echo after"}},
+        ]},
+    }))
+    n += 1
+    lines.append(json.dumps({
+        "type": "user",
+        "message": {"id": f"m{n}", "type": "message", "role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t9", "is_error": False, "content": "ok"},
+        ]},
+    }))
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_mid_stream_orphan_still_flagged() -> None:
+    """中途漏收结果（其后仍有已配对调用）必须仍被判 orphan_call。"""
+    sess = _TRANSCRIPTS_DIR / "-home-administrator-ccs-workspaces-midfixture-role"
+    sess.mkdir(parents=True, exist_ok=True)
+    jf = sess / "fixture_mid.jsonl"
+    try:
+        _make_mid_orphan_transcript(jf)
+        result = TrajectoryQualityChecker().check("midfixture", "eval_midfixture")
+        orphans = [f for f in result["findings"] if f["issue"] == "orphan_call"]
+        assert len(orphans) == 1 and orphans[0]["id"] == "mid1", \
+            f"中途漏收结果应判 orphan_call 且只报那一条，实际: {orphans}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     test_blind_edit_only_flagged()
     print("PASS: TrajectoryQualityChecker flags only blind edit")
+    test_bash_read_not_flagged_as_blind_edit()
+    print("PASS: Bash-read file not flagged as blind edit")
+    test_tail_orphans_not_flagged()
+    print("PASS: tail orphans (session boundary) not flagged")
+    test_mid_stream_orphan_still_flagged()
+    print("PASS: mid-stream orphan still flagged")
