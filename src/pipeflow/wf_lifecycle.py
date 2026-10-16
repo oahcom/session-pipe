@@ -274,6 +274,7 @@ class WorkflowLifecycleMixin:
                         completed_now = True
                         return
                     _all_subs_done = True
+                    _forced: list = []  # 被强制取消的子链 (step_id, subflow_id, 原状态)
                     for _sid, _sdata in (json.loads(_db_res["step_results"]) if _db_res and _db_res["step_results"] else {}).items():
                         if not isinstance(_sdata, dict):
                             continue
@@ -298,6 +299,29 @@ class WorkflowLifecycleMixin:
                                     "UPDATE workflow_instances SET status='cancelled' "
                                     "WHERE instance_id=? AND status NOT IN ('completed')",
                                     (_sf,))
+                                # 强制关闭子链 = 该步产出未达成的信号。原实现静默取消后
+                                # 父链照判 completed，导致「父链完成」不蕴含「产出存在」
+                                # （实测 wf_ae31fd1c4c11：4/6 产出物缺失仍算完成）。
+                                # 此处记账 + 写 bus，让缺失可被外部观测（不改完成语义，
+                                # 避免复活 2026-08-10「主链无限等待」事故）。
+                                _forced.append((_sid, _sf, _st['status']))
+                    # bus 写入必须在事务外：_bb.write 自带连接/事务，
+                    # 在 _conn_tx 内调用会撞 "cannot start a transaction within a transaction"。
+                    for _fsid, _fsf, _fst in _forced:
+                        try:
+                            self._bb.write(
+                                "blocker",
+                                f"[workflow] {wf_id[:12]}/{_fsid} 子链超时强制取消，"
+                                f"该步产出未达成（子链 {_fsf[:12]} status={_fst}）",
+                                src="workflow_engine",
+                                evidence=f"父链 {wf_name} 末步收尾时子链超 5 分钟宽限未完成；"
+                                         f"父链仍按原语义判 completed，但此步产出缺失。"
+                                         f"请核查 {_fsid} 的产出物是否已写入 workspace。")
+                            LOGGER.warning(
+                                "wf %s/%s 子链 %s 超宽限强制取消（status=%s），产出可能缺失",
+                                wf_id[:8], _fsid, _fsf[:12], _fst)
+                        except Exception as _bwe:
+                            LOGGER.debug("forced-subflow blocker 写入失败: %s", _bwe)
                     if not _all_subs_done:
                         return
                     LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
@@ -422,7 +446,15 @@ class WorkflowLifecycleMixin:
                     # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
                     # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
                     # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
-                    if self._is_role_busy(next_step.target_role, exclude_wf_id=wf_id,
+                    #
+                    # 注意 exclude_wf_id 传空：原实现传 wf_id（"排除自己"），但这样
+                    # 会把"主链 next_step 刚被投递、正占用该角色"这个事实一起排除掉
+                    # → 守卫恒 False → 照建同角色子流 → 与主链步骤争抢同一角色
+                    # → 子流反复投递失败 → delivery_blocked → 恢复 → 再失败（实测
+                    # wf_sub_ee176a2b55a1 的 delivery_fail_count 涨到 2）。
+                    # 实测对比：exclude=wf_id → False（漏判）；exclude='' → True（真实）。
+                    # 子流是新增占用者，必须看真实占用状态，故不排除本主链。
+                    if self._is_role_busy(next_step.target_role, exclude_wf_id="",
                                           pane_fallback=False):
                         LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
                                     next_step.target_role, next_step.subflow_template)

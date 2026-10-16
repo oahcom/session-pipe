@@ -224,7 +224,8 @@ class LifecycleManager:
     # ── 核心操作（并发安全） ─────────────────────
 
     def start_wf(self, wf_id: str, current_step_id: str = "s1",
-                  template_id: str = "", context: dict = None) -> bool:
+                  template_id: str = "", context: dict = None,
+                  initiator: str = None) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -258,8 +259,18 @@ class LifecycleManager:
                 self._conn.commit()
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
+                # 真人发起 → 写 assigner 列使审批人得以算出，否则 assign器=workflow_engine 被豁免审批。
+                # 写在 UPDATE 后（无论 rowcount）: engine.start 路径在 L237 UPDATE 命中，
+                # 必须在此同步改写 assigner 列，否则实例永久 assigner=workflow_engine。
+                _assigner = initiator or self.role
+                if _assigner in ("workflow_engine", "system", ""):
+                    _assigner = "workflow_engine"
+                if _assigner != "workflow_engine":
+                    self._conn.execute(
+                        "UPDATE workflow_instances SET assigner=? WHERE instance_id=?",
+                        (_assigner, wf_id))
                 self._log(wf_id, task_id, "wf_started",
-                          detail=f"workflow started by {self.role}, step={current_step_id}")
+                          detail=f"workflow started by {self.role}, initiator={initiator or self.role}, step={current_step_id}")
                 return True
             except Exception:
                 self._conn.rollback()
@@ -600,7 +611,15 @@ class LifecycleManager:
 
     def close_wf(self, wf_id: str, status: str = "completed"):
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            # 可能已在调用方的事务中（_advance_production_wf 的 _conn_tx 块内先做过
+            # DML，sqlite3 默认 isolation_level='' 已隐式 BEGIN）。此时再 BEGIN
+            # IMMEDIATE 会抛 "cannot start a transaction within a transaction"——
+            # 实测生产 wf_3d7210c2bc57 与 wf_ae31fd1c4c11 收尾时各触发过一轮，
+            # 导致 conn.commit() 从未执行、完成状态不落库。
+            # in_transaction 为真时复用外层事务，提交权交还调用方。
+            _own_tx = not self._conn.in_transaction
+            if _own_tx:
+                self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
                     "UPDATE workflow_instances SET status=?, completed_at=? "
@@ -610,10 +629,12 @@ class LifecycleManager:
                 task_id = wf.get("task_id") if wf else None
                 self._sync_task_unsafe(task_id)
                 self._log_unsafe(wf_id, task_id, "wf_closed", detail=f"workflow {status}")
-                self._conn.commit()
+                if _own_tx:
+                    self._conn.commit()
                 return True
             except Exception:
-                self._conn.rollback()
+                if _own_tx:
+                    self._conn.rollback()
                 raise
 
     # ── 子工作流级联操作 ───────────────────────────
