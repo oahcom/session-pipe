@@ -280,15 +280,13 @@ class RoleLifecycleMixin:
             return True
 
         # 拉起前加锁 + 冷却：check-then-act 的写入侧必须串行化。
-        # 锁内二次确认存活——等锁期间别的 tick 可能已拉起成功。
+        # 锁内不重复探测 tmux（外层刚判过）：并发 tick 的第二个只需看冷却戳即可，
+        # 冷却戳由先到的 tick 写入，后者读到后直接退出。
         with self._RESTART_LOCK:
             _now = time.time()
             if _now - self._last_restart.get(role, 0.0) < _RESTART_COOLDOWN_SEC:
                 LOGGER.debug("CCS %s: 拉起冷却期内，跳过", role)
                 return False
-            if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
-                       capture_output=True, timeout=5).returncode == 0:
-                return True  # 等锁期间已被其他调用点拉起
             self._last_restart[role] = _now
         # 拉起 CCS（infinite 模式，agent 常驻执行任务）
         # ponytail: ondemand 模式只写哨兵不创建 tmux 会话，必须用 infinite 让 agent 持续运行
@@ -470,13 +468,13 @@ class RoleLifecycleMixin:
         # integrity.py 又把这个 prompt_template 截断填进「用户指令：{goal_text}」，
         # 于是角色收到的"用户指令"字面就是 /goal（bus #374984/#374982 实证）。
         import re as _re
-        prompt = _re.sub(r"^/goal\s*", "", prompt, count=1, flags=_re.IGNORECASE)
+        prompt = _re.sub(r"^/goal(?:\s+|$)", "", prompt, count=1, flags=_re.IGNORECASE)
         prompt = "/goal " + prompt
         # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
         # 用正则剥掉 /goal 前缀（lstrip 字符集会误伤内容开头的 g/o/a/l）
         # 阈值 10→4：10 会误杀「请调研 Python」这类 6 字合法中文任务；
         # 4 仍能拦住空/占位符（[]、p、x），继续防 #141691 死循环
-        _goal_content = _re.sub(r"^/goal\s*", "", prompt, count=1, flags=_re.IGNORECASE).strip()
+        _goal_content = _re.sub(r"^/goal(?:\s+|$)", "", prompt, count=1, flags=_re.IGNORECASE).strip()
         if len(_goal_content) < 4:
             LOGGER.warning("send-to-role %s 拒绝: goal 内容过短 (len=%d, wf=%s step=%s)",
                           role, len(_goal_content), wf_id[:12] if wf_id else "?", step_id)

@@ -45,11 +45,12 @@ def _has_content_words(title: str) -> bool:
     return any(w in t for w in _CONTENT_WORDS)
 
 
-_ROLE_REPORT_RE = re.compile(r"^\[([a-z_]+)\]")
+_ROLE_REPORT_RE = re.compile(r"^\[([a-z_\-]+)\]")
+
 
 
 def _is_role_report_title(title: str) -> bool:
-    """[角色名] 开头的 title 是产出汇报，不是任务派发。
+    """[标签] 开头的 title 是产出汇报或系统自述，不是任务派发。
 
     WHY: 这些 title 由角色完成后写 bus（如 `[engineer] s1-complete (wf_xxx)`、
     `[deploy] wf_xxx 产出已部署`），routes 把它们当新任务再派给每个 consumer，
@@ -57,7 +58,7 @@ def _is_role_report_title(title: str) -> bool:
     92/92 个 [角色名] 开头实例全部 fan-out（同 title 多角色），无一例外。
     """
     m = _ROLE_REPORT_RE.match(title or "")
-    return bool(m) and m.group(1) not in ("auto", "用户")
+    return bool(m)
 
 
 
@@ -134,7 +135,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
             assignments.append({
                 "id": msg["id"],
                 "category": msg["category"],
-                "title": msg["text"][:60],
+                # 与 route_to_ccs 同口径（首行 + 80 上限）：两条路径对同一条
+                # bus 消息必须产出相同 title，否则 client.create_task_v2 的
+                # 按 title 去重会漏掉跨路径重复（60 vs 80 截断不等）
+                "title": (msg["text"] or "").split("\n")[0][:80],
                 "priority": msg["priority"],
                 "consumers": ordered,
             })

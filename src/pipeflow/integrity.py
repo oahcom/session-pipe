@@ -193,7 +193,7 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     # 剥离 /goal 前缀：模板存的 prompt_template 自带该前缀，直接截断填进
     # 「用户指令：」会让角色收到字面的 /goal（bus #374984 实证）。
     # 剥完为空时退回 step.title —— 至少是有语义的步骤名，而非空占位。
-    goal_text = _re.sub(r"^/goal\s*", "",
+    goal_text = _re.sub(r"^/goal(?:\s+|$)", "",
                         getattr(step, 'prompt_template', '') or '',
                         count=1, flags=_re.IGNORECASE).strip()
     if not goal_text:
@@ -242,7 +242,7 @@ def make_full_prompt(run: object, step: object, step_results: dict) -> str:
     if hasattr(step, "prompt_template"):
         # 剥离模板自带的 /goal 前缀：它是指令语法，不是需求原文。
         # 原样输出会把字面的 /goal 混进「步骤目标：」喂给角色。
-        _goal = _re.sub(r"^/goal\s*", "", step.prompt_template or "",
+        _goal = _re.sub(r"^/goal(?:\s+|$)", "", step.prompt_template or "",
                         count=1, flags=_re.IGNORECASE).strip()
     parts = []
     if _title:
