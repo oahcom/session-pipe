@@ -8,6 +8,7 @@ import json
 import time
 import uuid
 import logging
+import hashlib
 import threading
 import re  # 修复: _scan_tasks 用 re.match 但漏 import, 导致每 tick NameError 使任务生成静默死亡
 from pathlib import Path
@@ -15,6 +16,19 @@ from pathlib import Path
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 
 LOGGER = logging.getLogger("workflow.engine")
+
+
+def _event_key(title: str, assignee: str, template_id: str) -> str:
+    """事件去重键（DESIGN §2.1）：同一 标题|角色|模板 24h 内只 mint 一个任务实例。
+
+    与既有 5-min 精确标题去重（workflow/client.py create_task_v2）互补：
+    标题常内嵌 wf 实例号，精确匹配恒不命中，hash 键把语义同一的事件收敛。
+    """
+    return hashlib.sha256(f"{title}|{assignee}|{template_id}".encode()).hexdigest()[:16]
+
+
+# per-role running 上限（DESIGN §2.2 backpressure 水位线）。
+MAX_RUNNING_PER_ROLE = 3
 
 # 测试 harness 模板名前缀。**不用 `.*_test`**：它会命中 qa_test_* 等生产模板
 # （实测 qa_test_execute/qa_test_plan 被误判为 harness → 超时即静默 cancel，
@@ -372,11 +386,26 @@ class TaskGeneratorMixin:
                     continue
             except Exception:
                 pass
-
-            # 3) 组装有描述性的任务标题
+            # 3) 组装有描述性的任务标题（必须在去重检查**之前**：
+            # 去重要按 title 比对，先读后写会 UnboundLocalError，
+            # 且被下面的 except 吞掉 → 去重静默失效）
             _title = f"[auto] {_wf.title or _wf_name}: {_wf.description[:40]}" if _wf.description else f"[auto] 执行 {_wf_name} 工作流"
             if len(_title) < 12:
                 continue  # 跳过标题过短
+            # S1 事件去重（DESIGN §2.1）：同标题同角色 24h 内已 mint 过 task → 跳过。
+            # 上一段 per-template 守卫挡不住同模板下不同标题的事件洪水（每次超时
+            # 重推/路由消费都带新标题），title 维度的 24h 窗口补齐该缺口。
+            try:
+                _dup = self._lifecycle.query(
+                    "SELECT COUNT(*) as c FROM tasks "
+                    "WHERE title=? AND assignee=? AND created_at > ?",
+                    (_title[:80], _role, _now - 86400)
+                )[0]["c"]
+                if _dup > 0:
+                    continue
+            except Exception as _e:
+                # 不再静默：去重失效 = 事件洪水无闸门，必须在日志可见
+                LOGGER.warning("auto-task title 去重检查失败（降级为不去重）: %s", _e)
             _prompt = (
                 f"/goal\n\n"
                 f"## 任务\n执行工作流模板 {_wf_name}\n\n"
@@ -435,11 +464,27 @@ class TaskGeneratorMixin:
 
         L1: tmux 会话存活（session 不存在 → 不可分配）
         L2: 正在思考（liveness L1 thinking 信号 → busy，跳过）
+        L3: running 实例 >= MAX_RUNNING_PER_ROLE → backpressure（DESIGN §2.2）
         idel/stale/unknown → 放行
         """
         _skip = {"coordinator", "pipeline", "claude", "workflow_engine", ""}
         if role in _skip:
             return False
+        # L3: per-role running 上限（防洪水第二层）：角色已有 >= MAX_RUNNING_PER_ROLE
+        # 个 running/pending 实例 → 拒绝新派发，等回收自然降到水位线以下。
+        # 常量化而非配置：改大=放开洪水闸门，改小=饿死慢角色；3 与 DESIGN 验收 ⑤ 一致。
+        try:
+            _run = self._lifecycle.query(
+                "SELECT COUNT(*) as c FROM workflow_instances "
+                "WHERE assignee=? AND status IN ('running','pending')",
+                (role,)
+            )[0]["c"]
+            if _run >= MAX_RUNNING_PER_ROLE:
+                LOGGER.debug("_can_assign_role backpressure: %s running=%d >= %d",
+                             role, _run, MAX_RUNNING_PER_ROLE)
+                return False
+        except Exception as _e:
+            LOGGER.debug("_can_assign_role running-count query failed: %s", _e)
         # L1: tmux 存活（与原实现一致：异常/session 不在 → 不可分配）
         from liveness import _tmux_has_session, role_liveness
         if _tmux_has_session(role, timeout=5) is not True:
