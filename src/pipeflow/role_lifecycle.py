@@ -37,7 +37,6 @@ class RoleLifecycleMixin:
     _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
     _last_compact: dict[str, float] = {}
-    _last_restart: dict[str, float] = {}
     _RESTART_LOCK = threading.Lock()
     # check-then-act 竞态防护：cooldown 检查与写入之间加锁
     _COMPACT_LOCK = threading.Lock()
@@ -283,6 +282,10 @@ class RoleLifecycleMixin:
         # 锁内不重复探测 tmux（外层刚判过）：并发 tick 的第二个只需看冷却戳即可，
         # 冷却戳由先到的 tick 写入，后者读到后直接退出。
         with self._RESTART_LOCK:
+            # 实例级冷却戳：类级 dict 会跨实例共享（测试间污染）；生产只有一个
+            # engine 实例，实例级足以挡并发。
+            if not hasattr(self, "_last_restart"):
+                self._last_restart = {}
             _now = time.time()
             if _now - self._last_restart.get(role, 0.0) < _RESTART_COOLDOWN_SEC:
                 LOGGER.debug("CCS %s: 拉起冷却期内，跳过", role)
@@ -380,8 +383,6 @@ class RoleLifecycleMixin:
             LOGGER.info("Role %s is ready (idle & alive)", role)
             return True
 
-            time.sleep(5)
-
         LOGGER.warning("_wait_for_role_ready: role %s not ready after %ds", role, max_wait)
         return False
 
@@ -467,13 +468,16 @@ class RoleLifecycleMixin:
             LOGGER.warning("_send_to_role %s: role not ready after wait, skipping", role)
             return False
 
-        # 剥离 prompt 里已含的 /goal 前缀后再统一加一次。
-        # WHY: 早期"检测到就不动"的写法把模板自带的 `/goal\n## 产出` 原样投递，
-        # integrity.py 又把这个 prompt_template 截断填进「用户指令：{goal_text}」，
-        # 于是角色收到的"用户指令"字面就是 /goal（bus #374984/#374982 实证）。
+        # /goal 前缀语义：Claude Code 把它变成**会话级 Stop hook 硬条件**，
+        # 条件不满足则角色无法停止。这对"完成任务"是正确语义，对运维催办是灾难——
+        # 实测 [deadlock] test_report 超时 6769s 被投递后，age 每秒 +1 使条件永不成立，
+        # 角色被永久锁死（qa 会话 215 条该 hook、助理文本 0 条；全角色累计 943 条）。
+        # integrity 提醒同病：条件含"（简答）请回答"类无法自证的疑问句，且 60s 节流
+        # 反复重推 → 同样永久锁定。故：仅真实任务 (force=False) 加前缀。
         import re as _re
         prompt = _re.sub(r"^/goal(?:\s+|$)", "", prompt, count=1, flags=_re.IGNORECASE)
-        prompt = "/goal " + prompt
+        if not force:
+            prompt = "/goal " + prompt
         # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
         # 用正则剥掉 /goal 前缀（lstrip 字符集会误伤内容开头的 g/o/a/l）
         # 阈值 10→4：10 会误杀「请调研 Python」这类 6 字合法中文任务；
@@ -570,8 +574,13 @@ class RoleLifecycleMixin:
                             encoding="utf-8")
             except (ValueError, KeyError, TypeError):
                 pass
-        # 超时/告警通知走 blocker 而非 task_spec，防止 coordinator 误认为新任务
-        _is_warning = any(kw in prompt for kw in ["持续超时", "异常", "超时自动回收"])
+        # _send_to_role 只发任务，分类恒为 task_spec。
+        #
+        # 原实现用关键词猜告警（prompt 含"异常"/"持续超时"/"超时自动回收"→ 写 blocker），
+        # 但 prompt 是**任务正文**：正常任务模板标题含"异常诊断"即命中 → 真实任务被写成
+        # blocker，污染告警通道（实测 2026-10-17 05:50 maintainer/qa 的 6 条"告警"实为
+        # 正常任务派发）。真告警有专用通道 _notify_role()（直接写 blocker，不经此函数），
+        # 故此处无需猜测——按调用方语义（而非消息内容）分类，与 scheduler_noise 同范式。
         # 去重：同一 (wf_id, step_id) 在冷却窗内只写一条，重推不再刷新 ts。
         _dedup_key = f"{wf_id}/{step_id}"
         _should_write = True
@@ -580,14 +589,17 @@ class RoleLifecycleMixin:
                 _prev = self._last_bus_write.get(_dedup_key, 0)
                 _should_write = not _prev or (time.time() - _prev) >= self._BUS_WRITE_COOLDOWN
                 if _should_write:
+                    # 顺手清过期项：key 是 wf_id/step_id（无界，每个工作流新 key），
+                    # 不清理则 daemon 长跑内存持续增长。
+                    if len(self._last_bus_write) > 512:
+                        _cutoff = time.time() - self._BUS_WRITE_COOLDOWN
+                        self._last_bus_write = {
+                            k: v for k, v in self._last_bus_write.items() if v >= _cutoff
+                        }
                     self._last_bus_write[_dedup_key] = time.time()
         if _should_write:
-            if _is_warning:
-                _title = f"[workflow] {role} 告警: {wf_id}/{step_id}" if wf_id else f"[workflow] {role} 告警"
-                self._bb.write("blocker", _title, evidence=prompt, src="workflow_engine")
-            else:
-                _title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
-                self._bb.write("task_spec", _title, evidence=prompt, src="workflow_engine")
+            _title = f"needs_implementation @{role} 工作流任务: {wf_id}/{step_id}" if wf_id else f"@{role} 工作流任务"
+            self._bb.write("task_spec", _title, evidence=prompt, src="workflow_engine")
         # ccs send 推送全文（参数顺序：ccs.py send <target_role> <message> --from <source>）
         # 投递成功与否以子进程退出码为准：returncode != 0 视为投递失败，必须返回 False，
         # 否则 engine 会错盖 notified（违反红线：投递失败必须返回 False，下轮重试，
