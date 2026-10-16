@@ -213,13 +213,30 @@ def parse_conversation_signals(pane_text: str, role: str) -> ConversationSignal:
             sig.idle_evidence = idle_match.group(0)[:150]
 
     # ── 信号 3：越界操作 ──
+    # 只扫**已执行命令的回显行**，不扫整段 pane 文本。
+    # WHY: pane 里大部分文字是角色的叙述（调研报告、分析结论、引用验证命令），
+    # 对全文跑正则会把人话当命令。实测（2026-10-16）5 个样本里 3 个纯文本讨论
+    # 全被误判——scout 写"验证命令: systemctl is-active …"、正文讨论 pytest
+    # 覆盖率、读含 systemctl 字样的日志，都被判越界。
+    # 放大效应：误报 → 引擎反复注入停止指令/cancel_step → 步骤无法推进 →
+    # 2.4h 后当僵尸回收。wf_6ff71a38016c 的 s1 累计 violation_count=26，
+    # 而其 transcript 里 2911 条 Bash 命令全是只读（cat/ls/sqlite3 SELECT），
+    # 真实的越界数为 0。
+    # 回显格式（Claude Code 渲染）：`  ⎿  $ <cmd>` 或 `  ⎿  ⏵ $ <cmd>`。
+    # 只认带 `$` 的 ⎿ 行；角色正文里的裸命令名不再命中。
     forbidden_ops = _FORBIDDEN_OPS.get(role, _DEFAULT_FORBIDDEN)
     found = []
-    for op_type in forbidden_ops:
-        for pat in _SHELL_SIGNATURES.get(op_type, []):
-            matches = re.findall(pat, pane_text, re.IGNORECASE)
-            for m in matches:
-                found.append(f"{op_type}: {m}")
+    for line in pane_text.splitlines():
+        if "$" not in line:
+            continue
+        # 仅命令回显行：⎿ 前缀（含可选 ⏵/⏵⏵ 标记）
+        if "⎿" not in line:
+            continue
+        _cmd = line.split("$", 1)[1]
+        for op_type in forbidden_ops:
+            for pat in _SHELL_SIGNATURES.get(op_type, []):
+                for m in re.findall(pat, _cmd, re.IGNORECASE):
+                    found.append(f"{op_type}: {m}")
     if found:
         sig.violation_found = True
         sig.violation_commands = found[:5]

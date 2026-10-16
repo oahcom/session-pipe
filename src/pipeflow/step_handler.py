@@ -210,6 +210,8 @@ class StepHandlerMixin:
                                          send_to_role=self._send_to_role)
                 except Exception as _e:
                     LOGGER.debug("tmux 越界停止指令失败: %s", _e)
+            # 计数写在 if/else 之外，与上方 idle 分支同构：达阈值时 cancel_step
+            # 已接管，随即 return；未达阈值（或 cancel 失败）则累加，供下轮判定。
             _sig_state["violation_count"] = _viol_n
         if _sig_state:
             run.step_results[step.id] = {

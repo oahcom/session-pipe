@@ -102,7 +102,7 @@ def test_idle_excludes_waiting_reply():
 
 def test_violation_engineer_kubectl():
     """信号3: engineer 执行 kubectl → deploy 越界"""
-    text = "$ kubectl apply -f deploy.yaml"
+    text = "  ⎿  $ kubectl apply -f deploy.yaml"
     sig = parse_conversation_signals(text, "engineer")
     assert sig.violation_found
     assert any("deploy" in cmd for cmd in sig.violation_commands)
@@ -110,7 +110,7 @@ def test_violation_engineer_kubectl():
 
 def test_violation_qa_writes_code():
     """信号3: qa 写代码越界"""
-    text = "$ cat > new_module.py << EOF"
+    text = "  ⎿  $ cat > new_module.py << EOF"
     sig = parse_conversation_signals(text, "qa")
     assert sig.violation_found
     assert any("write_code" in cmd for cmd in sig.violation_commands)
@@ -118,10 +118,45 @@ def test_violation_qa_writes_code():
 
 def test_violation_pg_runs_tests():
     """信号3: pg 跑 pytest 越界"""
-    text = "$ python3 -m pytest tests/"
+    text = "  ⎿  $ python3 -m pytest tests/"
     sig = parse_conversation_signals(text, "pg")
     assert sig.violation_found
     assert any("run_tests" in cmd for cmd in sig.violation_commands)
+
+
+# ── 误报回归（2026-10-16）──
+# 判据原先对**整段 pane 文本**跑正则，把人话当命令：角色写调研报告、引用验证
+# 命令、读含关键词的日志，都被判越界。实测 5 样本中 3 个纯文本讨论全误判。
+# 放大效应：误报 → 引擎反复注入停止指令/cancel_step → 步骤不推进 → 2.4h 后
+# 当僵尸回收（wf_6ff71a38016c 的 s1 累计 violation_count=26，而其 transcript
+# 里 2911 条 Bash 命令全是只读，真实越界 0 次）。
+
+def test_discussing_pytest_in_prose_not_violation():
+    """正文讨论 pytest 不判越界——scout 调研报告的正常内容。"""
+    text = "本次调研发现该项目的 pytest 覆盖率已达 87%，建议关注"
+    sig = parse_conversation_signals(text, "scout")
+    assert not sig.violation_found, f"正文讨论被误判: {sig.violation_commands}"
+
+def test_citing_command_in_prose_not_violation():
+    """正文引用验证命令不判越界——写报告时的正常内容。"""
+    text = "验证命令: systemctl is-active hermes-gateway"
+    sig = parse_conversation_signals(text, "scout")
+    assert not sig.violation_found, f"命令引用被误判: {sig.violation_commands}"
+
+def test_reading_log_mentioning_systemctl_not_violation():
+    """读含 systemctl 字样的日志不判越界。"""
+    text = "日志显示 systemctl status 反复报 failed，根因是 unit 文件路径错误"
+    sig = parse_conversation_signals(text, "scout")
+    assert not sig.violation_found, f"读日志被误判: {sig.violation_commands}"
+
+def test_executed_command_with_echo_marker_still_flagged():
+    """正向控制：带 ⎿ 回显的已执行命令**仍须**判越界。
+
+    防止判据被改过头成"永不报警"的静默器——只放行叙述文字而放过真实执行。
+    """
+    text = "  ⎿  ⏵ $ systemctl restart hermes-gateway"
+    sig = parse_conversation_signals(text, "scout")
+    assert sig.violation_found, "已执行命令应判越界，实际被放过"
 
 
 def test_no_violation_engineer_normal_work():
@@ -133,7 +168,7 @@ def test_no_violation_engineer_normal_work():
 
 def test_violation_coordinator_deploy():
     """信号3: coordinator deploy 越界"""
-    text = "$ git push origin main"
+    text = "  ⎿  $ git push origin main"
     sig = parse_conversation_signals(text, "coordinator")
     assert sig.violation_found
     assert any("deploy" in cmd for cmd in sig.violation_commands)
@@ -143,7 +178,7 @@ def test_combined_signals():
     """组合信号：完成 + 空闲 + 越界同时出现"""
     text = """✔ Goal achieved (15s · 1 turn · 351 tokens)
 ● Same generic template. No change. Idle.
-$ kubectl get pods"""
+  ⎿  $ kubectl get pods"""
     sig = parse_conversation_signals(text, "engineer")
     assert sig.step_completed
     assert sig.idle_complaint
@@ -180,7 +215,7 @@ def test_propose_idle_signal_writes_bus():
 
 def test_propose_violation_signal_writes_bus():
     """violation 命中 → 写 bus architecture 提案"""
-    pane = "kubectl apply -f prod.yaml\nsystemctl restart hermes-gateway"
+    pane = "  ⎿  $ kubectl apply -f prod.yaml\n  ⎿  $ systemctl restart hermes-gateway"
     with mock.patch("conversation_monitor.capture_role_pane", return_value=pane), \
          mock.patch("conversation_monitor.subprocess.run") as m_run:
         result = propose_governance_action("engineer")
