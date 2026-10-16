@@ -181,7 +181,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self.workflows_dir = Path(workflows_dir).expanduser()
         self.runs_dir = self.workflows_dir / "runs"
         # 非默认目录（测试/沙箱）→ 使用目录内独立 DB，避免污染生产 workflows.db
-        # ponytail: 测试仍共享生产 bus；若要完全隔离需注入 Blackboard
+        # bus 隔离由 tests/conftest.py 完成：它 patch hermes_bus.blackboard_legacy
+        # 与 hermes_bus.config 的 BLACKBOARD_DB 快照，故此处无参构造的 Blackboard()
+        # 在 pytest 下指向 /tmp/pipeline-test-state-*/blackboard.db。
+        # 实测（2026-10-16）：bb.db_path = /tmp/pipeline-test-state-*/blackboard.db，
+        # 未命中生产路径。裸跑（不经 conftest）仍连生产 —— 这是 Blackboard() 无参
+        # 构造的固有语义，不由本处负责。
         self._db_path = db_path or (
             str(self.workflows_dir / "test_workflows.db")
             if self.workflows_dir != Path(_WORKFLOWS_DIR)
@@ -924,8 +929,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         """收集并拉起所有活跃工作流的守护角色。"""
         _alive_roles = self._collect_guard_roles()
         for _role in _alive_roles:
-            self._ensure_role_alive(_role)
+            # 单角色异常不得中断整轮：本函数在 run_once 里无 try 保护，
+            # 一处抛错则同 tick 的其它角色全部不被拉起。
+            try:
+                self._ensure_role_alive(_role)
+            except Exception as _e:
+                LOGGER.warning("ensure_role_alive %s 失败: %s", _role, _e)
         return _alive_roles
+
 
     def _recover_delivery_blocked(self) -> None:
         """恢复 delivery_blocked：若目标角色已恢复在线，重置 step_results 允许重试。
