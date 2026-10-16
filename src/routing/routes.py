@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -42,6 +43,34 @@ def _has_content_words(title: str) -> bool:
     """标题是否含内容性动词（防 'ok'/'hi'/'x' 这类纯占位标题生成无意义 workflow）。"""
     t = title.lower()
     return any(w in t for w in _CONTENT_WORDS)
+
+
+_ROLE_REPORT_RE = re.compile(r"^\[([a-z_]+)\]")
+
+
+def _is_role_report_title(title: str) -> bool:
+    """[角色名] 开头的 title 是产出汇报，不是任务派发。
+
+    WHY: 这些 title 由角色完成后写 bus（如 `[engineer] s1-complete (wf_xxx)`、
+    `[deploy] wf_xxx 产出已部署`），routes 把它们当新任务再派给每个 consumer，
+    于是同一份"完成汇报"变成 7~9 个角色的新 workflow。实测 72h 数据：
+    92/92 个 [角色名] 开头实例全部 fan-out（同 title 多角色），无一例外。
+    """
+    m = _ROLE_REPORT_RE.match(title or "")
+    return bool(m) and m.group(1) not in ("auto", "用户")
+
+
+
+def _is_self_echo(msg: dict, role: str) -> bool:
+    """该消息由 role 自己写 —— 不派回给 role。
+
+    WHY: 回执/完成汇报是"我已处理"的状态，不是任务请求。bus 的 rc 字段已
+    原生追踪消费（consume 时 rc+1），无需再写消息。实测 2026-10-17 01 时段：
+    consumer 回执被自身反复消费，30 分钟 bus 写 1789 条，正反馈放大。
+    对应 RFC 3834：自动回执不应再触发回执。
+    """
+    src = msg.get("src", "")
+    return bool(src) and src == role
 
 
 
@@ -89,9 +118,13 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
             _tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", msg.get("text", ""))
             if _tags:
                 consumers = [c for c in consumers if c in _tags]
+            # 回声抑制：消息由某角色自己写 → 不派回给该角色（RFC 3834）。
+            # 回执/完成汇报是状态而非任务，派回自己只会自激放大。
             ordered = (
-                [c for c in consumers if "*" not in router.routing.get(c, {}).get("consume", [])]
-                + [c for c in consumers if "*" in router.routing.get(c, {}).get("consume", [])]
+                [c for c in consumers if "*" not in router.routing.get(c, {}).get("consume", [])
+                 and not _is_self_echo(msg, c)]
+                + [c for c in consumers if "*" in router.routing.get(c, {}).get("consume", [])
+                   and not _is_self_echo(msg, c)]
             )
             if not ordered:
                 METRICS.inc("route_orphan_count")
@@ -142,11 +175,16 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                 _t = assignment.get("title", "")
                                 if len(_t) < 8 or not _has_content_words(_t):
                                     LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_t), role)
+                                elif _is_role_report_title(_t):
+                                    # [角色名] 开头的 title 是"某角色的产出汇报"，不是"给某角色的任务"。
+                                    # 实测 72h 内 92/92 个 [角色名] 开头实例都是 fan-out（同 title 多角色），
+                                    # 100% 是噪音。不创建 workflow。
+                                    LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
                                 else:
                                     try:
                                         _wc = WorkflowClient(role)
                                         _wc.create_task_v2(_t[:80], assignee=role,
-                                                           initiator_role="", bus_category=cat)
+                                                           initiator_role="system", bus_category=cat)
                                         _wc.close()
                                     except Exception as _e:
                                         LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
@@ -225,6 +263,9 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         # get_consumers_prioritized 同一语义，此处原先缺失）。
         # 缺此过滤则 blocker 等消息被投给全部 32 个角色，其中 24 个不消费它。
         if _my_cats and "*" not in _my_cats and msg.get("category") not in _my_cats:
+            return False
+        # 回声抑制：role 自己写的消息不推回给它自己（与 route_all 同语义）。
+        if _is_self_echo(msg, role_name):
             return False
         text = msg.get("text", "")
         tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", text)
@@ -353,10 +394,14 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     # 阈值与 route_all 对齐（len<8 或 无内容词）: 同消息两路径判定一致
                     if len(_title) < 8 or not _has_content_words(_title):
                         LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_title), role_name)
+                    elif _is_role_report_title(_title):
+                        # 与 route_all 对齐：[角色名] 开头是产出汇报，不是派发任务。
+                        # 缺此判定时同一份完成汇报被 fan-out 成 7~9 个角色各自的新 workflow。
+                        LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _title[:40], role_name)
                     else:
                         _wf = WorkflowClient(role_name)
-                        _wf.create_task_v2(_title, assignee=role_name, initiator_role="",
-                                           bus_category=_cat)
+                        _wf.create_task_v2(_title, assignee=role_name,
+                                           initiator_role="system", bus_category=_cat)
                         _wf.close()
                 except Exception as _e:
                     LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)

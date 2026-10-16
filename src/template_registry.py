@@ -7,6 +7,7 @@ template_registry.py — 模板注册中心
 """
 
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Optional
 
 from paths import WORKFLOWS_DB as DB_PATH, SESSION_ROLES_PERSONAS, HERMES_WORKFLOWS
+
+LOGGER = logging.getLogger("template_registry")
 
 # ── 有效角色列表（从 persona JSON 动态加载） ──────
 _ROLE_REGISTRY: list[str] = []
@@ -240,6 +243,27 @@ _BOILER_PROMPT_SECTIONS = [
     "## 操作要求\n1. 理解任务背景",
     "## 引用要求\n所有事实性声明标注来源",
 ]
+
+
+# 内容层建议项：文体/长度/风格，不导致运行期卡死，因此不参与推荐门禁。
+# 结构性已在注册期由 _validate_schema 保证（缺 exit_condition 的步骤 Step 构造即失败）。
+_ADVISORY_ERROR_MARKERS = (
+    "prompt_template 缺少",   # 三段式（做什么/怎么做/验收标准）
+    "prompt too short",       # 长度
+    "contains boilerplate",   # 残留模板段
+    "generic failure_pattern",
+    "fallback failure_pattern",
+    # 注意：不滤 "missing meta field" —— 必填字段缺失是结构问题（如 quality_standards
+    # 整个没有），必须拦截。只滤它的*措辞*类错误（"too generic"/"must be >= 8 chars"）。
+    "quality_standards must be",
+    "quality_standards too generic",
+)
+
+
+def _meta_hard_errors(template: dict) -> list[str]:
+    """只返回会导致运行期故障的硬错误，滤除文体建议项。"""
+    return [e for e in _validate_meta(template).errors
+            if not any(m in e for m in _ADVISORY_ERROR_MARKERS)]
 
 
 def _validate_meta(template: dict) -> ValidationReport:
@@ -652,15 +676,20 @@ class TemplateRegistry:
         for tpl in all_templates:
             if not bool(tpl.get("is_active", True)):
                 continue
-            # 内容质量门禁: 不通过 _validate_meta 的模板不参与推荐
-            if not _validate_meta(tpl).passed:
+            # 结构性门禁: 只拦会导致运行期卡死的硬错误（文体建议项不阻断，见分层注释）
+            _hard = _meta_hard_errors(tpl)
+            if _hard:
+                LOGGER.debug("skip template %s (hard errors): %s",
+                             tpl.get("template_id"), "; ".join(_hard[:3]))
                 continue
             trigger_scenes = tpl.get("trigger_scene", [])
             if not isinstance(trigger_scenes, list):
                 continue
 
             # 角色适配: 发起角色不在 allowed_initiators 中 → 排除
-            if initiator_role:
+            # 系统发起方不参与该过滤：allowed_initiators 列的是业务角色，
+            # "system"/"pipeline" 是路由 daemon 的自动创建身份（见 gateway 白名单）。
+            if initiator_role and initiator_role not in ("system", "pipeline"):
                 _allowed_init = tpl.get("allowed_initiators", [])
                 if isinstance(_allowed_init, list) and initiator_role not in _allowed_init:
                     continue
