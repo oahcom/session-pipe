@@ -429,7 +429,16 @@ class StepHandlerMixin:
             # codex P2-1：wait_roles 协作步骤不走 relaxed-advance（避免绕过协作门控）
             # 新增：handoff/review 且有真人 assigner 时，禁止宽松推进，必须等真人审批
             _is_review_or_handoff = step.type in ("handoff", "review")
-            if timeout_count >= 1 and not step.dual_node and not getattr(step, "wait_roles", None):
+            # 排队降级路径（_QUEUE_DEGRADE_AT）下来的 timeout_count 首次变 1，此时
+            # 角色并未"超时未响应"，只是排了很久队。若不排除，会立即命中下面的
+            # relaxed-advance（它只要求角色写过任意同 wf 消息，不限分类）→ 误推进。
+            # 读持久化字段而非 locals()：_queued 只在 busy 分支（:272）定义，
+            # 非 busy 路径根本不存在该局部变量，locals() 探测会拿到旧值或抛错。
+            _from_queue_degrade = (run.step_results.get(step.id, {}).get("queued", 0)
+                                   >= _QUEUE_DEGRADE_AT)
+            if (timeout_count >= 1 and not step.dual_node
+                    and not getattr(step, "wait_roles", None)
+                    and not _from_queue_degrade):
                 # 审批人唯一权威来源是 _get_assigner_for_step（step_results 无 assigner 键）；
                 # 仅超时后才查（内含 DB 查询，避免每 tick 开销）。
                 _assigner = self._lifecycle._get_assigner_for_step(
@@ -713,8 +722,14 @@ class StepHandlerMixin:
                             # 不发 [deadlock]——那会让角色被永久 Stop hook 锁死
                             # （bus #374984 实证：age 每秒+1 使条件永不成立）。
                             pass
-                        elif latest[0].ts > _notified and time.time() - latest[0].ts >= track_timeout:
-                            age = time.time() - latest[0].ts
+                        elif time.time() - max(latest[0].ts, _notified) >= track_timeout:
+                            # 该分类非前序步骤产出物 → 本步预期它产出。两种超时形态：
+                            #   a) 曾活跃后静默（latest.ts > notified_at）
+                            #   b) 本步内从未活跃（latest.ts <= notified_at）—— latest.ts
+                            #      是上一实例的旧消息，恰是 failure_patterns 要抓的真死锁。
+                            # 统一按"自 notified_at 以来该分类无新消息且超时"判据。
+                            # _notified 缺失时取 0（退回消息时间基准）。
+                            age = time.time() - max(latest[0].ts, _notified)
                             # 节流：同一 tracking 周期只通知一次
                             _sdata = run.step_results.get(step.id, {}) or {}
                             _last = _sdata.get("track_notified_at", 0)

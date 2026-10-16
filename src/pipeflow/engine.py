@@ -649,7 +649,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.debug("lifecycle ping failed during run_once")
         try:
             rows = lm.query(
-                "SELECT instance_id, template_id, current_step_id, step_results, created_at, status "
+                # task_id 必选：下方 run context 补齐（integrity 提醒填充任务正文）依赖它
+                "SELECT instance_id, template_id, current_step_id, step_results, created_at, "
+                "status, task_id "
                 "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
             for row in rows:
@@ -791,7 +793,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 状态机对 status 缺失时重建覆盖，丢失 exit_messages/node1_done）
                     _existing_sr = results.get(step_id, {}) or {}
                     results[step_id] = {
-                        **{k: v for k, v in _existing_sr.items() if k != 'status'},
+                        **{k: v for k, v in _existing_sr.items()
+                           if k not in ('status', 'queued_since')},
                         "status": "notified", "ts": time.time(), "notified_at": time.time()
                     }
                     lm.execute(
@@ -839,9 +842,27 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 无 bus_category 时退化为纯超时驱动
                 if step_status in ("notified", "running"):
                     _created = inst.get("created_at") or time.time()
+                    # context 从 tasks 表补齐：实例行的 context 列恒为 {}（实测），
+                    # 真实任务上下文在 tasks.title/description。空 context 会让
+                    # integrity 提醒的"用户指令：{description}"填充落空 → 被
+                    # _UNMATCHED_VAR_RE 拦下 → 用户要求的"重复提醒"机制整体失效
+                    # （实测生产 blocker 2026-10-17 06:42 仍在报 {description} 未替换）。
+                    _run_ctx: dict = {}
+                    try:
+                        _trow = lm.query(
+                            "SELECT title, description FROM tasks WHERE task_id=?",
+                            (inst.get("task_id"),))
+                        if _trow:
+                            _run_ctx = {"title": _trow[0]["title"] or "",
+                                        "description": _trow[0]["description"] or ""}
+                    except Exception as _ctx_e:
+                        LOGGER.debug("run context 补齐失败(降级为空): %s", _ctx_e)
+                    if _run_ctx.get("description"):
+                        # 模板无 {title}/{description} 时用 description 兜底
+                        _run_ctx.setdefault("topic", _run_ctx.get("title") or "")
                     run = WorkflowRun(
                         id=inst["instance_id"], workflow_name=wf_name,
-                        context={}, current_step=step_id,
+                        context=_run_ctx, current_step=step_id,
                         status="running", step_results=results,
                         created_at=_created, updated_at=_created,
                     )
