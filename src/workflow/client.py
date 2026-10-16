@@ -124,11 +124,14 @@ class WorkflowClient:
         # "s1-complete 复核通过" 消息在 0.5s 内给 6~9 个角色各建一个 workflow
         # （实测 2026-10-17：单条消息 fan-out 到 closer/devops/pm/qa/engineer/coordinator）。
         # 路由的语义是"通知相关角色"，不是"给每个角色派同一份任务"。
-        # 只拦活跃状态：failed/cancelled 的任务若在 5 分钟内重投是真重试，
-        # 拦掉会让重试彻底消失（且调用方只 warning，bus 上无痕迹）。
+        # 只放过 **failed/cancelled**：那是真重试，拦掉会让它彻底消失
+        # （调用方只 warning、bus 无痕迹）。completed **不放过**——
+        # 本系统 completed 常是"建成即盖戳"（实测 75 秒就 completed 的第二条
+        # 又被创建，正是排除 completed 造成的回归）。统计 300s 内同 title 重复对
+        # 1347 个，前条 completed 占 909、真重试仅 14；放行 completed 得不偿失。
         _cross = self._conn.execute(
             "SELECT assignee FROM tasks WHERE title=? AND created_at > ? "
-            "AND status NOT IN ('failed','cancelled','completed') LIMIT 1",
+            "AND status NOT IN ('failed','cancelled') LIMIT 1",
             (title, time.time() - 300)
         ).fetchone()
         if _cross:
