@@ -16,4 +16,9 @@ workflow*.db-wal
 *.db-wal
 # 仓库根目录的 SQLite 数据库一律不入库（生产 DB 在 ~/.hermes/data/state/）
 /*.db
+# 运行时产物：投递链状态与守护锁（根目录与 src/ 均会生成）
+delivery_chain_status.json
+delivery_chain_status.lock
+# 工作流引擎本地库（workflows.db-shm/-wal 已由上方 *.db-shm / *.db-wal 覆盖）
+pipeflow.db
 .coverage
