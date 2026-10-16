@@ -545,15 +545,6 @@ class WorkflowClient:
                 lanes["blocked"].append(wf)
         return [{"lane": k, "count": len(v), "items": v} for k, v in lanes.items()]
 
-    def workflow_stats(self) -> dict:
-        stats = {}
-        for lane in ("pending", "running", "completed", "failed", "cancelled"):
-            row = self._conn.execute("SELECT COUNT(*) as c FROM workflow_instances WHERE status=?", (lane,)).fetchone()
-            stats[lane] = row["c"] if row else 0
-        stats["total"] = sum(stats.values())
-        stats["completion_rate"] = round(stats["completed"] / max(stats["total"], 1) * 100, 1)
-        return stats
-
     def close(self):
         self._conn.close()
 
