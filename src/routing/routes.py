@@ -45,7 +45,11 @@ def _has_content_words(title: str) -> bool:
     return any(w in t for w in _CONTENT_WORDS)
 
 
-_ROLE_REPORT_RE = re.compile(r"^\[([a-z_\-]+)\]")
+# 只匹配"机器标签"形态：纯小写字母/数字/下划线/连字符（engineer、ccs-monitor、
+# self-reflect、test_role_interact_0d76d4）。**不收中文**——`[紧急] 修复X`、
+# `[重要] ...` 是合法任务标签，收了会把它们静默丢弃（无 bus 痕迹、无法重试）。
+# 中文自述标签（[修复]/[闭环缺口]）靠 client.py 的跨角色去重兜底。
+_ROLE_REPORT_RE = re.compile(r"^\[([a-z0-9_\-]+)\]")
 
 
 
@@ -183,7 +187,9 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                     # [角色名] 开头的 title 是"某角色的产出汇报"，不是"给某角色的任务"。
                                     # 实测 72h 内 92/92 个 [角色名] 开头实例都是 fan-out（同 title 多角色），
                                     # 100% 是噪音。不创建 workflow。
-                                    LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
+                                    # INFO 而非 DEBUG：拦截会改变投递行为，需在 journalctl 可见，
+                                    # 否则若某个合法任务被误判，排查时无迹可寻。
+                                    LOGGER.info("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
                                 else:
                                     try:
                                         _wc = WorkflowClient(role)
