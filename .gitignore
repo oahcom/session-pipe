@@ -6,6 +6,12 @@ __pycache__/
 *.swp
 *.swo
 *~
-workflow.db-shm
-workflow.db-wal
+# workflow*.db*：SQLite 数据库与其 WAL/SHM 运行时文件不入库。
+# 原规则写作 workflow.db-shm（少一个 s），与实际文件名 workflows.db-shm
+# 不匹配，导致 ca9d1b9 误提交二进制 WAL/SHM。
+workflow*.db
+workflow*.db-shm
+workflow*.db-wal
+*.db-shm
+*.db-wal
 .coverage
