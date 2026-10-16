@@ -133,25 +133,42 @@ class WorkflowLifecycleMixin:
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
                 elif age_h > _global_limit_h:
                     reason = f"{_st} 运行{age_h:.0f}h > {_global_limit_h}h全局阈值"
-                # 条件4: running 但当前步骤确已超时且 >1h
+                # 条件4: running 且当前步骤确已停滞 >1h
                 # 关键修正：仅空 step_results 不足以判 stale——长任务 /goal 步骤完成前 step_results
                 # 本就为空，1h 墙钟误杀正常推进中的角色（bus #728c6e430 误报根因）。
-                # 故要求 timeout_count >= 1（引擎真实超时标记）或 queued >= 2（排队降级标记）。
+                # 故要求 timeout_count >= 1（引擎真实超时标记）或 queued >= _Q 排队降级标记。
                 #
                 # 为何加 queued 判据：同角色多实例并发时全部走"排队"分支——该分支只递增
                 # queued 且重置 ts，不递增 timeout_count（step_handler.py:297-305）。而
                 # liveness busy 判据自带 `timeout_count < 3` 前提，两个互判 busy 的实例
                 # timeout_count 都恒为 0 → 条件4 永不成立 → 永不回收。实测 95 台
                 # WL-01@s1 全部 status=notified/queued=2/tc 缺失，卡死 4.5h 无人回收。
+                #
+                # 停滞时长以**当前步骤**的 ts 计（引擎每 tick 重推时刷新），不用实例年龄：
+                # 实例跑完 5 步到 s4 时创建已 >1h，但当前步骤可能刚排队几分钟——用 age_h
+                # 会误杀（独立审查 2026-10-17 实测反例：age_h=1.5 的实例刚排队 2 次即被回收）。
+                # 且 queued 阈值必须与 step_handler 的升级链对齐（queued>=3 降级为
+                # timeout_count、>=6 通知 coordinator、>=10 auto-cancel）——在此另设
+                # 更低阈值会绕过那条链，使升级与通知形同虚设。
                 elif _st == "running" and age_h > 1:
                     _cur = d.get("current_step_id", "")
                     _cur_sr = sr.get(_cur, {}) if isinstance(sr, dict) else {}
                     if isinstance(_cur_sr, dict):
                         _cur_tc = _cur_sr.get("timeout_count", 0)
                         _cur_q = _cur_sr.get("queued", 0) or 0
-                        if _cur_tc >= 1 or _cur_q >= 2:
+                        # 停滞时长起点优先用 queued_since（首次排队时刻，不随 ts 重置），
+                        # 退回 ts（每次重推刷新），再退回实例创建时间。
+                        # 为什么必须用 queued_since：排队分支每轮都重置 ts，用 ts 算停滞
+                        # 恒为"刚排队"→ 卡死实例永不满足阈值（这正是原 98 台卡 4.5h 的机制）。
+                        _step_ts = (_cur_sr.get("queued_since") or _cur_sr.get("ts")
+                                    or created or 0)
+                        _stall_h = (now - _step_ts) / 3600 if _step_ts else 0
+                        from pipeflow.step_handler import _QUEUE_DEGRADE_AT as _Q_DEGRADE
+                        # tc>=1 是引擎已确认超时；queued 达降级阈值且真实停滞 >1h 属同等情况
+                        if _cur_tc >= 1 or (_cur_q >= _Q_DEGRADE and _stall_h > 1):
                             _reason_step = _cur_sr.get("step", _cur)
-                            reason = (f"running 状态 {_reason_step} 无推进记录 {age_h:.1f}h "
+                            reason = (f"running 状态 {_reason_step} 无推进记录 "
+                                      f"步骤停滞 {_stall_h:.1f}h / 实例 {age_h:.1f}h "
                                       f"(timeout_count={_cur_tc}, queued={_cur_q})")
 
                 if reason:

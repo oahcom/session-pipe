@@ -193,9 +193,25 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     # 剥离 /goal 前缀：模板存的 prompt_template 自带该前缀，直接截断填进
     # 「用户指令：」会让角色收到字面的 /goal（bus #374984 实证）。
     # 剥完为空时退回 step.title —— 至少是有语义的步骤名，而非空占位。
+    #
+    # 变量填充：prompt_template 是**模板原文**（含 {description}/{title}/{assignee} 等
+    # 占位符）。直接把原文塞进提醒 → 角色收到"用户指令：## 诊断结果 {description}"，
+    # 拿未填充的占位符无法回答"是否解决了用户的问题"（实测 2026-10-17：product_architect
+    # /maintainer 的提醒里 {description}/{assignee} 原样出现，且该未替换文本被
+    # _UNMATCHED_VAR_RE 拦下 → 提醒投递失败 → 用户要求的"重复提醒"机制整体失效）。
+    # 用 run.context 做最小填充——与 _fill_prompt_vars 同源，但不依赖 engine 实例。
     goal_text = _re.sub(r"^/goal(?:\s+|$)", "",
                         getattr(step, 'prompt_template', '') or '',
                         count=1, flags=_re.IGNORECASE).strip()
+    _ctx = getattr(run, 'context', None) or {}
+    for _var, _val in (
+        ("{description}", _ctx.get("description", "")),
+        ("{title}", _ctx.get("title", "")),
+        ("{assignee}", getattr(step, 'target_role', '') or ''),
+        ("{topic}", _ctx.get("title", "")),
+    ):
+        if _var in goal_text and _val:
+            goal_text = goal_text.replace(_var, str(_val))
     if not goal_text:
         goal_text = getattr(step, 'title', '') or ''
     # 复用 CORE_QUESTIONS（与 DIMENSIONS 前两条同源，P1-1 统一）

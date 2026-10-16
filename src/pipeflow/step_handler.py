@@ -295,6 +295,11 @@ class StepHandlerMixin:
                     **run.step_results.get(step.id, {}),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
                     "queued": _queued,
+                    # 首次排队时刻，**不随 ts 重置**：ts 每轮排队都被刷新，故它无法反映
+                    # "排队了多久"——回收器据此判定会永远看到刚排队的假象。queued_since
+                    # 只在首次排队时写入（后续排队沿用原值），给回收器一个真实的排队起点。
+                    "queued_since": run.step_results.get(step.id, {}).get(
+                        "queued_since", time.time()),
                 }
                 self._sync_step_results(run.id, run.step_results)
                 # 排队豁免只在"另一个工作流真占着角色"时成立。但 busy 判据自身含
@@ -673,19 +678,43 @@ class StepHandlerMixin:
                     if latest[0].src == step.target_role:
                         pass  # 自己写的消息，不报死锁
                     else:
-                        # 超时基准：自步骤通知（notified_at）以来该分类无新消息才判超时。
+                        # 超时判据：先区分「配置错位」与「真死锁」，再判停滞。
                         #
                         # 误报根因（2026-10-17 实测 151 条 monitor_audit / 0 条真实死锁）：
                         # max(latest_ts, notified_at) 在"该分类于步骤开始前就已静默"时退化为
                         # notified_at，此后时间流逝即恒定判超时——但步骤期间本就无该分类
                         # 活动（如 WL-dev_with_collab/s4 target=closer 却 track qa 的
                         # test_report，qa 早在 s3 写完），这是配置错位而非角色卡死。
-                        # 故：仅当该分类在步骤开始后确有消息（latest_ts > notified_at）才有
-                        # 资格判超时——即"曾经活跃、之后静默"，才是真停滞信号。
+                        #
+                        # 但「latest_ts <= notified_at」不能单独作为豁免依据：scout 在
+                        # food_chain_loop/s1 一个字未写 evolution_report 时，latest_ts 是
+                        # 上一轮 s1 的旧消息，同样 <= notified_at——那恰是真死锁（failure_patterns
+                        # 要抓的形态），一并豁免会变成漏报。故改为查模板声明：
+                        # track_cat 若是**前序某步**的 exit 类别，说明它是上一步的产出物
+                        # （上一步已消费完），本步不该再等 → 配置错位，不告警；
+                        # 若不属于任何前序步骤，则本步预期该分类产出却全程无消息 → 真死锁。
+                        # notified_at 缺失（如 _mark_step_delivery_failed 会 pop 掉它）时不
+                        # 伪造基准：取 0 使 latest_ts > 0 恒真，退回旧语义（有能力判超时），
+                        # 不用 run.created_at——created_at 是"实例创建"而非"步骤开始"，
+                        # 用它会把步骤开始前就存在的旧消息误判为"步骤期间活跃过"。
                         _notified = run.step_results.get(step.id, {}).get("notified_at", 0)
-                        if latest[0].ts <= _notified:
-                            pass  # 该分类步骤期间从未活跃 → track 不适用，不误报
-                        elif time.time() - latest[0].ts >= track_timeout:
+                        _wf_def = self._workflows.get(run.workflow_name)
+                        _prev_exit_cats: set[str] = set()
+                        if _wf_def:
+                            _steps_list = getattr(_wf_def, "steps", []) or []
+                            _idx = next((i for i, s in enumerate(_steps_list) if s.id == step.id), -1)
+                            for _ps in _steps_list[:_idx]:
+                                _pec = getattr(_ps, "exit_condition", None) or {}
+                                if isinstance(_pec, dict) and _pec.get("bus_category"):
+                                    _prev_exit_cats.add(_pec["bus_category"])
+                        _is_prev_step_output = track_cat in _prev_exit_cats
+                        if _is_prev_step_output:
+                            # 配置错位：该分类是前序步骤的产出类别（如 s4 track 的
+                            # test_report 在 s3 已由 qa 写完并消费）→ 本步不该等它。
+                            # 不发 [deadlock]——那会让角色被永久 Stop hook 锁死
+                            # （bus #374984 实证：age 每秒+1 使条件永不成立）。
+                            pass
+                        elif latest[0].ts > _notified and time.time() - latest[0].ts >= track_timeout:
                             age = time.time() - latest[0].ts
                             # 节流：同一 tracking 周期只通知一次
                             _sdata = run.step_results.get(step.id, {}) or {}
