@@ -45,6 +45,9 @@ def _build_eng() -> WorkflowEngine:
     eng.runs_dir = eng.workflows_dir / "runs"
     eng._workflows = {}
     eng._lm = MagicMock()
+    # _fill_prompt_vars 需要 str 类型的 task_title/task_desc；MagicMock 默认返回
+    # MagicMock 导致 .replace() 抛 TypeError。配置 query 返回真实行数据。
+    eng._lm.query.return_value = [{"title": "测试任务", "description": "测试描述"}]
     eng._bb = MagicMock()
     eng._send_to_role = MagicMock()  # 阻止 tmux 子进程调用
     eng._sync_step_results = MagicMock()
