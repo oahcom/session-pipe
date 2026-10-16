@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -82,8 +83,16 @@ def _parse_allowed_categories(targets: list) -> set:
     return cats | _ALWAYS_ALLOWED
 
 
+# 漂移判定的时间窗：只看最近 N 小时的角色产出。
+# 原实现只看「最近 50 条」无时间窗 —— 引擎停摆 35 天期间积压的历史消息占满窗口
+# （实测 scout 最近 50 条里 36 条属 08-23~08-25），一条 53 天前的 design_issue
+# 持续每小时被判为漂移，直到被新消息挤出窗口。漂移是"当前产出是否越界"，
+# 历史越界早已处理完毕，不应长期挂账。
+_DRIFT_WINDOW_HOURS = 24
+
+
 def detect_drift(role: str, limit: int = 50) -> List[dict]:
-    """检测指定角色的 output 漂移"""
+    """检测指定角色的 output 漂移（仅最近 _DRIFT_WINDOW_HOURS 小时的产出）"""
     config = _load_role_config(role)
     if config is None:
         log.warning("role %r not found in persona dir", role)
@@ -95,11 +104,18 @@ def detect_drift(role: str, limit: int = 50) -> List[dict]:
     allowed |= _parse_allowed_categories(config.get("input_signals", []))
     bb = Blackboard()
     facts = bb.read(src=role, limit=limit)
+    _cutoff = time.time() - _DRIFT_WINDOW_HOURS * 3600
     drift = []
     for f in facts:
         # 排除测试场景消息（test_role_interact_* 是测试工作流产物，合法但非生产）
         if f.t.startswith("[test_role_interact_"):
             continue
+        try:
+            if float(f.ts) < _cutoff:
+                continue
+        except (TypeError, ValueError):
+            # ts 非数值（测试 mock / 脏数据）→ 不据其判窗口，保留原判定行为
+            pass
         if f.cat not in allowed:
             drift.append({
                 "category": f.cat,
