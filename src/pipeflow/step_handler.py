@@ -49,6 +49,50 @@ def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role
 class StepHandlerMixin:
     """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _check_exit。"""
 
+    def _nudge_assigner(self, run: WorkflowRun, step: Step, token: str):
+        """审批超时保护：把审批请求重新推给 assigner 角色，唤醒它审批。
+
+        仅作为兜底动作（TTL 过期但未超 grace 30min）供角色在线上响应；daemon
+        不在此自动 confirm——那会绕开人工质量闸门。真人角色长时间不审批时，
+        这里持续每轮重新 nudge，直到角色 confirm 或 TTL+30min grace 后由
+        step_handler 的 fallback 自动通过。
+        """
+        # _get_assigner_for_step 只读 type/target_role，此处传最小 dict 而非 Step dataclass
+        assigner = self._lifecycle._get_assigner_for_step(
+            self._lifecycle._get_wf_unsafe(run.id) or {},
+            {"type": step.type, "target_role": step.target_role}, step.id)
+        if not assigner:
+            LOGGER.debug("nudge skipped %s/%s: 无审批人", run.workflow_name, step.id)
+            return
+        _step_def = self._lifecycle.get_step(run.id, step.id) or {}
+        _approval_prompt = _step_def.get("approval_prompt", "") or ""
+        if not _approval_prompt:
+            _approval_prompt = (
+                f"## 审批请求: 步骤 {step.id} - {step.title}\n\n"
+                f"工作流: {run.id}\n审批密钥: {token}\n有效期: 1小时\n\n"
+                f"请尽快确认（approval_token 已过期，daemon 于 TTL+30min grace 后自动通过）。"
+            )
+        msg = (
+            f"[workflow] 审批再次请求（超时保护）\n\n"
+            f"工作流: {run.id}\n步骤: {step.id} — {step.title}\n"
+            f"密钥: {token}\n有效期: 1小时（已过期，daemon 待 TTL+30min grace 后自动通过）\n\n"
+            f"审批提示:\n{_approval_prompt}"
+        )
+        try:
+            from workflow.client import get_ccs_cli
+            _ccs_cli = get_ccs_cli()
+            _ccs_cli = str(_ccs_cli) if not isinstance(_ccs_cli, str) else _ccs_cli
+            import subprocess as _sp
+            _r = _sp.run(["python3", _ccs_cli, "send-safe", assigner, msg,
+                          "--from", "workflow_engine"],
+                         capture_output=True, timeout=15)
+            _lvl = "warning" if _r.returncode != 0 else "info"
+            LOGGER.log(getattr(LOGGER, _lvl.upper(), logging.INFO),
+                       "nudge_assigner %s/%s -> %s: rc=%s",
+                       run.workflow_name, step.id, assigner, _r.returncode)
+        except Exception as _e:
+            LOGGER.warning("nudge_assigner %s/%s failed: %s", run.workflow_name, step.id, _e)
+
     def _tick(self, run: WorkflowRun, step: Step):
         """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
@@ -324,51 +368,63 @@ class StepHandlerMixin:
             #    匹配策略：先找引擎发的 task_spec（含 wf 前缀）→ 再匹配该角色在
             #    task_spec 之后写的任意消息（标题可能不含 wf 前缀，按时间窗匹配）。
             # codex P2-1：wait_roles 协作步骤不走 relaxed-advance（避免绕过协作门控）
+            # 新增：handoff/review 且有真人 assigner 时，禁止宽松推进，必须等真人审批
+            _is_review_or_handoff = step.type in ("handoff", "review")
             if timeout_count >= 1 and not step.dual_node and not getattr(step, "wait_roles", None):
-                try:
-                    # 全量读：_has_anchor 需跨分类找 task_spec 锚点（cat 过滤会漏掉），
-                    # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
-                    _role_msgs = self._bb.read(limit=500)
-                    _wf_id = run.id
-                    _notified_ts = run.step_results.get(step.id, {}).get("notified_at", 0)
-                    _relaxed = [
-                        {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
-                        for f in _role_msgs
-                        if f.src == step.target_role
-                        and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
-                        and f.ts > _notified_ts
-                        and f.ts < time.time() + 60  # 防未来时间戳
-                    ]
-                    # task_spec 锚点确认确实是本工作流任务
-                    _has_anchor = any(
-                        _wf_id[:8] in str(f.t) and f.cat == "task_spec"
-                        for f in _role_msgs
-                    )
-                    if _relaxed and _has_anchor:
-                        LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
-                                    run.workflow_name, step.id, len(_relaxed))
-                        run.step_results[step.id] = {
-                            **run.step_results.get(step.id, {}),
-                            "bus_anchor": _relaxed[0]["ts"],
-                            "exit_messages": _relaxed,
-                            "relaxed_advance": True,
-                        }
-                        self._sync_step_results(run.id, run.step_results)
-                        self._bb.write("blocker",
-                            f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
-                            f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
-                            src="workflow_engine")
-                        # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
-                        _integ_send_bypass(run, step, "relaxed",
-                                           send_to_role=self._send_to_role,
-                                           sync_step_results=self._sync_step_results)
-                        try:
-                            self._lifecycle.complete_step(run.id, step.id)
-                        except Exception as _e:
-                            LOGGER.debug("relaxed-advance complete_step 失败: %s", _e)
-                        return
-                except Exception as _relax_err:
-                    LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
+                # 审批人唯一权威来源是 _get_assigner_for_step（step_results 无 assigner 键）；
+                # 仅超时后才查（内含 DB 查询，避免每 tick 开销）。
+                _assigner = self._lifecycle._get_assigner_for_step(
+                    self._lifecycle._get_wf_unsafe(run.id) or {},
+                    {"type": step.type, "target_role": step.target_role}, step.id)
+                if _is_review_or_handoff and _assigner:
+                    # handoff/review 且有真人 assigner → 禁止宽松推进，必须等真人审批
+                    LOGGER.debug("skip relaxed-advance %s/%s: handoff/review with human assigner=%s",
+                                 run.workflow_name, step.id, _assigner)
+                else:
+                    try:
+                        # 全量读：_has_anchor 需跨分类找 task_spec 锚点（cat 过滤会漏掉），
+                        # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
+                        _role_msgs = self._bb.read(limit=500)
+                        _wf_id = run.id
+                        _notified_ts = run.step_results.get(step.id, {}).get("notified_at", 0)
+                        _relaxed = [
+                            {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
+                            for f in _role_msgs
+                            if f.src == step.target_role
+                            and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
+                            and f.ts > _notified_ts
+                            and f.ts < time.time() + 60  # 防未来时间戳
+                        ]
+                        # task_spec 锚点确认确实是本工作流任务
+                        _has_anchor = any(
+                            _wf_id[:8] in str(f.t) and f.cat == "task_spec"
+                            for f in _role_msgs
+                        )
+                        if _relaxed and _has_anchor:
+                            LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
+                                        run.workflow_name, step.id, len(_relaxed))
+                            run.step_results[step.id] = {
+                                **run.step_results.get(step.id, {}),
+                                "bus_anchor": _relaxed[0]["ts"],
+                                "exit_messages": _relaxed,
+                                "relaxed_advance": True,
+                            }
+                            self._sync_step_results(run.id, run.step_results)
+                            self._bb.write("blocker",
+                                f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
+                                f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
+                                src="workflow_engine")
+                            # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
+                            _integ_send_bypass(run, step, "relaxed",
+                                               send_to_role=self._send_to_role,
+                                               sync_step_results=self._sync_step_results)
+                            try:
+                                self._lifecycle.complete_step(run.id, step.id)
+                            except Exception as _e:
+                                LOGGER.debug("relaxed-advance complete_step 失败: %s", _e)
+                            return
+                    except Exception as _relax_err:
+                        LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
 
 
         # ── 完整性提醒阶段（在 timeout 之前，任何步骤完成时都触发）──
@@ -663,43 +719,55 @@ class StepHandlerMixin:
             except Exception as _idle_err:
                 LOGGER.debug("idle detection skipped: %s", _idle_err)
 
-            # ── 自动确认单步/通知步骤，推进到下一棒 ──
-            # daemon 替代人工 approve，用 step 角色名作为密钥
-            # handoff/review 步骤默认需等人工审批，不自动确认
+            # ── handoff/review/subflow 步骤：默认等真人角色审批 ──
+            # 设计意图：这类步骤的产出需 assigner 角色确认（manager._get_assigner_for_step
+            # 已算好审批人，_issue_approval_token 已通过 ccs send-safe 把 token 推给审批人）。
+            # daemon 不再抢先 auto-advance —— 那会让 review 质量闸门形同虚设。
+            # 仅当模板显式 auto_advance:true（如自驱动 food_chain_loop）才保留 daemon 自动推进。
             if step.type in ("handoff", "review", "subflow"):
-                # 超时降级：approval_token 超过 TTL+30min grace 未消费 → 自动 approve 推进
-                # （修复 lr_tech_decision 卡死根因：reviewer 未消费导致 24h+ stuck）
+                _tpl = self._workflows.get(run.workflow_name)
+                _auto_advance = getattr(_tpl, "auto_advance", False)
+                if _auto_advance:
+                    # 豁免模板：沿用原 daemon 自动推进（维持自治闭环）
+                    try:
+                        _token = self._lifecycle.get_approval_token(run.id, step.id)
+                        if _token:
+                            self._lifecycle.confirm_step(run.id, step.id, token=_token,
+                                                          approved=True, reason="daemon auto-advance")
+                            LOGGER.info("auto-advance %s/%s -> next step (auto_advance template)",
+                                       run.workflow_name, step.id)
+                    except Exception as e:
+                        LOGGER.debug("auto-advance skipped for %s/%s: %s", run.workflow_name, step.id, e)
+                    return
+                # 非豁免：等角色审批。超时处理 = 重新拉起审批人，而非静默自动通过。
                 try:
                     _token = self._lifecycle.get_approval_token(run.id, step.id)
-                    if _token:
-                        _db_results = self._lifecycle._parse_results(
+                    if not _token:
+                        return  # 无 token（如系统角色发起、无审批人）→ 保持现状
+                    _db_results = self._lifecycle._parse_results(
+                        self._lifecycle._get_wf_unsafe(run.id))
+                    _ttl = _db_results.get(step.id, {}).get("approval_token_ttl", 0)
+                    # 第一阶段超时（TTL 过期）：重新把审批请求推给审批人，唤醒它响应
+                    if _ttl > 0 and time.time() > _ttl:
+                        self._nudge_assigner(run, step, _token)
+                    # 极端超时（TTL + 30min grace）：兜底自动通过，防永久卡死
+                    # （修复 lr_tech_decision 卡死根因：reviewer 未消费导致 24h+ stuck）
+                    elif _ttl > 0 and time.time() > _ttl + 1800:
+                        self._lifecycle.confirm_step(
+                            run.id, step.id, token=_token, approved=True,
+                            reason="daemon approval_timeout_fallback",
+                            allow_expired=True)  # P0-A 修复: token 已过期时也允许确认
+                        LOGGER.warning("approval_timeout_fallback %s/%s: token 超时 30min 未消费，自动 approve",
+                                       run.workflow_name, step.id)
+                        _db_after = self._lifecycle._parse_results(
                             self._lifecycle._get_wf_unsafe(run.id))
-                        _ttl = _db_results.get(step.id, {}).get("approval_token_ttl", 0)
-                        # _ttl=0 表示字段不存在或 token 无效，不触发降级
-                        if _ttl > 0 and time.time() > _ttl + 1800:  # TTL + 30min grace
-                            self._lifecycle.confirm_step(
-                                run.id, step.id, token=_token, approved=True,
-                                reason="daemon approval_timeout_fallback",
-                                allow_expired=True)  # P0-A 修复: token 已过期时也允许确认
-                            LOGGER.warning("approval_timeout_fallback %s/%s: token 超时 30min 未消费，自动 approve",
-                                           run.workflow_name, step.id)
-                            # 同步 step_results 到 DB（confirm_step 内部已写，这里确保 run 内存状态也刷新）
-                            _db_after = self._lifecycle._parse_results(
-                                self._lifecycle._get_wf_unsafe(run.id))
-                            run.step_results[step.id] = _db_after.get(step.id, {})
-                            self._sync_step_results(run.id, run.step_results)
-                            return
+                        run.step_results[step.id] = _db_after.get(step.id, {})
+                        self._sync_step_results(run.id, run.step_results)
+                        return
                 except Exception as _e:
-                    LOGGER.debug("approval_timeout check skipped: %s", _e)
+                    LOGGER.debug("approval timeout handling skipped for %s/%s: %s",
+                                 run.workflow_name, step.id, _e)
                 return
-            try:
-                _token = self._lifecycle.get_approval_token(run.id, step.id)
-                if _token:
-                    self._lifecycle.confirm_step(run.id, step.id, token=_token, approved=True,
-                                                  reason="daemon auto-advance")
-                    LOGGER.info("auto-advance %s/%s -> next step", run.workflow_name, step.id)
-            except Exception as e:
-                LOGGER.debug("auto-advance skipped for %s/%s: %s", run.workflow_name, step.id, e)
 
             # lifecycle.manager 已写入 step_results，此处不再重复写入
             return
@@ -855,16 +923,22 @@ class StepHandlerMixin:
         for fname, props in schema.get("properties", {}).items():
             fpath = ws / fname
             # 通配符一次解析：所有检查器共享匹配列表
+            # 2s 容差：fs 时间戳精度与 time.time() 不保证有序，同一瞬间写出的
+            # 文件 mtime 可能早于 run.created_at 数微秒（实测约 100µs 量级）。
+            # 无容差会把"本步刚写的文件"判成历史遗留。
+            _wf_floor = (getattr(run, 'created_at', 0) or 0) - 2
             if "*" in fname:
                 import glob as _gl
                 all_matches = [Path(m) for m in _gl.glob(str(fpath))]
                 # 过滤：只检查工作流创建后被修改/新建的文件（本次任务产出），
                 # 排除 workspace 历史遗留文件导致的 minLength/mustContain 误报
                 # 计数检查（minCount）不依赖 matched——即使 matched 为空也需执行
-                _wf_created = getattr(run, 'created_at', 0) or 0
-                matched = [m for m in all_matches if m.stat().st_mtime >= _wf_created] if _wf_created else all_matches
+                matched = [m for m in all_matches if m.stat().st_mtime >= _wf_floor] if _wf_floor > 0 else all_matches
             else:
-                matched = [fpath] if fpath.exists() else []
+                # 固定文件名同样过滤 mtime：历史文件（如 41 天前的 SCOUT_REPORT.md）
+                # 只查 exists() 会把它当成本次产出，让 step 靠陈旧文件虚假通过。
+                all_matches = [fpath] if fpath.exists() else []
+                matched = [m for m in all_matches if m.stat().st_mtime >= _wf_floor] if _wf_floor > 0 else all_matches
 
             if not matched and fpath.is_dir():
                 matched = []  # minFiles 走单独检查，不混入内容检查
