@@ -14,4 +14,6 @@ workflow*.db-shm
 workflow*.db-wal
 *.db-shm
 *.db-wal
+# 仓库根目录的 SQLite 数据库一律不入库（生产 DB 在 ~/.hermes/data/state/）
+/*.db
 .coverage
