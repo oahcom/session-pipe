@@ -112,9 +112,12 @@ class WorkflowClient:
                 f"标题 '{title[:40]}' 是占位符，不会产生实际收益。"
                 f"请提供有描述性的任务标题（≥8字符，描述具体做什么）"
             )
-        # 去重防御：同一角色同一标题 5 分钟内不重复创建
+        # 去重防御：同一角色同一标题 5 分钟内不重复创建。
+        # status 过滤与下方 _cross 保持一致：本检查先执行，若不过滤 failed/cancelled，
+        # 失败任务的重投会在这里就被拦下，下方"放行 failed/cancelled"永远不可达。
         dup = self._conn.execute(
-            "SELECT 1 FROM tasks WHERE assignee=? AND title=? AND created_at > ? LIMIT 1",
+            "SELECT 1 FROM tasks WHERE assignee=? AND title=? AND created_at > ? "
+            "AND status NOT IN ('failed','cancelled') LIMIT 1",
             (assignee, title, time.time() - 300)
         ).fetchone()
         if dup:
@@ -151,6 +154,12 @@ class WorkflowClient:
         from workflow.gateway import Gate
         gate = Gate(str(self.db_path) if hasattr(self, 'db_path') and self.db_path else None)
         gate.validate_create_task(template_id, initiator_role, assignee)
+        # assignee 对齐模板首步目标：路由自动创建时 assignee 是"路由消费者"，
+        # 而多角色链（如 WL-01: product_architect→pg→reviewer→qa→devops）的
+        # 首步目标可能完全不同。错配的实例永远做不了自己那一步，只会堆积。
+        # 实测（2026-10-17）：活跃实例 107 个错配 / 48 个正确，其中
+        # WL-01 被误派给 devops(42) 和 qa(39) —— 两者完成率均为 0%。
+        assignee = self._align_assignee_to_first_step(template_id, assignee)
         task_id = self._create_task_impl(title, description, assignee, 0, template_id)
         if parent_task_id:
             # 写入父子关联
@@ -161,6 +170,33 @@ class WorkflowClient:
         wf_id = self._create_workflow_instance(task_id, template_id, assignee, initiator_role)
         gate.route_task(task_id, initiator_role, assignee)
         return (task_id, wf_id)
+
+    def _align_assignee_to_first_step(self, template_id: str, assignee: str) -> str:
+        """把 assignee 校正为模板首步的 target_role。
+
+        路由自动创建任务时 assignee 取"路由消费者"，但多角色链的首步目标
+        可能完全不同（WL-01 首步是 product_architect，却被派给 devops/qa）。
+        错配实例永远执行不了自己那一步，只会堆在 s1 直到超时取消。
+        读不到模板或首步无 target_role 时原样返回（不阻断既有路径）。
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT steps_json FROM workflow_templates WHERE template_id=?",
+                (template_id,)).fetchone()
+            if not row or not row[0]:
+                return assignee
+            steps = __import__("json").loads(row[0])
+            if not steps:
+                return assignee
+            first = steps[0]
+            target = (first.get("target_role") or "").strip()
+            if target and target != assignee:
+                LOGGER.info("assignee 对齐模板首步: %s -> %s (template=%s)",
+                            assignee, target, template_id)
+                return target
+        except Exception as _e:
+            LOGGER.debug("align assignee 失败（原样返回）: %s", _e)
+        return assignee
 
     def _create_task_impl(self, title: str, description: str,
                           assignee: str, priority: int,
