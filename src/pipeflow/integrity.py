@@ -204,11 +204,18 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
                         getattr(step, 'prompt_template', '') or '',
                         count=1, flags=_re.IGNORECASE).strip()
     _ctx = getattr(run, 'context', None) or {}
+    # 变量表与 _fill_prompt_vars 对齐（db 模板实测出现 {title}/{description}/{assignee}，
+    # {task_definition}/{topic}/{acceptance_criteria} 为 JSON 模板源可能出现的同义变量）。
+    # 每个都以 title 兜底：tasks.description 91% 为空（616/675 实测），
+    # 只填 description 会让绝大多数提醒仍带未替换变量并被守卫拦下。
+    _title_fb = _ctx.get("title") or _ctx.get("description") or ""
     for _var, _val in (
-        ("{description}", _ctx.get("description", "")),
-        ("{title}", _ctx.get("title", "")),
+        ("{description}", _ctx.get("description") or _title_fb),
+        ("{title}", _title_fb),
         ("{assignee}", getattr(step, 'target_role', '') or ''),
-        ("{topic}", _ctx.get("title", "")),
+        ("{topic}", _ctx.get("topic") or _title_fb),
+        ("{task_definition}", _ctx.get("task_definition") or _title_fb),
+        ("{acceptance_criteria}", _ctx.get("description") or _title_fb),
     ):
         if _var in goal_text and _val:
             goal_text = goal_text.replace(_var, str(_val))

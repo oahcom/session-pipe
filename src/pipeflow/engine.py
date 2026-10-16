@@ -847,19 +847,25 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # integrity 提醒的"用户指令：{description}"填充落空 → 被
                     # _UNMATCHED_VAR_RE 拦下 → 用户要求的"重复提醒"机制整体失效
                     # （实测生产 blocker 2026-10-17 06:42 仍在报 {description} 未替换）。
+                    #
+                    # description 为空时必须回退 **title**：实测 675 个 task 中 616 个
+                    # description 为空（91%）——只补 description 会让 91% 的提醒仍带
+                    # 未替换变量、继续被守卫拦下（2026-10-17 07:10 实测复发）。title
+                    # 由调用方必填（create_task_v2 的 title 参数），是唯一可靠兜底。
                     _run_ctx: dict = {}
                     try:
                         _trow = lm.query(
                             "SELECT title, description FROM tasks WHERE task_id=?",
                             (inst.get("task_id"),))
                         if _trow:
-                            _run_ctx = {"title": _trow[0]["title"] or "",
-                                        "description": _trow[0]["description"] or ""}
+                            _title = _trow[0]["title"] or ""
+                            _desc = _trow[0]["description"] or ""
+                            _fallback = _desc or _title
+                            _run_ctx = {"title": _title, "description": _fallback,
+                                        "task_definition": _fallback}
+                            _run_ctx["topic"] = _title or _fallback
                     except Exception as _ctx_e:
                         LOGGER.debug("run context 补齐失败(降级为空): %s", _ctx_e)
-                    if _run_ctx.get("description"):
-                        # 模板无 {title}/{description} 时用 description 兜底
-                        _run_ctx.setdefault("topic", _run_ctx.get("title") or "")
                     run = WorkflowRun(
                         id=inst["instance_id"], workflow_name=wf_name,
                         context=_run_ctx, current_step=step_id,
