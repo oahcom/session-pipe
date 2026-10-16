@@ -145,21 +145,37 @@ def detect_all_drift() -> Dict[str, list]:
     return results
 
 
+# 每轮检测写一条全量快照（固定标题 → bus 的 ON CONFLICT(t) 保证全库仅一行，
+# 恒被最新一轮覆写）。消费方据此判断「该角色本轮是否仍在漂移」。
+#
+# 为何需要：原实现只写「有漂移」的角色，不写「已恢复」的角色 —— 角色一旦停止
+# 漂移，其旧告警行无人清理，长期留在 bus 最近 N 条内被反复注入 pane
+# （实测 scout/pm/engineer 于 17:26 修复后，其 17:15 的告警仍持续注入）。
+_DRIFT_SUMMARY_TITLE = "[role_drift_summary]"
+
+
 def report_drift(results: Dict[str, list]) -> int:
     """将漂移结果写入 bus，返回有漂移的角色数"""
-    if not results:
-        return 0
     bb = Blackboard()
-    for role, entries in results.items():
-        cats = ", ".join(e["category"] for e in entries)
+    drifted = [r for r, e in (results or {}).items() if e]
+    for role in drifted:
+        cats = ", ".join(e["category"] for e in results[role])
         bb.write(
             "architecture",
-            f"[role_drift] {role} has {len(entries)} drift entries: {cats}",
-            evidence=json.dumps(entries, ensure_ascii=False, default=str),
+            f"[role_drift] {role} has {len(results[role])} drift entries: {cats}",
+            evidence=json.dumps(results[role], ensure_ascii=False, default=str),
             tags="role_drift",
             src="drift_detector",
         )
-    return len(results)
+    # 全量快照：标题固定 → 恒覆写同一行，无累积噪音
+    bb.write(
+        "architecture",
+        _DRIFT_SUMMARY_TITLE,
+        evidence=json.dumps({"drifted": drifted}, ensure_ascii=False),
+        tags="role_drift",
+        src="drift_detector",
+    )
+    return len(drifted)
 
 
 def main():
