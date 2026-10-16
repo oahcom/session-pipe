@@ -240,3 +240,65 @@ def test_routing_links_wildcard_covers_orphan():
     res = check_routing_links(routing, {"x", "y", "z"})
     assert res["ok"] is True  # y/z 无生产者，但 * 兜底
     assert res["orphaned"] == [] and res["zombies"] == []
+
+
+def test_category_consistency_dict_output_target():
+    """output_targets 用新式 dict 格式（含 bus_cat）→ 正常解析，不抛 TypeError。
+
+    回归：旧实现直接对 target 调 finditer，dict 会抛
+    `TypeError: expected string or bytes-like object, got 'dict'`，而调用方
+    （routing_daemon 每小时校验）用 except 包住 → 该防御检查自上线起从未
+    成功执行过一次（实测 14 天 15 次异常 / 0 次通过）。
+    """
+    from routing.consistency import check_category_consistency
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        _write_persona(td_path, "99_consumer", output_targets=[
+            {"bus_cat": "architecture", "label": "消息处理报告"},
+        ])
+        undef = check_category_consistency(td_path, {"architecture"})
+    assert undef == []
+
+
+def test_category_consistency_dict_output_target_undefined():
+    """dict 格式引用了未定义分类 → 仍应被报出（不能因格式变化漏检）。"""
+    from routing.consistency import check_category_consistency
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        _write_persona(td_path, "99_consumer", output_targets=[
+            {"bus_cat": "no_such_cat", "label": "x"},
+        ])
+        undef = check_category_consistency(td_path, {"architecture"})
+    assert len(undef) == 1
+    assert "no_such_cat" in undef[0]
+
+
+def test_category_consistency_wildcard_category_not_reported():
+    """spec.category="*" 是合法通配符，不是未定义分类。
+
+    回归：5 个 persona 用 "*" 声明"接收所有信号"，旧实现对它报假阳性。
+    """
+    from routing.consistency import check_category_consistency
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        _write_persona(td_path, "06_closer", input_signals=[
+            {"type": "bus", "spec": {"category": "*"}},
+        ])
+        undef = check_category_consistency(td_path, {"architecture"})
+    assert undef == []
+
+
+def test_category_consistency_non_str_non_dict_target_skipped():
+    """output_targets 混入非法类型（如 None/数字）→ 跳过，不抛异常。"""
+    from routing.consistency import check_category_consistency
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        _write_persona(td_path, "07_odd", output_targets=[
+            None, 42, "正常 bus cat=architecture",
+        ])
+        undef = check_category_consistency(td_path, {"architecture"})
+    assert undef == []

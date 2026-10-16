@@ -33,13 +33,28 @@ def check_category_consistency(
             undef.append(f"{f.name}: 无法解析 JSON")
             continue
         for target in data.get("output_targets", []):
+            # output_targets 有两种合法格式（与 drift_detector._parse_allowed_categories
+            # 一致）：新式 dict {"bus_cat": ..., "label": ...} 与旧式字符串 "bus cat=xxx"。
+            # 只处理字符串会对 dict 调 finditer → TypeError，而调用方（routing_daemon
+            # 每小时校验）用 except 包住 → 该防御检查自上线起从未成功执行过一次
+            # （实测 14 天 15 次异常 / 0 次通过）。
+            if isinstance(target, dict):
+                cat = target.get("bus_cat")
+                if isinstance(cat, str) and cat and cat not in defined_categories:
+                    undef.append(f"{f.name} 产出 {cat}")
+                continue
+            if not isinstance(target, str):
+                continue
             for m in _CAT_REF_RE.finditer(target):
                 if m.group(1) not in defined_categories:
                     undef.append(f"{f.name} 产出 {m.group(1)}")
         for sig in data.get("input_signals", []):
             # Check bare spec.category value directly (e.g. "security")
             raw_cat = sig.get("spec", {}).get("category", "")
-            if isinstance(raw_cat, str) and raw_cat and raw_cat not in defined_categories:
+            # "*" 是合法通配符（消费全部分类），不是未定义分类——5 个 persona
+            # 用它声明"接收所有信号"，旧实现对它报假阳性。
+            if (isinstance(raw_cat, str) and raw_cat and raw_cat != "*"
+                    and raw_cat not in defined_categories):
                 undef.append(f"{f.name} 消费 {raw_cat}")
             # Check natural language references (output_targets, source with bus cat=xxx)
             src = sig.get("source", raw_cat)
