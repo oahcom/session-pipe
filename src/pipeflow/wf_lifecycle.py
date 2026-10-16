@@ -1016,6 +1016,11 @@ class WorkflowLifecycleMixin:
 
     def _write_step_prompt(self, run, step: Step, extra_prompt: str = ""):
         ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
+        # assignee 无条件赋值：它只是 step.target_role，不依赖 DB 查询。
+        # 旧位置在下方 `if "{title}" or "{description}"` 块内 —— 模板含 {assignee}
+        # 但不含 {title}/{description} 时（WL-01 s1 实测）该块整体跳过，变量原样
+        # 投出，被 _UNMATCHED_VAR_RE 拦下 → 投递恒失败（bus #375006 同一现象）。
+        ctx["assignee"] = step.target_role
         if "{workspace_summary}" in step.prompt_template:
             # 运行时读属性而非 import 期冻结：测试用 conftest monkeypatch 该常量隔离。
             ws_dir = _paths_mod.ITERATION_WORKSPACES / ctx.get("project_name", "")
@@ -1032,7 +1037,6 @@ class WorkflowLifecycleMixin:
                 if task:
                     ctx["title"] = task["title"]
                     ctx["description"] = task["description"]
-                    ctx["assignee"] = step.target_role
             except Exception:
                 LOGGER.exception("_write_step_prompt task context fetch failed for %s", run.id)
         prompt = step.prompt_template + "\n" + extra_prompt if extra_prompt else step.prompt_template

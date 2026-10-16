@@ -166,7 +166,9 @@ class TaskGeneratorMixin:
         except Exception as _e:
             LOGGER.debug("heal cooldown read failed: %s", _e)
         self._ensure_role_alive(role)
-        _ok = bool(self._send_to_role(role, prompt, wf_id=instance_id, step_id=step_id))
+        # 用 `is not False` 而非 bool()："busy"（角色正忙）不应视为投递失败去重试 ——
+        # 角色已在工作，heal 无意义；只对真失败（False）返回不盖戳以待下轮。
+        _ok = self._send_to_role(role, prompt, wf_id=instance_id, step_id=step_id) is not False
         if not _ok:
             return
         try:

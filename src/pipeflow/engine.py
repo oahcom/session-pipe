@@ -739,6 +739,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
                     # 进而触发 _cleanup_stale_workflows 的"running 且 sr 空>1h"静默误杀
                     if not _delivered:
+                        # "busy" = 角色正忙（正常排队），非故障：不计失败、不盖戳，
+                        # 下一 tick 自然重试。计入会让并发实例互相判死（227 条实测）。
+                        if _delivered == "busy":
+                            LOGGER.debug("run_once: %s/%s 角色忙，跳过计数",
+                                         inst["instance_id"][:12], step_id)
+                            continue
                         # 幂等护栏：已 notified 的 step 不再重复计数。
                         # 根因：_send_to_role 在 goal 过短等路径返回 None（falsy），
                         # 已成功盖戳 notified 的 step 每 tick 重走本分支 → delivery_fail_count
