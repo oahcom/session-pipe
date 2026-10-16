@@ -340,8 +340,26 @@ class StepHandlerMixin:
                         f"超时1次但{step.target_role}忙碌（有其他任务执行中），自动排队等待",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                 else:
-                    self._send_to_role(step.target_role, step.prompt_template,
-                                       wf_id=run.id, step_id=step.id, force=True)
+                    # 重推必须走 _fill_prompt_vars：直接投 prompt_template 会把
+                    # {assignee}/{title} 等原样发出，被 _send_to_role 的未替换守卫
+                    # 拦下 → 重推恒失败（bus #375006 实测 {assignee}）。与首推、
+                    # kick-stalled 三条路径共用同一填充，保证重推拿到的 prompt 与首推一致。
+                    _rt_row = self._lifecycle.query(
+                        "SELECT title, description FROM tasks WHERE task_id="
+                        "(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
+                        (run.id,))
+                    _rt = _rt_row[0] if _rt_row else None
+                    _rt_title = _rt["title"] if _rt else run.workflow_name
+                    _rt_desc = _rt["description"] if _rt else ""
+                    _rt_wf = self._workflows.get(run.workflow_name)
+                    _rt_idx = next((i for i, s in enumerate(_rt_wf.steps) if s.id == step.id), -1) if _rt_wf else -1
+                    _rt_prev = _rt_wf.steps[_rt_idx - 1].id if _rt_wf and _rt_idx > 0 else ""
+                    self._send_to_role(
+                        step.target_role,
+                        self._fill_prompt_vars(
+                            step.prompt_template, step, run.workflow_name,
+                            _rt_title, _rt_desc, run.step_results, _rt_prev),
+                        wf_id=run.id, step_id=step.id, force=True)
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
