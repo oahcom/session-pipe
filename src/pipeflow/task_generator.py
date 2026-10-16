@@ -48,6 +48,11 @@ class TaskGeneratorMixin:
     _TASK_GEN_COOLDOWN: dict[str, float] = {}  # role → last gen ts
     # check-then-act 竞态防护：cooldown 检查与写入之间加锁（GIL 下结构不损坏，仅语义竞态）
     _TASK_GEN_LOCK = threading.Lock()
+    # 积压告警冷却（DESIGN §2.6 S4）：同一角色积压告警 30min 内只发一次。
+    # 无冷却时每个 run_once tick 对同一积压角色重发同一条 → curator 实测 3 天 106 条
+    # 重复告警（8 角色各 4-19 条），把 architecture 类淹没成噪音。只告警一次不丢信息量。
+    _BACKLOG_ALERT_TS: dict[str, float] = {}
+    _BACKLOG_ALERT_COOLDOWN_S = 1800
 
     def _scan_tasks(self):
         lm = self._lifecycle
@@ -177,6 +182,19 @@ class TaskGeneratorMixin:
         except Exception as _e:
             LOGGER.debug("heal stamp failed: %s", _e)
 
+    def _backlog_alert_allowed(self, role: str) -> bool:
+        """积压告警冷却闸（DESIGN §2.6 S4）：同角色 30min 内只放行一次。
+
+        无冷却时每 run_once tick 对同一积压角色重发同条告警 → curator 实测
+        3 天 106 条。去重键取 assignee：消息文本含实时计数、每 tick 都变，
+        文本维度的 hash 恒不命中（这正是原告警无节流的原因）。
+        """
+        _now = time.time()
+        if _now - self._BACKLOG_ALERT_TS.get(role, 0) < self._BACKLOG_ALERT_COOLDOWN_S:
+            return False
+        self._BACKLOG_ALERT_TS[role] = _now
+        return True
+
     def _check_anomalies(self, conn=None, deferred=None):
         """Detect workflows stuck across multiple steps; auto-heal.
         Also monitors overall completion rate and backlog health.
@@ -215,6 +233,11 @@ class TaskGeneratorMixin:
                     "WHERE status IN ('pending','running') GROUP BY assignee"
                 ).fetchall():
                     if _row["c"] > 10:
+                        # S4 冷却（DESIGN §2.6）：同角色积压告警 30min 只发一次。
+                        # 去重键用 assignee（不是消息文本）：文本含实时计数，每 tick 都变，
+                        # 文本 hash 恒不命中 → 冷却失效。只按角色节流即可。
+                        if not self._backlog_alert_allowed(_row["assignee"]):
+                            continue
                         self._bb.write("architecture",
                             f"[workflow_engine] 角色 {_row['assignee']} 积压 {_row['c']} 个运行中任务，超过阈值 10",
                             src="workflow_engine")
