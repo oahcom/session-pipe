@@ -8,12 +8,14 @@ import json
 import os
 import re
 import time
+import hashlib
 import subprocess
 import logging
 import pathlib
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
+from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
 from pipeflow.engine import Step, WorkflowRun
 from pipeflow.wf_lifecycle import _value_audit_failed
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
@@ -29,6 +31,11 @@ from pipeflow.integrity import (
 )
 
 LOGGER = logging.getLogger("workflow.engine")
+
+# 排队降级阈值：排队分支原本永久 return（不递增 timeout_count），但 busy 判据
+# 自带 `timeout_count < 3` 前提（liveness.py:211），同角色两个卡死实例互判 busy →
+# 双方 timeout_count 恒 0 → 永远 busy。此阈值把"被真占用"与"整链卡死"分开。
+_QUEUE_DEGRADE_AT = 3
 
 
 def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
@@ -240,7 +247,7 @@ class StepHandlerMixin:
                 # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
                 if cat:
                     _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
+                        wf_id=run.id if ec.get("require_wf") else "",
                         wait_roles=getattr(step, "wait_roles", None))
                     if _busy_match_ts:
                         # exit_schema 校验与主路径一致：busy 不绕过文件约束
@@ -290,7 +297,17 @@ class StepHandlerMixin:
                     "queued": _queued,
                 }
                 self._sync_step_results(run.id, run.step_results)
-                return  # 排队路径不递增 timeout_count（防误回收）
+                # 排队豁免只在"另一个工作流真占着角色"时成立。但 busy 判据自身含
+                # `timeout_count < 3`（liveness.py:211），同角色的两个卡死实例会互相
+                # 判对方 busy → 双方都走排队分支 → timeout_count 恒 0 → 永不到 3
+                # → 永远 busy（自我互锁）。实测积压 153 个 running 实例 timeout_count≡0。
+                # 破环：排队够多仍无进展，说明不是"被占用"而是"整条链卡死"，
+                # 降级走超时路径递增计数，让回收器能开工。
+                if _queued >= _QUEUE_DEGRADE_AT:
+                    LOGGER.warning("排队 %d 次无进展 → %s/%s 降级为超时计数解锁回收",
+                                   _queued, run.id[:12], step.id)
+                else:
+                    return  # 排队路径不递增 timeout_count（防误回收）
 
             timeout_count = run.step_results.get(step.id, {}).get("timeout_count", 0) + 1
             run.step_results[step.id] = {
@@ -377,7 +394,7 @@ class StepHandlerMixin:
                 # 超时但审查指令已发、角色可能已完成 → 检查 exit 匹配
                 _wide = re.sub(r"-complete$", "-", text_filter)
                 _match_ts2, _match_msgs2 = self._check_exit(cat, src_filter, _wide, created_after=last_ts,
-                    wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
+                    wf_id=run.id if ec.get("require_wf") else "",
                     wait_roles=getattr(step, "wait_roles", None))
                 if _match_ts2:
                     # 防御：__new__ 实例化（测试路径）可能无此属性，timeout 段先于初始化引用
@@ -516,7 +533,7 @@ class StepHandlerMixin:
             # 若传 wait_roles，integrity 回复本身也会被协作门死锁（2026-08-11 codex 审查确认）
             _integ_ts, _integ_msgs = self._check_exit(
                 cat, src_filter, _integ_filter, created_after=last_ts,
-                wf_id=run.id if ec.get("require_wf") else "", strict_wf=False
+                wf_id=run.id if ec.get("require_wf") else ""
             )
             if _integ_ts:
                 _integ_msgs = [m for m in _integ_msgs if m["id"] not in self._consumed_exit_ids]
@@ -566,10 +583,10 @@ class StepHandlerMixin:
                 # 宽匹配：第二节点消息（codex-approved）到达时也能匹配
                 _wide_filter = re.sub(r"-complete$", "-", text_filter)
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, _wide_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False, wait_roles=_wait_roles)
+                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles)
             else:
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", strict_wf=False, wait_roles=_wait_roles)
+                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles)
             if _match_ts:
                 # 过滤已被其他工作流消费的消息
                 _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
@@ -613,7 +630,7 @@ class StepHandlerMixin:
                         self._sync_step_results(run.id, run.step_results)
                         LOGGER.info("双节点: %s/%s 第一节点完成，已发 codex 审查指令", run.workflow_name, step.id)
                         # R5: 自动执行 codex review --uncommitted (三方20维审查自动化)
-                        _codex_result = self._run_codex_review(run, step, cat)
+                        _codex_result = self._run_codex_review(run, step)
                         if _codex_result.get("success"):
                             LOGGER.info("双节点: %s/%s codex review 通过，等待 node2 消息", run.workflow_name, step.id)
                         else:
@@ -656,10 +673,20 @@ class StepHandlerMixin:
                     if latest[0].src == step.target_role:
                         pass  # 自己写的消息，不报死锁
                     else:
-                        # 超时基准：自步骤通知（notified_at）以来该分类无新消息才判超时
+                        # 超时基准：自步骤通知（notified_at）以来该分类无新消息才判超时。
+                        #
+                        # 误报根因（2026-10-17 实测 151 条 monitor_audit / 0 条真实死锁）：
+                        # max(latest_ts, notified_at) 在"该分类于步骤开始前就已静默"时退化为
+                        # notified_at，此后时间流逝即恒定判超时——但步骤期间本就无该分类
+                        # 活动（如 WL-dev_with_collab/s4 target=closer 却 track qa 的
+                        # test_report，qa 早在 s3 写完），这是配置错位而非角色卡死。
+                        # 故：仅当该分类在步骤开始后确有消息（latest_ts > notified_at）才有
+                        # 资格判超时——即"曾经活跃、之后静默"，才是真停滞信号。
                         _notified = run.step_results.get(step.id, {}).get("notified_at", 0)
-                        age = time.time() - max(latest[0].ts, _notified)
-                        if age >= track_timeout:
+                        if latest[0].ts <= _notified:
+                            pass  # 该分类步骤期间从未活跃 → track 不适用，不误报
+                        elif time.time() - latest[0].ts >= track_timeout:
+                            age = time.time() - latest[0].ts
                             # 节流：同一 tracking 周期只通知一次
                             _sdata = run.step_results.get(step.id, {}) or {}
                             _last = _sdata.get("track_notified_at", 0)
@@ -675,20 +702,32 @@ class StepHandlerMixin:
                                         src="workflow_engine")
                                 except Exception:
                                     LOGGER.debug("monitor_audit write failed for %s", run.workflow_name)
+                                # S3 fan-out 去重（DESIGN §2.3）：同一超时事件对同一目标角色
+                                # 24h 内只提醒一次。多 daemon/多 tick 并发时同一事件会遍历
+                                # notify_roles 多轮，每轮都 _send_to_role 一次 → 同角色收到
+                                # N 条相同 deadlock 提醒（实测 track 提醒放大是洪水主因之一）。
+                                # age 不入文案：它每秒 +1，使 _event_key 恒变 → 24h 去重
+                                # 形同虚设（实测 qa 单会话 215 条该提醒且助理文本为 0）。
+                                _track_prompt = (f"[deadlock] {track_cat} 超时，请继续当前步骤 "
+                                                 f"{step.id}（{step.title}）")
+                                _seen_events: set[str] = set()
                                 try:
                                     for nr in notify_roles:
+                                        _ekey = _event_key(_track_prompt[:80], nr, run.workflow_name)
+                                        if _ekey in _seen_events:
+                                            continue
+                                        _seen_events.add(_ekey)
                                         # 存活检查（旧 tracker 交叉验证语义）：先确保通知
                                         # 对象活着（死了由引擎拉起），再发提醒
                                         self._ensure_role_alive(nr)
-                                        self._send_to_role(nr,
-                                            f"[deadlock] {track_cat} 超时 {int(age)}s，请继续",
+                                        self._send_to_role(nr, _track_prompt,
                                             wf_id=run.id, step_id=step.id, force=True)
                                 except Exception:
                                     LOGGER.debug("track notify failed for %s", run.workflow_name)
         if not cat:
             return
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                        wf_id=run.id if ec.get("require_wf") else "", strict_wf=False,
+                        wf_id=run.id if ec.get("require_wf") else "",
                         wait_roles=getattr(step, "wait_roles", None))
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
@@ -887,7 +926,7 @@ class StepHandlerMixin:
 
         return
 
-    def _run_codex_review(self, run, step, bus_cat: str) -> dict:
+    def _run_codex_review(self, run, step) -> dict:
         """自动执行 codex review --uncommitted (三方20维审查自动化，R5 增长).
 
         在 dual_node 第一节点完成后，自动运行 codex review --uncommitted
@@ -1083,13 +1122,12 @@ class StepHandlerMixin:
         return (len(errs) == 0, errs)
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
-                    wf_id: str = "", strict_wf: bool = False, wait_roles: list = None) -> tuple:
+                    wf_id: str = "", wait_roles: list = None) -> tuple:
         """查 exit 是否有匹配消息。返回 (timestamp, matched_msgs)。
 
         wf_id 非空时过滤"消息必须含当前工作流实例 id"——防止新工作流
         匹配旧工作流的同分类消息（2026-08-09 观测：wf_4c51d890c082/s2
         匹配到 wf_6e338fd3 的 s2-complete，跨实例串消息）。
-        strict_wf=True（require_wf=true 时）：消息必须含当前 wf_id，否则不匹配。
         防止旧工作流的同分类消息（不带 wf_id）串入 require_wf 步骤
         （2026-08-10 观测：wf_7f37 s1 匹配到 wf_cde32 的 s1-complete）。
         wait_roles（协作门）：非空时要求所有声明角色都写了匹配消息才返回匹配。
@@ -1117,8 +1155,7 @@ class StepHandlerMixin:
             if created_after and f.ts < created_after:
                 continue
             # wf 归属校验：消息含别的 wf_id → 串消息 → 过滤；
-            # 消息不含 wf_id 时，若 strict_wf（require_wf=true）→ 不匹配，
-            # 否则时间窗口已保证属于当前实例，放行。
+            # 消息不含 wf_id 时放行（时间窗口已保证属于当前实例）。
             # 角色写消息通常不带 wf_id（2026-08-10 观测：scout/pm 的完成消息无 wf 前缀），
             # 但 require_wf=true 是引擎硬校验，必须严格：无 wf_id 的消息不能匹配，
             # 否则旧工作流的同分类消息会串入新工作流（观测 wf_7f37 匹配到 wf_cde32 的

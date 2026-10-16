@@ -133,17 +133,26 @@ class WorkflowLifecycleMixin:
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
                 elif age_h > _global_limit_h:
                     reason = f"{_st} 运行{age_h:.0f}h > {_global_limit_h}h全局阈值"
-                # 条件4: running 但当前步骤确已超时（step 级 timeout_count 真增长）且 >1h
+                # 条件4: running 但当前步骤确已超时且 >1h
                 # 关键修正：仅空 step_results 不足以判 stale——长任务 /goal 步骤完成前 step_results
                 # 本就为空，1h 墙钟误杀正常推进中的角色（bus #728c6e430 误报根因）。
-                # 故要求当前步骤 timeout_count >= 1（引擎 step_handler 真实超时标记）再判 stale。
+                # 故要求 timeout_count >= 1（引擎真实超时标记）或 queued >= 2（排队降级标记）。
+                #
+                # 为何加 queued 判据：同角色多实例并发时全部走"排队"分支——该分支只递增
+                # queued 且重置 ts，不递增 timeout_count（step_handler.py:297-305）。而
+                # liveness busy 判据自带 `timeout_count < 3` 前提，两个互判 busy 的实例
+                # timeout_count 都恒为 0 → 条件4 永不成立 → 永不回收。实测 95 台
+                # WL-01@s1 全部 status=notified/queued=2/tc 缺失，卡死 4.5h 无人回收。
                 elif _st == "running" and age_h > 1:
                     _cur = d.get("current_step_id", "")
                     _cur_sr = sr.get(_cur, {}) if isinstance(sr, dict) else {}
-                    _cur_tc = _cur_sr.get("timeout_count", 0) if isinstance(_cur_sr, dict) else 0
-                    if _cur_tc >= 1:
-                        _reason_step = _cur_sr.get("step", _cur) if isinstance(_cur_sr, dict) else _cur
-                        reason = f"running 状态 {_reason_step} 超时无推进记录 {age_h:.1f}h (timeout_count={_cur_tc})"
+                    if isinstance(_cur_sr, dict):
+                        _cur_tc = _cur_sr.get("timeout_count", 0)
+                        _cur_q = _cur_sr.get("queued", 0) or 0
+                        if _cur_tc >= 1 or _cur_q >= 2:
+                            _reason_step = _cur_sr.get("step", _cur)
+                            reason = (f"running 状态 {_reason_step} 无推进记录 {age_h:.1f}h "
+                                      f"(timeout_count={_cur_tc}, queued={_cur_q})")
 
                 if reason:
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)
@@ -431,7 +440,12 @@ class WorkflowLifecycleMixin:
         # 状态为 pending（清 notified_at），让引擎下轮重新走 advance 重发。
         _delivered = self._send_to_role(next_step.target_role, prompt,
                                          wf_id=wf_id, step_id=next_step.id)
-        if not _delivered:
+        # 用 `is not True` 而非 not："busy"（角色忙，truthy 字符串）必须同样走失败分支，
+        # 否则会跳过 _mark_step_delivery_failed 直接往下推进，把"未投递"当"已投递"。
+        # busy 是暂时态 → 下轮 advance 重发，无需回滚状态，故不 return。
+        if _delivered == "busy":
+            LOGGER.debug("advance skip: %s 角色忙，等待下轮重发", next_step.target_role)
+        elif _delivered is not True:
             self._mark_step_delivery_failed(lm, wf_id, next_step.id)
             return
         # 如果步骤有子工作流模板 → 自动创建子工作流

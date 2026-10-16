@@ -65,10 +65,14 @@ def test_fanout_dedup_skips_duplicate_role():
     eng._lm = MagicMock()  # _lifecycle 是 property，实现在 _lm 上
     eng._consumed_exit_ids = set()
 
-    # bus 上有一条非 target_role 的旧消息 → track 判超时
+    # bus 上有一条非 target_role 的消息：步骤开始后活跃过（ts > notified_at），
+    # 之后静默超时 → track 判真停滞。顺序不能倒——ts 早于 notified_at 是"该分类
+    # 步骤期间从未活跃"的配置错位场景，2026-10-17 起不再误报（见 step_handler track 分支）。
     _fact = MagicMock()
     _fact.src = "survival_monitor"
-    _fact.ts = time.time() - 1000
+    # ts 必须严格大于 notified_at：步骤开始后该分类曾活跃，之后静默超时
+    # （ts <= notified_at 为"步骤期间从未活跃"，会被 track 分支跳过，不进入去重逻辑）
+    _fact.ts = time.time() - 10
     eng._bb = MagicMock()
     eng._bb.read.return_value = [_fact]
 
