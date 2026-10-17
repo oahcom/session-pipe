@@ -481,24 +481,11 @@ class WorkflowLifecycleMixin:
         # 原逻辑丢弃返回值直接盖戳 notified → 角色没收到任务却被判"已通知"，
         # 靠 timeout 兜底重推（bus #728c6e4307c1 根因）。此处据返回值回退 step
         # 状态为 pending（清 notified_at），让引擎下轮重新走 advance 重发。
-        _delivered = self._send_to_role(next_step.target_role, prompt,
-                                         wf_id=wf_id, step_id=next_step.id)
-        # 用 `is not True` 而非 not："busy"（角色忙，truthy 字符串）必须同样走失败分支，
-        # 否则会跳过 _mark_step_delivery_failed 直接往下推进，把"未投递"当"已投递"。
-        # busy 与 False 同路径回退。原注释称"busy 是暂时态 → 下轮 advance 重发"，
-        # 但该重发不存在：next_step 的状态在上面（:404）于 _send_to_role **之前**就已
-        # commit 为 notified，而 _advance_production_wf 只在当前步骤
-        # step_done_ready/completed 时被调（engine.py:854），下一步既已 notified，
-        # run_once 的首发分支（`if not step_status`）不会重走 → 角色没收到却被判
-        # 已通知，只剩 30min 超时重推兜底（codex 三方审查 P1-2，2026-10-17）。
-        # _mark_step_delivery_failed 内部判据是 `status == "notified"`，恰好适用。
-        if _delivered is not True:
-            if _delivered == "busy":
-                LOGGER.debug("advance skip: %s 角色忙，已回退 step 待下轮重推",
-                             next_step.target_role)
-            self._mark_step_delivery_failed(lm, wf_id, next_step.id)
-            return
-        # 如果步骤有子工作流模板 → 自动创建子工作流
+        # ── 有子链的步骤：先建子链，由子链接管；建不出才回退投主链步骤 ──
+        # 用户需求（2026-10-17）：「主链第一步生成二级工作流，二级工作流严格要求
+        # 该角色完成任务」—— 主链步骤是容器，干活的是子链。原顺序（先投主链 →
+        # 角色变忙 → 守卫必然命中 → 子链永不创建）实测让 11/12 条带 subflow 的链
+        # 零子链（WL-full_dev_pipeline 历史最佳 0/6 步）。
         if next_step.subflow_template:
             try:
                 # 防重：DB 中该步骤已有 subflow_id → 不重复创建
@@ -515,14 +502,13 @@ class WorkflowLifecycleMixin:
                     # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
                     # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
                     #
-                    # 注意 exclude_wf_id 传空：原实现传 wf_id（"排除自己"），但这样
-                    # 会把"主链 next_step 刚被投递、正占用该角色"这个事实一起排除掉
-                    # → 守卫恒 False → 照建同角色子流 → 与主链步骤争抢同一角色
-                    # → 子流反复投递失败 → delivery_blocked → 恢复 → 再失败（实测
-                    # wf_sub_ee176a2b55a1 的 delivery_fail_count 涨到 2）。
-                    # 实测对比：exclude=wf_id → False（漏判）；exclude='' → True（真实）。
-                    # 子流是新增占用者，必须看真实占用状态，故不排除本主链。
-                    if self._is_role_busy(next_step.target_role, exclude_wf_id="",
+                    # 判据（2026-10-17 修正）：只排除**本主链自身的占用**。
+                    # 沿用 exclude="" 会把"本主链刚投递本步"也算成忙 → 恒真 →
+                    # 子链永不创建（实测 11/12 条带 subflow 的链零子链，
+                    # WL-full_dev_pipeline 历史最佳 0/6 步）。
+                    # exclude_wf_id=wf_id：角色被**别的**工作流占用仍跳过（防争抢），
+                    # 仅本主链的占用不阻止。
+                    if self._is_role_busy(next_step.target_role, exclude_wf_id=wf_id,
                                           pane_fallback=False):
                         LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
                                     next_step.target_role, next_step.subflow_template)
@@ -559,8 +545,26 @@ class WorkflowLifecycleMixin:
                         conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                             (json.dumps(new_results, ensure_ascii=False), wf_id))
                         conn2.commit()
+                        return  # 子链已接管：不投主链步骤
             except Exception as _e:
                 LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
+        _delivered = self._send_to_role(next_step.target_role, prompt,
+                                         wf_id=wf_id, step_id=next_step.id)
+        # 用 `is not True` 而非 not："busy"（角色忙，truthy 字符串）必须同样走失败分支，
+        # 否则会跳过 _mark_step_delivery_failed 直接往下推进，把"未投递"当"已投递"。
+        # busy 与 False 同路径回退。原注释称"busy 是暂时态 → 下轮 advance 重发"，
+        # 但该重发不存在：next_step 的状态在上面（:404）于 _send_to_role **之前**就已
+        # commit 为 notified，而 _advance_production_wf 只在当前步骤
+        # step_done_ready/completed 时被调（engine.py:854），下一步既已 notified，
+        # run_once 的首发分支（`if not step_status`）不会重走 → 角色没收到却被判
+        # 已通知，只剩 30min 超时重推兜底（codex 三方审查 P1-2，2026-10-17）。
+        # _mark_step_delivery_failed 内部判据是 `status == "notified"`，恰好适用。
+        if _delivered is not True:
+            if _delivered == "busy":
+                LOGGER.debug("advance skip: %s 角色忙，已回退 step 待下轮重推",
+                             next_step.target_role)
+            self._mark_step_delivery_failed(lm, wf_id, next_step.id)
+            return
 
     def _mark_step_delivery_failed(self, lm, wf_id: str, step_id: str):
         """投递失败回退：清掉 notified_at，把该 step 状态归 pending。
