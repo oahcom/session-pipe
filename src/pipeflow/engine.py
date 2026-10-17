@@ -856,6 +856,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # description 为空（91%）——只补 description 会让 91% 的提醒仍带
                     # 未替换变量、继续被守卫拦下（2026-10-17 07:10 实测复发）。title
                     # 由调用方必填（create_task_v2 的 title 参数），是唯一可靠兜底。
+                    #
+                    # task 行缺失时（task_id 悬空：实测有 1 个实例如此）退回 **step.title**：
+                    # 它是模板里的步骤名，恒非空。不退回则 context 全空 → {description}
+                    # 泄漏 → 提醒被守卫拦下（终审标注的边界，生产可达但罕见）。
                     _run_ctx: dict = {}
                     try:
                         _trow = lm.query(
@@ -870,6 +874,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             _run_ctx["topic"] = _title or _fallback
                     except Exception as _ctx_e:
                         LOGGER.debug("run context 补齐失败(降级为空): %s", _ctx_e)
+                    if not _run_ctx.get("description"):
+                        # step 可能为 None（上面 next() 未命中）→ getattr 兜 "" → wf_name
+                        _fb = (getattr(step, "title", "") if step else "") or wf_name
+                        _run_ctx = {"title": _fb, "description": _fb,
+                                    "task_definition": _fb, "topic": _fb}
                     run = WorkflowRun(
                         id=inst["instance_id"], workflow_name=wf_name,
                         context=_run_ctx, current_step=step_id,
