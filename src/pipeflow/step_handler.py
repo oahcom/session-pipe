@@ -19,6 +19,11 @@ from pipeflow.engine import Step, WorkflowRun
 from pipeflow.wf_lifecycle import _value_audit_failed
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 from conversation_monitor import get_conversation_signal
+
+# codex 三方审查超时（秒）。实测标定：21 文件/734 行 diff 需 6m19s（2026-10-17），
+# 故不能用 300s——该规模下必然超时，闸门回落人工审查。
+import os as _os
+_CODEX_REVIEW_TIMEOUT = int(_os.environ.get("CODEX_REVIEW_TIMEOUT", "900"))
 from pipeflow.integrity import (
     DIMENSIONS as _integ_dimensions,
     load_state as _integ_load,
@@ -116,11 +121,18 @@ class StepHandlerMixin:
         # ponytail: fallback 用 time.time() 而非 run.created_at——当 wf complete 全量覆写
         # step_results 擦除 poll_since/bus_anchor 时，fall back 到 workflow 创建时间
         # 会导致 created_after 过滤器跳过所有近期 bus 消息，流水线永久卡死。
-        _persisted = run.step_results.get(step.id, {}).get("poll_since", time.time())
-        _bus_anchor = run.step_results.get(step.id, {}).get("bus_anchor")
+        # isinstance 守卫：step_results 的值不保证是 dict（生产 DB 实测 413 个
+        # 非 dict 值：'summary'/'files'/'approval_token' 等键）。缺守卫时下面三行
+        # 链式 .get 抛 AttributeError，冒泡到 engine.run_once 的 except → 该轮
+        # for 循环整体中止，后续所有工作流当轮不再 tick（静默失败）。
+        _sd = run.step_results.get(step.id, {})
+        if not isinstance(_sd, dict):
+            _sd = {}
+        _persisted = _sd.get("poll_since", time.time())
+        _bus_anchor = _sd.get("bus_anchor")
         # 初始化时用 notified_at（步骤首次通知时间），确保不跳过消息
         if _bus_anchor is None:
-            _bus_anchor = run.step_results.get(step.id, {}).get("notified_at", _persisted)
+            _bus_anchor = _sd.get("notified_at", _persisted)
         # 时间下限 = max(锚定, 工作流创建时间)：bus_anchor 可能被旧工作流残留值污染
         # （wf_7f37 匹配到 wf_cde32 的旧消息，bus_anchor=旧消息 ts, 2026-08-10）。
         # 工作流创建前绝对不存在属于它的消息 → 硬下限。
@@ -265,10 +277,19 @@ class StepHandlerMixin:
                             _integ_send_bypass(run, step, "busy",
                                                send_to_role=self._send_to_role,
                                                sync_step_results=self._sync_step_results)
+                            _completed_via_busy = False
                             try:
                                 self._lifecycle.complete_step(run.id, step.id)
+                                _completed_via_busy = True
                             except Exception as _e:
                                 LOGGER.debug("busy exit-match complete_step 失败: %s", _e)
+                            # 已 complete 却继续往下走，会落到排队/auto-cancel/超时路径：
+                            # 同一 tick 内既"步骤完成"又"工作流被取消"（实测
+                            # close_wf 收到 ['cancelled','cancelled'] 双次调用）。
+                            # 姐妹站点（tick-rescue/relaxed/integrity/dual_node/
+                            # completion_check）均有 return，仅此处漏。
+                            if _completed_via_busy:
+                                return
                 _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
                 # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
                 # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
@@ -290,6 +311,9 @@ class StepHandlerMixin:
                                 src="workflow_engine")
                         except Exception as _cancel_e:
                             LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
+                        # 已取消的工作流不应再继续排队递增与 timeout_count，
+                        # 否则达阈值时会再 close_wf 一次，并对已取消实例发"超时自动回收"假告警。
+                        return
                 run.step_results[step.id] = {
                     **run.step_results.get(step.id, {}),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
@@ -981,27 +1005,39 @@ class StepHandlerMixin:
         """
         try:
             # 运行 codex review --uncommitted -c model=9router_hermes
-            # timeout 300s (5 min) 防卡死
+            # timeout 实测标定：21 文件/734 行 diff 在本机需 6m19s（2026-10-17 实测），
+            # 原值 300s 在该规模下必然超时 → 闸门回落人工审查。值可经
+            # CODEX_REVIEW_TIMEOUT 调整（大 diff 上调，无需改代码）。
             # cwd 取角色 workspace：WorkflowRun 无 workspace 字段，旧代码在此抛
             # AttributeError 被下面 except Exception 吞掉 → codex 从未真正执行，
             # 质量闸门形同虚设（实测 2026-10-16）。
             _ws = _CCS_WORKSPACES / step.target_role
             result = subprocess.run(
                 ["codex", "review", "--uncommitted", "-c", "model=9router_hermes"],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=_CODEX_REVIEW_TIMEOUT,
                 cwd=str(_ws) if _ws.exists() else None,
             )
             if result.returncode == 0:
-                # 解析输出：若有 "No issues" 或 "0 issues" 视为通过
                 out = result.stdout + result.stderr
-                if "No issues" in out or "0 issues" in out or "0 problems" in out:
+                # 通过判据：codex 0.148.0 的实际措辞是 "No findings"（实测），
+                # 原判据只认 "No issues"/"0 issues"/"0 problems"（全部 0 命中）
+                # → 干净 diff 也被判失败，引擎回落"让角色人工审查"，闸门形同虚设。
+                # 改为：否定词表匹配 + 必须无严重级别标记（两条同时满足才算通过）。
+                _clean = out.lower()
+                _passed_phrase = any(s in _clean for s in (
+                    "no findings", "no issues", "no problems", "0 issues",
+                    "0 problems", "no security issues", "nothing to report"))
+                _has_finding = any(s in _clean for s in (
+                    "[p0]", "[p1]", "[p2]", "critical", "vulnerability",
+                    "security issue", "bug:", "error:"))
+                if _passed_phrase and not _has_finding:
                     return {"success": True, "output": out[:500]}
-                # 有问题输出
                 return {"success": False, "error": f"codex 发现问题: {out[:300]}", "output": out[:500]}
             else:
                 return {"success": False, "error": f"codex 返回码 {result.returncode}: {result.stderr[:300]}"}
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": "codex review 超时 (300s)"}
+            return {"success": False,
+                    "error": f"codex review 超时 ({_CODEX_REVIEW_TIMEOUT}s)"}
         except FileNotFoundError:
             return {"success": False, "error": "codex CLI 未找到 (请确认已安装)"}
         except Exception as e:
