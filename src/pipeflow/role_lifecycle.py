@@ -539,7 +539,19 @@ class RoleLifecycleMixin:
         # 在此按忙闲择一：模板不改（保持语义单一），运行时替换为真实空闲者。
         # 只在目标"是池内成员"且另一成员空闲时替换——忙碌或探测失败一律保持原样，
         # 避免把投递从"排队"变成"投给一个同样忙的人"。
+        _orig_role = role
         role = self._pick_dev_role(role, wf_id)
+        if role != _orig_role and wf_id:
+            # 归属跟随实际执行者：assignee 列被背压计数（task_generator 按 assignee
+            # 数 running 实例控配额）与任务生成消费。只换投递目标而不改这里，
+            # 会让 pg 收到的负载仍计在 engineer 头上 → 两边配额都失真。
+            # 仅在真发生分流时写，失败不影响投递（背压不准比丢任务轻）。
+            try:
+                self._lifecycle.execute(
+                    "UPDATE workflow_instances SET assignee=? WHERE instance_id=?",
+                    (role, wf_id))
+            except Exception as _ae:
+                LOGGER.debug("dev pool assignee 同步失败 %s: %s", wf_id[:12], _ae)
         if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=False):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
