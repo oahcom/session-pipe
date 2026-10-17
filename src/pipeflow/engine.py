@@ -740,13 +740,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 仅当真实投递成功才盖戳 notified；投递被并发守卫/变量校验拦截时
                     # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
                     # 进而触发 _cleanup_stale_workflows 的"running 且 sr 空>1h"静默误杀
-                    if not _delivered:
-                        # "busy" = 角色正忙（正常排队），非故障：不计失败、不盖戳，
-                        # 下一 tick 自然重试。计入会让并发实例互相判死（227 条实测）。
-                        if _delivered == "busy":
-                            LOGGER.debug("run_once: %s/%s 角色忙，跳过计数",
-                                         inst["instance_id"][:12], step_id)
-                            continue
+                    # busy 是**真值字符串**，必须用 == 判三态，不能用 not。
+                    # 历史缺陷（4fe4086 引入，2026-10-17 定位）：原写成 `if not _delivered:`
+                    # 且 busy 判断嵌在块内——`not "busy"` 恒为 False，该块永不进入，
+                    # busy 径直落到下方盖戳分支，把**从未投递**的 step 标记为 notified，
+                    # 角色没收到任务却被判"已通知"，只能等超时回收（实测 48 条 cancelled）。
+                    # 同仓 task_generator.py:171 / wf_lifecycle.py:491 已用 is not False /
+                    # is not True 处理三态，仅此主派发路径漏改。
+                    if _delivered == "busy":
+                        # 角色正忙（正常排队），非故障：不计失败、不盖戳，下一 tick 重试。
+                        # 计入会让并发实例互相判死（227 条实测）。
+                        LOGGER.debug("run_once: %s/%s 角色忙，跳过计数",
+                                     inst["instance_id"][:12], step_id)
+                        continue
+                    if _delivered is not True:
                         # 幂等护栏：已 notified 的 step 不再重复计数。
                         # 根因：_send_to_role 在 goal 过短等路径返回 None（falsy），
                         # 已成功盖戳 notified 的 step 每 tick 重走本分支 → delivery_fail_count
