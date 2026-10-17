@@ -104,6 +104,19 @@ class StepHandlerMixin:
         except Exception as _e:
             LOGGER.warning("nudge_assigner %s/%s failed: %s", run.workflow_name, step.id, _e)
 
+    @staticmethod
+    def _step_sd(run, step) -> dict:
+        """取 step_results[step.id] 并归一化为 dict。
+
+        step_results 的值不保证是 dict：生产 DB 实测 413 个非 dict 值
+        （'summary'/'files'/'approval_token' 等键，亦有 'done' 简写形）。
+        裸链式 .get 会抛 AttributeError，冒泡到 engine.run_once 的 except
+        → 该轮 for 循环整体中止，后续所有工作流当轮不再 tick（静默失败）。
+        所有读写 step_results[step.id] 的站点都走此函数，避免逐处补漏。
+        """
+        _v = run.step_results.get(step.id, {})
+        return _v if isinstance(_v, dict) else {}
+
     def _tick(self, run: WorkflowRun, step: Step):
         """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
@@ -125,9 +138,7 @@ class StepHandlerMixin:
         # 非 dict 值：'summary'/'files'/'approval_token' 等键）。缺守卫时下面三行
         # 链式 .get 抛 AttributeError，冒泡到 engine.run_once 的 except → 该轮
         # for 循环整体中止，后续所有工作流当轮不再 tick（静默失败）。
-        _sd = run.step_results.get(step.id, {})
-        if not isinstance(_sd, dict):
-            _sd = {}
+        _sd = self._step_sd(run, step)
         _persisted = _sd.get("poll_since", time.time())
         _bus_anchor = _sd.get("bus_anchor")
         # 初始化时用 notified_at（步骤首次通知时间），确保不跳过消息
@@ -139,8 +150,8 @@ class StepHandlerMixin:
         last_ts = max(_bus_anchor or 0.0, run.created_at or 0.0)
 
         # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
-        _sdata = run.step_results.get(step.id, {})
-        if isinstance(_sdata, dict) and _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_sent")):
+        _sdata = self._step_sd(run, step)
+        if _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_sent")):
             # bypass 补发完整性提醒（tick rescue 直接 complete，跳过双节点审查）
             # 两个问题分开发送（用户约束：每个步骤分开提示词）
             _integ_send_bypass(run, step, "tick rescue",
@@ -233,7 +244,7 @@ class StepHandlerMixin:
             _sig_state["violation_count"] = _viol_n
         if _sig_state:
             run.step_results[step.id] = {
-                **run.step_results.get(step.id, {}),
+                **self._step_sd(run, step),
                 "tmux_signals": _sig_state,
             }
             try:
@@ -243,7 +254,7 @@ class StepHandlerMixin:
         # ── Timeout 检查（每次 tick 都执行，不受 schema/verify 影响）──
         # 超时后自动升级到 coordinator，不会被 schema 失败 return 阻断。
         # 超限阈值: max(max_retries+2, 3) 次超时后自动 cancel，防止无限重试堆积。
-        _start_ts = run.step_results.get(step.id, {}).get("ts", run.created_at)
+        _start_ts = self._step_sd(run, step).get("ts", run.created_at)
         # None 守卫：ts 或 created_at 缺失时不能相减（TypeError），按未开始处理
         elapsed = time.time() - _start_ts if _start_ts is not None else 0.0
         # 超时自动回收阈值: 默认 4 次超时后 cancel，防无限重推写 monitor_audit 噪音。
@@ -268,7 +279,7 @@ class StepHandlerMixin:
                             _schema_ok, _ = self._validate_exit_schema(step, run)
                         if _schema_ok:
                             run.step_results[step.id] = {
-                                **run.step_results.get(step.id, {}),
+                                **self._step_sd(run, step),
                                 "bus_anchor": _busy_match_ts,
                                 "exit_messages": _busy_match_msgs,
                             }
@@ -290,7 +301,7 @@ class StepHandlerMixin:
                             # completion_check）均有 return，仅此处漏。
                             if _completed_via_busy:
                                 return
-                _queued = run.step_results.get(step.id, {}).get("queued", 0) + 1
+                _queued = self._step_sd(run, step).get("queued", 0) + 1
                 # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
                 # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
                 if _queued >= 6:
@@ -315,13 +326,13 @@ class StepHandlerMixin:
                         # 否则达阈值时会再 close_wf 一次，并对已取消实例发"超时自动回收"假告警。
                         return
                 run.step_results[step.id] = {
-                    **run.step_results.get(step.id, {}),
+                    **self._step_sd(run, step),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
                     "queued": _queued,
                     # 首次排队时刻，**不随 ts 重置**：ts 每轮排队都被刷新，故它无法反映
                     # "排队了多久"——回收器据此判定会永远看到刚排队的假象。queued_since
                     # 只在首次排队时写入（后续排队沿用原值），给回收器一个真实的排队起点。
-                    "queued_since": run.step_results.get(step.id, {}).get(
+                    "queued_since": self._step_sd(run, step).get(
                         "queued_since", time.time()),
                 }
                 self._sync_step_results(run.id, run.step_results)
@@ -337,9 +348,9 @@ class StepHandlerMixin:
                 else:
                     return  # 排队路径不递增 timeout_count（防误回收）
 
-            timeout_count = run.step_results.get(step.id, {}).get("timeout_count", 0) + 1
+            timeout_count = self._step_sd(run, step).get("timeout_count", 0) + 1
             run.step_results[step.id] = {
-                **run.step_results.get(step.id, {}),
+                **self._step_sd(run, step),
                 "timeout_count": timeout_count,
                 "ts": time.time(),  # 重置计时器，给角色响应窗口
             }
@@ -458,7 +469,7 @@ class StepHandlerMixin:
             # relaxed-advance（它只要求角色写过任意同 wf 消息，不限分类）→ 误推进。
             # 读持久化字段而非 locals()：_queued 只在 busy 分支（:272）定义，
             # 非 busy 路径根本不存在该局部变量，locals() 探测会拿到旧值或抛错。
-            _from_queue_degrade = (run.step_results.get(step.id, {}).get("queued", 0)
+            _from_queue_degrade = (self._step_sd(run, step).get("queued", 0)
                                    >= _QUEUE_DEGRADE_AT)
             if (timeout_count >= 1 and not step.dual_node
                     and not getattr(step, "wait_roles", None)
@@ -478,7 +489,7 @@ class StepHandlerMixin:
                         # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
                         _role_msgs = self._bb.read(limit=500)
                         _wf_id = run.id
-                        _notified_ts = run.step_results.get(step.id, {}).get("notified_at", 0)
+                        _notified_ts = self._step_sd(run, step).get("notified_at", 0)
                         _relaxed = [
                             {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
                             for f in _role_msgs
@@ -496,7 +507,7 @@ class StepHandlerMixin:
                             LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
                                         run.workflow_name, step.id, len(_relaxed))
                             run.step_results[step.id] = {
-                                **run.step_results.get(step.id, {}),
+                                **self._step_sd(run, step),
                                 "bus_anchor": _relaxed[0]["ts"],
                                 "exit_messages": _relaxed,
                                 "relaxed_advance": True,
@@ -532,14 +543,14 @@ class StepHandlerMixin:
             self._consumed_exit_ids = set(list(self._consumed_exit_ids)[-500:])
         _integ_state = _integ_load(run.step_results, step.id)
         _integ_dual_pending = (getattr(step, 'dual_node', False)
-                               and not run.step_results.get(step.id, {}).get("node2_sent"))
+                               and not self._step_sd(run, step).get("node2_sent"))
         if _integ_state.pending and not _integ_state.complete and not _integ_dual_pending:
             if _integ_should_send(_integ_state):
                 _dim = _integ_next_dim(_integ_state)
                 if _dim:
                     _goal = _integ_full_prompt(run, step, run.step_results)
                     _output_summary = str(
-                        run.step_results.get(step.id, {}).get("exit_messages", [""])
+                        self._step_sd(run, step).get("exit_messages", [""])
                     )[:200]
                     _prompt_text = _integ_format(_dim, step_goal=_goal, output_summary=_output_summary)
                     _bus_msg = (
@@ -589,7 +600,7 @@ class StepHandlerMixin:
                         LOGGER.debug("integrity reply complete_step 失败: %s", _e)
                     return
             else:
-                _integ_elapsed = time.time() - run.step_results.get(step.id, {}).get(
+                _integ_elapsed = time.time() - self._step_sd(run, step).get(
                     "integrity_last_sent_at", time.time())
                 _integ_timeout = ec.get("timeout_minutes", 30) * 60
                 _fail_open = False
@@ -729,7 +740,7 @@ class StepHandlerMixin:
                         # 伪造基准：取 0 使 latest_ts > 0 恒真，退回旧语义（有能力判超时），
                         # 不用 run.created_at——created_at 是"实例创建"而非"步骤开始"，
                         # 用它会把步骤开始前就存在的旧消息误判为"步骤期间活跃过"。
-                        _notified = run.step_results.get(step.id, {}).get("notified_at", 0)
+                        _notified = self._step_sd(run, step).get("notified_at", 0)
                         _wf_def = self._workflows.get(run.workflow_name)
                         _prev_exit_cats: set[str] = set()
                         if _wf_def:
@@ -801,7 +812,7 @@ class StepHandlerMixin:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
             # 同时保存 exit_messages 作为角色产出证据（task_evidence 依赖此字段判定收益）
             run.step_results[step.id] = {
-                **run.step_results.get(step.id, {}),
+                **self._step_sd(run, step),
                 "bus_anchor": _match_ts,
                 "exit_messages": _match_msgs,
             }
@@ -924,7 +935,7 @@ class StepHandlerMixin:
         _now = time.time()
         _new_poll = _now - 30
         run.step_results[step.id] = {
-            **run.step_results.get(step.id, {}),
+            **self._step_sd(run, step),
             "poll_since": _new_poll,
         }
         self._sync_step_results(run.id, run.step_results)
