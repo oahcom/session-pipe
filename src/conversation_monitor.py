@@ -334,7 +334,11 @@ def scan_and_propose(roles: list[str] | None = None) -> list[dict]:
     _action ∈ {"idle","violation","content_void"} 供自动执行判定。
     """
     if roles is None:
-        roles = [p.stem.replace("persona_", "") for p in
+        # 文件名 persona_<序号>_<角色名>.json → 角色名。旧写法只剥 "persona_"，
+        # 留下序号（persona_14_knowledge_curator → "14_knowledge_curator"），
+        # 拼成 ccs-14_knowledge_curator 与实际会话 ccs-knowledge_curator 永不相等
+        # → pane capture 100% 失败 → G3 僵尸回收整体失效（实测 6h 内 31 次全带前缀）。
+        roles = [re.sub(r"^persona_\d+_", "", p.stem) for p in
                  Path.home().joinpath("hermes-session-roles", "personas", "session-roles").glob("persona_*.json")]
     roles = [r for r in roles if r not in _NON_PRODUCTION_ROLES]
     proposals: list[dict] = []
