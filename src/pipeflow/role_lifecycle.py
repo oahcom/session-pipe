@@ -11,6 +11,7 @@ import time
 import logging
 import threading
 import os as _os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
@@ -29,6 +30,55 @@ _KICK_COOLDOWN_SEC = 600
 # 各自判定"不存活"后同时拉起同一角色（实测 scout 建 116 个会话）。
 # 同一角色在冷却窗内不重复拉起。
 _RESTART_COOLDOWN_SEC = 300
+
+# 溢出报错的时效（秒）：超过此年龄不再触发 /compact。
+# 按"多久前"而非"距文件尾多少字节"判断：实测错误行距文件尾 7.8KB~10.8MB
+# （35 会话样本）、最远 4111 行，任何固定字节/行数窗口都会漏。
+_OVERFLOW_ERR_MAX_AGE = 600
+
+# 角色 transcript 根目录（测试可注入 tmp_path）。
+# 目录名把 cwd 路径的每个 `/` 换成 `-`：/home/administrator/ccs-workspaces/<role>。
+_TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
+
+
+def _transcript_shows_overflow(role: str, max_age: float = _OVERFLOW_ERR_MAX_AGE) -> bool:
+    """从角色 transcript 判断近期是否发生上下文溢出。
+
+    pane 走备用屏（alternate_on=1）时无 scrollback，溢出报错滚出视口即不可见；
+    transcript 是落盘事实，不受视口与进程存活影响（scout 实测在 `Prompt is too long`
+    终止后 1s 才被检测到，此时 agent 已死、send-keys 无处可发）。
+
+    溢出事件形如：{"type":"assistant","isApiErrorMessage":true,
+        "message":{"model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]}}
+    """
+    import glob as _glob
+    try:
+        _d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+        files = sorted(_glob.glob(str(_d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
+        if not files:
+            return False
+        _pat = ("Prompt is too long", "Context limit reached", "Context low")
+        cutoff = time.time() - max_age
+        # 尾读 64KB 即可覆盖"本轮"错误：溢出后角色无法继续产出，错误必落在文件尾
+        with open(files[0], "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read().decode("utf-8", "ignore")
+        for line in reversed(tail.splitlines()):
+            if '"isApiErrorMessage":true' not in line.replace(" ", ""):
+                continue
+            if not any(p in line for p in _pat):
+                continue
+            try:
+                _ts = json.loads(line).get("timestamp", "")
+                _dt = datetime.strptime(_ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError, KeyError):
+                return True  # 时间戳不可解析：保守按"刚发生"处理，宁可多 compact 一次
+            return _dt.timestamp() > cutoff
+        return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 class RoleLifecycleMixin:
@@ -123,7 +173,15 @@ class RoleLifecycleMixin:
                 or "Prompt is too long" in output
                 or ("Context" in output and "remaining" in output and "compact" in output.lower())
             )
-
+            # 第二路：transcript 回退。pane 跑在 claude TUI 的**备用屏**（alternate_on=1），
+            # 该屏无 scrollback——`-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，
+            # 故溢出报错一旦滚出视口就再也抓不到。transcript 是落盘事实，不受视口与
+            # 进程存活影响。实测（2026-10-17）"Prompt is too long" 全角色累计 252 次，
+            # 而本函数从未触发过一次 /compact——只有 pane 单路时角色溢出后永久卡死
+            # （product-architect 90 次 / consumer 35 次）。CLAUDE.md 早已声明本路存在，
+            # 实为缺失实现。
+            if not has_overflow:
+                has_overflow = _transcript_shows_overflow(role)
             if not has_overflow:
                 continue
 
@@ -400,8 +458,14 @@ class RoleLifecycleMixin:
                 health_dir=self._HEALTH_DIR, workflows=self._workflows,
             )
             return res["busy"]
-        except Exception:
-            return False
+        except Exception as _e:
+            # 探测失败 → 保守判忙。调用方的默认动作是"投递"（role_lifecycle:446
+            # 跳过排队守卫直接发、step_handler:244/357 排队判定、kick_stalled:191），
+            # 返回 False 等于"探测不了就当它空闲"→ DB 抖动一次即打穿所有忙闲门控，
+            # 正在执行任务的角色被叠加投递（正是 _KICK_COOLDOWN_SEC 注释记录的
+            # "被自己的重复指令淹没"）。安全方向是宁可漏投一轮，不可重复打扰。
+            LOGGER.warning("_is_role_busy 探测异常，保守判忙: %s (%s)", role, _e)
+            return True
 
     def _recently_producing(self, role: str) -> bool:
         """角色最近 180s 是否有 bus 产出（比 pane_active 可靠: 单 pane 恒 1）。
@@ -613,8 +677,13 @@ class RoleLifecycleMixin:
         except (ValueError, KeyError, TypeError):
             try:
                 ccs_cli = _CCS_CLI
+                # --from 不可省：缺省落到 ccs.py:128 的 default="cli"，而 cli 在
+                # user_intent_reminder._USER_SOURCES 人类白名单里 → 被当人类请求注入
+                # 提醒、写永不过期的 core.send 痕迹 → 角色被反复唤醒空转
+                # （codex 三方审查 P2-1，2026-10-17）。主路径带此参数，兜底漏了。
                 _result = _engine_mod._sp.run(
-                    ["python3", str(ccs_cli), "send", role, prompt[:2000]],
+                    ["python3", str(ccs_cli), "send", role, prompt[:2000],
+                     "--from", "workflow_engine"],
                     capture_output=True, timeout=10,
                 )
             except Exception as _e:

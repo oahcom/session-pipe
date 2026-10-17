@@ -485,10 +485,17 @@ class WorkflowLifecycleMixin:
                                          wf_id=wf_id, step_id=next_step.id)
         # 用 `is not True` 而非 not："busy"（角色忙，truthy 字符串）必须同样走失败分支，
         # 否则会跳过 _mark_step_delivery_failed 直接往下推进，把"未投递"当"已投递"。
-        # busy 是暂时态 → 下轮 advance 重发，无需回滚状态，故不 return。
-        if _delivered == "busy":
-            LOGGER.debug("advance skip: %s 角色忙，等待下轮重发", next_step.target_role)
-        elif _delivered is not True:
+        # busy 与 False 同路径回退。原注释称"busy 是暂时态 → 下轮 advance 重发"，
+        # 但该重发不存在：next_step 的状态在上面（:404）于 _send_to_role **之前**就已
+        # commit 为 notified，而 _advance_production_wf 只在当前步骤
+        # step_done_ready/completed 时被调（engine.py:854），下一步既已 notified，
+        # run_once 的首发分支（`if not step_status`）不会重走 → 角色没收到却被判
+        # 已通知，只剩 30min 超时重推兜底（codex 三方审查 P1-2，2026-10-17）。
+        # _mark_step_delivery_failed 内部判据是 `status == "notified"`，恰好适用。
+        if _delivered is not True:
+            if _delivered == "busy":
+                LOGGER.debug("advance skip: %s 角色忙，已回退 step 待下轮重推",
+                             next_step.target_role)
             self._mark_step_delivery_failed(lm, wf_id, next_step.id)
             return
         # 如果步骤有子工作流模板 → 自动创建子工作流

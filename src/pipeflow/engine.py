@@ -749,9 +749,28 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # is not True 处理三态，仅此主派发路径漏改。
                     if _delivered == "busy":
                         # 角色正忙（正常排队），非故障：不计失败、不盖戳，下一 tick 重试。
-                        # 计入会让并发实例互相判死（227 条实测）。
-                        LOGGER.debug("run_once: %s/%s 角色忙，跳过计数",
-                                     inst["instance_id"][:12], step_id)
+                        # 但**必须写排队账本**——本步 status 留空，而 _tick 的入口是
+                        # `step_status in ("notified","running")`，不写账本则 _tick 整条
+                        # 排队链（queued 计数 → _QUEUE_DEGRADE_AT 降级 → 通知 coordinator
+                        # → auto-cancel）与回收器条件4（需 timeout_count>=1 或
+                        # queued>=3）全部不可达 → 该类实例只能等 24h 全局兜底
+                        # （codex 三方审查 P1-1，2026-10-17）。写 queued 而非盖 status：
+                        # 盖 notified 会让本分支下轮不再重试投递（投递永久悬空）。
+                        _q_sr = results.get(step_id, {}) or {}
+                        results[step_id] = {
+                            **_q_sr,
+                            "queued": (_q_sr.get("queued", 0) or 0) + 1,
+                            # queued_since 只在首次排队写入：回收器据它算真实停滞起点，
+                            # 随 ts 刷新会让回收判据永远看到"刚排队"
+                            "queued_since": _q_sr.get("queued_since") or time.time(),
+                        }
+                        lm.execute(
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(results, ensure_ascii=False), inst["instance_id"])
+                        )
+                        LOGGER.debug("run_once: %s/%s 角色忙，排队 %s 次，跳过计数",
+                                     inst["instance_id"][:12], step_id,
+                                     results[step_id]["queued"])
                         continue
                     if _delivered is not True:
                         # 幂等护栏：已 notified 的 step 不再重复计数。
@@ -769,6 +788,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 达阈值设终态 delivery_blocked，停止每 tick 重刷 blocker
                         # （旧文案"已停止重试"失真：continue 仅跳本 tick，下 tick 仍重刷）
                         _reached_cap = _fail_count >= 3
+                        # status 留空是**投递重试机制本身**：run_once 的投递分支入口是
+                        # `if not step_status`，空状态才会每 tick 重试投递；写 "notified"
+                        # 会让重试永不发生（任务悬空且无终态）。投递失败的兜底是
+                        # _reached_cap 后的 delivery_blocked 终态 + blocker，不是 _tick。
                         results[step_id] = {
                             **_cur_sr,
                             "delivery_fail_count": _fail_count,
@@ -1013,8 +1036,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 sr = json.loads(row["step_results"] or "{}")
                 # 只检查当前步：历史步的遗留标记不应触发恢复
                 _cur = row["current_step_id"]
+                # isinstance 守卫：生产 DB 实测 408 行 step_results 值是非法形状
+                # （"$.s1.timeout_count" 这种 JSONPath 键 / str / int），非 dict 直接
+                # v.get 抛 AttributeError，被外层 except 吞掉 → 本函数当轮完全跳过
+                # （不是跳过该行，是整批 delivery_blocked 实例都得不到恢复），
+                # 连带让 recover_count>=3 → failed 的护栏失效。同文件 1009 与
+                # wf_lifecycle.py:101、health_check.py:39 都已有此守卫。
                 _cand = {_cur: sr[_cur]} if _cur in sr else {
-                    k: v for k, v in sr.items() if v.get("status") == "delivery_blocked"}
+                    k: v for k, v in sr.items()
+                    if isinstance(v, dict) and v.get("status") == "delivery_blocked"}
                 for step_id, step_sr in _cand.items():
                     # 兼容两种签名：未被恢复过（status=delivery_blocked）与
                     # 已被旧版恢复重置过（status='' 且 fail_count=0）
