@@ -191,6 +191,29 @@ def test_config_writing_systemctl_still_flagged():
     assert sig.violation_found, "写配置子命令应判越界，实际被放过"
     assert any("edit_config" in c for c in sig.violation_commands), sig.violation_commands
 
+def test_flag_prefixed_config_write_still_flagged():
+    """P1-1 回归: 动词前带 flag 的写配置仍须判越界。
+
+    `systemctl --user <verb>` 是本生态主导写法（~/.hermes/scripts/ 内 80 处）。
+    收窄正则若要求动词紧跟 systemctl，则 flag 前缀写配置全部漏判（reviewer
+    dev_implement/s2 CONDITIONAL_APPROVED P1-1）。
+    """
+    for cmd in ("systemctl --user disable x.service",
+                "systemctl --user enable x.timer",
+                "sudo systemctl --user mask x",
+                "systemctl --now disable x"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert sig.violation_found, f"flag 前缀写配置漏判: {cmd}"
+        assert any("edit_config" in c for c in sig.violation_commands), sig.violation_commands
+
+def test_flag_prefixed_readonly_still_not_flagged():
+    """反向控制: flag 前缀的只读查询仍不判越界（防 flag 通配过头）。"""
+    for cmd in ("systemctl --user status x.service",
+                "systemctl --user is-active x",
+                "systemctl --user show x -p TimeoutStopUSec"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert not sig.violation_found, f"flag 前缀只读查询被误判: {cmd} -> {sig.violation_commands}"
+
 
 def test_no_violation_engineer_normal_work():
     """信号3: engineer 正常写代码不触发"""

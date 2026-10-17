@@ -119,7 +119,10 @@ _SHELL_SIGNATURES: dict[str, list[str]] = {
         # engineer 排障 `systemctl status user@1000`、maintainer 恢复 `systemctl start
         # user@1000` 均被误报「越界: edit_config」，引擎反复注入停止指令卡住 s1（bus #397969/
         # #398702）。status/is-active/cat/show 是读；start/stop/restart 是生命周期（restart 归 deploy）。
-        r"\bsystemctl\s+(?:enable|disable|mask|unmask|edit|set-property|preset|"
+        # 允许动词前有可选 flags（--user/-q/--now…）：`systemctl --user disable x`
+        # 是本生态主导写法（scripts/ 内 80 处），旧式 \s+ 要求动词紧跟 systemctl
+        # → flag 前缀写配置全部漏判（reviewer P1-1，dev_implement/s2 审查）。
+        r"\bsystemctl\s+(?:--?[\w-]+\s+)*(?:enable|disable|mask|unmask|edit|set-property|preset|"
         r"link|revert|reenable)\b",
         r"\bsed -i\b.*\.(json|yaml|yml|conf|toml|ini)",
         r"\b(?:vim|vi)\b .*\.(json|yaml|yml|conf|env|toml|ini)",
