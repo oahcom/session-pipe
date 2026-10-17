@@ -443,18 +443,46 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
     def _resolve_effective_role(self, inst: dict, step, results: dict) -> str:
         """本步的实际执行角色：实例 effective_roles 覆盖优先，否则模板值。
 
-        开发角色池（DEV_ROLE_POOL / _pick_dev_role）已于 89c3c03 回滚 ——
-        投递层单点替换无法让下游状态机一致（exit_messages 过滤 / busy 门控 /
-        exit_schema 的 workspace / codex 的 cwd 都按角色取值）。回滚后本方法
-        退化为**纯读取**：只消费已持久化的 effective_roles（若有），不再自行
-        择一。保留方法名与签名是与 liveness.effective_role 同一契约。
+        开发角色池：engineer 与 pg 职责重叠（persona 描述均为"按方案编码、
+        自测、提 PR"），但主链模板写死 engineer → 实例全压 engineer、pg 闲置。
 
-        原实现引用已被删除的 _DEV_ROLE_POOL → NameError 被外层 except 吞掉
-        → 每个 tick 的生产工作流扫描整体失败（实测 2026-10-17 journal 反复
-        "生产工作流扫描异常: name '_DEV_ROLE_POOL' is not defined"）。
+        分流决定**持久化到实例的 effective_roles 列**，这是与"投递层单点替换"
+        （89c3c03 已回滚）的关键区别：下游全部按角色取值（exit_messages 过滤 /
+        busy 门控 / exit_schema 的 workspace / codex 的 cwd）。只在投递处换参数时，
+        pg 以 src=pg 写的产出因过滤条件仍是 engineer 而永不被认可 → 步骤必然超时。
+
+        择一规则：仅当目标属池且对侧空闲时重定向；已决定过则沿用（防 tick 间
+        反复横跳）；探测失败或两者都忙 → 保持模板值（宁排队不误投）。
+
+        历史坑：原实现引用被删除的 _DEV_ROLE_POOL → NameError 被外层 except
+        吞掉 → 每个 tick 的生产工作流扫描整体失败。故池常量必须与本方法同文件。
         """
         from liveness import effective_role as _eff_role
-        return _eff_role(inst, step.id, fallback=step.target_role)
+        _cur = _eff_role(inst, step.id, fallback=step.target_role)
+        if _cur != step.target_role:
+            return _cur  # 已有持久化决定 → 沿用
+        if step.target_role not in _DEV_ROLE_POOL:
+            return _cur
+        _alt = next((r for r in _DEV_ROLE_POOL if r != step.target_role), None)
+        if not _alt:
+            return _cur
+        _inst_id = inst.get("instance_id") if isinstance(inst, dict) else getattr(inst, "id", "")
+        try:
+            if self._is_role_busy(_alt, exclude_wf_id=_inst_id or "", pane_fallback=False):
+                return _cur  # 两个都忙 → 排队
+        except Exception as _e:
+            LOGGER.debug("_resolve_effective_role 探测失败，保持 %s: %s", step.target_role, _e)
+            return _cur
+        try:
+            if _inst_id:
+                self._lifecycle.execute(
+                    "UPDATE workflow_instances SET effective_roles=?, assignee=? WHERE instance_id=?",
+                    (json.dumps({step.id: _alt}, ensure_ascii=False), _alt, _inst_id))
+        except Exception as _e:
+            LOGGER.debug("effective_roles 持久化失败 %s: %s", _inst_id, _e)
+        LOGGER.info("dev pool: %s 忙 → %s/%s 改投空闲的 %s",
+                    step.target_role, str(_inst_id)[:12], step.id, _alt)
+        return _alt
 
 
     def start(self, name: str, context: dict = None, initiator: str = None) -> str:
