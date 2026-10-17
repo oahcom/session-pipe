@@ -444,6 +444,32 @@ class RoleLifecycleMixin:
         LOGGER.warning("_wait_for_role_ready: role %s not ready after %ds", role, max_wait)
         return False
 
+    # 开发角色池：职责重叠（按方案编码、自测、提 PR）的等价执行者。
+    # 主链模板写死 engineer，但 pg 同样可承接 —— 池内成员忙闲互补。
+    # 加新开发角色时只需追加此处，模板与 persona 均不动。
+    DEV_ROLE_POOL = ("engineer", "pg")
+
+    def _pick_dev_role(self, role: str, wf_id: str = "") -> str:
+        """池内成员按忙闲择一。非池内角色原样返回。
+
+        仅当`role`属池且存在另一空闲成员时才替换。判据用 exclude_wf_id=wf_id
+        与真实投递一致（本工作流自身的步骤不算占用）。
+        探测失败（异常）一律保持原角色：宁排队不误投。
+        """
+        if role not in self.DEV_ROLE_POOL:
+            return role
+        try:
+            for _cand in self.DEV_ROLE_POOL:
+                if _cand == role:
+                    continue
+                if not self._is_role_busy(_cand, exclude_wf_id=wf_id, pane_fallback=False):
+                    LOGGER.info("dev pool: %s 忙/占用 → 改投空闲的 %s (wf=%s)",
+                                role, _cand, wf_id[:12] if wf_id else "?")
+                    return _cand
+        except Exception as _e:
+            LOGGER.debug("dev pool 择一失败，保持 %s: %s", role, _e)
+        return role
+
     def _is_role_busy(self, role: str, exclude_wf_id: str = "", pane_fallback: bool = True) -> bool:
         """检查角色是否真的在工作。
 
@@ -507,6 +533,13 @@ class RoleLifecycleMixin:
         返回: True=已投递；"busy"=角色忙（正常排队，非故障，调用方不应计失败）；
               False=真失败（变量残留/角色未就绪/投递异常）。
         force=True 时跳过 pending/busy 检查，用于超时重推。"""
+
+        # 开发角色池：engineer 与 pg 职责重叠（都是"按方案编码、自测、提 PR"），
+        # 但主链模板把开发步骤全写死 engineer → 4/6 实例压在 engineer 上、pg 闲置。
+        # 在此按忙闲择一：模板不改（保持语义单一），运行时替换为真实空闲者。
+        # 只在目标"是池内成员"且另一成员空闲时替换——忙碌或探测失败一律保持原样，
+        # 避免把投递从"排队"变成"投给一个同样忙的人"。
+        role = self._pick_dev_role(role, wf_id)
         if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=False):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
@@ -528,9 +561,14 @@ class RoleLifecycleMixin:
         # 关键修复：确保角色存活并就绪，不只是 tmux 存活
         # 1. 先确保 tmux session 存活（如不存在则拉起）
         # 2. 等待角色真正就绪（有 claude 进程且非 busy）
+        #
+        # 未就绪是**临时**状态（忙/启动中/探测抖动），不是投递失败。返回 "busy"
+        # 让 engine 走排队分支（不计数、下 tick 重试）；返回 False 会被 engine 计入
+        # delivery_fail_count，3 次即灌 delivery_blocked 终态且无恢复路径
+        # —— WL-full_dev_pipeline 7/7 实例卡死 s1 的根因（实测）。
         if not self._wait_for_role_ready(role, wf_id=wf_id, step_id=step_id):
-            LOGGER.warning("_send_to_role %s: role not ready after wait, skipping", role)
-            return False
+            LOGGER.warning("_send_to_role %s: role not ready, queue for next tick", role)
+            return "busy"
 
         # /goal 前缀语义：Claude Code 把它变成**会话级 Stop hook 硬条件**，
         # 条件不满足则角色无法停止。这对"完成任务"是正确语义，对运维催办是灾难——
