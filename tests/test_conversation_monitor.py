@@ -158,6 +158,39 @@ def test_executed_command_with_echo_marker_still_flagged():
     sig = parse_conversation_signals(text, "scout")
     assert sig.violation_found, "已执行命令应判越界，实际被放过"
 
+def test_readonly_systemctl_query_not_violation():
+    """只读 systemctl 查询（排障常用）不判 edit_config 越界。
+
+    实测 2026-10-17：engineer 执行 `systemctl status user@1000` 排障被误报
+    「越界: edit_config」，引擎连发停止指令卡住工作流 s1。
+    """
+    for cmd in ("systemctl status user@1000.service --no-pager",
+                "systemctl is-active user@1000.service",
+                "systemctl cat hermes-dbus-watchdog.service",
+                "systemctl show user@1000 -p TimeoutStopUSec",
+                "systemctl list-timers --all"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert not sig.violation_found, f"只读查询被误判: {cmd} -> {sig.violation_commands}"
+
+def test_readonly_and_lifecycle_systemctl_not_edit_config():
+    """只读查询与生命周期动作（start/stop）不判 edit_config。
+
+    实测 bus #397969/#398702：`systemctl start user@1000`（maintainer 恢复动作）
+    与 `systemctl status`（排障）均被误报，引擎连发停止指令卡住工作流。
+    """
+    for cmd in ("systemctl start user@1000.service",
+                "sudo systemctl stop user@1000.service",
+                "systemctl restart hermes-gateway"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert not any("edit_config" in c for c in sig.violation_commands), \
+            f"误判 edit_config: {cmd} -> {sig.violation_commands}"
+
+def test_config_writing_systemctl_still_flagged():
+    """正向控制：写配置类 systemctl 子命令仍须判 edit_config 越界（防矫枉过正）。"""
+    sig = parse_conversation_signals("  ⎿  $ systemctl disable hermes-gateway.service\n", "engineer")
+    assert sig.violation_found, "写配置子命令应判越界，实际被放过"
+    assert any("edit_config" in c for c in sig.violation_commands), sig.violation_commands
+
 
 def test_no_violation_engineer_normal_work():
     """信号3: engineer 正常写代码不触发"""

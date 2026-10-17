@@ -114,7 +114,13 @@ _SHELL_SIGNATURES: dict[str, list[str]] = {
         r"\becho .*>.*\.py\b", r"\bcat .*>.*\.py\b",
     ],
     "edit_config": [
-        r"\bsystemctl\b(?! restart)",
+        # 只认**写配置类**子命令（enable/disable/mask/edit… 改的是 unit 配置与符号链接）。
+        # WHY: 旧式 `\bsystemctl\b(?! restart)` 把只读查询与生命周期动作也当改配置——实测
+        # engineer 排障 `systemctl status user@1000`、maintainer 恢复 `systemctl start
+        # user@1000` 均被误报「越界: edit_config」，引擎反复注入停止指令卡住 s1（bus #397969/
+        # #398702）。status/is-active/cat/show 是读；start/stop/restart 是生命周期（restart 归 deploy）。
+        r"\bsystemctl\s+(?:enable|disable|mask|unmask|edit|set-property|preset|"
+        r"link|revert|reenable)\b",
         r"\bsed -i\b.*\.(json|yaml|yml|conf|toml|ini)",
         r"\b(?:vim|vi)\b .*\.(json|yaml|yml|conf|env|toml|ini)",
         r"\bnano .*\.(json|yaml|yml|conf|env)",
