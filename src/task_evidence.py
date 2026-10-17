@@ -255,6 +255,13 @@ def _evaluate_with(db):
 
 def extract():
     db = sqlite3.connect(str(DB))
+    try:
+        return _extract_with(db)
+    finally:
+        db.close()
+
+
+def _extract_with(db):
     db.row_factory = sqlite3.Row
 
     # 1. 已完成的 task
