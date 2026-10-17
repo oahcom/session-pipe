@@ -97,8 +97,19 @@ def evaluate_and_feedback():
     只评估最近 1 小时完成的 workfow，避免重复。
     收益判定由规则引擎基于真实产出证据（bus 消息、产出文件、workflow 进度）
     独立评估，不使用标题长度等表面启发式。
+
+    连接必须关闭：本函数由引擎 daemon 每 tick 调用（task_generator.py:156），
+    原实现裸 connect 从不 close —— 实测每轮泄漏 1 个 fd，与 Blackboard 同类，
+    9 分钟累积后随引擎进程一并崩溃（2026-10-17）。
     """
     db = sqlite3.connect(str(DB))
+    try:
+        return _evaluate_with(db)
+    finally:
+        db.close()
+
+
+def _evaluate_with(db):
     db.row_factory = sqlite3.Row
     _now = time.time()
     _cutoff = _now - 3600
