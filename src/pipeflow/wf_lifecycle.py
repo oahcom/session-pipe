@@ -481,73 +481,12 @@ class WorkflowLifecycleMixin:
         # 原逻辑丢弃返回值直接盖戳 notified → 角色没收到任务却被判"已通知"，
         # 靠 timeout 兜底重推（bus #728c6e4307c1 根因）。此处据返回值回退 step
         # 状态为 pending（清 notified_at），让引擎下轮重新走 advance 重发。
-        # ── 有子链的步骤：先建子链，由子链接管；建不出才回退投主链步骤 ──
-        # 用户需求（2026-10-17）：「主链第一步生成二级工作流，二级工作流严格要求
-        # 该角色完成任务」—— 主链步骤是容器，干活的是子链。原顺序（先投主链 →
-        # 角色变忙 → 守卫必然命中 → 子链永不创建）实测让 11/12 条带 subflow 的链
-        # 零子链（WL-full_dev_pipeline 历史最佳 0/6 步）。
-        if next_step.subflow_template:
-            try:
-                # 防重：DB 中该步骤已有 subflow_id → 不重复创建
-                # （否则每 tick 推进同一历史步骤都会新建 subflow，垃圾任务堆积）
-                with lm._conn_tx() as conn2:
-                    _db_sr = conn2.execute(
-                        "SELECT step_results FROM workflow_instances WHERE instance_id=?",
-                        (wf_id,)).fetchone()
-                    _db_sdata = (json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"]
-                                 else {}).get(next_step.id, {})
-                    if isinstance(_db_sdata, dict) and _db_sdata.get("subflow_id"):
-                        return
-                    # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
-                    # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
-                    # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
-                    #
-                    # 判据（2026-10-17 修正）：只排除**本主链自身的占用**。
-                    # 沿用 exclude="" 会把"本主链刚投递本步"也算成忙 → 恒真 →
-                    # 子链永不创建（实测 11/12 条带 subflow 的链零子链，
-                    # WL-full_dev_pipeline 历史最佳 0/6 步）。
-                    # exclude_wf_id=wf_id：角色被**别的**工作流占用仍跳过（防争抢），
-                    # 仅本主链的占用不阻止。
-                    if self._is_role_busy(next_step.target_role, exclude_wf_id=wf_id,
-                                          pane_fallback=False):
-                        LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
-                                    next_step.target_role, next_step.subflow_template)
-                        return
-                    # 模板名兼容：同仓两条命名并存（裸名 architect_full_design /
-                    # WF- 前缀 WF-architect_full_design，见 manager.py:174 同款回退）。
-                    # 只按裸名查会让 WL-full_dev_pipeline 这类"裸名声明 + WF- 注册"
-                    # 的组合静默失配 → 子链永不创建 → 主链停在首步（实测该链
-                    # 历史最佳 0/6 步，7+ 实例全部 delivery_blocked @s1）。
-                    _sub_wf = (self._workflows.get(next_step.subflow_template)
-                               or self._workflows.get(f"WF-{next_step.subflow_template}"))
-                    if _sub_wf and _sub_wf.steps and _sub_wf.steps[0].target_role == next_step.target_role:
-                        _prev_done = ""
-                        if idx >= 0:
-                            _prev_done = results.get(step_id, {}).get("completed_by", "")
-                        if not _prev_done:
-                            _prev_wf = conn2.execute("SELECT assigner FROM workflow_instances WHERE instance_id=?", (wf_id,)).fetchone()
-                            _prev_done = _prev_wf["assigner"] if _prev_wf else "pm"
-                        _task_id = f"task_sub_{uuid.uuid4().hex[:8]}"
-                        _wf_id = f"wf_sub_{uuid.uuid4().hex[:12]}"
-                        conn2.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
-                            (_task_id, f"{wf_name}/{next_step.id}: {next_step.title}", task_desc, _prev_done, next_step.target_role, time.time(), time.time(), next_step.subflow_template))
-                        # 兼容迁移前的表（template_id 列可能缺失）——子工作流 tasks 行的 template_id
-                        # 只做溯源用途，缺列时静默降级为 parent_task_id 记录父工作流（2026-08-10 观测）
-                        try:
-                            conn2.execute("SELECT template_id FROM tasks LIMIT 1")
-                        except Exception:
-                            conn2.execute("UPDATE tasks SET parent_task_id=? WHERE task_id=?", (wf_id, _task_id))
-                            conn2.commit()
-                        conn2.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at,parent_wf_id,subflow_source_step_id) VALUES (?,?,?,?,?,'pending','s1',?,?,?,?)",
-                            (_wf_id, next_step.subflow_template, _task_id, _prev_done, next_step.target_role, json.dumps({}), time.time(), wf_id, next_step.id))
-                        conn2.commit()
-                        new_results[next_step.id]["subflow_id"] = _wf_id
-                        conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                            (json.dumps(new_results, ensure_ascii=False), wf_id))
-                        conn2.commit()
-                        return  # 子链已接管：不投主链步骤
-            except Exception as _e:
-                LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
+        # 有子链的步骤：先建子链，由子链接管；建不出才回退投主链步骤。
+        # 用户需求：「主链第一步生成二级工作流，二级工作流严格要求该角色完成任务」。
+        if next_step.subflow_template and self._subflow_takeover(
+                lm, wf_id, wf_name, next_step, idx, results, step_id):
+            return  # 子链已接管：不投主链步骤
+
         _delivered = self._send_to_role(next_step.target_role, prompt,
                                          wf_id=wf_id, step_id=next_step.id)
         # 用 `is not True` 而非 not："busy"（角色忙，truthy 字符串）必须同样走失败分支，
@@ -565,6 +504,87 @@ class WorkflowLifecycleMixin:
                              next_step.target_role)
             self._mark_step_delivery_failed(lm, wf_id, next_step.id)
             return
+
+
+    def _subflow_takeover(self, lm, wf_id: str, wf_name: str, tgt_step,
+                          idx: int, results: dict, prev_prev_step_id: str) -> bool:
+        """为即将投递的步骤创建二级工作流（子链）。True = 子链已接管该步。
+
+        WHY 顺序：原实现把子链创建放在 _send_to_role **之后** → 角色刚被投递
+        即判忙 → 紧随的 _is_role_busy 守卫必然命中 → 子链永不创建。实测
+        11/12 条带 subflow 的链零子链（WL-full_dev_pipeline 历史最佳 0/6 步）。
+
+        用户需求：「主链第一步生成二级工作流，二级工作流严格要求该角色完成
+        任务」—— 主链步骤是容器，干活的是子链。首步（engine.py run_once 的
+        `if not step_status` 分支）与推进步（_advance_production_wf）是两条
+        独立投递路径，都需调用本方法。
+        """
+        try:
+            # 防重：DB 中该步骤已有 subflow_id → 不重复创建
+            # （否则每 tick 推进同一历史步骤都会新建 subflow，垃圾任务堆积）
+            with lm._conn_tx() as conn2:
+                _db_sr = conn2.execute(
+                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                    (wf_id,)).fetchone()
+                _db_sdata = (json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"]
+                             else {}).get(tgt_step.id, {})
+                if isinstance(_db_sdata, dict) and _db_sdata.get("subflow_id"):
+                    return
+                # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
+                # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
+                # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
+                #
+                # 判据（2026-10-17 修正）：只排除**本主链自身的占用**。
+                # 沿用 exclude="" 会把"本主链刚投递本步"也算成忙 → 恒真 →
+                # 子链永不创建（实测 11/12 条带 subflow 的链零子链，
+                # WL-full_dev_pipeline 历史最佳 0/6 步）。
+                # exclude_wf_id=wf_id：角色被**别的**工作流占用仍跳过（防争抢），
+                # 仅本主链的占用不阻止。
+                if self._is_role_busy(tgt_step.target_role, exclude_wf_id=wf_id,
+                                      pane_fallback=False):
+                    LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
+                                tgt_step.target_role, tgt_step.subflow_template)
+                    return
+                # 模板名兼容：同仓两条命名并存（裸名 architect_full_design /
+                # WF- 前缀 WF-architect_full_design，见 manager.py:174 同款回退）。
+                # 只按裸名查会让 WL-full_dev_pipeline 这类"裸名声明 + WF- 注册"
+                # 的组合静默失配 → 子链永不创建 → 主链停在首步（实测该链
+                # 历史最佳 0/6 步，7+ 实例全部 delivery_blocked @s1）。
+                _sub_wf = (self._workflows.get(tgt_step.subflow_template)
+                           or self._workflows.get(f"WF-{tgt_step.subflow_template}"))
+                if _sub_wf and _sub_wf.steps and _sub_wf.steps[0].target_role == tgt_step.target_role:
+                    _prev_done = ""
+                    if idx >= 0:
+                        _prev_done = results.get(prev_step_id, {}).get("completed_by", "")
+                    if not _prev_done:
+                        _prev_wf = conn2.execute("SELECT assigner FROM workflow_instances WHERE instance_id=?", (wf_id,)).fetchone()
+                        _prev_done = _prev_wf["assigner"] if _prev_wf else "pm"
+                    _task_id = f"task_sub_{uuid.uuid4().hex[:8]}"
+                    _wf_id = f"wf_sub_{uuid.uuid4().hex[:12]}"
+                    conn2.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
+                        # 子链任务描述：用步骤自身信息（方法内无调用方的 task_desc 作用域）
+                        (_task_id, f"{wf_name}/{tgt_step.id}: {tgt_step.title}",
+                         f"{tgt_step.title}\n{(getattr(tgt_step, 'prompt_template', '') or '')[:500]}",
+                         _prev_done, tgt_step.target_role, time.time(), time.time(), tgt_step.subflow_template))
+                    # 兼容迁移前的表（template_id 列可能缺失）——子工作流 tasks 行的 template_id
+                    # 只做溯源用途，缺列时静默降级为 parent_task_id 记录父工作流（2026-08-10 观测）
+                    try:
+                        conn2.execute("SELECT template_id FROM tasks LIMIT 1")
+                    except Exception:
+                        conn2.execute("UPDATE tasks SET parent_task_id=? WHERE task_id=?", (wf_id, _task_id))
+                        conn2.commit()
+                    conn2.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at,parent_wf_id,subflow_source_step_id) VALUES (?,?,?,?,?,'pending','s1',?,?,?,?)",
+                        (_wf_id, tgt_step.subflow_template, _task_id, _prev_done, tgt_step.target_role, json.dumps({}), time.time(), wf_id, tgt_step.id))
+                    conn2.commit()
+                    new_results[tgt_step.id]["subflow_id"] = _wf_id
+                    conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                        (json.dumps(new_results, ensure_ascii=False), wf_id))
+                    conn2.commit()
+                    return True   # 子链已接管
+        except Exception as _e:
+            LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
+        return False
+
 
     def _mark_step_delivery_failed(self, lm, wf_id: str, step_id: str):
         """投递失败回退：清掉 notified_at，把该 step 状态归 pending。

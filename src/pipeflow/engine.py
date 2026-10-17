@@ -739,6 +739,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # → 守卫形同虚设。实测 2026-10-16：pytest fixture 的 "test" 任务
                     # 覆盖了 scout/engineer 的真实 TASKS.md（16:22:50/52）。
                     prompt = prompt.replace("{workspace_summary}", self._collect_workspace_summary(Path.home() / "ccs-workspaces" / step.target_role) if hasattr(self,'_collect_workspace_summary') else "")
+                    # ── 首步有子链：先建子链，由子链接管；建不出才投主链步骤 ──
+                    # 用户需求：「主链第一步生成二级工作流」——首步与推进步是两条
+                    # 独立投递路径，此前只有推进步（wf_lifecycle）有子链逻辑，
+                    # 首步从不生成子链（实测 s1 恒无子链）。
+                    if step.subflow_template and self._subflow_takeover(
+                            lm, inst["instance_id"], wf_name, step, -1, results, step_id):
+                        self._sync_step_results(inst["instance_id"], results)
+                        continue   # 子链已接管
+
                     _delivered = self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 仅当真实投递成功才盖戳 notified；投递被并发守卫/变量校验拦截时
                     # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
