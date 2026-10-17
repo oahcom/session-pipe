@@ -444,31 +444,8 @@ class RoleLifecycleMixin:
         LOGGER.warning("_wait_for_role_ready: role %s not ready after %ds", role, max_wait)
         return False
 
-    # 开发角色池：职责重叠（按方案编码、自测、提 PR）的等价执行者。
-    # 主链模板写死 engineer，但 pg 同样可承接 —— 池内成员忙闲互补。
-    # 加新开发角色时只需追加此处，模板与 persona 均不动。
-    DEV_ROLE_POOL = ("engineer", "pg")
-
-    def _pick_dev_role(self, role: str, wf_id: str = "") -> str:
-        """池内成员按忙闲择一。非池内角色原样返回。
-
-        仅当`role`属池且存在另一空闲成员时才替换。判据用 exclude_wf_id=wf_id
-        与真实投递一致（本工作流自身的步骤不算占用）。
-        探测失败（异常）一律保持原角色：宁排队不误投。
-        """
-        if role not in self.DEV_ROLE_POOL:
-            return role
-        try:
-            for _cand in self.DEV_ROLE_POOL:
-                if _cand == role:
-                    continue
-                if not self._is_role_busy(_cand, exclude_wf_id=wf_id, pane_fallback=False):
-                    LOGGER.info("dev pool: %s 忙/占用 → 改投空闲的 %s (wf=%s)",
-                                role, _cand, wf_id[:12] if wf_id else "?")
-                    return _cand
-        except Exception as _e:
-            LOGGER.debug("dev pool 择一失败，保持 %s: %s", role, _e)
-        return role
+    # 开发角色池（DEV_ROLE_POOL / _pick_dev_role）已删除 —— 见 _send_to_role
+    # 处注释：投递层单点替换无法让下游步骤状态机一致，需在步骤/模板层实现。
 
     def _is_role_busy(self, role: str, exclude_wf_id: str = "", pane_fallback: bool = True) -> bool:
         """检查角色是否真的在工作。
@@ -536,22 +513,13 @@ class RoleLifecycleMixin:
 
         # 开发角色池：engineer 与 pg 职责重叠（都是"按方案编码、自测、提 PR"），
         # 但主链模板把开发步骤全写死 engineer → 4/6 实例压在 engineer 上、pg 闲置。
-        # 在此按忙闲择一：模板不改（保持语义单一），运行时替换为真实空闲者。
-        # 只在目标"是池内成员"且另一成员空闲时替换——忙碌或探测失败一律保持原样，
-        # 避免把投递从"排队"变成"投给一个同样忙的人"。
-        _orig_role = role
-        role = self._pick_dev_role(role, wf_id)
-        if role != _orig_role and wf_id:
-            # 归属跟随实际执行者：assignee 列被背压计数（task_generator 按 assignee
-            # 数 running 实例控配额）与任务生成消费。只换投递目标而不改这里，
-            # 会让 pg 收到的负载仍计在 engineer 头上 → 两边配额都失真。
-            # 仅在真发生分流时写，失败不影响投递（背压不准比丢任务轻）。
-            try:
-                self._lifecycle.execute(
-                    "UPDATE workflow_instances SET assignee=? WHERE instance_id=?",
-                    (role, wf_id))
-            except Exception as _ae:
-                LOGGER.debug("dev pool assignee 同步失败 %s: %s", wf_id[:12], _ae)
+        #
+        # 已回滚（ac76b9b/4c966bc）：只换投递目标而不改步骤状态读取，会在下游制造
+        # 更严重的不一致 —— exit_messages 按 step.target_role 过滤（pg 的产出永不被
+        # 认可 → 步骤超时）、busy 门控看 engineer（pg 的工作不可见）、exit_schema
+        # 校验 engineer 的 workspace 而产出落在 pg（校验必失败）。
+        # 三方审查结论：要么把重定向持久化到步骤定义（改 step.target_role），
+        # 并在步骤状态机内完成，要么不做。半途实现比不做更糟。
         if not force and wf_id and self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=False):
             LOGGER.info("send-to-role %s 跳过: 有其他 workflow 在进行中 (wf=%s step=%s)",
                         role, wf_id[:12], step_id)
@@ -575,9 +543,9 @@ class RoleLifecycleMixin:
         # 2. 等待角色真正就绪（有 claude 进程且非 busy）
         #
         # 未就绪是**临时**状态（忙/启动中/探测抖动），不是投递失败。返回 "busy"
-        # 让 engine 走排队分支（不计数、下 tick 重试）；返回 False 会被 engine 计入
-        # delivery_fail_count，3 次即灌 delivery_blocked 终态且无恢复路径
-        # —— WL-full_dev_pipeline 7/7 实例卡死 s1 的根因（实测）。
+        # 让 engine 走排队分支（不计数、下 tick 重试）；返回 False 会被 engine
+        # 计入 delivery_fail_count，3 次即灌 delivery_blocked 终态且无恢复路径
+        # （该方法唯一的 False 路径是 90s 空转超时，见 _wait_for_role_ready 末尾）。
         if not self._wait_for_role_ready(role, wf_id=wf_id, step_id=step_id):
             LOGGER.warning("_send_to_role %s: role not ready, queue for next tick", role)
             return "busy"
