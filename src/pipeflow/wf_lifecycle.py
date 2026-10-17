@@ -590,9 +590,14 @@ class WorkflowLifecycleMixin:
                     conn2.execute("INSERT OR IGNORE INTO workflow_instances (instance_id,template_id,task_id,assigner,assignee,status,current_step_id,step_results,created_at,parent_wf_id,subflow_source_step_id) VALUES (?,?,?,?,?,'pending','s1',?,?,?,?)",
                         (_wf_id, tgt_step.subflow_template, _task_id, _prev_done, tgt_step.target_role, json.dumps({}), time.time(), wf_id, tgt_step.id))
                     conn2.commit()
-                    new_results[tgt_step.id]["subflow_id"] = _wf_id
+                    # 写 subflow_id 到该步骤的 step_results。用方法参数 results，
+                    # **不是** _advance_production_wf 的局部 new_results —— 那是
+                    # 另一个作用域，方法内引用会 NameError 被 except 吞掉，
+                    # 导致子链创建静默失败（实测生产 journal：
+                    # "subflow creation failed: name 'new_results' is not defined"）。
+                    results.setdefault(tgt_step.id, {})["subflow_id"] = _wf_id
                     conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                        (json.dumps(new_results, ensure_ascii=False), wf_id))
+                        (json.dumps(results, ensure_ascii=False), wf_id))
                     conn2.commit()
                     return True   # 子链已接管
         except Exception as _e:
