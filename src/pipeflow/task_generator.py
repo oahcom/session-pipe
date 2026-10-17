@@ -431,16 +431,7 @@ class TaskGeneratorMixin:
             except Exception as _e:
                 # 不再静默：去重失效 = 事件洪水无闸门，必须在日志可见
                 LOGGER.warning("auto-task title 去重检查失败（降级为不去重）: %s", _e)
-            _prompt = (
-                f"/goal\n\n"
-                f"## 任务\n执行工作流模板 {_wf_name}\n\n"
-                f"## 描述\n{_wf.description}\n\n"
-                f"## 步骤\n"
-            )
-            for _s in _wf.steps:
-                _prompt += f"  {_s.id}: {_s.title}\n"
-            if _wf.quality_standards:
-                _prompt += f"\n## 质量标准\n{_wf.quality_standards}\n"
+            # 原 _prompt 构造块已删除：只赋值从不使用，且内含 /goal 死路径 (task_generator.py:434-443)
 
             # 4) 直接启动工作流——绕过路由 daemon 直接创建 task + workflow_instance
             # _can_assign_role 已检测 tmux 会话存活
@@ -515,25 +506,19 @@ class TaskGeneratorMixin:
         if _tmux_has_session(role, timeout=5) is not True:
             return False
         # L2: thinking 信号（health 文件 survival_l2_thinking）。health 文件缺失时
-        # （available=False）降级回 pane_activity 60s 检查，保留原语义兜底——
+        # （available=False）降级回 pane 活跃检查，保留原语义兜底——
         # 否则自动任务生成从"60s 活跃拦截"退化为"无条件放行"（review P1-2 修复）。
         res = role_liveness(role, level=1)
         if res["busy"]:
             return False
         if res.get("signals", {}).get(1, {}).get("available"):
             return True  # health 信号可用且不忙
-        # 降级：health 文件缺失 → pane_activity 60s 兜底（原 _can_assign_role L2 语义）
-        try:
-            _pr = _engine_mod._sp.run(["tmux", "list-panes", "-t", f"ccs-{role}",
-                           "-F", "#{pane_activity}"],
-                          capture_output=True, text=True, timeout=3)
-            if _pr.returncode == 0 and _pr.stdout.strip():
-                _val = _pr.stdout.strip().split("\n")[0]
-                if _val and _val != "0" and time.time() - float(_val) < 60:
-                    return False
-        except Exception as _e:
-            # D1 修复: pane_activity 解析失败返回 False（保守），
-            # 防 tmux 异常导致角色误判空闲 → 重复分配任务
-            LOGGER.debug("_can_assign_role pane_activity fallback failed: %s", _e)
-            return False
-        return True
+        # 降级：health 文件缺失 → pane 最近有无输出（原 _can_assign_role L2 语义）。
+        # 原实现直接跑 `tmux list-panes -F #{pane_activity}`，该格式在 tmux 3.4
+        # 恒为空串（实测），故条件恒不成立 → 返回 False → 角色永久不可分配任务。
+        # 改调 liveness.tmux_pane_active()：同一信号源，#{window_activity} 已实测有效。
+        from liveness import tmux_pane_active
+        _active = tmux_pane_active(role, timeout=3)
+        if _active is None:
+            return True  # 探测不可用 → 不阻断（与 liveness 的 available=False 放行一致）
+        return not _active  # 近期有输出 = 在干活 → 不可分配

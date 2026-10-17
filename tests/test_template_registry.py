@@ -204,12 +204,7 @@ def test_upsert_rejects_bad_structure():
 
 # ── 10. 双节点端到端闭环（完整推进链） ──
 def test_dual_node_full_cycle():
-    """start → run_once → complete_step(s1) → run_once → 引擎推进到 s2。
-
-    模板首步即 s1（dual_node，无 s0）。沙箱内 completion_check 文件新鲜时，
-    引擎在首次 run_once 的同一 tick 内标记 notified 并完成第一节点
-    （node1_done + 发 codex 审查指令），再等 node2 消息后才推进。
-    """
+    """start → run_once → complete_step(s0) → run_once(s1 dual_node) → complete_step(s1) → run_once → 引擎推进。验证完整生命周期。"""
     import sys as _sys, logging as _logging, json as _json
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     _logging.disable(_logging.CRITICAL)
@@ -238,24 +233,30 @@ def test_dual_node_full_cycle():
         eng = WorkflowEngine(workflows_dir=wf_dir, db_path=str(Path(tmp) / "t.db"))
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = b"pid=123"
-        mock_result.stderr = b""
+        # str 而非 bytes：调用方普遍传 text=True，tmux 探测（liveness.tmux_pane_active）
+        # 会解析 stdout 里的时间戳，bytes 会抛 TypeError。
+        mock_result.stdout = "pid=123"
+        mock_result.stderr = ""
         with patch("subprocess.run", return_value=mock_result),              patch.object(eng, "_ensure_role_alive", return_value=True):
             wf_id = eng.start("food_chain_loop", {"source": "test", "loop_iteration": 1})
-            # 第一次 run_once: 处理首步 s1 (dual_node) — 沙箱 SCOUT_REPORT.md 新鲜，
-            # completion_check 在同一 tick 内直接完成第一节点
+            # 第一次 run_once: 处理 s0 (非 dual_node)，标记 notified
             eng.run_once()
             _sr0 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
-            assert _sr0.get("s1", {}).get("status") == "notified", \
-                "第一次 run_once 应通知 s1 并标记 notified"
-            assert _sr0.get("s1", {}).get("node1_done") is True, \
-                "第一次 run_once 应完成 dual_node 第一节点 node1_done"
-            assert _sr0.get("s1", {}).get("node2_sent") is True, \
-                "第一次 run_once 应发送 codex review 指令（第二节点）"
+            assert _sr0.get("s0", {}).get("status") == "notified", "第一次 run_once 应完成 s0 并标记 notified"
 
-            # 完成 s1（第二节点消息已到）
-            r0 = eng._lifecycle.complete_step(wf_id, "s1")
-            assert r0 in ("step_done_ready", "completed_and_advanced"), f"s1 应完成并推进: {r0}"
+            # 完成 s0，推进到 s1 (dual_node)
+            r0 = eng._lifecycle.complete_step(wf_id, "s0")
+            assert r0 in ("step_done_ready", "completed_and_advanced"), f"s0 应完成并推进: {r0}"
+
+            # 第二次 run_once: 处理 s1 (dual_node)，标记 node1_done + 发送 codex review
+            eng.run_once()
+            _sr1 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
+            assert _sr1.get("s1", {}).get("node1_done") is True, "第二次 run_once 应完成 dual_node 第一步 node1_done"
+            assert _sr1.get("s1", {}).get("node2_sent") is True, "第二次 run_once 应发送 codex review 指令"
+
+            # 完成 s1
+            r2 = eng._lifecycle.complete_step(wf_id, "s1")
+            assert r2 in ("step_done_ready", "completed_and_advanced"), f"第二步应完成: {r2}"
             eng.run_once()
             rows = eng._lifecycle.query(
                 "SELECT current_step_id FROM workflow_instances WHERE instance_id=?", (wf_id,))
