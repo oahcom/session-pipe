@@ -527,7 +527,13 @@ class WorkflowLifecycleMixin:
                         LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
                                     next_step.target_role, next_step.subflow_template)
                         return
-                    _sub_wf = self._workflows.get(next_step.subflow_template)
+                    # 模板名兼容：同仓两条命名并存（裸名 architect_full_design /
+                    # WF- 前缀 WF-architect_full_design，见 manager.py:174 同款回退）。
+                    # 只按裸名查会让 WL-full_dev_pipeline 这类"裸名声明 + WF- 注册"
+                    # 的组合静默失配 → 子链永不创建 → 主链停在首步（实测该链
+                    # 历史最佳 0/6 步，7+ 实例全部 delivery_blocked @s1）。
+                    _sub_wf = (self._workflows.get(next_step.subflow_template)
+                               or self._workflows.get(f"WF-{next_step.subflow_template}"))
                     if _sub_wf and _sub_wf.steps and _sub_wf.steps[0].target_role == next_step.target_role:
                         _prev_done = ""
                         if idx >= 0:
