@@ -749,11 +749,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # is not True 处理三态，仅此主派发路径漏改。
                     if _delivered == "busy":
                         # 角色正忙（正常排队），非故障：不计失败、不盖戳，下一 tick 重试。
-                        # 但**必须写排队账本**——本步 status 留空，而 _tick 的入口是
-                        # `step_status in ("notified","running")`，不写账本则 _tick 整条
-                        # 排队链（queued 计数 → _QUEUE_DEGRADE_AT 降级 → 通知 coordinator
-                        # → auto-cancel）与回收器条件4（需 timeout_count>=1 或
-                        # queued>=3）全部不可达 → 该类实例只能等 24h 全局兜底
+                        # 但**必须写排队账本**——本步 status 留空（投递重试所需），
+                        # 而回收器条件4 的判据要求 `timeout_count>=1` 或
+                        # `queued>=_QUEUE_DEGRADE_AT 且停滞>1h`，两者都只在 _tick 内累加，
+                        # 而 _tick 入口是 `step_status in ("notified","running")` ——
+                        # 不写账本则该实例对回收器完全不可见，只能等 24h 全局阈值
                         # （codex 三方审查 P1-1，2026-10-17）。写 queued 而非盖 status：
                         # 盖 notified 会让本分支下轮不再重试投递（投递永久悬空）。
                         _q_sr = results.get(step_id, {}) or {}
