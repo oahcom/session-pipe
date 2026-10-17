@@ -728,10 +728,18 @@ class TemplateRegistry:
                 if isinstance(_allowed_exe, list) and assignee not in _allowed_exe:
                     continue
 
-            # 计算匹配度
+            # 计算匹配度。description 一并参与：trigger_scene 是内部行话
+            # （"产品经理需求拆解"），而角色/用户输入是自然需求（"做一个高质量
+            # 网页"），两者 2-gram 无交集 → 推荐为空 → create_task_v2 抛"无法匹配
+            # 模板" → 建流入口物理不可用（实测 2026-10-17）。description 是自然语言
+            # （"新功能开发、架构改造"），能把需求词对上。
+            _haystack = [str(ts) for ts in trigger_scenes]
+            _desc = tpl.get("description")
+            if _desc:
+                _haystack.append(str(_desc))
             score = 0
-            for ts in trigger_scenes:
-                ts_lower = str(ts).lower()
+            for ts in _haystack:
+                ts_lower = ts.lower()
                 if scenario_lower == ts_lower:
                     score += 10  # 完全匹配
                 elif scenario_lower in ts_lower or ts_lower in scenario_lower:
