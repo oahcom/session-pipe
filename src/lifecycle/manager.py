@@ -1180,6 +1180,11 @@ class LifecycleManager:
             ("workflow_instances", "context", "TEXT DEFAULT '{}'"),
             ("workflow_instances", "parent_wf_id", "TEXT"),
             ("workflow_instances", "subflow_source_step_id", "TEXT"),
+            # 步骤-角色重定向持久化（如 engineer↔pg 开发角色池按忙闲择一）。
+            # 存在实例级而非改 step.target_role：模板是权威定义不动，且分流决定
+            # 需随实例存活、对下游全部消费点可见（exit_messages 过滤、busy 门控、
+            # exit_schema 校验目录、codex cwd 等 20+ 处）。JSON: {"s4": "pg"}
+            ("workflow_instances", "effective_roles", "TEXT DEFAULT '{}'"),
             ("tasks", "parent_task_id", "TEXT"),
             ("tasks", "template_id", "TEXT"),
         ]:

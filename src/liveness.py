@@ -111,6 +111,32 @@ def _row_get(row, key: str, idx: int):
     return row[idx] if len(row) > idx else None
 
 
+def effective_role(inst: dict, step_id: str, fallback: str = "") -> str:
+    """取步骤的实际执行角色：实例的 effective_roles 覆盖优先，否则回退模板值。
+
+    背景：engineer 与 pg 是等价开发角色（persona 描述均为"按方案编码、自测、
+    提 PR"），但主链模板写死 engineer → 实例全压 engineer、pg 闲置。分流决定
+    必须**随实例持久化**才能在全部消费点一致生效：exit_messages 按角色过滤、
+    busy 门控、exit_schema 校验的 workspace、codex review 的 cwd 等 20+ 处。
+    在投递层单点替换已被三方审查证明会在下游制造更严重的不一致（"pg 写的产出
+    永不被认可 → 步骤必然超时"）。
+
+    inst 可以是 dict（DB 行）或任何带 effective_roles/step_results 的对象。
+    """
+    if inst is None:
+        return fallback
+    _er = inst.get("effective_roles") if isinstance(inst, dict) else getattr(inst, "effective_roles", None)
+    if isinstance(_er, str):
+        import json as _json
+        try:
+            _er = _json.loads(_er or "{}")
+        except (ValueError, TypeError):
+            _er = {}
+    if isinstance(_er, dict) and _er.get(step_id):
+        return _er[step_id]
+    return fallback
+
+
 def _s3_assigned(role: str, db_conn=None, **opts) -> dict:
     """L3: 有活跃工作流记录。DB pending/running（同 WorkflowClient.check_task）。"""
     if db_conn is None:

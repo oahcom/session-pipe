@@ -117,6 +117,26 @@ class StepHandlerMixin:
         _v = run.step_results.get(step.id, {})
         return _v if isinstance(_v, dict) else {}
 
+    def _eff_role(self, run, step) -> str:
+        """步骤的实际执行角色：实例 effective_roles 覆盖优先，否则模板值。
+
+        engineer/pg 是等价开发角色，但主链模板写死 engineer → 实例全压
+        engineer、pg 闲置。分流决定必须随实例持久化，否则下游消费点
+        （exit_messages 过滤 / busy 门控 / exit_schema 的 workspace /
+        codex cwd）会按模板角色判，而产出落在另一角色处 → 步骤必超时。
+        """
+        from liveness import effective_role as _er
+        _inst = getattr(run, "_inst_row", None) or getattr(run, "effective_roles", None)
+        if _inst is None and hasattr(run, "id") and getattr(self, "_lifecycle", None):
+            try:
+                _rows = self._lifecycle.query(
+                    "SELECT effective_roles FROM workflow_instances WHERE instance_id=?",
+                    (run.id,))
+                _inst = _rows[0] if _rows else None
+            except Exception:
+                _inst = None
+        return _er(_inst, step.id, fallback=step.target_role)
+
     def _tick(self, run: WorkflowRun, step: Step):
         """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
@@ -128,6 +148,10 @@ class StepHandlerMixin:
         text_filter = ec.get("text_contains", "")
         timeout = ec.get("timeout_minutes", 30) * 60
         max_retries = step.max_retries
+        # 实际执行角色（实例 effective_roles 覆盖优先）。tick 开头解析一次，
+        # 避免每一处消费点各自查 DB；engineer↔pg 等等价角色池的分流决定
+        # 存在实例上，必须让本函数内全部判定（exit 过滤/busy/workspace）一致。
+        _eff = self._eff_role(run, step)
 
         # ── 双锚点：persisted.poll_since 与 bus_anchor，避免 tick 内消息被跳 ──
         # bus_anchor：永久记录已匹配消息的时间戳，只增不减；poll_since：轮询游标，仅在 exit_condition 匹配后同步
@@ -169,7 +193,7 @@ class StepHandlerMixin:
         #   idle_complaint → 发提醒（不 cancel）
         #   violation      → 注入停止指令（越界操作）
         try:
-            sig = get_conversation_signal(step.target_role)
+            sig = get_conversation_signal(_eff)
         except Exception as _e:
             LOGGER.debug("conversation_monitor 信号获取失败: %s", _e)
             sig = None
@@ -264,7 +288,7 @@ class StepHandlerMixin:
         if elapsed >= timeout:
             # 角色忙（有其他任务执行中）→ 排队语义：不递增 timeout_count，
             # 仅延长响应窗口（避免"忙时被塞任务→未响应→超时回收"的假阳性）
-            if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
+            if self._is_role_busy(_eff, exclude_wf_id=run.id):
                 # 角色忙 ≠ 任务未完成：先做 exit 匹配，产出已存在则直接推进
                 # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
                 if cat:
@@ -307,17 +331,17 @@ class StepHandlerMixin:
                 if _queued >= 6:
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} "
-                        f"排队 {_queued} 次仍未响应（角色 {step.target_role} 活跃但可能卡死），请介入",
+                        f"排队 {_queued} 次仍未响应（角色 {_eff} 活跃但可能卡死），请介入",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                     # 排队上限 = 角色被其他工作流占用，子链无法执行 → auto-cancel
                     if _queued >= 10:
                         LOGGER.warning("auto-cancel subflow: %s queued=%d，角色 %s 活跃占用",
-                                       run.id[:12], _queued, step.target_role)
+                                       run.id[:12], _queued, _eff)
                         try:
                             self._lifecycle.close_wf(run.id, status="cancelled")
                             self._bb.write("workflow",
                                 f"[workflow] {run.workflow_name} 排队超限自动取消: "
-                                f"角色 {step.target_role} 被其他工作流占用，"
+                                f"角色 {_eff} 被其他工作流占用，"
                                 f"排队 {_queued} 次后自动回收",
                                 src="workflow_engine")
                         except Exception as _cancel_e:
@@ -389,11 +413,11 @@ class StepHandlerMixin:
             # 注意：此处在完整性阶段的 if not cat: return 之后，_integ_state 需重新读取
             _integ_retry_guard = _integ_load({step.id: self._step_sd(run, step)}, step.id)
             if timeout_count == 1 and not _integ_retry_guard.pending and not _integ_retry_guard.complete:
-                if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
+                if self._is_role_busy(_eff, exclude_wf_id=run.id):
                     # 角色在忙，延长超时窗口：通知 coordinator 而非重推
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} "
-                        f"超时1次但{step.target_role}忙碌（有其他任务执行中），自动排队等待",
+                        f"超时1次但{_eff}忙碌（有其他任务执行中），自动排队等待",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                 else:
                     # 重推必须走 _fill_prompt_vars：直接投 prompt_template 会把
@@ -411,7 +435,7 @@ class StepHandlerMixin:
                     _rt_idx = next((i for i, s in enumerate(_rt_wf.steps) if s.id == step.id), -1) if _rt_wf else -1
                     _rt_prev = _rt_wf.steps[_rt_idx - 1].id if _rt_wf and _rt_idx > 0 else ""
                     self._send_to_role(
-                        step.target_role,
+                        _eff,
                         self._fill_prompt_vars(
                             step.prompt_template, step, run.workflow_name,
                             _rt_title, _rt_desc, run.step_results, _rt_prev),
@@ -424,7 +448,7 @@ class StepHandlerMixin:
                     try:
                         self._bb.write("monitor_audit",
                             f"决策: 轮次超时 → {run.workflow_name}/{run.current_step} "
-                            f"step={step.id} role={step.target_role} 超时 {timeout}s，已重推+升级",
+                            f"step={step.id} role={_eff} 超时 {timeout}s，已重推+升级",
                             src="workflow_engine")
                     except Exception:
                         LOGGER.debug("monitor_audit write failed for %s/%s", run.workflow_name, step.id)
@@ -478,7 +502,7 @@ class StepHandlerMixin:
                 # 仅超时后才查（内含 DB 查询，避免每 tick 开销）。
                 _assigner = self._lifecycle._get_assigner_for_step(
                     self._lifecycle._get_wf_unsafe(run.id) or {},
-                    {"type": step.type, "target_role": step.target_role}, step.id)
+                    {"type": step.type, "target_role": _eff}, step.id)
                 if _is_review_or_handoff and _assigner:
                     # handoff/review 且有真人 assigner → 禁止宽松推进，必须等真人审批
                     LOGGER.debug("skip relaxed-advance %s/%s: handoff/review with human assigner=%s",
@@ -493,7 +517,7 @@ class StepHandlerMixin:
                         _relaxed = [
                             {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
                             for f in _role_msgs
-                            if f.src == step.target_role
+                            if f.src == _eff
                             and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                             and f.ts > _notified_ts
                             and f.ts < time.time() + 60  # 防未来时间戳
@@ -561,7 +585,7 @@ class StepHandlerMixin:
                     )
                     try:
                         self._send_to_role(
-                            step.target_role,
+                            _eff,
                             f"/goal\n## 完整性审查\n{_bus_msg}",
                             wf_id=run.id, step_id=step.id, force=True
                         )
@@ -684,7 +708,7 @@ class StepHandlerMixin:
                         else:
                             LOGGER.warning("双节点: %s/%s codex review 失败: %s，仍发提示让角色人工审查",
                                            run.workflow_name, step.id, _codex_result.get("error", "未知错误"))
-                        self._send_to_role(step.target_role, _codex_prompt,
+                        self._send_to_role(_eff, _codex_prompt,
                                            wf_id=run.id, step_id=step.id, force=True)
                         return
                     else:
@@ -718,7 +742,7 @@ class StepHandlerMixin:
                 if latest:
                     # 作者过滤（旧 tracker 语义）：若最新消息作者是 target_role 自己，
                     # 说明角色没卡死（刚写过），不是死锁，跳过告警
-                    if latest[0].src == step.target_role:
+                    if latest[0].src == _eff:
                         pass  # 自己写的消息，不报死锁
                     else:
                         # 超时判据：先区分「配置错位」与「真死锁」，再判停滞。
@@ -871,7 +895,7 @@ class StepHandlerMixin:
                 ).lower()
                 if any(pat in _msgs_text for pat in _IDLE_PATTERNS):
                     _cs = CronScheduler()
-                    _cs.report_idle(step.target_role)
+                    _cs.report_idle(_eff)
             except Exception as _idle_err:
                 LOGGER.debug("idle detection skipped: %s", _idle_err)
 
@@ -903,12 +927,15 @@ class StepHandlerMixin:
                     _db_results = self._lifecycle._parse_results(
                         self._lifecycle._get_wf_unsafe(run.id))
                     _ttl = _db_results.get(step.id, {}).get("approval_token_ttl", 0)
-                    # 第一阶段超时（TTL 过期）：重新把审批请求推给审批人，唤醒它响应
-                    if _ttl > 0 and time.time() > _ttl:
-                        self._nudge_assigner(run, step, _token)
-                    # 极端超时（TTL + 30min grace）：兜底自动通过，防永久卡死
-                    # （修复 lr_tech_decision 卡死根因：reviewer 未消费导致 24h+ stuck）
-                    elif _ttl > 0 and time.time() > _ttl + 1800:
+                    # 判定顺序不可颠倒：grace 超时（更严格）必须排在普通 TTL 超时之前。
+                    # 原实现反着写 → `now > _ttl` 在 `now > _ttl+1800` 时仍为真，
+                    # elif 恒不可达 → 「TTL+30min grace 自动通过」这个防永久卡死的兜底
+                    # 从未执行过。实测（2026-10-17）：已 completed/cancelled 的实例仍被
+                    # 逐轮重推审批请求，engineer 44 分钟内收到 33 次（其中 8/10 个 wf_id
+                    # 在 DB 中根本不存在），真实任务反而挤不进去。
+                    if _ttl > 0 and time.time() > _ttl + 1800:
+                        # 极端超时（TTL + 30min grace）：兜底自动通过，防永久卡死
+                        # （修复 lr_tech_decision 卡死根因：reviewer 未消费导致 24h+ stuck）
                         self._lifecycle.confirm_step(
                             run.id, step.id, token=_token, approved=True,
                             reason="daemon approval_timeout_fallback",
@@ -920,6 +947,9 @@ class StepHandlerMixin:
                         run.step_results[step.id] = _db_after.get(step.id, {})
                         self._sync_step_results(run.id, run.step_results)
                         return
+                    # 第一阶段超时（TTL 过期但未过 grace）：重新把审批请求推给审批人，唤醒它响应
+                    if _ttl > 0 and time.time() > _ttl:
+                        self._nudge_assigner(run, step, _token)
                 except Exception as _e:
                     LOGGER.debug("approval timeout handling skipped for %s/%s: %s",
                                  run.workflow_name, step.id, _e)
@@ -985,7 +1015,7 @@ class StepHandlerMixin:
                         run.step_results[step.id] = _sdata
                         self._sync_step_results(run.id, run.step_results)
                         try:
-                            self._send_to_role(step.target_role, _codex_prompt,
+                            self._send_to_role(_eff, _codex_prompt,
                                                wf_id=run.id, step_id=step.id, force=True)
                             LOGGER.info("双节点: %s/%s 第一节点完成，codex 审查指令已发送", run.workflow_name, step.id)
                         except Exception as _send_err:
@@ -1022,7 +1052,9 @@ class StepHandlerMixin:
             # cwd 取角色 workspace：WorkflowRun 无 workspace 字段，旧代码在此抛
             # AttributeError 被下面 except Exception 吞掉 → codex 从未真正执行，
             # 质量闸门形同虚设（实测 2026-10-16）。
-            _ws = _CCS_WORKSPACES / step.target_role
+            # cwd 取**实际执行者**的 workspace（effective_roles 覆盖优先）：
+            # 若按模板角色取，分流后的步骤会在错误目录里跑 codex（审不到产出）。
+            _ws = _CCS_WORKSPACES / self._eff_role(run, step)
             result = subprocess.run(
                 ["codex", "review", "--uncommitted", "-c", "model=9router_hermes"],
                 capture_output=True, text=True, timeout=_CODEX_REVIEW_TIMEOUT,
@@ -1082,7 +1114,9 @@ class StepHandlerMixin:
         schema = step.exit_schema
         if not schema:
             return (True, [])
-        ws = _CCS_WORKSPACES / step.target_role
+        # 校验**实际执行者**的 workspace：分流后产出落在该角色目录，
+        # 按模板角色校验会必失败（或让陈旧文件误过）。
+        ws = _CCS_WORKSPACES / self._eff_role(run, step)
         ws_real = os.path.realpath(ws)
         errs: list[str] = []
 

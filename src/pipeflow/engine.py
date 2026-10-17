@@ -17,6 +17,12 @@ import subprocess as _sp
 
 from pathlib import Path
 LOGGER = logging.getLogger("workflow.engine")
+
+# 开发角色池：职责重叠（按方案编码、自测、提 PR）的等价执行者。
+# 主链模板写死 engineer，但 pg 同样可承接。与「投递层单点替换」的区别见
+# _resolve_effective_role：分流决定持久化到实例的 effective_roles 列，
+# 让下游全部消费点（exit 过滤/busy/workspace 校验）读到一致的执行者。
+_DEV_ROLE_POOL = ("engineer", "pg")
 from typing import Any, Optional
 from types import SimpleNamespace
 
@@ -433,6 +439,24 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("活跃模板查询失败 %s: %s", template_id, e)
             return True  # 查询失败时保守跳过（宁可少创建，不可重复创建）
 
+
+    def _resolve_effective_role(self, inst: dict, step, results: dict) -> str:
+        """本步的实际执行角色：实例 effective_roles 覆盖优先，否则模板值。
+
+        开发角色池（DEV_ROLE_POOL / _pick_dev_role）已于 89c3c03 回滚 ——
+        投递层单点替换无法让下游状态机一致（exit_messages 过滤 / busy 门控 /
+        exit_schema 的 workspace / codex 的 cwd 都按角色取值）。回滚后本方法
+        退化为**纯读取**：只消费已持久化的 effective_roles（若有），不再自行
+        择一。保留方法名与签名是与 liveness.effective_role 同一契约。
+
+        原实现引用已被删除的 _DEV_ROLE_POOL → NameError 被外层 except 吞掉
+        → 每个 tick 的生产工作流扫描整体失败（实测 2026-10-17 journal 反复
+        "生产工作流扫描异常: name '_DEV_ROLE_POOL' is not defined"）。
+        """
+        from liveness import effective_role as _eff_role
+        return _eff_role(inst, step.id, fallback=step.target_role)
+
+
     def start(self, name: str, context: dict = None, initiator: str = None) -> str:
         # 轮 9：eval 质量门禁软回退 —— 只在入口检查**新建** workflow，不读取运行实例状态，
         # 因此不会中断任何已在 running 的 workflow（红线）。blocked 且有 rollback_target
@@ -748,7 +772,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         self._sync_step_results(inst["instance_id"], results)
                         continue   # 子链已接管
 
-                    _delivered = self._send_to_role(step.target_role, prompt, wf_id=inst["instance_id"], step_id=step_id)
+                    # 分流决定**先持久化再投递**：下游（exit_messages 过滤 / busy
+                    # 门控 / exit_schema 的 workspace / codex cwd）都读 effective_roles，
+                    # 若先投递后落库，本轮 tick 内下游仍按模板角色判 → 产出不被认可。
+                    _eff = self._resolve_effective_role(inst, step, results)
+                    _delivered = self._send_to_role(_eff, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 仅当真实投递成功才盖戳 notified；投递被并发守卫/变量校验拦截时
                     # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
                     # 进而触发 _cleanup_stale_workflows 的"running 且 sr 空>1h"静默误杀
