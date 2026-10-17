@@ -87,6 +87,13 @@ class RoleLifecycleMixin:
     _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
     _last_compact: dict[str, float] = {}
+    # 上下文阈值告警：从 pane 状态栏 `↓ 117.1k tokens` 提取用量，超阈值写 blocker。
+    # 与溢出检测（_check_context_overflow 的 has_overflow）分两路：溢出信号要等
+    # 真正撞墙才出现，那时 /compact 已排在长任务队列尾（实测 engineer 117k 时
+    # 正在跑 21 分钟的 pytest）。提前告警让 coordinator 能安排任务间隙。
+    _CONTEXT_WARN_K = 100.0            # 触发告警的上下文用量（k tokens）
+    _CONTEXT_WARN_COOLDOWN = 1800      # 同角色两次告警最小间隔（秒）
+    _last_context_warn: dict[str, float] = {}
     _RESTART_LOCK = threading.Lock()
     # check-then-act 竞态防护：cooldown 检查与写入之间加锁
     _COMPACT_LOCK = threading.Lock()
@@ -173,10 +180,30 @@ class RoleLifecycleMixin:
                 or "Prompt is too long" in output
                 or ("Context" in output and "remaining" in output and "compact" in output.lower())
             )
-            # 第二路：transcript 回退。pane 跑在 claude TUI 的**备用屏**（alternate_on=1），
-            # 该屏无 scrollback——`-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，
-            # 故溢出报错一旦滚出视口就再也抓不到。transcript 是落盘事实，不受视口与
-            # 进程存活影响。实测（2026-10-17）"Prompt is too long" 全角色累计 252 次，
+            # pane 跑在 claude TUI 的**备用屏**（alternate_on=1），该屏无 scrollback——
+            # `-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，故溢出报错一旦滚出
+            # 视口就再也抓不到。transcript 是落盘事实，不受视口与进程存活影响。
+            #
+            # 阈值告警（与溢出检测独立，先于它执行）：从状态栏 `↓ 117.1k tokens`
+            # 提取当前用量，超阈值就写 blocker —— 溢出信号要等真正撞墙才出现，
+            # 那时 /compact 已排在长任务队列尾（实测 engineer 117k 时正在跑 21 分钟
+            # 的 pytest，compact 要等它结束）。提前告警让 coordinator 能安排任务间隙。
+            if not has_overflow:
+                _m = __import__("re").search(r"↓\s*([\d.]+)\s*k tokens", output)
+                if _m:
+                    _used_k = float(_m.group(1))
+                    if _used_k >= _CONTEXT_WARN_K:
+                        with self._COMPACT_LOCK:
+                            _last_warn = self._last_context_warn.get(role, 0.0)
+                            if now - _last_warn >= _CONTEXT_WARN_COOLDOWN:
+                                self._last_context_warn[role] = now
+                                LOGGER.warning("上下文预警: %s 已用 %.1fk tokens (阈值 %.0fk)",
+                                               role, _used_k, _CONTEXT_WARN_K)
+                                self._bb.write("blocker",
+                                    f"[context_warn] {role} 上下文已用 {_used_k:.0f}k（阈值 {_CONTEXT_WARN_K:.0f}k）"
+                                    f" — 建议在任务间隙安排 /compact，避免溢出后排队",
+                                    src="workflow_engine")
+            # 实测（2026-10-17）"Prompt is too long" 全角色累计 252 次，
             # 而本函数从未触发过一次 /compact——只有 pane 单路时角色溢出后永久卡死
             # （product-architect 90 次 / consumer 35 次）。CLAUDE.md 早已声明本路存在，
             # 实为缺失实现。
