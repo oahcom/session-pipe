@@ -943,11 +943,20 @@ class LifecycleManager:
             self._sync_task_unsafe(task_id)
             return False
         next_step = steps[idx + 1]
-        self._conn.execute(
-            "UPDATE workflow_instances SET current_step_id=? WHERE instance_id=?",
-            (next_step.get("step_id") or next_step.get("id"), wf_id)
-        )
-        # advance 时把旧步骤 status 改为 completed，防止 DB 扫描时
+        # assignee 跟随当前步的执行者：它只在建实例时设一次（首步角色），
+        # 之后推进从不更新 → 实测 8/9 running 实例的 assignee 与当前步要求
+        # 的角色不一致（如 WL-dev_with_collab 走到 s4 要求 closer 却仍归
+        # engineer）。而 assignee 被背压计数与任务生成消费 → 配额长期失真。
+        _next_sid = next_step.get("step_id") or next_step.get("id")
+        _next_role = next_step.get("target_role")
+        if _next_role:
+            self._conn.execute(
+                "UPDATE workflow_instances SET current_step_id=?, assignee=? "
+                "WHERE instance_id=?", (_next_sid, _next_role, wf_id))
+        else:
+            self._conn.execute(
+                "UPDATE workflow_instances SET current_step_id=? WHERE instance_id=?",
+                (_next_sid, wf_id))
         # 旧步骤的 notified 状态误判角色 busy（2026-08-10 观测：
         # s1 推进到 s2 后，_is_role_busy 扫到 s1 的 notified → pm 误判 busy）
         try:
