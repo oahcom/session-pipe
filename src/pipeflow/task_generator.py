@@ -36,10 +36,27 @@ MAX_RUNNING_PER_ROLE = 3
 # 新增测试模板请以 test_ 或 drill 开头，或加入本元组。
 _TEST_HARNESS_PREFIXES = ("test_", "exit_schema", "role_interact", "drill")
 
+# engine 注册 JSON 模板时用 "WL-" + name 生成 workflow_id（engine.py:316），于是同一个
+# harness 模板在 DB/内存里有两个 id：`test_x` 与 `WL-test_x`。只堵不带前缀的那个等于
+# 没堵：WL-test_exit_schema 逃过本判据 → 自动选择把它排在真实模板之前 → 路由 daemon
+# 把真任务的标题套上测试模板 → 产出回执又是新的 code_fix 消息 → 自激循环，无外部
+# 输入也能永转（2026-10-17 实测：177 个实例、159 条 bus fact、12 个角色被派）。
+_WORKFLOW_ID_PREFIXES = ("WL-", "WF-")
+
+
+def _strip_wf_prefix(template_id: str) -> str:
+    """剥离 engine 生成 id 时的 WL-/WF- 前缀（str.removeprefix 不接受元组）。"""
+    for p in _WORKFLOW_ID_PREFIXES:
+        if template_id.startswith(p):
+            return template_id[len(p):]
+    return template_id
+
 
 def _is_test_harness_template(template_id: str | None) -> bool:
     """该模板是否为测试 harness（不参与真实生产派发/超时取消）。"""
-    return bool(template_id) and template_id.startswith(_TEST_HARNESS_PREFIXES)
+    if not template_id:
+        return False
+    return _strip_wf_prefix(template_id).startswith(_TEST_HARNESS_PREFIXES)
 
 
 class TaskGeneratorMixin:
@@ -287,7 +304,19 @@ class TaskGeneratorMixin:
                     if _sid and _role and wf:
                         _sf = next((s for s in wf.steps if s.id == _sid), None)
                         if _sf:
-                            _prompt = _sf.prompt_template
+                            # 必须走 _fill_prompt_vars：直接投 prompt_template 会把
+                            # {title}/{description} 原样发出，被 _send_to_role 的
+                            # _UNMATCHED_VAR_RE 守卫拦下 → 自愈链路整体空转（_heal_send
+                            # 返回前就 return、不盖 last_heal，下轮重来）。与
+                            # step_handler:380、role_lifecycle:214、wf_lifecycle:417 一致。
+                            _hf_name = inst.get("template_id") or ""
+                            _hf_title = inst.get("title") or _hf_name
+                            _hf_idx = next((n for n, s in enumerate(wf.steps)
+                                            if s.id == _sid), -1)
+                            _hf_prev = wf.steps[_hf_idx - 1].id if _hf_idx > 0 else ""
+                            _prompt = self._fill_prompt_vars(
+                                _sf.prompt_template, _sf, _hf_name, _hf_title,
+                                inst.get("description") or "", results, _hf_prev)
                             # 锁外执行：投递成功才盖戳 last_heal（投递失败不下轮重试，不误标已自愈）
                             _deferred.append(lambda role=_role, p=_prompt, i=inst, s=_sid:
                                 self._heal_send(role, p, i["instance_id"], s))

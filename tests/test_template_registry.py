@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from template_registry import (
-    TemplateRegistry, _validate_schema, _validate_meta,
+    TemplateRegistry, _is_test_harness, _validate_schema, _validate_meta,
 )
 
 from paths import HERMES_WORKFLOWS
@@ -261,5 +261,75 @@ def test_dual_node_full_cycle():
             rows = eng._lifecycle.query(
                 "SELECT current_step_id FROM workflow_instances WHERE instance_id=?", (wf_id,))
             assert rows[0]["current_step_id"] in ("s2", "s1"), f"应推进: {rows[0]['current_step_id']}"
+
+
+def test_harness_detection_strips_wf_prefix():
+    """回归守卫：engine 用 "WL-"+name 生成 workflow_id，harness 判据必须剥前缀。
+
+    2026-10-17 事故：只堵无前缀形态 → WL-test_exit_schema 逃过过滤 →
+    recommend() 把它排在真实模板之前（bus_category 命中同样 +5 分）→
+    真任务被套上测试模板 → 产出回执又是新的 code_fix 消息 → 自激循环。
+    实测 177 实例 / 159 条 bus fact / 12 个角色被派。
+    """
+    for tid in ("test_exit_schema", "WL-test_exit_schema", "WF-drill_x",
+                "WL-role_interact", "exit_schema_v2", "WL-exit_schema_v2"):
+        assert _is_test_harness(tid), f"{tid} 应判为 harness"
+
+
+def test_harness_detection_spares_production_templates():
+    """前缀剥离不得误伤生产模板（尤其 qa_test_* 系列）。"""
+    for tid in ("WF-dev_implement", "WL-01", "WL-food_chain_loop",
+                "qa_test_execute", "WF-qa_test_plan", "WL-09",
+                "WF-closer_close_loop", "", None):
+        assert not _is_test_harness(tid), f"{tid} 不是 harness，不得排除"
+
+
+_COMPLIANT_PROMPT = """## 做什么
+修复指定问题。
+
+## 怎么做
+定位根因后最小改动修复，跑测试验证。
+
+## 验收标准
+测试通过，无回归。
+
+## 完成
+写 bus cat=code_fix title 含 s1-complete 并附证据。"""
+
+
+def test_recommend_excludes_harness():
+    """recommend() 是唯一自动选择入口，harness 模板必须在此拦住。
+
+    自建库而非依赖生产 DB：conftest 把 SESSION_PIPELINE_WORKFLOWS_DB 指向临时库，
+    读外部库会 skip；而本用例要验的是 recommend() 的过滤分支本身。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"),
+                               workflows_dir=Path(tmp))
+        try:
+            def _tpl(wid, name):
+                return {
+                    "workflow_id": wid, "name": name, "title": "t",
+                    "description": "a" * 30,
+                    "trigger_scene": ["修复"],
+                    "allowed_initiators": ["coordinator"],
+                    "allowed_executors": ["engineer"],
+                    "max_duration_hours": 24,
+                    "quality_standards": "a" * 30,
+                    "steps": [{
+                        "id": "s1", "title": "do", "target_role": "engineer",
+                        "prompt_template": _COMPLIANT_PROMPT,
+                        "exit_condition": {"bus_category": "code_fix"},
+                    }],
+                }
+            reg.register(_tpl("WL-test_exit_schema", "test_exit_schema"))
+            reg.register(_tpl("WL-dev_implement", "dev_implement"))
+            got = [x["template_id"] for x in reg.recommend(
+                "[修复] 9router 路由", initiator_role="system",
+                assignee="engineer", bus_category="code_fix")]
+            assert "WL-dev_implement" in got, f"真实模板应被推荐: {got}"
+            assert "WL-test_exit_schema" not in got, f"harness 混入推荐: {got}"
+        finally:
+            reg.close()
 
 

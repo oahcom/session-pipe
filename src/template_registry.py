@@ -260,6 +260,25 @@ _ADVISORY_ERROR_MARKERS = (
 )
 
 
+# 测试 harness 模板判据。本地定义而非 import pipeflow.task_generator：
+# 本模块被 pipeflow 依赖，反向 import 会成环。两处判据必须同步（
+# tests/test_template_registry.py 有回归守卫比对两者结论）。
+_HARNESS_NAME_PREFIXES = ("test_", "exit_schema", "role_interact", "drill")
+_WORKFLOW_ID_PREFIXES = ("WL-", "WF-")
+
+
+def _is_test_harness(template_id: str | None) -> bool:
+    """剥离 WL-/WF- 前缀后按名字判 harness。engine 用 "WL-"+name 生成 id，
+    只堵无前缀形态等于没堵（2026-10-17 自激循环事故）。"""
+    if not template_id:
+        return False
+    for p in _WORKFLOW_ID_PREFIXES:
+        if template_id.startswith(p):
+            template_id = template_id[len(p):]
+            break
+    return template_id.startswith(_HARNESS_NAME_PREFIXES)
+
+
 def _meta_hard_errors(template: dict) -> list[str]:
     """只返回会导致运行期故障的硬错误，滤除文体建议项。"""
     return [e for e in _validate_meta(template).errors
@@ -675,6 +694,15 @@ class TemplateRegistry:
 
         for tpl in all_templates:
             if not bool(tpl.get("is_active", True)):
+                continue
+            # 测试 harness 模板不参与自动推荐：它是唯一的自动选择入口
+            # （workflow/client.py:create_task_v2 不传 template_id 时落到这里），
+            # 而 harness 模板的 exit_condition.bus_category 命中同样 +5 分，
+            # 排名会压过真实模板 → 真任务被套上测试模板 → 产出回执又是新的
+            # 同分类消息 → 自激循环（2026-10-17 实测）。
+            if _is_test_harness(tpl.get("template_id")):
+                LOGGER.debug("skip test harness template %s in recommend",
+                             tpl.get("template_id"))
                 continue
             # 结构性门禁: 只拦会导致运行期卡死的硬错误（文体建议项不阻断，见分层注释）
             _hard = _meta_hard_errors(tpl)

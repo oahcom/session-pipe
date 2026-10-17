@@ -129,9 +129,13 @@ def _check_cron_schedules() -> int:
                 continue
             # 检查是否触发了
             try:
-                cron = croniter.croniter(cron_exp, now - 60)
+                # 种子用 now（非 now-60）：get_prev 返回严格早于种子的调度点。
+                # 旧写法 seed=now-60 使 prev <= now-60，而 now_minute > now-60 恒成立
+                # → `now_minute <= prev` 恒假 → 本函数永不触发（实测 * * * * * 触发 0 次，
+                # subprocess.run 调用 0 次）。判据改为“调度点落在当前这一分钟内”。
+                cron = croniter.croniter(cron_exp, now)
                 prev = cron.get_prev(float)
-                if now_minute <= prev < now:
+                if now_minute <= prev < now_minute + 60:
                     # 去重：同一角色同一分钟不重复触发
                     key = f"{role}:{cron_exp}"
                     last = triggered.get(key, 0)
