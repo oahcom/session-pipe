@@ -132,3 +132,69 @@ def test_busy_is_truthy_string():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_undelivered_step_keeps_empty_status_for_retry():
+    """投递失败时 status 必须留空 —— 空状态是**投递重试机制本身**（R88 修正）。
+
+    run_once 的投递分支入口是 `if not step_status`，只有空状态才会每 tick 重试投递。
+    曾试图改为保留 'notified' 以便 _tick 的超时机制接管，但那样会让投递重试永不发生
+    （实测 test_delivery_fail_count_accumulates_when_unnotified 从 3 跌到 1）。
+    投递失败的兜底是 _reached_cap 后的 delivery_blocked 终态 + blocker 通知。
+    """
+    import inspect
+    from pipeflow import engine
+    src = inspect.getsource(engine.WorkflowEngine.run_once)
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert '"delivery_blocked" if _reached_cap else ""' in code, \
+        "投递失败非终态时必须保留空 status，否则每 tick 重试投递失效"
+
+
+def test_busy_writes_queue_ledger_for_reclaimer():
+    """busy 分支必须写 queued 账本 —— 否则回收器条件4 不可达（codex P1-1）。
+
+    本步 status 留空（投递重试需要），而 _tick 的入口是
+    `step_status in ("notified","running")` → 排队链与回收器条件4
+    （需 timeout_count>=1 或 queued>=3）全部不可达 → 实例只能等 24h 全局兜底。
+    """
+    import inspect
+    from pipeflow import engine
+    src = inspect.getsource(engine.WorkflowEngine.run_once)
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    _i = code.find('if _delivered == "busy":')
+    assert _i >= 0, "缺 busy 分支"
+    _blk = code[_i:_i + 1400]
+    assert '"queued"' in _blk, "busy 分支必须写 queued 账本，否则回收器看不到排队"
+    assert '"queued_since"' in _blk, "必须写 queued_since（回收器据它算真实停滞起点）"
+
+
+def test_busy_does_not_stamp_notified():
+    """busy 分支不得盖 status='notified' —— 否则投递永不重试。
+
+    窗口取到该分支自身的 `continue` 为止，避免越界到大分支后续代码。
+    """
+    import inspect
+    from pipeflow import engine
+    src = inspect.getsource(engine.WorkflowEngine.run_once)
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    _i = code.find('if _delivered == "busy":')
+    _end = code.find("continue", _i)
+    assert _i >= 0 and _end > _i, "缺 busy 分支或其 continue"
+    _blk = code[_i:_end]
+    assert '"status"' not in _blk, \
+        "busy 分支写了 status → 投递重试失效（投递分支入口是 `if not step_status`）"
+
+
+def test_advance_busy_also_reverts_step():
+    """advance 路径 busy 也必须回退 —— 否则 next_step 卡在 notified 无人重投（P1-2）。"""
+    import inspect
+    from pipeflow import wf_lifecycle
+    src = inspect.getsource(wf_lifecycle.WorkflowLifecycleMixin._advance_production_wf)
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert "if _delivered is not True:" in code, \
+        "advance 必须用 `is not True` 判三态（busy 也要走回退）"
+    _i = code.find("if _delivered is not True:")
+    _blk = code[_i:_i + 400]
+    assert "_mark_step_delivery_failed" in _blk, \
+        "advance 的 `is not True` 分支必须调 _mark_step_delivery_failed（busy 同路径）"
+    assert "return" in _blk, "advance 回退后必须 return，否则继续建子工作流/部署"
