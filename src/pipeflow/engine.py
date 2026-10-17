@@ -462,9 +462,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             )
             self._upsert_template(name, wf)
             try:
+                # assignee 传首步 target_role：start_wf 缺省写 workflow_engine，
+                # 会因实例归属错位导致步骤无法投递（探针与自建链都踩过）。
                 self._lifecycle.start_wf(run.id, current_step_id=wf.steps[0].id,
                                           template_id=name, context=context,
-                                          initiator=initiator)
+                                          initiator=initiator,
+                                          assignee=wf.steps[0].target_role)
             except Exception as e:
                 LOGGER.error("[wf] LM start_wf 失败: %s", e)
             self._write_step_prompt(run, wf.steps[0])

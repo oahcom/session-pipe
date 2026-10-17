@@ -71,7 +71,11 @@ class IntegrityState:
 # ── 持久化 ──
 
 def load_state(step_results: dict, step_id: str) -> IntegrityState:
-    sr = step_results.get(step_id, {})
+    # 归一化：step_results[step_id] 可能是真值非 dict（'done'/'summary' 等
+    # 简写形，生产 DB 实测 413 个）。裸 .get 会抛 AttributeError，而调用方
+    # 多数在 run_once 的 try 内 → 整个 tick 循环中止（静默失败）。
+    _v = step_results.get(step_id, {})
+    sr = _v if isinstance(_v, dict) else {}
     return IntegrityState(
         pending=sr.get("integrity_pending", False),
         dim_index=sr.get("integrity_dim_index", 0),
@@ -85,7 +89,12 @@ def load_state(step_results: dict, step_id: str) -> IntegrityState:
 
 
 def save_state(step_results: dict, step_id: str, state: IntegrityState) -> None:
-    sr = step_results.setdefault(step_id, {})
+    # 同 load_state：真值非 dict 时 setdefault 返回原值（不是新 dict），
+    # 后续赋值抛 TypeError；先归一化再写。
+    _v = step_results.get(step_id)
+    if not isinstance(_v, dict):
+        step_results[step_id] = {}
+    sr = step_results[step_id]
     sr["integrity_pending"] = state.pending
     sr["integrity_dim_index"] = state.dim_index
     sr["integrity_last_sent_at"] = state.last_sent_at
@@ -208,7 +217,10 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     # {task_definition}/{topic}/{acceptance_criteria} 为 JSON 模板源可能出现的同义变量）。
     # 每个都以 title 兜底：tasks.description 91% 为空（616/675 实测），
     # 只填 description 会让绝大多数提醒仍带未替换变量并被守卫拦下。
-    _title_fb = _ctx.get("title") or _ctx.get("description") or ""
+    _title_fb = (_ctx.get("title") or _ctx.get("description")
+                 or _ctx.get("task_title")
+                 or getattr(run, "workflow_name", "") or getattr(step, "title", "")
+                 or "步骤")
     for _var, _val in (
         ("{description}", _ctx.get("description") or _title_fb),
         ("{title}", _title_fb),
@@ -217,7 +229,7 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
         ("{task_definition}", _ctx.get("task_definition") or _title_fb),
         ("{acceptance_criteria}", _ctx.get("description") or _title_fb),
     ):
-        if _var in goal_text and _val:
+        if _var in goal_text:
             goal_text = goal_text.replace(_var, str(_val))
     if not goal_text:
         goal_text = getattr(step, 'title', '') or ''

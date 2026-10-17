@@ -57,10 +57,15 @@ def test_false_when_goal_too_short():
     assert r is False
 
 
-def test_false_when_role_not_ready():
+def test_busy_when_role_not_ready():
+    """未就绪是临时态（忙/启动中/探测抖动）→ 返回 "busy" 让 engine 排队重试。
+
+    返回 False 会被 engine 计入 delivery_fail_count，3 次即灌 delivery_blocked
+    终态且无恢复路径 —— WL-full_dev_pipeline 7/7 实例卡死 s1 的根因（实测）。
+    """
     h = _Harness(busy=False, ready=False)
     r = h._send_to_role("qa", "hello world", wf_id="wf_x", step_id="s1")
-    assert r is False
+    assert r == "busy"
 
 
 # ── 调用点级: 源码契约（三态处理分支存在于正确位置） ──

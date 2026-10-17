@@ -210,7 +210,7 @@ class LifecycleManager:
 
     def start_wf(self, wf_id: str, current_step_id: str = "s1",
                   template_id: str = "", context: dict = None,
-                  initiator: str = None) -> bool:
+                  initiator: str = None, assignee: str = None) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -226,20 +226,26 @@ class LifecycleManager:
                     _ctx = context or {}
                     _task_id = _ctx.get("task_id") or ("task_" + _uuid.uuid4().hex[:8])
                     _now = time.time()
+                    # assignee 取真实执行者（首步 target_role）。写死 workflow_engine 会
+                    # 让实例/任务归属于引擎自身，而引擎不是可投递角色：下游按 assignee
+                    # 算审批人、算忙闲、算归属时全部错位（实测 s0 排 10 次无法投递）。
+                    # engine.start 调用方可显式传 assignee；未传时回退旧值。
+                    _assignee = assignee or "workflow_engine"
                     self._conn.execute("""
                         INSERT OR IGNORE INTO tasks
                         (task_id, title, description, assigner, assignee, priority,
                          status, created_at, updated_at, template_id)
-                        VALUES (?, ?, ?, 'workflow_engine', 'workflow_engine', 0,
+                        VALUES (?, ?, ?, 'workflow_engine', ?, 0,
                                 'in_progress', ?, ?, ?)
-                    """, (_task_id, template_id or wf_id, "", _now, _now, template_id or None))
+                    """, (_task_id, template_id or wf_id, "", _assignee, _now, _now,
+                          template_id or None))
                     self._conn.execute("""
                         INSERT OR IGNORE INTO workflow_instances
                         (instance_id, task_id, assigner, assignee, status, current_step_id,
                          template_id, created_at, context)
-                        VALUES (?, ?, 'workflow_engine', 'workflow_engine', 'running',
+                        VALUES (?, ?, 'workflow_engine', ?, 'running',
                                 ?, ?, ?, ?)
-                    """, (wf_id, _task_id, current_step_id,
+                    """, (wf_id, _task_id, _assignee, current_step_id,
                           template_id or None, time.time(), ctx_json))
                 self._conn.commit()
                 wf = self.get_wf(wf_id)
