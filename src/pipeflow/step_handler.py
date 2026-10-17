@@ -177,7 +177,7 @@ class StepHandlerMixin:
             # wait_roles 协作门：tmux 信号不能绕过协作门控（2026-08-10 codex P1），
             # 等所有声明角色都产出匹配消息才允许推进
             _wr = getattr(step, "wait_roles", None)
-            _wr_ok = not _wr or set(_wr).issubset({m.get("src", "") for m in (run.step_results.get(step.id, {}) or {}).get("exit_messages", [])})
+            _wr_ok = not _wr or set(_wr).issubset({m.get("src", "") for m in self._step_sd(run, step).get("exit_messages", [])})
             # 契约门：tmux 信号只证明角色「自称完成」，产出文件可能还没落盘。
             # 实测 food_chain_loop/s7：16:54:18 被信号推进，而 VALUE_AUDIT.md
             # 16:55:32 才落盘——盖戳时契约文件根本不存在。主路径的 bus 匹配分支
@@ -199,7 +199,7 @@ class StepHandlerMixin:
         # 计数存于 step_results["tmux_signals"]（跨 tick 持久化），
         # 防高频骚扰：闲置提醒 ≥3 次/越界 ≥1 次后各自冷却 5 分钟；
         # 升级：闲置/越界累计 ≥5 次 → cancel 步骤（角色不响应，继续等待无意义）。
-        _sig_state = (run.step_results.get(step.id, {}) or {}).get("tmux_signals") or {}
+        _sig_state = self._step_sd(run, step).get("tmux_signals") or {}
         _now = time.time()
         if sig and sig.idle_complaint:
             _idle_n = _sig_state.get("idle_count", 0) + 1
@@ -387,7 +387,7 @@ class StepHandlerMixin:
             # 角色忙（有其他任务在跑）→ 不强制重推，通知 coordinator 排队
             # 架构 P1-2：完整性阶段进行中时跳过重推（避免 /goal 覆盖完整性提醒）
             # 注意：此处在完整性阶段的 if not cat: return 之后，_integ_state 需重新读取
-            _integ_retry_guard = _integ_load(run.step_results, step.id)
+            _integ_retry_guard = _integ_load({step.id: self._step_sd(run, step)}, step.id)
             if timeout_count == 1 and not _integ_retry_guard.pending and not _integ_retry_guard.complete:
                 if self._is_role_busy(step.target_role, exclude_wf_id=run.id):
                     # 角色在忙，延长超时窗口：通知 coordinator 而非重推
@@ -541,7 +541,7 @@ class StepHandlerMixin:
         # 避免全量清空导致跨实例消息去重失效（bus #162146 防护）
         if len(self._consumed_exit_ids) > 1000:
             self._consumed_exit_ids = set(list(self._consumed_exit_ids)[-500:])
-        _integ_state = _integ_load(run.step_results, step.id)
+        _integ_state = _integ_load({step.id: self._step_sd(run, step)}, step.id)
         _integ_dual_pending = (getattr(step, 'dual_node', False)
                                and not self._step_sd(run, step).get("node2_sent"))
         if _integ_state.pending and not _integ_state.complete and not _integ_dual_pending:
@@ -624,7 +624,7 @@ class StepHandlerMixin:
             # 消息去重：同一消息不应被多个工作流同时消费（bus #162146 QA 4任务共享测试结果）
             # _consumed_exit_ids 已在上方完整性阶段初始化（P1-3 死代码已删）
             # dual_node：node2_sent 后将 filter 改为 s{N}-（匹配 s2-complete 和 s2-codex-approved）
-            _node2_sent = (run.step_results.get(step.id, {}) or {}).get("node2_sent", False)
+            _node2_sent = self._step_sd(run, step).get("node2_sent", False)
             # 协作门：wait_roles 声明的角色都产出匹配消息才推进（多角色协作）
             _wait_roles = getattr(step, "wait_roles", None)
             if step.dual_node and _node2_sent:
@@ -642,7 +642,7 @@ class StepHandlerMixin:
             if _match_ts:
                 # 标记消息已消费，防止其他工作流重复匹配（bus #162146）
                 self._consumed_exit_ids.update(m["id"] for m in _match_msgs)
-                _old = run.step_results.get(step.id, {})
+                _old = self._step_sd(run, step)
                 run.step_results[step.id] = {
                     **_old,
                     "bus_anchor": _match_ts,
@@ -659,7 +659,7 @@ class StepHandlerMixin:
                 # 连续两次零问题后角色再写第二条 bus，两条都到才算完成。
                 # dual_node 步骤走此路径；非 dual_node 走 integrity 20 维问答。
                 if getattr(step, 'dual_node', False):
-                    _sdata = run.step_results.get(step.id, {}) or {}
+                    _sdata = self._step_sd(run, step)
                     if not _sdata.get("node2_sent"):
                         _codex_prompt = (
                             "/goal\n## codex CLI 三方审查\n"
@@ -766,7 +766,7 @@ class StepHandlerMixin:
                             # _notified 缺失时取 0（退回消息时间基准）。
                             age = time.time() - max(latest[0].ts, _notified)
                             # 节流：同一 tracking 周期只通知一次
-                            _sdata = run.step_results.get(step.id, {}) or {}
+                            _sdata = self._step_sd(run, step)
                             _last = _sdata.get("track_notified_at", 0)
                             if time.time() - _last >= track_timeout:
                                 _sdata["track_notified_at"] = time.time()
@@ -854,7 +854,7 @@ class StepHandlerMixin:
                 if "步骤不匹配" in str(e):
                     return
                 # DB 瞬态故障 → 有 timeout_count 间接阻止无限重试
-                _prev = run.step_results.get(step.id, {})
+                _prev = self._step_sd(run, step)
                 run.step_results[step.id] = {
                     **_prev,
                     "timeout_count": _prev.get("timeout_count", 0) + 1,
@@ -965,7 +965,7 @@ class StepHandlerMixin:
                             _fp.name, _min, step.id)
                 if step.dual_node:
                     # dual_node：文件存在 = 第一节点完成，注入第二节点审查指令
-                    _sdata = run.step_results.get(step.id, {}) or {}
+                    _sdata = self._step_sd(run, step)
                     if not _sdata.get("node1_done"):
                         _sdata["node1_done"] = True
                         _sdata["node1_at"] = time.time()
