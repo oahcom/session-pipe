@@ -451,9 +451,16 @@ class WorkflowLifecycleMixin:
         except Exception as _audit_err:
             LOGGER.debug("step_output audit failed %s/%s: %s", wf_id[:8], step_id, _audit_err)
 
-        # ── 返工门禁：review 步骤被拒绝 → 不推进，s6 保持 notified，引擎下一轮 tick
-        # 自动重查 exit 匹配（修复后新 review 结果会正常推进）。
+        # ── 返工门禁：评审步骤被拒绝 → 不推进，保持当前步，引擎下一轮 tick
+        # 自动重查 exit 匹配（修复后新评审结果会正常推进）。
         # 同时创建 engineer 返工子链（若已有则不重复创建）。
+        #
+        # 类型判据含 gate：模板里 reviewer 步骤有 review(9) 与 gate(3) 两类，
+        # 而原判据只认 "review" → gate 型评审的 CHANGES_REQUESTED 被无视，
+        # 流水线带着未修复的设计继续往下走（实测 wf_98a18e738d：s3 判
+        # "CHANGES_REQUESTED (0 P0, 3 P1, 2 P2)" 却推进到了 s4）。
+        # 门禁的语义是"产出需被把关"，与该步叫 review 还是 gate 无关。
+        _REVIEW_TYPES = ("review", "gate")
         _reject = False
         try:
             _done_sr = results.get(step_id, {}) if isinstance(results, dict) else {}
@@ -461,11 +468,13 @@ class WorkflowLifecycleMixin:
                 m.get("text", "") for m in _done_sr.get("exit_messages", [])
                 if isinstance(m, dict)
             ).lower()
-            if any(kw in _msgs_text for kw in ("changes_requested", "rejected", "fix", "需修复", "回退")):
+            # 关键词 "fix" 已移除：它在正常文案里高频出现（bugfix/prefix/配置文件/
+            # fixture），实测会把「已修复并通过」的正常评审误判为驳回 → 无谓返工。
+            if any(kw in _msgs_text for kw in ("changes_requested", "rejected", "需修复", "回退")):
                 _reject = True
         except Exception:
             pass
-        if _reject and getattr(steps[idx], "type", "") == "review":
+        if _reject and getattr(steps[idx], "type", "") in _REVIEW_TYPES:
             LOGGER.warning("review rejected: %s/%s → 返工门禁触发，s%s 保持 notified",
                            wf_id[:8], step_id, step_id)
             # 创建 engineer 返工子链（复用 engineer_feature 模板）
@@ -487,7 +496,12 @@ class WorkflowLifecycleMixin:
                 lm, wf_id, wf_name, next_step, idx, results, step_id):
             return  # 子链已接管：不投主链步骤
 
-        _delivered = self._send_to_role(next_step.target_role, prompt,
+        # 实际执行角色：与 engine 首步同一套解析（实例 effective_roles 覆盖
+        # 优先）—— 分流决定必须对推进步与首步一致，否则下游按模板角色判、
+        # 产出落另一角色处 → exit 条件永不匹配。
+        _eff_role = self._resolve_effective_role(
+            {"instance_id": wf_id}, next_step, results)
+        _delivered = self._send_to_role(_eff_role, prompt,
                                          wf_id=wf_id, step_id=next_step.id)
         # 用 `is not True` 而非 not："busy"（角色忙，truthy 字符串）必须同样走失败分支，
         # 否则会跳过 _mark_step_delivery_failed 直接往下推进，把"未投递"当"已投递"。
@@ -507,7 +521,7 @@ class WorkflowLifecycleMixin:
 
 
     def _subflow_takeover(self, lm, wf_id: str, wf_name: str, tgt_step,
-                          idx: int, results: dict, prev_prev_step_id: str) -> bool:
+                          idx: int, results: dict, prev_step_id: str) -> bool:
         """为即将投递的步骤创建二级工作流（子链）。True = 子链已接管该步。
 
         WHY 顺序：原实现把子链创建放在 _send_to_role **之后** → 角色刚被投递
