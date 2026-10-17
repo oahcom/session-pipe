@@ -12,21 +12,22 @@
   调用方按放行处理（busy=False），不阻断业务。
 
 关键参数说明：
-- pane_fallback: 仅 health 门控的 stale/dead/l2_false 分支用——tmux pane_active
-  （焦点 0/1）为 True 时视为忙（兜底）。注意 pane_active ≠ pane_activity（时间戳），
-  前者在 tmux 3.4 下恒为 1（单 pane 会话），是低误报兜底而非精确判活。
+- pane_fallback: 仅 health 门控的 stale/dead/l2_false 分支用——tmux pane 近期
+  （PANE_ACTIVE_WINDOW 秒内）有**输出活动**时视为忙（兜底）。注意判据是
+  #{window_activity} 时间戳而非 #{pane_active} 焦点：焦点在单 pane 会话下恒为 1，
+  曾使该兜底恒成立、空闲角色被判忙 → 任务排队 → 饿死 → 回收（见 tmux_pane_active）。
 - workflows: 可选内存 WorkflowDef 缓存（dict[str, WorkflowDef]）。_is_role_busy
   委托时传入（与原 self._workflows 语义一致）；已提供但模板不在其中 → 跳过该实例
   （engine 未加载的模板应由清理路径回收，不由忙检测拦截）；未提供 → 回退读 DB
   workflow_templates.steps_json（独立调用场景）。
-- _STEP_SCAN_LIMIT: L4 扫描上限。超过 40 个 running 实例时截断并返回不忙——
-  安全方向（放行），但会漏忙，日志 warning 提示。
+- 无扫描上限：实测 173 条 running 实例 + 模板查询合计 0.7ms，截断判据（>40）会在积压期把**所有角色**判为不忙 → 引擎继续投递 → 积压自我放大（2026-10-17 实测 82~173 个 running 实例常驻）。
 """
 
 import json
 import logging
 import os
 import subprocess
+import time
 from pathlib import Path
 
 LOGGER = logging.getLogger("liveness")
@@ -34,8 +35,10 @@ LOGGER = logging.getLogger("liveness")
 HEALTH_DIR = Path(os.environ.get("CCS_HEALTH_DIR", str(Path.home() / ".hermes" / "run" / "ccs-health")))
 SENTINEL_DIR = Path(os.environ.get("CCS_SENTINEL_DIR", str(Path.home() / ".hermes" / "run" / "ccs-sentinels")))
 
-# L4 步骤级扫描上限：>40 个 running 实例截断（只读信号，截断=不判忙，避免 CPU 放大）
-_STEP_SCAN_LIMIT = 40
+# pane 活跃窗口：与 survival_monitor._l2_check 的 thinking 判据同量级（300s），
+# 保证"两处对同一 pane 是否在动"的结论一致。
+PANE_ACTIVE_WINDOW = float(os.environ.get("CCS_PANE_ACTIVE_WINDOW", "300"))
+
 # 活跃步骤状态：与 _is_role_busy 信号2 一致
 _ACTIVE_STEP_STATUS = ("notified", "running", "step_done_ready")
 
@@ -162,10 +165,6 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
         rows = _db_fetch(db_conn,
             "SELECT instance_id, template_id, step_results, assigner, parent_wf_id "
             "FROM workflow_instances WHERE status='running'")
-        if len(rows) > _STEP_SCAN_LIMIT:
-            LOGGER.warning("liveness L4: role=%s %d running 实例超上限 %d，截断不判忙",
-                           role, len(rows), _STEP_SCAN_LIMIT)
-            return {"available": True, "busy": False, "truncated": True}
         for r in rows:
             inst_id = _row_get(r, "instance_id", 0)
             if exclude_wf_id and inst_id == exclude_wf_id:
@@ -190,9 +189,9 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                     steps = []
                     for s in (_raw_steps or []):
                         if isinstance(s, dict):
-                            steps.append({"id": s.get("step_id"), "target_role": s.get("target_role")})
+                            steps.append({"step_id": s.get("step_id") or s.get("id"), "target_role": s.get("target_role")})
                         else:  # 对象：WorkflowDef step（.id/.target_role）
-                            steps.append({"id": getattr(s, "id", None), "target_role": getattr(s, "target_role", None)})
+                            steps.append({"step_id": getattr(s, "id", None), "target_role": getattr(s, "target_role", None)})
             else:
                 steps = _load_steps_json(template_id, db_conn)
             if not steps:
@@ -207,7 +206,7 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
             for _s in steps:
                 if _s.get("target_role") != role:
                     continue
-                _sdata = step_results.get(_s.get("id", ""), {})
+                _sdata = step_results.get(_s.get("step_id") or _s.get("id") or "", {})
                 if not isinstance(_sdata, dict):
                     continue
                 if _sdata.get("status") in _ACTIVE_STEP_STATUS:
@@ -217,9 +216,9 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                         continue
                     if (_sdata.get("timeout_count") or 0) < 3:
                         LOGGER.info("liveness: skip %s busy with %s/%s (step=%s)",
-                                    role, inst_id[:8], _s.get("id"), _sdata.get("status"))
+                                    role, inst_id[:8], _s.get("step_id") or _s.get("id"), _sdata.get("status"))
                         return {"available": True, "busy": True,
-                                "wf_id": inst_id, "step_id": _s.get("id", "?")}
+                            "wf_id": inst_id, "step_id": _s.get("step_id") or _s.get("id") or "?"}
         return {"available": True, "busy": False}
     except Exception:
         return {"available": False, "busy": False, "error": "db_query_failed"}
@@ -232,8 +231,8 @@ def _health_gate(role: str, health_dir: Path, pane_fallback: bool) -> tuple[bool
     - busy_decision=True/False：门控直接给出结论（健康文件主导）
     - busy_decision=None：需要继续 L3/L4 DB 检查
 
-    pane_fallback 路径用 tmux_pane_active（#{pane_active} 焦点检查，非 has-session），
-    与原 _is_role_busy 的 self._tmux_pane_alive 语义一致。
+    pane_fallback 路径用 tmux_pane_active（pane 近期有无输出，非 has-session），
+    与原 _is_role_busy 的 self._tmux_pane_alive 兜底意图一致。
     """
     h = _read_health(role, health_dir)
     if h is None:
@@ -278,9 +277,9 @@ def role_liveness(role: str, level: int = 4, exclude_wf_id: str = "",
         if gate is not None:
             signals[1] = {"available": True, "gate": gate, "overall": (h or {}).get("survival_overall")}
             signals[2] = {"available": True, "gate": gate, "producing": (h or {}).get("survival_l3_producing")}
-            # 健康门控判 idle(bound=False)时, 若 L4 DB 步骤扫描有 running 实例(含 think 状态),
-            # 不能 short-circuit 回 busy=False——否则 tmux pane_active 判失效导致真在干的角色
-            # 被漏判 idle → step_handler 误走 delivery_blocked。让 L4 有判责。
+            # 健康门控判 idle 时，若 L4 DB 步骤扫描有 running 实例（含 think 状态），
+            # 不能 short-circuit 回 busy=False——否则真在干活的角色被漏判 idle，
+            # step_handler 误走 delivery_blocked。让 L4 有判责。
             if gate is False and level >= 4 and db_conn is not None:
                 s4 = _s4_stepping(role, db_conn, exclude_wf_id, workflows=workflows)
                 signals[4] = s4
@@ -341,16 +340,30 @@ def role_liveness(role: str, level: int = 4, exclude_wf_id: str = "",
     return {"busy": busy, "level_used": level_used, "signals": signals, "reason": reason}
 
 
-def tmux_pane_active(role: str, timeout: float = 3.0) -> bool | None:
-    """tmux pane_active（0/1 焦点）二值判断。保留原 _tmux_pane_alive 语义。
+def tmux_pane_active(role: str, timeout: float = 3.0,
+                     window: float = PANE_ACTIVE_WINDOW) -> bool | None:
+    """pane 在最近 window 秒内是否有输出活动（#{window_activity} 时间戳，非焦点标志）。
 
-    tmux 3.4 的 pane_activity 恒为空导致 survival L2 失效，这里用 pane_active 兜底。
+    原实现读 #{pane_active}（焦点 0/1）—— 单 pane 会话下恒为 1，等于恒返回 True，
+    使 stale/dead 兜底永远成立：**空闲被翻译成忙** → 任务排队 → 饿死 → 回收。
+    2026-10-17 实测全链停摆（running 实例 82~173 常驻、角色被反复判忙、投递全排队），
+    见 bus #395128/#395235/#395251。
+
+    #{window_activity} 是 pane 最后一次输出的 unix 时间戳，实测随输出递增，
+    与 survival_monitor._l2_check 同源（该处 2026-10-16 已从 pane_activity 修正）。
+    返回值：True=近期有活动；False=tmux 可达但已静默超窗；None=探测不可用（不判忙）。
     """
     try:
-        r = subprocess.run(["tmux", "list-panes", "-t", f"ccs-{role}", "-F", "#{pane_active}"],
-                           capture_output=True, text=True, timeout=timeout)
-        if r.returncode == 0 and "1" in r.stdout:
-            return True
-        return False
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None  # OSError: tmux socket 不可达/权限不足（review P3）
+        r = subprocess.run(
+            ["tmux", "list-panes", "-t", f"ccs-{role}", "-F", "#{window_activity}"],
+            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return False
+        raw = r.stdout.strip().split("\n")[0] if r.stdout.strip() else ""
+        if not raw or raw == "0":
+            return None  # 无数据 ≠ 不活跃，交调用方按未知处理
+        return (time.time() - float(raw)) < window
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        return None
+    except OSError:
+        return None  # tmux socket 不可达/权限不足（review P3）

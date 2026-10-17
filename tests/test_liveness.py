@@ -2,11 +2,13 @@
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from liveness import (
+    PANE_ACTIVE_WINDOW,
     _db_fetch, _health_gate, _load_steps_json, _row_get,
     _s0_alive, _s1_thinking, _s2_producing, _s3_assigned, _s4_stepping,
     _tmux_has_session, role_liveness, tmux_pane_active,
@@ -173,17 +175,17 @@ class TestL4Stepping(unittest.TestCase):
         s = _s4_stepping("qa", None)
         self.assertFalse(s["busy"])
 
-    def test_truncated_scan_returns_not_busy(self):
-        """>40 个 running 实例 → 截断，不判忙（安全方向，review P2 补测）。"""
+    def test_high_instance_count_still_detects_busy(self):
+        """>40 个 running 实例不再截断放行：生产实测 82~173 个实例常驻，
+        旧截断会把所有角色判为不忙 → 引擎继续投递 → 积压自我放大。"""
         conn = self._conn()
-        for i in range(41):
+        for i in range(60):
             conn.execute("INSERT INTO workflow_instances VALUES(?, 'tpl', ?, 'engineer', NULL, 'running')",
                           (f"wf_{i}", json.dumps({"s1": {"status": "running", "timeout_count": 0}})))
-        s = _s4_stepping("qa", conn)
-        self.assertFalse(s["busy"])
-        self.assertTrue(s.get("truncated"))
+        s_busy = _s4_stepping("qa", conn)
+        self.assertTrue(s_busy["busy"], "高实例数下仍应按步骤 target_role 判忙")
+        self.assertNotIn("truncated", s_busy, "截断键已删除，不再返回")
         conn.close()
-
     def test_list_format_steps_json(self):
         """steps_json 为 list 格式（真实 DB 生产格式）→ 正确读取步骤定义。"""
         conn = sqlite3.connect(":memory:")
@@ -276,6 +278,81 @@ class TestRoleLiveness(unittest.TestCase):
         res = role_liveness("qa", level=1, health_dir=self._hd)
         self.assertTrue(res["busy"])
         self.assertIn(1, res["signals"])
+
+
+class TestTmuxPaneActiveRegression(unittest.TestCase):
+    """回归守卫：tmux_pane_active 必须读活动时间戳，不得读焦点标志。
+
+    2026-10-17 P0：原实现读 #{pane_active}（焦点 0/1），单 pane 会话下恒为 1 →
+    恒 True → stale/dead 兜底永远成立 → 空闲角色被判忙 → 任务排队 → 饿死 → 回收，
+    全链停摆（bus #395128/#395235/#395251）。
+    """
+
+    def _run_stdout(self, stdout):
+        fake = MagicMock(returncode=0, stdout=stdout)
+        with patch("liveness.subprocess.run", return_value=fake) as m:
+            result = tmux_pane_active("qa", window=300)
+        return result, m
+
+    def test_reads_window_activity_not_pane_active(self):
+        """必须查 #{window_activity}；查 #{pane_active} 则此断言失败。"""
+        _, mock = self._run_stdout(str(int(time.time())) + "\n")
+        cmd = mock.call_args[0][0]
+        self.assertIn("#{window_activity}", cmd[-1],
+                      "必须用活动时间戳，焦点标志 pane_active 恒 1 会永远判忙")
+        self.assertNotIn("#{pane_active}", cmd[-1])
+
+    def test_recent_activity_is_true(self):
+        result, _ = self._run_stdout(str(int(time.time()) - 10) + "\n")
+        self.assertIs(result, True, "10s 前有输出应判活跃")
+
+    def test_silent_beyond_window_is_false(self):
+        result, _ = self._run_stdout(str(int(time.time()) - 5000) + "\n")
+        self.assertIs(result, False, "静默超窗应判不活跃")
+
+    def test_empty_output_is_unknown_not_busy(self):
+        """恒空输出（旧代码失败的形态）必须返回 None，不能返回 True。"""
+        result, _ = self._run_stdout("\n")
+        self.assertIsNone(result, "无数据 ≠ 活跃，须交调用方按未知处理")
+
+    def test_zero_timestamp_is_unknown(self):
+        result, _ = self._run_stdout("0\n")
+        self.assertIsNone(result)
+
+    def test_unparsable_output_is_unknown(self):
+        result, _ = self._run_stdout("not-a-number\n")
+        self.assertIsNone(result)
+
+    def test_tmux_missing_is_unknown(self):
+        with patch("liveness.subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(tmux_pane_active("qa"))
+
+
+class TestStaleRoleNotBusyWhenSilent(unittest.TestCase):
+    """回归守卫：stale 判定本身不得被 pane 存活推翻（P0 的直接症状）。
+
+    stale 的语义就是「无输出且无产出」；若此时因 pane 存活改判 busy，
+    引擎会一直排队等待，而角色永远不会产出 → 饿死。
+    """
+
+    def setUp(self):
+        self._hd = Path(tempfile.mkdtemp())
+
+    def _write(self, data):
+        (self._hd / "qa.json").write_text(json.dumps(data))
+
+    @patch("liveness.tmux_pane_active", return_value=False)
+    def test_stale_and_silent_is_not_busy(self, _m):
+        self._write({"survival_overall": "stale", "survival_l3_producing": False})
+        gate, _ = _health_gate("qa", self._hd, pane_fallback=True)
+        self.assertIs(gate, False)
+
+    @patch("liveness.tmux_pane_active", return_value=True)
+    def test_stale_but_recent_output_is_busy(self, _m):
+        """兜底仍应存在：health 快照 stale 但 pane 刚有输出（推理中）→ 不打断。"""
+        self._write({"survival_overall": "stale"})
+        gate, _ = _health_gate("qa", self._hd, pane_fallback=True)
+        self.assertIs(gate, True)
 
 
 if __name__ == "__main__":
