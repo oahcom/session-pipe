@@ -85,11 +85,6 @@ class LifecycleManager:
             self._conn.execute(sql, params)
             self._conn.commit()
 
-    def execute_many(self, sql: str, seq: list[tuple]) -> None:
-        """批量执行代理。"""
-        with self._lock:
-            self._conn.executemany(sql, seq)
-            self._conn.commit()
 
     def execute_raw(self, sql: str, params: tuple = ()) -> None:
         """执行 SQL（不自动提交，用于事务内操作）。"""
@@ -658,14 +653,6 @@ class LifecycleManager:
                                  detail=f"cascade from parent {_current}: {reason}")
                 _stack.append(_cid)
 
-    def _count_pending_subflows(self, wf_id: str, step_id: str) -> int:
-        """统计指定步骤创建的子工作流中未完成的个数。"""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM workflow_instances "
-            "WHERE parent_wf_id=? AND subflow_source_step_id=? AND status NOT IN ('completed')",
-            (wf_id, step_id)
-        ).fetchone()
-        return row[0] if row else 0
 
     # ── 内部 unsafe 方法（在已开启的事务中调用） ──
 
