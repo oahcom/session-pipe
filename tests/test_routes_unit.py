@@ -280,8 +280,11 @@ def test_route_to_ccs_not_running_skips(mock_metrics, mock_hb):
 def test_route_to_ccs_send_success(mock_hb, mock_metrics):
     """发送成功 → action=routed。"""
     from routing.routes import route_to_ccs
+    # 载体分类用 bug_report（待办请求）而非 code_fix：后者自 2026-10-17 起归入
+    # _SYSTEM_CATEGORIES（它承载的是"已修复"回报，不是请求），不再 mint 任务。
+    # 本用例验证的是"含内容词的标题应建 workflow"的路由逻辑，与载体分类无关。
     msgs = [{
-        "id": 32, "category": "code_fix", "text": "修复登录模块非json文本",
+        "id": 32, "category": "bug_report", "text": "修复登录模块非json文本",
         "priority": 1,
     }]
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
@@ -433,3 +436,68 @@ def test_route_all_to_ccs_single_role(mock_metrics, mock_hb):
     assert result["routed"] == 2
     assert result["total"] == 2
     mock_r2c.assert_called_once_with("engineer", False)
+
+
+# ── _is_role_report_title: 防 fan-out 纯函数 ──
+# 实测 2026-10-17：无此判定时 [self-reflect] 复盘消息被 fan-out 到 9 个角色
+# （16 源事件 → 54 条"创建任务"，3.4 倍放大）。
+
+def test_is_role_report_title_blocks_bracketed_tags():
+    """[标签] 开头一律是系统自述/产出汇报，不建 workflow。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[self-reflect] 任务《x》无产出") is True
+    assert _is_role_report_title("[deploy] wf_xxx 产出已部署") is True
+    assert _is_role_report_title("[engineer] s1-complete (wf_xxx)") is True
+    assert _is_role_report_title("[maintainer] 创建任务: xxx") is True
+    assert _is_role_report_title("[qa] 唤醒: wf_x/s4 测试报告已就绪") is True
+
+
+def test_is_role_report_title_allows_real_tasks():
+    """真实任务标题不误杀。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("needs_implementation @qa 工作流任务") is False
+    assert _is_role_report_title("修复登录超时 bug") is False
+    assert _is_role_report_title("") is False
+    assert _is_role_report_title(None) is False
+
+
+def test_is_self_echo_suppresses_only_own_messages():
+    """回声抑制：只拦自己写的，不误杀他人（RFC 3834）。"""
+    from routing.routes import _is_self_echo
+    assert _is_self_echo({"src": "consumer"}, "consumer") is True
+    assert _is_self_echo({"src": "engineer"}, "consumer") is False
+    assert _is_self_echo({"src": "workflow_engine"}, "consumer") is False
+    assert _is_self_echo({}, "consumer") is False
+    assert _is_self_echo({"src": ""}, "consumer") is False
+
+
+def test_needs_investigation_catches_maintainer_handoff():
+    """维护者发现缺陷但越界不改 → 移交 investigator 接手。"""
+    from routing.routes import _needs_investigation
+    assert _needs_investigation(_make_fact(
+        1, "code_fix", "[maintainer] 9Router 端口漂移",
+        "缺陷: launcher 兜底默认值指向死端口。建议（越界不自己改，交 engineer）恢复兜底")) is True
+
+
+def test_needs_investigation_skips_deploy_report():
+    """已完成回报（[deploy] 产出已部署）不是待办，不派 investigator。"""
+    from routing.routes import _needs_investigation
+    assert _needs_investigation(_make_fact(
+        1, "code_fix", "[deploy] wf_x 产出已部署: eval_consistency.py",
+        "路径: ~/.hermes/bin/eval_consistency.py")) is False
+
+
+def test_needs_investigation_skips_noop_health_report():
+    """健康巡检含"无需修复"，即使同时含 handoff 词也不派（否定式优先）。"""
+    from routing.routes import _needs_investigation
+    assert _needs_investigation(_make_fact(
+        1, "code_fix", "[maintainer] 健康检查: 服务全绿零僵尸(非修复,no-op报告)",
+        "本报告为健康巡检no-op(无异常无需修复),不应触发下游建修复任务")) is False
+
+
+def test_needs_investigation_no_marker_no_signal_is_false():
+    """无显式标记也无移交信号 → 默认不派，防淹没 investigator。"""
+    from routing.routes import _needs_investigation
+    assert _needs_investigation(_make_fact(
+        1, "code_fix", "CODE_FIX: wf_x/s2 代码开发 — 部署件安全抽查固化",
+        "新增 src/deploy_artifact_audit.py")) is False

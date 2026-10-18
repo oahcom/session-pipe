@@ -30,7 +30,15 @@ _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker
                                        # scheduler: 定时器心跳，206 条中 196 条同文（95% 重复），
                                        # 建 workflow 只会产出同标题空任务。session_log: 角色
                                        # 自述汇报，非工作请求。二者仍正常路由给角色，仅不建任务。
-                                       "scheduler", "session_log"})
+                                       # monitor_audit: 引擎自身的审计输出（如“决策: 轮次追踪超时”），
+                                       # 建 workflow 会形成引擎写审计→建 wf→引擎又写审计的自环
+                                       # （实测 2026-10-17：标题内秒数变化逃过唯一索引，每 5 分钟重建一批）。
+                                       #
+                                       # code_fix（2026-10-17 补）：它承载的是**已完成事件**的回报
+                                       # （"[deploy] wf_x 产出已部署"、"CODE_FIX: wf_x/sN ... 已落地并验证"），
+                                       # 不是待办请求。缺它导致 24h 内 99 条 [deploy] 回报被 mint 成新任务
+                                       # 派给 maintainer（maintainer→maintainer 自喂环 80 实例）。
+                                       "scheduler", "session_log", "monitor_audit", "code_fix"})
 _NON_TASK_CATEGORIES = frozenset({"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"})
 SYSTEM_CATEGORIES = _NON_TASK_CATEGORIES  # 向后兼容别名
 
@@ -76,6 +84,22 @@ def _is_self_echo(msg: dict, role: str) -> bool:
     """
     src = msg.get("src", "")
     return bool(src) and src == role
+
+
+def _is_noop_report(title: str, evidence: str = "") -> bool:
+    """no-op 健康报告判据（DESIGN §7 S3）：措辞命中 → 不 mint 工作流。
+
+    maintainer 服务健康时产出 `无职责内修复动作...` 报告，被路由 fan-out 成
+    新 WL-01 实例（要求为"什么都不用做"写技术方案）。判据委托给
+    cron_scheduler._is_noop_report，措辞表单一来源，避免两处漂移。
+    真修复报告携带变更 delta 措辞 → 不命中 → 正常 mint。
+    """
+    try:
+        from cron_scheduler import _is_noop_report as _f
+        return _f(title, evidence)
+    except Exception as _e:
+        LOGGER.debug("noop 判据不可用（放行）: %s", _e)
+        return False
 
 
 
@@ -190,6 +214,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                     # INFO 而非 DEBUG：拦截会改变投递行为，需在 journalctl 可见，
                                     # 否则若某个合法任务被误判，排查时无迹可寻。
                                     LOGGER.info("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
+                                elif _is_noop_report(_t, assignment.get("evidence", "")):
+                                    # DESIGN §7 S3：no-op 健康报告是状态而非任务请求，
+                                    # mint 出"为无需动作写方案"的空转实例。INFO 可见。
+                                    LOGGER.info("Skipping workflow create: no-op report (%s) role=%s", _t[:40], role)
                                 else:
                                     try:
                                         _wc = WorkflowClient(role)
@@ -408,6 +436,9 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                         # 与 route_all 对齐：[角色名] 开头是产出汇报，不是派发任务。
                         # 缺此判定时同一份完成汇报被 fan-out 成 7~9 个角色各自的新 workflow。
                         LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _title[:40], role_name)
+                    elif _is_noop_report(_title, _raw):
+                        # 与 route_all 对齐（DESIGN §7 S3）：no-op 健康报告不 mint。
+                        LOGGER.debug("Skipping workflow create: no-op report (%s) role=%s", _title[:40], role_name)
                     else:
                         _wf = WorkflowClient(role_name)
                         _wf.create_task_v2(_title, assignee=role_name,
@@ -499,6 +530,49 @@ def _match_investigator(evidence: str) -> str:
     return "investigator_general"
 
 
+# “已完成回报”词表：这些条目是角色报告自己已经做完的事，不是待办。
+# 命中则一律不派 investigator（否则每条 [deploy] 都变成一条排查任务）。
+# WHY 双向判据：单看移交词会把 "[修复] wf_x/s3 — 无异常, 全部已就绪" 误判为待办。
+_REPORT_DONE_WORDS = ("已部署", "已落地", "已修复", "已就绪", "已完成", "已通过", "已固化",
+                      "无异常", "全绿", "已收敛", "deployed", "completed", "no-op")
+
+# “待办移交”词表：角色发现缺陷但越界（或无权）自改，移交给他人的信号。
+# 对应实测场景：maintainer #407080 "建议（越界不自己改，交 engineer）"——
+# 该条既是 code_fix（被 routes.py:37 排除出建任务集合），标题又带 [maintainer]
+# 前缀（被 _is_role_report_title 拦截），两道门都无法接住 → 缺陷无人接手。
+_HANDOFF_WORDS = ("建议交", "交 engineer", "交 pg", "交 devops", "待修", "待处理", "需修复",
+                  "应改", "需要修复", "请 engineer", "请修复", "待办", "缺陷:", "缺陷：",
+                  "潜在回归", "dormant", "不自己改", "无法自行修复", "转交")
+
+# 否定式：含 handoff 词但语义相反（健康报告 "无异常无需修复"）。
+_NEGATED_WORDS = ("无需修复", "无需处理", "不需修复", "非修复", "no-op报告", "不触发下游")
+
+
+def _needs_investigation(fact) -> bool:
+    """该 bus 条目是否是需要排查的缺陷（而非已完成回报）。
+
+    显式标记优先（investigator 角色的 filter 契约）；否则按内容判别 ——
+    移交信号优先于完成回报词。实测 407080 的 evidence 同时含 "全绿"
+    （"其余健康项全绿"）与移交词（"建议交 engineer"）—— 若完成回报词优先，
+    真待办会被误排除，故移交词必须先于回报词检查。
+    """
+    _ev = (getattr(fact, "e", "") or "").lower()
+    if "needs_investigation" in _ev or "needs_triage" in _ev:
+        return True
+    _text = f"{getattr(fact, 't', '') or ''}\n{getattr(fact, 'e', '') or ''}"
+    _low = _text.lower()
+    # 否定式优先："无异常无需修复"、"非修复,no-op报告" 含 handoff 词但语义相反。
+    # 必须先于 handoff 判定，否则健康巡检报告会被误派为缺陷。
+    if any(w in _text for w in _NEGATED_WORDS):
+        return False
+    if any(w in _text for w in _HANDOFF_WORDS):
+        return True
+    if any(w in _low for w in _REPORT_DONE_WORDS):
+        return False
+    # 无移交词也无回报词 → 普通 code_fix（如 "[deploy] 产出已部署: X.py"），
+    # 不足以判定需排查。默认不派，防止 investigator 被淹没。
+    return False
+
 def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> dict:
     """自动分派需排查的消息给对应 investigator。
 
@@ -512,9 +586,8 @@ def dispatch_investigator(category: str = "code_fix", dry_run: bool = False) -> 
 
     results = []
     for f in facts:
-        # 只处理 filter=needs_investigation / needs_triage 的消息；
-        # 非目标消息直接消费（否则永远占 [:50] 窗口, 目标消息被挤出饿死）
-        if "needs_investigation" not in (f.e or "").lower() and "needs_triage" not in (f.e or "").lower():
+        if not _needs_investigation(f):
+            # 非目标消息直接消费（否则永远占 [:50] 窗口, 目标消息被挤出饿死）
             try:
                 bb.mark_consumed(f.id, consumer="auto_route_investigator")
             except Exception:
