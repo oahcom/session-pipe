@@ -862,7 +862,10 @@ class RoleLifecycleMixin:
             _result = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "send", role, prompt,
                  "--from", "workflow_engine"],
-                capture_output=True, timeout=30,
+                # 窗口必须覆盖子进程真实最坏路径：长 prompt 分块写入（每块
+                # 500 字符）+ tmux 自适应超时（负载 ≥12 时单次 20s，3 次重试）
+                # 可超 60s。30s 会在投递途中杀掉子进程，留下半截输入。
+                capture_output=True, timeout=120,
             )
         except _engine_mod._sp.TimeoutExpired as _te:
             # ccs send 超时（实测长 prompt 2299 字符 > 30s，19:53/19:57/20:54/21:19 共 8 次）：
