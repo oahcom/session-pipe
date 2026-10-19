@@ -70,3 +70,19 @@ def test_strict_ownership_ignores_body_mentions():
     f = _F("无关标题", e="顺带提到 wf_sub_4e63ad633d39")
     assert not _mentions(f, "wf_sub_4e63ad633d39", fields="t"), "严格路径只看标题"
     assert _mentions(f, "wf_sub_4e63ad633d39"), "宽松路径含正文"
+
+def test_subflow_verdict_only_checks_last_step():
+    """历史步骤里的驳回文案不得触发末步驳回告警（codex P2）。
+
+    子链 s1 曾被驳回、s2 重新通过后，s1 的 exit_messages 仍留在
+    step_results 里。若全量扫描，每次子链完成都会误报"末步驳回"。
+    """
+    from pipeflow.task_generator import _subflow_verdict_rejected
+    sr = {
+        "s1": {"exit_messages": [{"text": "CHANGES_REQUESTED"}]},  # 历史，已确认放行
+        "s2": {"exit_messages": [{"text": "s2-complete APPROVED"}]},
+    }
+    # 末步单独判：不含驳回词
+    assert not _subflow_verdict_rejected({"s2": sr["s2"]}), "末步 APPROVED 不应判驳回"
+    # 全量判会误报 —— 这正是修复前行为
+    assert _subflow_verdict_rejected(sr), "全量扫描确实会命中历史驳回（说明必须只看末步）"

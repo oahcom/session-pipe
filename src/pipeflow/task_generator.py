@@ -229,11 +229,18 @@ class TaskGeneratorMixin:
                                 # 必须查**子链**的 step_results：原实现传 _sr（父链的），
                                 # 于是判据恒在看父步自己的历史文案 —— 子链驳回永远检不出，
                                 # 而父步早前某步的驳回文案会一直误报。
+                                # 只看**末步**：历史步骤里被确认后放行的驳回文案
+                                # 会一直留在 step_results 里，全量扫描 → 每 tick
+                                # 误报（codex P2）。末步才是本次完成真正掩盖的结论。
                                 _sub_row_sr = conn.execute(
-                                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
-                                    (_sf,)).fetchone()
-                                _sub_verdict_sr = (json.loads(_sub_row_sr["step_results"] or "{}")
-                                                   if _sub_row_sr else {})
+                                    "SELECT current_step_id, step_results FROM workflow_instances "
+                                    "WHERE instance_id=?", (_sf,)).fetchone()
+                                _sub_all = (json.loads(_sub_row_sr["step_results"] or "{}")
+                                            if _sub_row_sr else {})
+                                _sub_last = _sub_all.get(_sub_row_sr["current_step_id"]) \
+                                    if _sub_row_sr else None
+                                _sub_verdict_sr = ({_sub_row_sr["current_step_id"]: _sub_last}
+                                                   if isinstance(_sub_last, dict) else {})
                                 if _subflow_verdict_rejected(_sub_verdict_sr):
                                     try:
                                         self._bb.write(
