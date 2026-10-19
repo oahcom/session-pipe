@@ -80,7 +80,6 @@ def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
     return bool(re.search(pat, body))
 
 
-
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
     """角色 tmux pane 显示越界操作 → 注入停止指令（安全护栏，不 cancel 工作流）。"""
     ops = "、".join(commands[:3])
