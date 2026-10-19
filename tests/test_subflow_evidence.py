@@ -105,6 +105,61 @@ def test_render_includes_evidence_body():
     assert "【业务问题→engineer】P1" in out
 
 
+def test_subflow_task_desc_carries_root_requirement():
+    """子链 tasks.description 必须含父任务的用户需求，而不只是步骤标题。
+
+    事故：用户需求「做一个高质量产品落地页」，pm 子链 s1 的 prompt 主体是
+    pm_requirements 模板自带的「读 scout 报告，筛 1-3 个方向」→ pm 按 scout
+    情报立项，与用户要的落地页无关。父任务描述是唯一的需求真相源。
+    """
+    from unittest.mock import MagicMock
+    from pipeflow.engine import WorkflowEngine, WorkflowDef, Step
+
+    eng = WorkflowEngine(workflows_dir=_WORKFLOWS_DIR)
+    inserted = []
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            if sql.strip().startswith("INSERT OR IGNORE INTO tasks"):
+                inserted.append(params[2])          # description
+            m = MagicMock()
+            if "FROM tasks t" in sql:
+                m.fetchone.return_value = {
+                    "title": "高质量产品落地页",
+                    "description": "响应式三档 + 无障碍 + 渐进增强"}
+            elif "FROM workflow_instances" in sql:
+                m.fetchone.return_value = {"step_results": "{}", "status": "running",
+                                           "assigner": "pm"}
+            else:
+                m.fetchone.return_value = None
+            m.fetchall.return_value = []
+            return m
+        def commit(self): pass
+
+    class _Lm:
+        def _conn_tx(self):
+            class C:
+                def __enter__(s): return _Conn()
+                def __exit__(s, *a): return False
+            return C()
+
+    wf = WorkflowDef(name="WF-product_delivery", title="t", description="d",
+                     steps=[Step(id="s1", title="需求确认与 PRD", target_role="pm",
+                                 prompt_template="x", exit_condition={},
+                                 subflow_template="pm_requirements")])
+    sub = WorkflowDef(name="pm_requirements", title="s", description="sd",
+                      steps=[Step(id="s1", title="需求收集", target_role="pm",
+                                  prompt_template="读 scout 报告", exit_condition={})])
+    eng._workflows = {"WF-product_delivery": wf, "pm_requirements": sub}
+    eng._is_role_busy = lambda *a, **k: False
+
+    eng._subflow_takeover(_Lm(), "wf_parent", "WF-product_delivery",
+                          wf.steps[0], -1, {}, "s0")
+    assert inserted, "应创建子链任务"
+    assert "高质量产品落地页" in inserted[0], f"需求标题未下传: {inserted[0]!r}"
+    assert "响应式三档" in inserted[0], f"需求正文未下传: {inserted[0]!r}"
+
+
 if __name__ == "__main__":
     for fn in (test_container_step_drills_into_subflow,
                test_own_exit_messages_win_over_subflow,

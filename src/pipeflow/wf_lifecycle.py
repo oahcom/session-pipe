@@ -751,7 +751,23 @@ class WorkflowLifecycleMixin:
                     # （实测 task_sub_80bd6be1 逐字含「标题: {title}」，blocker #397347）。
                     _up = (self._render_msgs(self._step_deliverables(prev_step_id, results), 1500)
                            if idx >= 0 else "")
-                    _desc = tgt_step.title + (f"\n上游交付证据：\n{_up}" if _up else "")
+                    # 父任务需求正文必须下传：子链 s1 的 prompt 主体是**子模板自己的**
+                    # 正文（如 pm_requirements s1 硬编码「读 scout 报告，筛 1-3 个方向」），
+                    # 不带用户需求时角色会把模板示例当成任务——实测「做一个高质量
+                    # 产品落地页」被 pm 按 scout 情报方向立项。父任务描述是唯一的需求真相源。
+                    _root = conn2.execute(
+                        "SELECT t.title, t.description FROM tasks t "
+                        "JOIN workflow_instances wi ON wi.task_id=t.task_id "
+                        "WHERE wi.instance_id=?", (wf_id,)).fetchone()
+                    _req = ""
+                    if _root:
+                        _req = (f"用户需求：{_root['title']}\n"
+                                f"{(_root['description'] or '').strip()}")
+                    _desc = "\n".join(x for x in (
+                        _req,
+                        f"本步：{tgt_step.title}",
+                        (f"上游交付证据：\n{_up}" if _up else ""),
+                    ) if x)
                     _desc = _engine_mod.UNMATCHED_VAR_RE.sub("", _desc)
                     conn2.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
                         (_task_id, f"{wf_name}/{tgt_step.id}: {tgt_step.title}",
