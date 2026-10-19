@@ -69,6 +69,19 @@ def _done(eng, step_id, src="test_role", extra=""):
     eng._bb.write("notice", f"DONE_{step_id.upper()}{_TAG} {extra}", src=src)
 
 
+
+def _poll_done(eng, rid, tries=25):
+    """轮询到工作流离开 running。末步收尾比角色完成消息晚一个 tick：
+    _advance_unsafe 对末步只返回 False（不自行 close，否则绕开部署与 loop 自触发），
+    close_wf 由引擎主循环的 _advance_production_wf 在下一次 tick 执行。
+    """
+    for _ in range(tries):
+        time.sleep(0.05)
+        eng.run_once()
+        if eng.status(rid)["status"] not in ("running", "pending"):
+            return eng.status(rid)
+    return eng.status(rid)
+
 def _poll(eng, rid, step_id, tries=20):
     """轮询等待步骤推进。固定 sleep(0.1)+单次 run_once 在负载下不够：
     advance 走两阶段（锁内 commit + 锁外 _send_to_role），实测 1/6 概率未完成。"""
@@ -103,11 +116,9 @@ def test_single_step_lifecycle(mock_run):
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "notified", s
 
-    # Bus exit -> run_once -> complete
+    # Bus exit -> 收尾（末步由下一轮 tick 的引擎主循环完成）
     _done(eng, "s1")
-    time.sleep(0.1)
-    eng.run_once()
-    s = eng.status(rid)
+    s = _poll_done(eng, rid)
     assert s["status"] == "completed", f"expected completed, got {s}"
 
     eng.cancel(rid)
@@ -141,11 +152,9 @@ def test_two_step_sequential(mock_run):
     # 否则消息被 s2 的 created_after 过滤，永远无法推进
     eng.run_once()
     # Exit s2
+    # Exit s2 -> 末步收尾
     _done(eng, "s2")
-    time.sleep(0.1)
-    eng.run_once()
-
-    s = eng.status(rid)
+    s = _poll_done(eng, rid)
     assert s["status"] == "completed", f"expected completed, got {s}"
     _cleanup(d)
 
@@ -473,6 +482,37 @@ def test_status_nonexistent():
     _cleanup(d)
 
 
+# ── 末步收尾不可被旁路 ──
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_last_step_runs_engine_closeout(mock_run):
+    """末步必须经引擎收尾，而非由 _advance_unsafe 直接写 completed。
+
+    为什么锁死：_advance_unsafe 的末步分支原实现直接 UPDATE status='completed'
+    就返回。那条路径绕开 _advance_production_wf 的 is_last 分支，连带丢掉三件
+    锁外收尾：子链检查、_deploy_production_outputs（产出装到 ~/.hermes/bin）、
+    wf.loop 的食物链自触发。实测单步链 prod_advance=0、deploy=0。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "closeout", [_step("s1")])
+    eng = WorkflowEngine(d)
+
+    deployed = []
+    _orig = eng._deploy_production_outputs
+    eng._deploy_production_outputs = lambda wf: (deployed.append(wf), _orig(wf))[1]
+
+    rid = eng.start("closeout", {})
+    eng.run_once()
+    _done(eng, "s1")
+    s = _poll_done(eng, rid)
+
+    assert s["status"] == "completed", f"应完成，实际 {s}"
+    assert deployed == [rid], f"末步收尾必须跑部署（实测被旁路），deployed={deployed}"
+    _cleanup(d)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Cleanup
 # ═══════════════════════════════════════════════════════════════════
@@ -502,6 +542,7 @@ if __name__ == "__main__":
         ("无效工作流名", test_start_invalid_workflow),
         ("空步骤", test_start_empty_steps),
         ("不存在状态", test_status_nonexistent),
+        ("末步经引擎收尾（不旁路部署）", test_last_step_runs_engine_closeout),
     ]
     passed, failed = 0, 0
     for name, fn in tests:

@@ -364,7 +364,14 @@ class LifecycleManager:
             for i, s in enumerate(steps):
                 if s.get("step_id") != step_id:
                     continue
-                prev = steps[i - 1].get("target_role", "") if i > 0 else ""
+                # 首步 review 没有「上一步产出」可审 → 语义上就是自审。
+                # 旧实现落到 wf.assigner，而引擎自动建的返工链把 assigner 写死
+                # "reviewer"（wf_lifecycle._create_rework_subflow）——reviewer
+                # 从不知道这条链存在，token 无人消费，白等 TTL+grace 90 分钟
+                # （实测 wf_rw_46e42f725e74/s1）。
+                if i == 0:
+                    return ""
+                prev = steps[i - 1].get("target_role", "")
                 if prev and prev != target and prev not in ("workflow_engine", "system"):
                     return prev
                 assigner = wf.get("assigner", "")
@@ -997,6 +1004,15 @@ class LifecycleManager:
                 idx = i
                 break
         if idx == -1 or idx + 1 >= len(steps):
+            # 末步：不自行 close。直接写 completed 会绕开引擎的收尾阶段
+            # （子链检查 + close_wf + 锁外部署 + 食物链 loop 自触发），
+            # 实测单步链 deploy=0、loop 永不启动。改为返回 False 让上层
+            # （step_handler → engine 主循环）按 step_done_ready 走
+            # _advance_production_wf 的 is_last 分支，拿到完整收尾。
+            # idx == -1（步骤不在模板）仍自行收尾：引擎对该情况 idx<0
+            # 直接 return，交出去会永久悬空。
+            if idx >= 0:
+                return False
             self._conn.execute(
                 "UPDATE workflow_instances SET status='completed', completed_at=? "
                 "WHERE instance_id=?", (time.time(), wf_id)
