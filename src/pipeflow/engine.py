@@ -731,6 +731,13 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         幂等锚 rework_escalated_at：无它则每 tick 重发一条。锚只在投递确实成功
         （True）时落——busy 是排队、False 是守卫拦下，都非送达，下轮重试；否则
         coordinator 没收到消息锚却已置位，升级永久丢失。
+
+        锚用单键 json_set 写，**不**擕整份 results——results 是本 tick 起始快照。
+        wait 分支紧跟在 _create_rework_subflow 之后（同一 tick 内可达），建链走
+        自己的 CAS 写 rework_ids，而本地 results 里没有它（建链前提就是
+        `not _rej_sr.get("rework_ids")`）。整份写回会把刚落库的 rework_ids 抹掉
+        → 下 tick `_rework_ids` 变空 → 再建一条同角色链：返工额外翻倍。
+        单键写只动锚，与建链的 CAS 互不覆盖。
         """
         wf_id = inst["instance_id"]
         if sr.get("rework_escalated_at"):
@@ -742,10 +749,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         if _ok is not True:      # busy=排队、False=守卫拦下，两者都非送达
             LOGGER.warning("升级投递未成功(%s) %s/%s → 下轮重试", _ok, wf_id[:12], step_id)
             return
-        sr["rework_escalated_at"] = time.time()
-        results[step_id] = sr
-        lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                   (json.dumps(results, ensure_ascii=False), wf_id))
+        _now = time.time()
+        sr["rework_escalated_at"] = _now
+        try:
+            lm.execute(
+                "UPDATE workflow_instances "
+                "SET step_results=json_set(COALESCE(step_results,'{}'), ?, ?) "
+                "WHERE instance_id=?",
+                (f'$."{step_id}".rework_escalated_at', _now, wf_id))
+        except Exception as _we:
+            # step_results 非合法 JSON 对象时 json_set 会报错。此时降级为整份写：
+            # 这类行本就不受建链影响（建链需要读得到 dict），且不降级则每 tick
+            # 重发一条升级消息（锚未落库）。
+            LOGGER.warning("单键写锚失败(%s)，降级整份写 %s/%s", _we, wf_id[:12], step_id)
+            results[step_id] = sr
+            lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                       (json.dumps(results, ensure_ascii=False), wf_id))
         self._bb.write("blocker",
                        f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
                        evidence=f"驳回理由: {(sr.get('rejection_reason') or '')[:200]}",

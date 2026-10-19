@@ -11,6 +11,7 @@ cleanup 五条件也全假 → 静默卡死至 24h 全局兜底。
 """
 import os
 import sys
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -197,6 +198,42 @@ class TestEscalateRejectedAnchor:
         # D：全缺 → None（调用方 `if _since` 拦住，不得误报超时）
         assert _rejected_wait_anchor({}, {}) is None
         assert _rejected_wait_anchor({}, None) is None
+
+    @patch("subprocess.run",
+           return_value=MagicMock(returncode=0, stdout="claude\n", stderr=b""))
+    def test_escalation_preserves_concurrently_written_rework_ids(self, _mock_run):
+        """升级写锚不得抹掉同 tick 刚落的 rework_ids。
+
+        wait 分支紧跟 _create_rework_subflow，同一 tick 内可达；建链走自己的 CAS
+        写 rework_ids，而本地 results（tick 起始快照）里没有它（建链前提就是
+        `not _rej_sr.get("rework_ids")`）。若升级擕整份 results 写回，刚落的
+        rework_ids 被抹 → 下 tick 变空 → 再建一条同角色链，返工翻倍。
+        """
+        d = _make_env()
+        try:
+            _write_wf(d, "esc_clobber", [_step("s1")])
+            eng = WorkflowEngine(d)
+            wf_id = eng.start("esc_clobber", {})
+            lm = eng._lifecycle
+
+            # 模拟：DB 里 s1 已有建链刚落的 rework_ids；本地 results 是旧快照
+            lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                       (json.dumps({"s1": {"status": "rejected",
+                                           "rework_ids": ["wf_rw_concurrent"]}},
+                                  ensure_ascii=False), wf_id))
+            results = {"s1": {"status": "rejected"}}   # 无 rework_ids
+            eng._send_to_role = lambda *a, **k: True
+            eng._escalate_rejected({"instance_id": wf_id, "created_at": time.time()},
+                                   "s1", results["s1"], results, lm, "clobber 测试")
+
+            got = json.loads(lm.query_one(
+                "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                (wf_id,))["step_results"])
+            assert got["s1"].get("rework_ids") == ["wf_rw_concurrent"], (
+                "升级擕整份旧快照写回，抹掉了并发落的 rework_ids → 下 tick 重建链")
+            assert got["s1"].get("rework_escalated_at"), "锚未落库 → 每 tick 重发"
+        finally:
+            _cleanup(d)
 
     @patch("subprocess.run",
            return_value=MagicMock(returncode=0, stdout="claude\n", stderr=b""))
