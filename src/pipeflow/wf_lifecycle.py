@@ -479,6 +479,18 @@ class WorkflowLifecycleMixin:
                                        wf_id[:8], wf_name)
                         self._lifecycle.close_wf(wf_id, status='failed')
                         conn.commit()
+                        # bus 必须写：本分支的结论只有 coordinator/lr 能处置，
+                        # 而他们读 bus 不读 journal。
+                        try:
+                            self._bb.write(
+                                "blocker",
+                                f"[workflow] {wf_id[:12]}/{wf_name} 价值审计 FAIL，"
+                                f"已按 failed 收尾（不是 completed）",
+                                src="workflow_engine",
+                                evidence=f"价值门禁文件 {_vg.get('file')} 判定 FAIL。"
+                                         f"本轮无收益，需 coordinator 决定重排或降级需求。")
+                        except Exception as _bwe:
+                            LOGGER.debug("value-gate blocker 写入失败: %s", _bwe)
                         return
                     _all_subs_done = True
                     _forced: list = []  # 被强制取消的子链 (step_id, subflow_id, 原状态)
