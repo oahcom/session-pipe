@@ -60,66 +60,6 @@ class TestPersonaCacheHitMiss(unittest.TestCase):
                        "mtime 相同时应复用缓存（同一 dict 对象）")
 
 
-class TestTrackAuthorSkip(unittest.TestCase):
-    """track 作者过滤: 最新消息作者是 target_role → 跳过告警。"""
-
-    def _tick_with_src(self, src: str, target_role: str):
-        eng = _eng()
-        eng._is_role_busy = MagicMock(return_value=False)
-        eng._check_exit = MagicMock(return_value=(0.0, []))
-        fake_fact = type("F", (), {"ts": time.time() - 600, "src": src})()
-        eng._bb.read = MagicMock(return_value=[fake_fact])
-        eng._sync_step_results = MagicMock()
-        step = Step(
-            id="s1", title="t", target_role=target_role, prompt_template="t",
-            exit_condition={},
-            track={"bus_category": "code_fix", "timeout_sec": 1,
-                   "notify_roles": ["pm"]})
-        run = WorkflowRun(
-            id="wf_auth", workflow_name="test_auth", context={},
-            current_step="s1", status="running",
-            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        eng._tick(run, step)
-        return eng
-
-    def test_author_is_self_skips(self):
-        """作者是 target_role → 不发消息（角色刚写过，不卡死）。"""
-        eng = self._tick_with_src("reviewer", "reviewer")
-        eng._send_to_role.assert_not_called()
-
-    def test_author_is_other_notifies(self):
-        """作者是其他角色 → 正常告警。"""
-        eng = self._tick_with_src("other_role", "reviewer")
-        eng._send_to_role.assert_called()
-
-
-class TestTrackThrottleIntegration(unittest.TestCase):
-    """track 节流: 第二次 tick 不重复告警。"""
-
-    def test_second_tick_throttled(self):
-        eng = _eng()
-        eng._is_role_busy = MagicMock(return_value=False)
-        eng._check_exit = MagicMock(return_value=(0.0, []))
-        eng._sync_step_results = MagicMock()
-        step = Step(
-            id="s1", title="t", target_role="scout", prompt_template="t",
-            exit_condition={},
-            track={"bus_category": "code_fix", "timeout_sec": 300,
-                   "notify_roles": ["pm"]})
-        run = WorkflowRun(
-            id="wf_th", workflow_name="test_th", context={},
-            current_step="s1", status="running",
-            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        fake_fact = type("F", (), {"ts": time.time() - 600, "src": "other"})()
-        eng._bb.read = MagicMock(return_value=[fake_fact])
-        eng._tick(run, step)
-        # 双轨: 执行轨 scout 1 条 + 监护轨 pm 1 条 = 2（ADR-NOTIFY-ROLES）
-        self.assertEqual(eng._send_to_role.call_count, 2, "第一次应通知执行者+监护者")
-        # 第二次 tick（track_notified_at 已设置）
-        eng._tick(run, step)
-        self.assertEqual(eng._send_to_role.call_count, 2, "第二次应被节流")
-
-
 class TestGuardWatchInvalidType(unittest.TestCase):
     """guard.watch 非法类型 → 引擎加载时丢弃，不拉起不存在角色。"""
 
@@ -188,40 +128,6 @@ class TestLoopValueGateIntegration(unittest.TestCase):
         self.assertEqual(len(inserts), 0, "FAIL 时不应 INSERT")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-class TestTrackPartnerRecovery(unittest.TestCase):
-    """track 完整闭环: 超时→通知→伙伴恢复→停止告警。"""
-
-    def test_partner_recovery_resets_track(self):
-        eng = _eng()
-        eng._is_role_busy = MagicMock(return_value=False)
-        eng._check_exit = MagicMock(return_value=(0.0, []))
-        eng._sync_step_results = MagicMock()
-        step = Step(
-            id="s1", title="t", target_role="scout", prompt_template="t",
-            exit_condition={},
-            track={"bus_category": "code_fix", "timeout_sec": 300,
-                   "notify_roles": ["pm"]})
-        run = WorkflowRun(
-            id="wf_recover", workflow_name="test_rec", context={},
-            current_step="s1", status="running",
-            step_results={"s1": {"status": "notified", "ts": time.time() - 600,
-                                 "notified_at": time.time() - 600}})
-        # tick1: 超时（600s 前消息）→ 应通知
-        eng._bb.read = MagicMock(return_value=[
-            type("F", (), {"ts": time.time() - 600, "src": "other"})()])
-        eng._tick(run, step)
-        # 双轨: 执行轨 scout + 监护轨 pm = 2（ADR-NOTIFY-ROLES）
-        self.assertEqual(eng._send_to_role.call_count, 2, "超时应通知执行者+监护者")
-        # tick2: 伙伴恢复（新消息 1s 前）→ 不再通知
-        eng._bb.read = MagicMock(return_value=[
-            type("F", (), {"ts": time.time() - 1, "src": "scout"})()])
-        eng._tick(run, step)
-        # age = now - max(1s前, 600s前) = 1s < 300s → 不超时
-        self.assertEqual(eng._send_to_role.call_count, 2, "伙伴恢复后不应再通知")
 
 
 class TestDualNodeNode2Complete(unittest.TestCase):

@@ -165,19 +165,15 @@ class Step:
     verify: str = ""
     failure_patterns: list[str] = None
     subflow_template: str = ""  # 该步骤对应的子工作流模板名
-    # 协作能力声明（旧 ccs.py --partner/--bus-track 收编）
+    # 协作能力声明（旧 ccs.py --partner 收编）
     # guard: 额外守护的角色（target_role 已由引擎自动守护，watch 定义 target_role 之外的）
     #   {"watch": ["role_a"], "auto_restart": true}
-    # track: 步骤执行期间的轮次追踪（与 exit_condition 一次性退出不同，这是持续轮询）
     #   {"bus_category": "cat", "timeout_sec": 300, "notify_roles": ["role_c"]}
     dual_node: bool = False  # 双节点完成机制：第一节点写 bus 后引擎注入 codex 审查，第二条 bus 才推进
     exit_schema: dict = None  # 退出校验 schema（文件校验/内容校验/自定义校验）
     # 主从模式：guard 声明额外守护角色（target_role 已自动守护），
     # 引擎每 tick 检查存活，死了拉起（_collect_guard_roles + _ensure_guard_roles）
     guard: dict = None  # CCS 守护声明 {"watch": ["role_a"], "auto_restart": true}
-    # 对等模式：track 声明轮次追踪，超时提醒 notify_roles，节流防重复，
-    # 伙伴恢复（新消息到达）自动停止告警（_tick track 段）
-    track: dict = None  # 轮次追踪声明 {"bus_category": "cat", "timeout_sec": 300, "notify_roles": [...]}
     # 仲裁模式：wait_roles 声明协作门——所有角色都产出匹配消息才推进
     # （_check_exit 门控；source_contains/relaxed-advance/tmux 信号均不绕过）
     wait_roles: list = None  # 协作门：等这些角色都产出匹配消息才推进（仲裁/对等模式）
@@ -309,14 +305,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 steps = []
                 for _s in data.get("steps", []):
                     _clean = {k: v for k, v in _s.items() if k in Step.__dataclass_fields__}
-                    # persona collab 注入：模板未显式声明 guard/track 时，
+                    # persona collab 注入：模板未显式声明 guard 时，
                     # 用 target_role persona 的 collab 字段（声明一次全模板生效）
-                    # 仅当 guard 和 track 都未声明时注入：模板显式声明任一字段
-                    # = 作者意图"此步骤仅此能力"，persona 不应补充另一项（2026-08-12 codex P1）
                     _tr = _clean.get("target_role", "")
-                    if _tr and not _clean.get("guard") and not _clean.get("track"):
+                    if _tr and not _clean.get("guard"):
                         _rc = _role_collab.get(_tr) or {}
-                        if not _clean.get("guard") and _rc.get("guard"):
+                        if _rc.get("guard"):
                             _g = _rc["guard"]
                             # 结构校验：watch 必须是字符串数组，否则遍历字符会拉起不存在的角色
                             if isinstance(_g, dict) and isinstance(_g.get("watch"), list) \
@@ -325,13 +319,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                 _clean["guard"] = json.loads(json.dumps(_g))
                             else:
                                 LOGGER.warning("collab guard 结构非法，跳过注入: %s", _tr)
-                        if not _clean.get("track") and _rc.get("track"):
-                            _t = _rc["track"]
-                            if isinstance(_t, dict) and isinstance(_t.get("bus_category"), str) \
-                                    and _t.get("bus_category"):
-                                _clean["track"] = json.loads(json.dumps(_t))
-                            else:
-                                LOGGER.warning("collab track 结构非法，跳过注入: %s", _tr)
                     # 统一结构校验（覆盖模板显式声明 + persona 注入两来源）：
                     # 非法 watch/notify_roles 会在消费点逐字符遍历 → 拉起不存在角色
                     _g2 = _clean.get("guard")
@@ -339,15 +326,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                                   or not all(isinstance(r, str) for r in _g2.get("watch", []))):
                         LOGGER.warning("guard 结构非法，丢弃: %s/%s", f.name, _tr)
                         _clean["guard"] = None
-                    _t2 = _clean.get("track")
-                    if isinstance(_t2, dict):
-                        if not isinstance(_t2.get("bus_category"), str) or not _t2.get("bus_category"):
-                            LOGGER.warning("track 结构非法，丢弃: %s/%s", f.name, _tr)
-                            _clean["track"] = None
-                        elif not isinstance(_t2.get("notify_roles", []), list) \
-                                or not all(isinstance(r, str) for r in _t2.get("notify_roles", [])):
-                            LOGGER.warning("track.notify_roles 非法，丢弃: %s/%s", f.name, _tr)
-                            _clean["track"] = None
                     _wr = _clean.get("wait_roles")
                     if _wr is not None and (not isinstance(_wr, list)
                                             or not all(isinstance(r, str) for r in _wr)):
@@ -440,10 +418,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     if _d_wr is not None and (not isinstance(_d_wr, list)
                                               or not all(isinstance(r, str) for r in _d_wr)):
                         s_clean["wait_roles"] = None
-                    _d_t = s_clean.get("track")
-                    if isinstance(_d_t, dict) and (not isinstance(_d_t.get("notify_roles", []), list)
-                                                   or not all(isinstance(r, str) for r in _d_t.get("notify_roles", []))):
-                        s_clean["track"] = None
                     try:
                         steps.append(Step(**s_clean))
                     except (ValueError, KeyError, TypeError):
@@ -640,7 +614,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             "dual_node": s.dual_node,
                             "exit_condition": s.exit_condition,
                             "exit_schema": s.exit_schema, "guard": s.guard,
-                            "track": s.track,
                             "wait_roles": getattr(s, "wait_roles", None),
                             "failure_patterns": getattr(s, "failure_patterns", None),
                         } for s in _missing)
@@ -664,7 +637,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                  "exit_condition": s.exit_condition,
                  "exit_schema": s.exit_schema,
                  "guard": s.guard,
-                 "track": s.track,
                  "wait_roles": getattr(s, "wait_roles", None),
                  "failure_patterns": getattr(s, "failure_patterns", None)}
                 for s in wf.steps

@@ -59,52 +59,6 @@ def test_can_assign_role_backpressure():
     print(f"✅ MAX_RUNNING_PER_ROLE={MAX_RUNNING_PER_ROLE} backpressure ✓")
 
 
-def test_fanout_dedup_skips_duplicate_role():
-    """notify_roles 列表含重复角色 → 同一超时事件只通知一次（DESIGN §2.3）。"""
-    eng = _get_test_eng()
-    eng._lm = MagicMock()  # _lifecycle 是 property，实现在 _lm 上
-    eng._consumed_exit_ids = set()
-
-    # bus 上有一条非 target_role 的消息：步骤开始后活跃过（ts > notified_at），
-    # 之后静默超时 → track 判真停滞。顺序不能倒——ts 早于 notified_at 是"该分类
-    # 步骤期间从未活跃"的配置错位场景，2026-10-17 起不再误报（见 step_handler track 分支）。
-    _fact = MagicMock()
-    _fact.src = "survival_monitor"
-    # ts 必须严格大于 notified_at：步骤开始后该分类曾活跃，之后静默超时
-    # （ts <= notified_at 为"步骤期间从未活跃"，会被 track 分支跳过，不进入去重逻辑）
-    _fact.ts = time.time() - 10
-    eng._bb = MagicMock()
-    eng._bb.read.return_value = [_fact]
-
-    _sent = []
-    eng._ensure_role_alive = lambda r: None
-    eng._send_to_role = lambda r, p, **kw: _sent.append((r, p)) or True
-
-    step = Step(
-        id="s1", title="步骤1", target_role="engineer", prompt_template="继续",
-        exit_condition={},  # cat 为空 → track 分支照常执行
-        track={"bus_category": "deadlock_signal", "timeout_sec": 1,
-               "notify_roles": ["qa", "qa", "devops"]},  # qa 重复
-    )
-    run = WorkflowRun(id="wf_dedup_test01", workflow_name="dedup_test",
-                      context={},
-                      step_results={"s1": {"notified_at": time.time() - 100}})
-
-    with patch("pipeflow.step_handler.get_conversation_signal", return_value=None), \
-         patch("pipeflow.step_handler._integ_load",
-               return_value=MagicMock(pending=False, complete=False)):
-        eng._tick(run, step)
-
-    _sent_roles = [r for r, _ in _sent]
-    # 双轨(ADR-NOTIFY-ROLES): 执行轨 engineer 1 + 监护轨 qa 1 + devops 1 = 3
-    # qa 在 notify_roles 中重复 2 次 → 去重后仅 1 次
-    assert _sent_roles.count("qa") == 1, f"qa 应只通知 1 次, got {_sent_roles}"
-    assert _sent_roles.count("devops") == 1, f"devops 应通知 1 次, got {_sent_roles}"
-    assert _sent_roles.count("engineer") == 1, f"执行者 engineer 应通知 1 次, got {_sent_roles}"
-    assert len(_sent) == 3, f"去重后应共 3 次通知, got {len(_sent)}: {_sent_roles}"
-    print("✅ fan-out 同事件同角色去重 ✓")
-
-
 def test_backlog_alert_cooldown_suppresses_repeat():
     """同角色积压告警 30min 内只放行一次（DESIGN §2.6 S4）。"""
     eng = _get_test_eng()

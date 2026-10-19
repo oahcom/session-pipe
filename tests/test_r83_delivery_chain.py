@@ -37,25 +37,6 @@ def test_goal_prefix_only_for_real_tasks():
     print("✓ test_goal_prefix_only_for_real_tasks PASS")
 
 
-def test_deadlock_prompt_has_no_age():
-    """deadlock 文案不得含随秒变化的数字，否则 24h 去重形同虚设。
-
-    背景：_event_key(title, assignee, template) 用 title 做去重键；标题里嵌
-    int(age) 使每秒的键都不同 → 去重恒 miss → 每秒重发（实测 15 台 s4 实例洪水）。
-    """
-    src = open(os.path.join(os.path.dirname(__file__), "..",
-                            "src/pipeflow/step_handler.py"),
-               encoding="utf-8").read()
-    m = re.search(r'_track_prompt = \(?f?"?\[deadlock\][^\n]*', src)
-    assert m, "应存在 _track_prompt 定义"
-    line = m.group(0)
-    assert "int(age)" not in line, \
-        f"deadlock 文案不应含 int(age)（每秒变化使去重失效）: {line}"
-    assert "{step.id}" in src[m.start():m.start() + 300], \
-        "deadlock 文案应补步骤语义（角色需要知道继续哪一步）"
-    print("✓ test_deadlock_prompt_has_no_age PASS")
-
-
 def test_queue_degrade_constant_exists_and_is_sane():
     """_QUEUE_DEGRADE_AT 存在且在既有升级链 (>=6 通知 / >=10 cancel) 之内。
 
