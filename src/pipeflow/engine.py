@@ -1349,6 +1349,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         except Exception:
             LOGGER.debug("context overflow check failed")
 
+        # 模型额度拒绝（403/429）→ 按退避发「继续」重试
+        try:
+            self._recover_rate_limited_roles()
+        except Exception:
+            LOGGER.debug("rate limit recovery failed")
+
     def _collect_guard_roles(self) -> set[str]:
         """收集所有活跃工作流步骤需要守护的角色。
 

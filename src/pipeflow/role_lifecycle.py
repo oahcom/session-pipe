@@ -102,6 +102,21 @@ class RoleLifecycleMixin:
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
     _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
+    # ── 模型额度拒绝（403/429）恢复 ──
+    # 9router 免费层按出口 IP 计配额：角色 pane 只剩 "API Error: 403" /
+    # "Rate limit exceeded"，进程活着但不产出。旧行为只把它排除出 idle 判定
+    # （conversation_monitor._EXCLUDE_IDLE），**没有任何恢复动作** → 步骤一直
+    # 等到超时取消。实测 pg 在 wf_sub_4e63ad633d39/s1 卡 78min。
+    # 退避：首次 120s，之后每次翻倍到 1800s 封顶，避免在额度耗尽期刷屏。
+    _RATE_LIMIT_BACKOFF_SEC = (120, 240, 480, 960, 1800)
+    _last_rate_recover: dict[str, tuple[float, int]] = {}   # role -> (last_ts, attempt)
+    _RATE_LIMIT_PATTERNS = (
+        "API Error: 403", "API Error: 429",
+        "Rate limit exceeded", "rate_limit_exceeded",
+        "FreeTierError", "FreeUsageLimitError",
+        "Please run /login",
+    )
+
     _last_compact: dict[str, float] = {}
     # 上下文阈值告警：从 pane 状态栏 `↓ 117.1k tokens` 提取用量，超阈值写 blocker。
     # 与溢出检测（_check_context_overflow 的 has_overflow）分两路：溢出信号要等
@@ -123,6 +138,68 @@ class RoleLifecycleMixin:
     _last_bus_write: dict[str, float] = {}
     _BUS_WRITE_LOCK = threading.Lock()
 
+
+    def _recover_rate_limited_roles(self) -> None:
+        """角色被模型额度拒绝（403/429）时按退避发「继续」重试。
+
+        WHY 不能只判 pane 空闲：403/429 时角色进程活着、pane 有内容（错误文案），
+        与"正在干活"在存活判据上完全一样；_EXCLUDE_IDLE 只是避免误判死，
+        没有任何恢复动作 → 步骤空等到超时取消。
+
+        WHY 发「继续」而不是重启：错误是上游额度/出口 IP 问题，重启进程
+        不改变额度；角色上下文里的任务还在，一句「继续」就能让它重试该请求。
+        """
+        roles = set()
+        try:
+            for row in self._lifecycle.query(
+                "SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"
+            ):
+                if row["assignee"]:
+                    roles.add(row["assignee"])
+        except Exception:
+            pass
+        if not roles:
+            return
+
+        now = time.time()
+        for role in roles:
+            tmux_name = f"ccs-{role}"
+            try:
+                r = _engine_mod._sp.run(
+                    ["tmux", "capture-pane", "-p", "-t", f"{tmux_name}:0.0", "-S", "-60"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except Exception:
+                continue
+            if r.returncode != 0:
+                continue
+            output = r.stdout or ""
+            if not any(p in output for p in self._RATE_LIMIT_PATTERNS):
+                continue
+
+            with self._COMPACT_LOCK:
+                last, attempt = self._last_rate_recover.get(role, (0.0, 0))
+                wait = self._RATE_LIMIT_BACKOFF_SEC[
+                    min(attempt, len(self._RATE_LIMIT_BACKOFF_SEC) - 1)]
+                if now - last < wait:
+                    continue
+                self._last_rate_recover[role] = (now, attempt + 1)
+
+            LOGGER.warning("额度拒绝: %s 命中 403/429，第 %d 次发「继续」重试", role, attempt + 1)
+            try:
+                _engine_mod._sp.run(
+                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
+                    capture_output=True, timeout=5,
+                )
+                _engine_mod._sp.run(
+                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "继续", "Enter"],
+                    capture_output=True, timeout=5,
+                )
+                self._bb.write("monitor_audit",
+                    f"[rate_limit] {role} 被额度拒绝 → 已发继续（第 {attempt + 1} 次）",
+                    evidence=output[-300:], src="workflow_engine")
+            except Exception as e:
+                LOGGER.warning("额度恢复发送失败 %s: %s", role, e)
 
     def _check_context_overflow(self):
         """检测角色 tmux pane 中 Claude 的上下文溢出信号，自动发 /compact。
