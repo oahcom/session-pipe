@@ -117,7 +117,7 @@ class WorkflowLifecycleMixin:
                 # current_step_id 必须选：:137/:148 的 d.get("current_step_id", "")
                 # 依赖它，漏选则恒为 "" → 抢救已产出步骤的分支与条件4 双双恒不触发
                 "SELECT instance_id, template_id, created_at, step_results, status, "
-                "current_step_id "
+                "current_step_id, assignee "
                 "FROM workflow_instances WHERE status IN ('running', 'step_done_ready')"
             ):
                 d = dict(row)
@@ -208,12 +208,20 @@ class WorkflowLifecycleMixin:
                                     or created or 0)
                         _stall_h = (now - _step_ts) / 3600 if _step_ts else 0
                         from pipeflow.step_handler import _QUEUE_DEGRADE_AT as _Q_DEGRADE
-                        # tc>=1 是引擎已确认超时；queued 达降级阈值且真实停滞 >1h 属同等情况
+                        # tc>=1 是引擎已确认超时；queued 达降级阈值且真实停滞 >1h 属同等情况。
+                        # 但 tc 递增会把 ts 重置为 now（step_handler 给角色响应窗口那次重写），
+                        # _stall_h 上限恒为一个超时窗（<1h）—— tc 分支结构上看不到真实停滞时长，
+                        # 角色持续工作时该分支仍成立（实测误杀正在写报告的 reviewer）。
+                        # 仅当 assignee 可解析且 pane 明确静默（False）才判死：None=探测不可用、
+                        # 空 assignee=解析失败（ccs- 是无效目标，探针必假阴性），都不算角色已死。
                         if _cur_tc >= 1 or (_cur_q >= _Q_DEGRADE and _stall_h > 1):
-                            _reason_step = _cur_sr.get("step", _cur)
-                            reason = (f"running 状态 {_reason_step} 无推进记录 "
-                                      f"步骤停滞 {_stall_h:.1f}h / 实例 {age_h:.1f}h "
-                                      f"(timeout_count={_cur_tc}, queued={_cur_q})")
+                            from liveness import tmux_pane_active
+                            _role = (d.get("assignee") or "").strip()
+                            if _role and tmux_pane_active(_role) is False:
+                                _reason_step = _cur_sr.get("step", _cur)
+                                reason = (f"running 状态 {_reason_step} 无推进记录 "
+                                          f"步骤停滞 {_stall_h:.1f}h / 实例 {age_h:.1f}h "
+                                          f"(timeout_count={_cur_tc}, queued={_cur_q})")
 
                 if reason:
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)
