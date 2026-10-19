@@ -1280,14 +1280,18 @@ class WorkflowLifecycleMixin:
             return
         for _role in _producers:
             try:
+                # start 与兄弟站点 role_lifecycle.py:404 对齐给 60s：ccs.py start
+                # 内部要等 tmux 就绪，30s 会结构性超时；且 TimeoutExpired 不在
+                # ValueError/KeyError/TypeError 继承链上，原先会冒泡出 run_once
+                # 中止整个 tick（与 R99 投递超时穿透同族），此处一并收口为告警。
                 _engine_mod._sp.run(["python3", str(_CCS_CLI), "stop", _role],
                         capture_output=True, timeout=30)
                 _engine_mod._sp.run(["python3", str(_CCS_CLI), "start", _role, "--no-attach",
                          "--drive", "infinite"],
-                        capture_output=True, timeout=30)
+                        capture_output=True, timeout=60)
                 LOGGER.info("wf %s loop: 生产者 %s 已重启 (iteration %d)",
                             wf_id[:8], _role, _iteration + 1)
-            except (ValueError, KeyError, TypeError) as _e:
+            except (_engine_mod._sp.TimeoutExpired, ValueError, KeyError, TypeError) as _e:
                 LOGGER.warning("loop producer restart failed %s: %s", _role, _e)
         self._bb.write("workflow",
             f"[workflow] {wf.name} 新一轮迭代 {_iteration + 1} 已启动: {_new_wf_id}",
