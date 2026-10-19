@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from liveness import (
-    PANE_ACTIVE_WINDOW,
+    PANE_ACTIVE_WINDOW, _STALE_NOTIFIED_SEC,
     _db_fetch, _health_gate, _load_steps_json, _row_get,
     _s0_alive, _s1_thinking, _s2_producing, _s3_assigned, _s4_stepping,
     _tmux_has_session, role_liveness, tmux_pane_active,
@@ -168,6 +168,43 @@ class TestL4Stepping(unittest.TestCase):
         conn.execute("INSERT INTO workflow_instances VALUES('wf_sub_x','tpl',?,'workflow_engine','wf_other_parent','running')",
                       (json.dumps({"s1": {"status": "running", "timeout_count": 0}}),))
         s = _s4_stepping("qa", conn, exclude_wf_id="wf_main")
+        self.assertTrue(s["busy"])
+        conn.close()
+
+    def test_stale_notified_not_busy(self):
+        """陈旧 notified（投递后长期零响应）不计占用 —— 防两条链互为"忙"饿死。
+
+        实测 wf_sub_4e63/wf_sub_b548 各卡一个 pg/s1 notified 110 分钟，
+        双方互判 busy，kick-stalled 每 10 分钟触发却直接 continue。
+        """
+        conn = self._conn()
+        stale = time.time() - _STALE_NOTIFIED_SEC - 60
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "notified", "notified_at": stale,
+                                          "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertFalse(s["busy"])
+        conn.close()
+
+    def test_fresh_notified_still_busy(self):
+        """新鲜 notified 仍算占用（角色可能正在思考，不该被抢）。"""
+        conn = self._conn()
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "notified",
+                                          "notified_at": time.time() - 5,
+                                          "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertTrue(s["busy"])
+        conn.close()
+
+    def test_stale_running_still_busy(self):
+        """running 不受陈旧豁免：它是角色主动写的执行中状态。"""
+        conn = self._conn()
+        stale = time.time() - _STALE_NOTIFIED_SEC - 60
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "running", "notified_at": stale,
+                                          "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
         self.assertTrue(s["busy"])
         conn.close()
 

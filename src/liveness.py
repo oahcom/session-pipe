@@ -46,6 +46,14 @@ PANE_ACTIVE_WINDOW = float(os.environ.get("CCS_PANE_ACTIVE_WINDOW", "300"))
 # wf_3f71a2a78f76 停滞 235 分钟）。
 _ACTIVE_STEP_STATUS = ("notified", "running")
 
+# notified 步骤的"仍算占用"窗口。超过该窗口且 timeout_count<3，说明角色从未
+# 响应过这次投递（403/卡在 login 提示等），此时继续判 busy 会让同角色的
+# 其他工作流全部饿死——两条互不相干的链各卡一个 notified 步骤时，双方互为
+# "忙"，谁都不会被重推（实测 wf_sub_4e63/wf_sub_b548 互锁 110 分钟，
+# kick-stalled 每 10 分钟触发却因 busy 直接 continue）。
+# running 不受此限：它是角色主动写的执行中状态，代表真在干活。
+_STALE_NOTIFIED_SEC = float(os.environ.get("CCS_STALE_NOTIFIED_SEC", "900"))
+
 
 def _tmux_has_session(role: str, timeout: float = 3.0) -> bool | None:
     """L0: tmux 会话存活。返回 None = 无数据（tmux 不可用），调用方按放行处理。"""
@@ -308,6 +316,16 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                     if _q >= 6 and exclude_wf_id and inst_id == exclude_wf_id:
                         LOGGER.info("liveness: %s queued=%d 同一工作流 → 豁免 busy", role, _q)
                         continue
+                    # 陈旧的 notified（投递后长期零响应）不构成"占用"：否则两条
+                    # 互不相干的链各卡一个 notified 步骤时互为"忙"，双双饿死。
+                    # 只豁免 notified；running 是角色主动写的，仍是真占用。
+                    if _sdata.get("status") == "notified":
+                        _notified_at = _sdata.get("notified_at") or _sdata.get("ts") or 0
+                        if _notified_at and (time.time() - _notified_at) >= _STALE_NOTIFIED_SEC:
+                            LOGGER.info("liveness: %s 步 %s/%s notified 已 %.0fs 无响应 → 不计占用",
+                                        role, inst_id[:8], _s.get("step_id") or _s.get("id"),
+                                        time.time() - _notified_at)
+                            continue
                     if (_sdata.get("timeout_count") or 0) < 3:
                         LOGGER.info("liveness: skip %s busy with %s/%s (step=%s)",
                                     role, inst_id[:8], _s.get("step_id") or _s.get("id"), _sdata.get("status"))
