@@ -46,6 +46,19 @@ def _load_forbidden_ops_from_launcher() -> dict:
         LOGGER.warning("failed to load forbidden_ops from roles.py: %s", e)
         return {}
 
+def _launcher_roles_mtime() -> float:
+    """launcher 的 roles.py mtime（禁区定义的权威源）；取不到则返回 0。
+
+    返回 0 会让「缓存是否新鲜」判为 True（0 <= 缓存 mtime），即维持旧行为 ——
+    宁可继续用缓存，也不因跨项目路径不可用而每 tick 反复加载。
+    """
+    try:
+        from paths import SESSION_LAUNCHER_SRC
+        return (Path(SESSION_LAUNCHER_SRC) / "routing" / "roles.py").stat().st_mtime
+    except Exception:
+        return 0.0
+
+
 def _ensure_forbidden_ops():
     global _forbidden_ops_loaded, _FORBIDDEN_OPS
     if _forbidden_ops_loaded:
@@ -53,15 +66,22 @@ def _ensure_forbidden_ops():
     with _forbidden_ops_lock:
         if _forbidden_ops_loaded:
             return
-        # 优先读缓存文件
+        # 优先读缓存文件——但源码更新后必须失效重算。
+        # 原实现只要缓存存在就用，改了 launcher 的 _FORBIDDEN_MAP 也不生效：
+        # 实测 2026-10-20 修正 9 个角色禁区后，reviewer 仍被判 run_tests 越界。
+        # 缓存版本号同时参与判断：语义变更但 mtime 未变（如 git checkout）也能失效。
+        _CACHE_VERSION = 2
         if _FORBIDDEN_CACHE.exists():
             try:
                 import json
                 cache_data = json.loads(_FORBIDDEN_CACHE.read_text())
-                _FORBIDDEN_OPS = cache_data.get("forbidden_ops", {})
-                _forbidden_ops_loaded = True
-                LOGGER.debug("forbidden_ops loaded from cache (%d roles)", len(_FORBIDDEN_OPS))
-                return
+                _src_fresh = _launcher_roles_mtime() <= _FORBIDDEN_CACHE.stat().st_mtime
+                if cache_data.get("version") == _CACHE_VERSION and _src_fresh:
+                    _FORBIDDEN_OPS = cache_data.get("forbidden_ops", {})
+                    _forbidden_ops_loaded = True
+                    LOGGER.debug("forbidden_ops loaded from cache (%d roles)", len(_FORBIDDEN_OPS))
+                    return
+                LOGGER.info("forbidden_ops 缓存过期（源码已更新或版本不符），重新生成")
             except Exception:
                 pass  # 缓存损坏，回退到重新生成
         # 无缓存或损坏 → 从 launcher 读取并写缓存
