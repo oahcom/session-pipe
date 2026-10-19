@@ -1294,9 +1294,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             # 必失配（自致盲）。实测 15 条历史实例因此永久搁浅（8-27 的恢复日志
             # 成功但行状态未变，10 秒后概况仍 delivery_blocked=12）。
             # 行级 status='delivery_blocked' 是 close_wf 打的，恢复不改它，稳定可查。
+            # 扫描条件必须两个分支都给：
+            #  1) 行级 delivery_blocked —— close_wf 打的终态，稳定可查（旧版靠它）
+            #  2) 行级活跃但**步级** delivery_blocked —— _tick 达投递上限只写 step_results，
+            #     close_wf 只在特定分支才被调用，故绝大多数实例行级仍是 running。
+            # 只查行级时，这类实例对本函数完全不可见：既不推进也不被回收
+            # （run_once 只查 pending/running/step_done_ready，_cleanup_stale 只查
+            # running/step_done_ready）→ 永久孤儿。实测生产库行级 0 条、步级 239 条，
+            # 存活父链 wf_22b96b1b0c 的 s3 正是此形态（行级 running + 步级 blocked），
+            # 恢复机制对它失效 40 分钟。
+            # 自致盲不成立：恢复把步级 status 置 "" 后 LIKE 失配，但行级分支独立命中；
+            # 反之行级还原为 running 后由本分支接管，两路互不遮蔽。
             rows = lm.query(
                 "SELECT instance_id, step_results, current_step_id FROM workflow_instances "
-                "WHERE status = 'delivery_blocked'"
+                "WHERE status = 'delivery_blocked' "
+                "   OR (status IN ('pending','running','step_done_ready') "
+                "       AND step_results LIKE '%delivery_blocked%')"
             )
             for row in rows:
                 inst_id = row["instance_id"]
@@ -1353,9 +1366,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 记 blocker 供人介入，而非静默留下。
                         LOGGER.warning("recover 上限已满，收敛为 failed: %s/%s (%d 次)",
                                        inst_id[:12], step_id, _rc)
+                        # 两个行级形态都要能收敛：行级 delivery_blocked，以及
+                        # 行级活跃但步级 blocked（上方新增的扫描分支）。
+                        # 只认行级时，后者 UPDATE 命中 0 行 → 写了 blocker 却仍是
+                        # 孤儿，护栏形同虚设。
                         lm.execute(
                             "UPDATE workflow_instances SET status='failed' "
-                            "WHERE instance_id=? AND status='delivery_blocked'",
+                            "WHERE instance_id=? AND status IN "
+                            "('delivery_blocked','pending','running','step_done_ready')",
                             (inst_id,))
                         try:
                             self._bb.write(
@@ -1389,8 +1407,13 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 第二次扫描必失配（自致盲，只能生效一次）。
                         # 实测 2026-08-27 日志：5 条被恢复且日志成功，10 秒后概况仍是
                         # delivery_blocked=12，行状态纹丝未动；8-27 后不再命中。
+                        # 行级还原用 CASE 而非无条件 'running'：新增的步级分支里
+                        # 行级可能已是 pending/step_done_ready，无条件覆盖会抹掉
+                        # step_done_ready 的"待推进"标记（该分支只需重置 step_results）。
                         lm.execute(
-                            "UPDATE workflow_instances SET step_results=?, status='running' "
+                            "UPDATE workflow_instances SET step_results=?, "
+                            "status=CASE WHEN status='delivery_blocked' THEN 'running' "
+                            "            ELSE status END "
                             "WHERE instance_id=?",
                             (json.dumps(new_sr, ensure_ascii=False), inst_id)
                         )
