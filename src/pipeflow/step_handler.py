@@ -340,7 +340,8 @@ class StepHandlerMixin:
                 if cat:
                     _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
                         wf_id=run.id if ec.get("require_wf") else "",
-                        wait_roles=getattr(step, "wait_roles", None))
+                        wait_roles=getattr(step, "wait_roles", None),
+                        eff_role=_eff)
                     if _busy_match_ts:
                         # exit_schema 校验与主路径一致：busy 不绕过文件约束
                         # （2026-08-12 codex P1：schema 要求不能因忙检测分支成空文）
@@ -505,7 +506,8 @@ class StepHandlerMixin:
                 _wide = re.sub(r"-complete$", "-", text_filter)
                 _match_ts2, _match_msgs2 = self._check_exit(cat, src_filter, _wide, created_after=last_ts,
                     wf_id=run.id if ec.get("require_wf") else "",
-                    wait_roles=getattr(step, "wait_roles", None))
+                    wait_roles=getattr(step, "wait_roles", None),
+                    eff_role=_eff)
                 if _match_ts2:
                     # 防御：__new__ 实例化（测试路径）可能无此属性，timeout 段先于初始化引用
                     if not hasattr(self, "_consumed_exit_ids"):
@@ -655,7 +657,8 @@ class StepHandlerMixin:
             # 若传 wait_roles，integrity 回复本身也会被协作门死锁（2026-08-11 codex 审查确认）
             _integ_ts, _integ_msgs = self._check_exit(
                 cat, src_filter, _integ_filter, created_after=last_ts,
-                wf_id=run.id if ec.get("require_wf") else ""
+                wf_id=run.id if ec.get("require_wf") else "",
+                eff_role=_eff,
             )
             if _integ_ts:
                 _integ_msgs = [m for m in _integ_msgs if m["id"] not in self._consumed_exit_ids]
@@ -705,10 +708,12 @@ class StepHandlerMixin:
                 # 宽匹配：第二节点消息（codex-approved）到达时也能匹配
                 _wide_filter = re.sub(r"-complete$", "-", text_filter)
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, _wide_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles)
+                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles,
+                            eff_role=_eff)
             else:
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles)
+                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles,
+                            eff_role=_eff)
             if _match_ts:
                 # 过滤已被其他工作流消费的消息
                 _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
@@ -780,125 +785,12 @@ class StepHandlerMixin:
                     _integ_interval = ec.get("integrity_interval_sec", 30)
                     _integ_activate(run.step_results, step.id, interval_sec=_integ_interval)
                     return  # 完整性阶段接管：下 tick 发 dim01/dim02，等回复后推进
-        # track 消费：步骤执行期间的轮次追踪（旧 --bus-track 收编）
-        # exit_condition 是一次性退出匹配，track 是步骤执行期间的持续轮询
-        if step.track:
-            track_cat = step.track.get("bus_category", "")
-            if track_cat and track_cat != cat:
-                # 与 exit_condition 不同的分类才单独追踪，避免重复
-                track_timeout = step.track.get("timeout_sec", 300)
-                notify_roles = step.track.get("notify_roles", [])
-                latest = self._bb.read(cat=track_cat, limit=1)
-                if latest:
-                    # 作者过滤（旧 tracker 语义）：若最新消息作者是 target_role 自己，
-                    # 说明角色没卡死（刚写过），不是死锁，跳过告警
-                    if latest[0].src == _eff:
-                        pass  # 自己写的消息，不报死锁
-                    else:
-                        # 超时判据：先区分「配置错位」与「真死锁」，再判停滞。
-                        #
-                        # 误报根因（2026-10-17 实测 151 条 monitor_audit / 0 条真实死锁）：
-                        # max(latest_ts, notified_at) 在"该分类于步骤开始前就已静默"时退化为
-                        # notified_at，此后时间流逝即恒定判超时——但步骤期间本就无该分类
-                        # 活动（如 WL-dev_with_collab/s4 target=closer 却 track qa 的
-                        # test_report，qa 早在 s3 写完），这是配置错位而非角色卡死。
-                        #
-                        # 但「latest_ts <= notified_at」不能单独作为豁免依据：scout 在
-                        # food_chain_loop/s1 一个字未写 evolution_report 时，latest_ts 是
-                        # 上一轮 s1 的旧消息，同样 <= notified_at——那恰是真死锁（failure_patterns
-                        # 要抓的形态），一并豁免会变成漏报。故改为查模板声明：
-                        # track_cat 若是**前序某步**的 exit 类别，说明它是上一步的产出物
-                        # （上一步已消费完），本步不该再等 → 配置错位，不告警；
-                        # 若不属于任何前序步骤，则本步预期该分类产出却全程无消息 → 真死锁。
-                        # notified_at 缺失（如 _mark_step_delivery_failed 会 pop 掉它）时不
-                        # 伪造基准：取 0 使 latest_ts > 0 恒真，退回旧语义（有能力判超时），
-                        # 不用 run.created_at——created_at 是"实例创建"而非"步骤开始"，
-                        # 用它会把步骤开始前就存在的旧消息误判为"步骤期间活跃过"。
-                        _notified = self._step_sd(run, step).get("notified_at", 0)
-                        _wf_def = self._workflows.get(run.workflow_name)
-                        _prev_exit_cats: set[str] = set()
-                        if _wf_def:
-                            _steps_list = getattr(_wf_def, "steps", []) or []
-                            _idx = next((i for i, s in enumerate(_steps_list) if s.id == step.id), -1)
-                            for _ps in _steps_list[:_idx]:
-                                _pec = getattr(_ps, "exit_condition", None) or {}
-                                if isinstance(_pec, dict) and _pec.get("bus_category"):
-                                    _prev_exit_cats.add(_pec["bus_category"])
-                        _is_prev_step_output = track_cat in _prev_exit_cats
-                        if _is_prev_step_output:
-                            # 配置错位：该分类是前序步骤的产出类别（如 s4 track 的
-                            # test_report 在 s3 已由 qa 写完并消费）→ 本步不该等它。
-                            # 不发 [deadlock]——那会让角色被永久 Stop hook 锁死
-                            # （bus #374984 实证：age 每秒+1 使条件永不成立）。
-                            pass
-                        elif time.time() - max(latest[0].ts, _notified) >= track_timeout:
-                            # 该分类非前序步骤产出物 → 本步预期它产出。两种超时形态：
-                            #   a) 曾活跃后静默（latest.ts > notified_at）
-                            #   b) 本步内从未活跃（latest.ts <= notified_at）—— latest.ts
-                            #      是上一实例的旧消息，恰是 failure_patterns 要抓的真死锁。
-                            # 统一按"自 notified_at 以来该分类无新消息且超时"判据。
-                            # _notified 缺失时取 0（退回消息时间基准）。
-                            age = time.time() - max(latest[0].ts, _notified)
-                            # 节流：同一 tracking 周期只通知一次
-                            _sdata = self._step_sd(run, step)
-                            _last = _sdata.get("track_notified_at", 0)
-                            if time.time() - _last >= track_timeout:
-                                _sdata["track_notified_at"] = time.time()
-                                run.step_results[step.id] = _sdata
-                                # 持久化：run 每 tick 从 DB 重建，不落库则 _last 恒为 0
-                                self._sync_step_results(run.id, run.step_results)
-                                try:
-                                    self._bb.write("monitor_audit",
-                                        f"决策: 轮次追踪超时 → {run.workflow_name}/{run.current_step} "
-                                        f"track={track_cat} 超时 {int(age)}s",
-                                        src="workflow_engine")
-                                except Exception:
-                                    LOGGER.debug("monitor_audit write failed for %s", run.workflow_name)
-                                # S3 fan-out 去重（DESIGN §2.3）：同一超时事件对同一目标角色
-                                # 只提醒一次。notify_roles 含重复项时（如 ["qa","qa","devops"]），
-                                # 本次调用内遍历会重复投递 → _seen_events（**本次调用内**的
-                                # 局部 set）拦掉重复。跨 tick 的节流由上方 track_notified_at
-                                # （track_timeout 窗口，默认 300s）负责，与本 set 无关。
-                                # age 不入文案：它每秒 +1，使 _event_key 恒变 → 跨 tick
-                                # 节流失效（实测 qa 单会话 215 条该提醒且助理文本为 0）。
-                                # ── 双轨路由（ADR-NOTIFY-ROLES, bus #416661/#416671）──
-                                # notify_roles 语义=监护/催办角色，target_role=执行角色。
-                                # 旧实现把执行指令 "请继续当前步骤" 直发 notify_roles，
-                                # 绕开真正执行者 → 40 模板 132 step 100% executor∉notify_roles
-                                # 时全数误投监护角色（实测 pm 被锁死 35h+，bus #417195）。
-                                # 修复：执行轨发 _eff，监护轨发催办文案并跳过 nr==_eff。
-                                _track_prompt = (f"[deadlock] {track_cat} 超时，请继续当前步骤 "
-                                                 f"{step.id}（{step.title}）")
-                                _guard_prompt = (f"[track] {run.workflow_name}/{step.id} "
-                                                 f"{track_cat} 超时，执行者 {_eff} 无产出，请催办")
-                                _seen_events: set[str] = set()
-                                try:
-                                    # 执行轨：只发实际执行角色（一次）
-                                    _e_key = _event_key(_track_prompt[:80], _eff, run.workflow_name)
-                                    _seen_events.add(_e_key)
-                                    self._ensure_role_alive(_eff)
-                                    self._send_to_role(_eff, _track_prompt,
-                                        wf_id=run.id, step_id=step.id, force=True)
-                                    # 监护轨：催办文案，跳过执行者自身（去重）
-                                    for nr in notify_roles:
-                                        if nr == _eff:
-                                            continue
-                                        _g_key = _event_key(_guard_prompt[:80], nr, run.workflow_name)
-                                        if _g_key in _seen_events:
-                                            continue
-                                        _seen_events.add(_g_key)
-                                        # 存活检查（旧 tracker 交叉验证语义）：先确保通知
-                                        # 对象活着（死了由引擎拉起），再发提醒
-                                        self._ensure_role_alive(nr)
-                                        self._send_to_role(nr, _guard_prompt,
-                                            wf_id=run.id, step_id=step.id, force=True)
-                                except Exception:
-                                    LOGGER.debug("track notify failed for %s", run.workflow_name)
         if not cat:
             return
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
                         wf_id=run.id if ec.get("require_wf") else "",
-                        wait_roles=getattr(step, "wait_roles", None))
+                        wait_roles=getattr(step, "wait_roles", None),
+                        eff_role=_eff)
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
             # 同时保存 exit_messages 作为角色产出证据（task_evidence 依赖此字段判定收益）
@@ -1319,7 +1211,8 @@ class StepHandlerMixin:
         return (len(errs) == 0, errs)
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
-                    wf_id: str = "", wait_roles: list = None) -> tuple:
+                    wf_id: str = "", wait_roles: list = None,
+                    eff_role: str = "") -> tuple:
         """查 exit 是否有匹配消息。返回 (timestamp, matched_msgs)。
 
         wf_id 非空时过滤"消息必须含当前工作流实例 id"——防止新工作流
@@ -1363,8 +1256,13 @@ class StepHandlerMixin:
         for f in facts:
             # src 精确匹配；src=claude（bus 默认值）视为角色未设 src，不排除
             # wait_roles 协作门：协作角色的消息也放行（否则 src 过滤器拦死门控）
+            # eff_role：engineer↔pg 等价角色池分流后实际执行者可能是 pg，但模板
+            # src_filter 写死 engineer → pg 的 code_fix 永不匹配（实测
+            # wf_sub_4e63ad633d39/s1 的 effective_roles={"s1":"pg"} 卡 48min）。
+            # 模板语义是"由该步的开发角色完成"，故实际执行者同等放行。
             if src_filter and f.src != src_filter and f.src != "claude":
-                if not wait_roles or f.src not in wait_roles:
+                _src_ok = bool(eff_role) and f.src == eff_role
+                if not _src_ok and (not wait_roles or f.src not in wait_roles):
                     continue
             if text_filter and text_filter not in f.t:
                 continue
