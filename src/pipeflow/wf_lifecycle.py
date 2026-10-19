@@ -697,16 +697,20 @@ class WorkflowLifecycleMixin:
                         _prev_done = _prev_wf["assigner"] if _prev_wf else "pm"
                     _task_id = f"task_sub_{uuid.uuid4().hex[:8]}"
                     _wf_id = f"wf_sub_{uuid.uuid4().hex[:12]}"
+                    # 子链任务描述 = 本步标题 + 上游交付证据。
+                    # 上游证据必须带过来：子链 s1 的 prompt 只由 tasks.description
+                    # 提供上下文，只写标题时角色收到「测试验证（qa）」这类空指令，
+                    # 只能自己翻 DB/bus 猜测什么（实测 food_chain_loop/s5 → qa）。
+                    # 不带父模板正文：未替换的 {title}/{description} 字面量会被
+                    # engine 首步分支再次注入 → 守卫拦下 → delivery_blocked
+                    # （实测 task_sub_80bd6be1 逐字含「标题: {title}」，blocker #397347）。
+                    _up = (self._render_msgs(self._step_deliverables(prev_step_id, results), 1500)
+                           if idx >= 0 else "")
+                    _desc = tgt_step.title + (f"\n上游交付证据：\n{_up}" if _up else "")
+                    _desc = _engine_mod.UNMATCHED_VAR_RE.sub("", _desc)
                     conn2.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
-                        # 子链任务描述：**只写步骤标题**。原实现拼接父模板正文
-                        # [:500]，把未替换的 {title}/{description} 字面量带进
-                        # tasks.description，engine 首步分支再把它以 [任务描述] 注入
-                        # prompt → 守卫拦下 → 3 次 delivery_fail → 子链
-                        # delivery_blocked 终态（实测 task_sub_80bd6be1 逐字含
-                        # 「标题: {title}」，blocker #397347）。子链正文由子链
-                        # **自己的** prompt_template 提供，无需父步骤正文。
                         (_task_id, f"{wf_name}/{tgt_step.id}: {tgt_step.title}",
-                         tgt_step.title,
+                         _desc,
                          _prev_done, tgt_step.target_role, time.time(), time.time(), tgt_step.subflow_template))
                     # 兼容迁移前的表（template_id 列可能缺失）——子工作流 tasks 行的 template_id
                     # 只做溯源用途，缺列时静默降级为 parent_task_id 记录父工作流（2026-08-10 观测）
@@ -1302,6 +1306,49 @@ class WorkflowLifecycleMixin:
             f"[workflow] {wf.name} 新一轮迭代 {_iteration + 1} 已启动: {_new_wf_id}",
             src="workflow_engine")
 
+    def _step_deliverables(self, step_id: str, results: dict) -> list:
+        """步骤的交付证据；容器步骤（子链接管）下钻到子链末步取真实产出。
+
+        WHY 必须下钻：子链回流只把父步盖成 completed，从不写父步的
+        exit_messages（task_generator._scan_tasks）。直接读父步 = 下游拿到空
+        上下文——实测 food_chain_loop/s5 的 qa 只收到「[任务描述] 测试验证（qa）」，
+        花整轮翻 DB/bus 找"测什么"，还撞上 403。
+
+        不回写父步 exit_messages 是有意的：驳回门禁按父步 exit_messages 判驳回，
+        把子链文案复制进来会让子链的 rejected 变成父步硬拦（改变完成语义）。
+        """
+        _sr = (results or {}).get(step_id) or {}
+        if not isinstance(_sr, dict):
+            return []
+        if _sr.get("exit_messages"):
+            return _sr["exit_messages"]
+        _sf = _sr.get("subflow_id")
+        if not _sf:
+            return []
+        try:
+            _row = self._lifecycle.query_one(
+                "SELECT current_step_id, step_results FROM workflow_instances WHERE instance_id=?",
+                (_sf,))
+            if not _row:
+                return []
+            _sub_sr = json.loads(_row["step_results"] or "{}")
+            for _sid in [_row["current_step_id"], *reversed(list(_sub_sr))]:
+                _sd = _sub_sr.get(_sid)
+                if isinstance(_sd, dict) and _sd.get("exit_messages"):
+                    return _sd["exit_messages"]
+        except Exception as _e:
+            LOGGER.debug("subflow deliverables read failed %s: %s", _sf[:12], _e)
+        return []
+
+    @staticmethod
+    def _render_msgs(msgs: list, limit: int = 3000) -> str:
+        """把 exit_messages 渲染成 prompt 文本（标题 + 证据正文）。"""
+        return "\n".join(
+            (str(m.get("text", "")) +
+             ("\n" + str(m["evidence"]) if m.get("evidence") else ""))
+            if isinstance(m, dict) else str(m)
+            for m in msgs)[:limit]
+
     def _fill_prompt_vars(self, prompt: str, step: Step, wf_name: str,
                           task_title: str, task_desc: str, results: dict,
                           prev_step_id: str = "", wf_id: str = "") -> str:
@@ -1312,7 +1359,21 @@ class WorkflowLifecycleMixin:
         wf_id 非空时在头部注入实例 id：exit_condition 带 require_wf 的步骤
         只认含本 id 的完成消息，角色不知道 id 就永远写不出匹配消息。"""
         if wf_id:
-            prompt = f"[实例] {wf_id}（完成消息标题必须含此 id）\n" + prompt
+            # 产物归属约定：模板里的上游路径是固定名（~/ccs-workspaces/pm/PRD.md），
+            # 而同一角色常有 2+ 条链并发写同名文件 —— 实测 pm 的 PRD.md 被 scout 链
+            # 覆盖，s2 product_architect 据此设计出完全无关的对象，s3 reviewer 判
+            # 「设计闸门失去可评对象」0P0/3P1 | exit #417441 vs #417534。
+            # 角色已自发按实例写副本（PRD-wf_654cd82159.md）并标注权威，但下游
+            # prompt 不知道去找它。此处把该约定说清，不改模板 JSON 与 exit_schema
+            # （标准名仍须写，契约不变），只补读取侧与标注侧。
+            prompt = (
+                f"[实例] {wf_id}（完成消息标题必须含此 id）\n"
+                f"[产物归属] 同一角色目录会被多条链并发写入固定名文件（如 PRD.md）。"
+                f"读上游产物时优先读带本实例 id 的副本（如 PRD-{wf_id}.md），"
+                f"并在完成消息里指明哪一份是本实例的权威副本；"
+                f"写产出时标准文件名照常写（契约不变），"
+                f"同时另存一份带本实例 id 的副本。\n"
+            ) + prompt
 
         prompt = prompt.replace("{title}", task_title)
         prompt = prompt.replace("{description}", task_desc)
@@ -1327,12 +1388,12 @@ class WorkflowLifecycleMixin:
                                     self._collect_workspace_summary(_ws_dir))
         except Exception:
             pass
-        # 步骤间数据传递：上一步骤的 exit_messages 填充后续步骤变量
-        prev_sr = (results or {}).get(prev_step_id, {}) if prev_step_id else {}
-        prev_msgs = prev_sr.get("exit_messages", []) if isinstance(prev_sr, dict) else []
+        # 步骤间数据传递：上一步骤的交付证据填充后续步骤变量。
+        # _step_deliverables 会在上一步是容器（子链接管）时下钻取子链产出。
+        prev_msgs = self._step_deliverables(prev_step_id, results) if prev_step_id else []
         fallback = task_desc or task_title or wf_name
         if prev_msgs:
-            prev_text = "\n".join(str(m) for m in prev_msgs)[:3000]
+            prev_text = self._render_msgs(prev_msgs)
             # 上一步消息用于目标/发现/结果变量；{project}/{changes}/{task_list} 仍用 fallback 填充
             # （不填充会导致 _UNMATCHED_VAR_RE 拦截推进，architect/qa 子链 s2 卡死）
             for var in ("{target}", "{findings}", "{results}", "{backlog}",
