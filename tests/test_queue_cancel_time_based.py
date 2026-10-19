@@ -79,3 +79,18 @@ def test_long_queue_cancels():
     eng._lifecycle.close_wf.assert_called_once()
     args, kwargs = eng._lifecycle.close_wf.call_args
     assert kwargs.get("status") == "cancelled", kwargs
+
+def test_degrade_path_respects_30min_window():
+    """降级为超时计数也必须等满 30 分钟，否则 4 个 tick 就绕过门槛。
+
+    codex P1：_queued>=3 后走降级分支，timeout_count 每 tick +1，
+    _auto_cancel_at=4 → 排队约 50s 即 cancel，与修复前的 97~121s 误杀同型。
+    """
+    eng = _Eng()
+    # 排队 2 分钟、timeout_count 已经到 3（降级后正常值）
+    run = _run(queued=5, since=time.time() - 120, timeout_count=3)
+    for _ in range(3):
+        with _no_signal():
+            eng._tick(run, _step())
+    assert not eng._lifecycle.close_wf.called, \
+        f"排队 2 分钟且 tc=3 时不得 cancel（实际 {eng._lifecycle.close_wf.call_args_list}）"

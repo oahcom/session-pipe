@@ -441,9 +441,15 @@ class StepHandlerMixin:
                 # → 永远 busy（自我互锁）。实测积压 153 个 running 实例 timeout_count≡0。
                 # 破环：排队够多仍无进展，说明不是"被占用"而是"整条链卡死"，
                 # 降级走超时路径递增计数，让回收器能开工。
-                if _queued >= _QUEUE_DEGRADE_AT:
-                    LOGGER.warning("排队 %d 次无进展 → %s/%s 降级为超时计数解锁回收",
-                                   _queued, run.id[:12], step.id)
+                # 必须同时等满 30 分钟：降级路径会每 tick 递增 timeout_count，
+                # 4 次（默认 _auto_cancel_at）即 cancel —— 若只看次数，排队
+                # ~50s 就绕过了上面的 30 分钟门槛，误杀原样复现（codex P1）。
+                # 互锁破环本身不受影响：30 分钟后仍会降级并回收。
+                if (_queued >= _QUEUE_DEGRADE_AT
+                        and time.time() - _q_since >= 1800):
+                    LOGGER.warning("排队 %d 次、%d 分钟无进展 → %s/%s 降级为超时计数解锁回收",
+                                   _queued, int((time.time() - _q_since) / 60),
+                                   run.id[:12], step.id)
                 else:
                     return  # 排队路径不递增 timeout_count（防误回收）
 
