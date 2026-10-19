@@ -446,21 +446,39 @@ class WorkflowLifecycleMixin:
                     # 此处复用 _handle_wf_loop 的文件门禁判定：文件存在且非 FAIL → 允许 close。
                     _vg = (wf.loop or {}).get("value_gate") or {}
                     _vg_passed = False
+                    _vg_failed = False
                     for _vg_dir, _vg_name in _resolve_value_gate_paths(
                             _vg.get("file", ""), _vg.get("workspace", "")):
                         _audit_path = _vg_dir / _vg_name
-                        if _audit_path.exists() and not _value_audit_failed(
+                        if not _audit_path.exists():
+                            continue
+                        if _value_audit_failed(
                                 _audit_path.read_text(encoding="utf-8", errors="ignore")):
-                            _vg_passed = True
-                            LOGGER.info("wf %s [%s] 末位值门禁 PASS（文件 %s），允许收尾",
-                                        wf_id[:8], wf_name, _audit_path.name)
+                            _vg_failed = True
                             break
+                        _vg_passed = True
+                        LOGGER.info("wf %s [%s] 末位值门禁 PASS（文件 %s），允许收尾",
+                                    wf_id[:8], wf_name, _audit_path.name)
+                        break
                     if _vg_passed:
                         # 直接跳到 close（跳过子链扫描——子链 cancelled 已在下面兼容）
                         LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
                         self._lifecycle.close_wf(wf_id, status='completed')
                         conn.commit()
                         completed_now = True
+                        return
+                    if _vg_failed:
+                        # 审计明确写 FAIL → 本轮无收益，不能盖 completed。旧行为
+                        # 落到下方子链扫描后照样 completed：实测 wf_5f5eebc881 于
+                        # 05:29 收尾 completed，而 lr/VALUE_AUDIT.md 首行是 FAIL
+                        # （"无实质收益；s5 测另一条工作流的产物"）——状态与审计
+                        # 结论直接矛盾，下游据此以为收益已达成。交 coordinator 处置。
+                        # 仅认「文件存在且判 FAIL」；文件缺失走原有子链扫描语义，
+                        # 缺失本身由 exit_schema 的 required 约束兜底。
+                        LOGGER.warning("wf %s [%s] 价值审计 FAIL → 按 failed 收尾（不推进为 completed）",
+                                       wf_id[:8], wf_name)
+                        self._lifecycle.close_wf(wf_id, status='failed')
+                        conn.commit()
                         return
                     _all_subs_done = True
                     _forced: list = []  # 被强制取消的子链 (step_id, subflow_id, 原状态)
