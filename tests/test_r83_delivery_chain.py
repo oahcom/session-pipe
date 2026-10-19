@@ -91,12 +91,16 @@ def test_queue_degrade_fallthrough_reaches_timeout():
 
     若降级后仍 return，timeout_count 不会递增 → 回收器（依赖 tc>=1）仍不工作
     → 降级形同虚设。这是"修了等于没修"的典型陷阱。
+
+    达阈值**且**排队满 30 分钟后才降级：只按次数会让 4 个 tick 绕过排队门槛
+    （codex P1），互锁破环在 30 分钟后仍成立。
     """
     src = open(os.path.join(os.path.dirname(__file__), "..",
                             "src/pipeflow/step_handler.py"),
                encoding="utf-8").read()
+    # 条件可能跨行（排队降级另加 30 分钟窗口），用 \s* 吸收换行与续行括号
     m = re.search(
-        r"if _queued >= _QUEUE_DEGRADE_AT:[\s\S]{0,400}?else:\s*\n\s+return", src)
+        r"if \(?_queued >= _QUEUE_DEGRADE_AT[\s\S]{0,400}?else:\s*\n\s+return", src)
     assert m, (
         "降级分支应为 if/else 结构：达阈值时不 return（fall-through 到超时计数），"
         "未达阈值才 return")
