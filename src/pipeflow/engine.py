@@ -134,6 +134,20 @@ def _rework_exit(sts: list) -> str:
     return "requeue"                 # 已交付（或链已删）→ 重审原步
 
 
+def _rejected_wait_anchor(sr: dict, inst: dict):
+    """等返工链的计时锚 → 时间戳，无可用锚则 None。
+
+    rejected_at 只有 manager.py:481（角色 confirm 驳回）会写，审批超时兜底
+    路径不写——实测唯一需要超时保护的实例 wf_256be862ea86/s3 它的值是 None。
+    单用 `or time.time()` 则差值恒 0 → 永不触发（fail-open）。逐级回退，
+    最后退到实例创建时间：宁可早报，不可漏报。
+    抽为纯函数：测试直调真代码，复刻会与引擎漂移。
+    """
+    return (sr.get("rejected_at") or sr.get("notified_at")
+            or (inst or {}).get("created_at"))
+
+
+
 @dataclass
 class Step:
     id: str
@@ -1175,8 +1189,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         if _exit == "wait":
                             # 返工链仍在跑：等它，但有上限（返工链自身无 timeout，
                             # 链内卡一步父链就永远等）。超限只喊一次、不停止等。
-                            if (time.time() - (_rej_sr.get("rejected_at") or time.time())
-                                    > _REJECTED_WAIT_MAX):
+                            _since = _rejected_wait_anchor(_rej_sr, inst)
+                            if _since and time.time() - _since > _REJECTED_WAIT_MAX:
                                 self._escalate_rejected(
                                     inst, step_id, _rej_sr, results, lm,
                                     f"返工链等待超 {_REJECTED_WAIT_MAX // 60} 分钟仍未完成"

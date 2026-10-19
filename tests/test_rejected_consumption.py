@@ -11,6 +11,7 @@ cleanup 五条件也全假 → 静默卡死至 24h 全局兜底。
 """
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -18,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeflow.wf_lifecycle import WorkflowLifecycleMixin as W
 from pipeflow.engine import (_MAX_REJECTED_RETRY, _REJECTED_WAIT_MAX, _REQUEUE_DROP,
-                             WorkflowEngine, _rework_exit)
+                             WorkflowEngine, _rejected_wait_anchor, _rework_exit)
 from test_workcycle_e2e import _cleanup, _make_env, _step, _write_wf
 
 
@@ -169,6 +170,33 @@ class TestEscalateRejectedAnchor:
         assert _REJECTED_WAIT_MAX > 0, "等返工链无上限 → 只能熬 24h 兜底"
         assert "rework_escalated_at" in _REQUEUE_DROP, (
             "升级锚不随重投清 → 下一轮升级被永久抑制（该发的消息一条不发）")
+
+    def test_wait_anchor_falls_back_when_rejected_at_missing(self):
+        """rejected_at 缺失时仍须能触发——否则唯一的保护点 fail-open。
+
+        审批超时兜底路径不写 rejected_at（只有 manager.py:481 角色 confirm
+        驳回会写）。实测唯一需要本保护的实例 wf_256be862ea86/s3 它的值正是
+        None；若只用 `or time.time()` 差值恒 0 → 永不升级。
+        直调引擎真函数——复刻会与引擎漂移（本文件 :95 已记过同型事故）。
+        """
+        now = time.time()
+        old = now - _REJECTED_WAIT_MAX - 60
+
+        # A：唯一的真实形态——rejected_at 缺失，退化到 notified_at
+        sr_a = {"status": "rejected", "rejected_at": None, "notified_at": old}
+        assert _rejected_wait_anchor(sr_a, {}) == old, "notified_at 回退未生效"
+        assert now - _rejected_wait_anchor(sr_a, {}) > _REJECTED_WAIT_MAX
+
+        # B：两个字段都缺 → 退化到实例创建时间
+        assert _rejected_wait_anchor({}, {"created_at": old}) == old
+
+        # C：首选字段在则优先用它
+        sr_c = {"rejected_at": now - 10, "notified_at": old}
+        assert _rejected_wait_anchor(sr_c, {"created_at": old}) == now - 10
+
+        # D：全缺 → None（调用方 `if _since` 拦住，不得误报超时）
+        assert _rejected_wait_anchor({}, {}) is None
+        assert _rejected_wait_anchor({}, None) is None
 
     @patch("subprocess.run",
            return_value=MagicMock(returncode=0, stdout="claude\n", stderr=b""))
