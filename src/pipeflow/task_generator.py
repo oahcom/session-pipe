@@ -110,10 +110,14 @@ class TaskGeneratorMixin:
             _st = next((s for s in (_wf.steps if _wf else []) if s.id == step_id), None)
             if not _st or not _st.exit_schema:
                 return []
-            # effective_roles 一并带上：等价角色分流后产出落在实际执行者目录
+            # _inst_row 而非 effective_roles：_eff_role 先取 _inst_row，
+            # 拿到字符串形式的 effective_roles 时 effective_role() 走
+            # getattr(str, "effective_roles") → None → 回退模板角色。
+            # 等价角色分流（engineer→pg）后产出落在 pg 目录，按 engineer 校验
+            # 会把真实交付报成缺失（假 contract_unmet）。
             _run = SimpleNamespace(
                 id=wf_id, created_at=_row["created_at"],
-                effective_roles=_row["effective_roles"],
+                _inst_row={"effective_roles": _row["effective_roles"]},
                 step_results=json.loads(_row["step_results"] or "{}"))
             ok, errs = self._validate_exit_schema(_st, _run)
             return [] if ok else errs
