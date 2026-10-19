@@ -861,19 +861,36 @@ class StepHandlerMixin:
                                 # （track_timeout 窗口，默认 300s）负责，与本 set 无关。
                                 # age 不入文案：它每秒 +1，使 _event_key 恒变 → 跨 tick
                                 # 节流失效（实测 qa 单会话 215 条该提醒且助理文本为 0）。
+                                # ── 双轨路由（ADR-NOTIFY-ROLES, bus #416661/#416671）──
+                                # notify_roles 语义=监护/催办角色，target_role=执行角色。
+                                # 旧实现把执行指令 "请继续当前步骤" 直发 notify_roles，
+                                # 绕开真正执行者 → 40 模板 132 step 100% executor∉notify_roles
+                                # 时全数误投监护角色（实测 pm 被锁死 35h+，bus #417195）。
+                                # 修复：执行轨发 _eff，监护轨发催办文案并跳过 nr==_eff。
                                 _track_prompt = (f"[deadlock] {track_cat} 超时，请继续当前步骤 "
                                                  f"{step.id}（{step.title}）")
+                                _guard_prompt = (f"[track] {run.workflow_name}/{step.id} "
+                                                 f"{track_cat} 超时，执行者 {_eff} 无产出，请催办")
                                 _seen_events: set[str] = set()
                                 try:
+                                    # 执行轨：只发实际执行角色（一次）
+                                    _e_key = _event_key(_track_prompt[:80], _eff, run.workflow_name)
+                                    _seen_events.add(_e_key)
+                                    self._ensure_role_alive(_eff)
+                                    self._send_to_role(_eff, _track_prompt,
+                                        wf_id=run.id, step_id=step.id, force=True)
+                                    # 监护轨：催办文案，跳过执行者自身（去重）
                                     for nr in notify_roles:
-                                        _ekey = _event_key(_track_prompt[:80], nr, run.workflow_name)
-                                        if _ekey in _seen_events:
+                                        if nr == _eff:
                                             continue
-                                        _seen_events.add(_ekey)
+                                        _g_key = _event_key(_guard_prompt[:80], nr, run.workflow_name)
+                                        if _g_key in _seen_events:
+                                            continue
+                                        _seen_events.add(_g_key)
                                         # 存活检查（旧 tracker 交叉验证语义）：先确保通知
                                         # 对象活着（死了由引擎拉起），再发提醒
                                         self._ensure_role_alive(nr)
-                                        self._send_to_role(nr, _track_prompt,
+                                        self._send_to_role(nr, _guard_prompt,
                                             wf_id=run.id, step_id=step.id, force=True)
                                 except Exception:
                                     LOGGER.debug("track notify failed for %s", run.workflow_name)

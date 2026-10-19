@@ -113,10 +113,11 @@ class TestTrackThrottleIntegration(unittest.TestCase):
         fake_fact = type("F", (), {"ts": time.time() - 600, "src": "other"})()
         eng._bb.read = MagicMock(return_value=[fake_fact])
         eng._tick(run, step)
-        self.assertEqual(eng._send_to_role.call_count, 1, "第一次应通知")
+        # 双轨: 执行轨 scout 1 条 + 监护轨 pm 1 条 = 2（ADR-NOTIFY-ROLES）
+        self.assertEqual(eng._send_to_role.call_count, 2, "第一次应通知执行者+监护者")
         # 第二次 tick（track_notified_at 已设置）
         eng._tick(run, step)
-        self.assertEqual(eng._send_to_role.call_count, 1, "第二次应被节流")
+        self.assertEqual(eng._send_to_role.call_count, 2, "第二次应被节流")
 
 
 class TestGuardWatchInvalidType(unittest.TestCase):
@@ -213,13 +214,14 @@ class TestTrackPartnerRecovery(unittest.TestCase):
         eng._bb.read = MagicMock(return_value=[
             type("F", (), {"ts": time.time() - 600, "src": "other"})()])
         eng._tick(run, step)
-        self.assertEqual(eng._send_to_role.call_count, 1, "超时应通知")
+        # 双轨: 执行轨 scout + 监护轨 pm = 2（ADR-NOTIFY-ROLES）
+        self.assertEqual(eng._send_to_role.call_count, 2, "超时应通知执行者+监护者")
         # tick2: 伙伴恢复（新消息 1s 前）→ 不再通知
         eng._bb.read = MagicMock(return_value=[
             type("F", (), {"ts": time.time() - 1, "src": "scout"})()])
         eng._tick(run, step)
         # age = now - max(1s前, 600s前) = 1s < 300s → 不超时
-        self.assertEqual(eng._send_to_role.call_count, 1, "伙伴恢复后不应再通知")
+        self.assertEqual(eng._send_to_role.call_count, 2, "伙伴恢复后不应再通知")
 
 
 class TestDualNodeNode2Complete(unittest.TestCase):

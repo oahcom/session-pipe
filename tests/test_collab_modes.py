@@ -151,12 +151,57 @@ class TestPeerTrack(unittest.TestCase):
         with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
             eng._tick(run, step)
         first_call_count = eng._send_to_role.call_count
-        self.assertEqual(first_call_count, 1, "第一次应提醒")
+        # 双轨: 执行轨 scout 1 条 + 监护轨 pm 1 条 = 2
+        self.assertEqual(first_call_count, 2, "第一次应提醒执行者+监护者")
         # 第二次 tick（节流窗口内，track_notified_at 已设置）
         with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
             eng._tick(run, step)
         second_call_count = eng._send_to_role.call_count
-        self.assertEqual(second_call_count, 1, "第二次应被节流，不重复提醒")
+        self.assertEqual(second_call_count, first_call_count, "第二次应被节流，不重复提醒")
+
+    def test_track_executor_gets_deadlock_guard_gets_nudge(self):
+        """双轨路由: 执行指令只发 target_role，监护角色收催办文案，无交叉。
+
+        ADR-NOTIFY-ROLES: notify_roles=监护/催办, target_role=执行。
+        回归 bug #417195: 旧实现把 [deadlock] 执行指令直发 notify_roles。
+        """
+        eng = self._eng_with_track(latest_ts=time.time() - 600)
+        step = Step(
+            id="s1", title="执行文档编写", target_role="writer", prompt_template="t",
+            exit_condition={},
+            track={"bus_category": "code_fix", "timeout_sec": 300,
+                   "notify_roles": ["pm"]})
+        run = WorkflowRun(
+            id="wf_dual", workflow_name="WF-writer_document", context={},
+            current_step="s1", status="running",
+            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
+        sent = {c.args[0]: c.args[1] for c in eng._send_to_role.call_args_list}
+        self.assertIn("writer", sent, "执行角色 writer 应收到执行指令")
+        self.assertIn("[deadlock]", sent["writer"], "writer 收 [deadlock] 执行指令")
+        self.assertIn("pm", sent, "监护角色 pm 应收到催办")
+        self.assertIn("[track]", sent["pm"], "pm 收 [track] 催办文案")
+        self.assertNotIn("[deadlock]", sent["pm"], "pm 不应收到执行指令（旧 bug）")
+        self.assertNotIn("[track]", sent["writer"], "writer 不应收到催办文案")
+
+    def test_track_notify_role_equal_executor_deduped(self):
+        """去重: notify_roles 含执行者自身时跳过，不重发。"""
+        eng = self._eng_with_track(latest_ts=time.time() - 600)
+        step = Step(
+            id="s1", title="生产", target_role="writer", prompt_template="t",
+            exit_condition={},
+            track={"bus_category": "code_fix", "timeout_sec": 300,
+                   "notify_roles": ["writer"]})
+        run = WorkflowRun(
+            id="wf_dedup", workflow_name="test", context={},
+            current_step="s1", status="running",
+            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
+        targets = [c.args[0] for c in eng._send_to_role.call_args_list]
+        self.assertEqual(targets.count("writer"), 1,
+                         "nr==_eff 时应跳过监护轨，writer 只收 1 条")
 
     def test_track_same_cat_as_exit_skipped(self):
         """track_cat == exit cat 时跳过 track 消费。"""

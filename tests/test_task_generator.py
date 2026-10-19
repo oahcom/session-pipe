@@ -96,9 +96,12 @@ def test_fanout_dedup_skips_duplicate_role():
         eng._tick(run, step)
 
     _sent_roles = [r for r, _ in _sent]
+    # 双轨(ADR-NOTIFY-ROLES): 执行轨 engineer 1 + 监护轨 qa 1 + devops 1 = 3
+    # qa 在 notify_roles 中重复 2 次 → 去重后仅 1 次
     assert _sent_roles.count("qa") == 1, f"qa 应只通知 1 次, got {_sent_roles}"
     assert _sent_roles.count("devops") == 1, f"devops 应通知 1 次, got {_sent_roles}"
-    assert len(_sent) == 2, f"去重后应共 2 次通知, got {len(_sent)}: {_sent_roles}"
+    assert _sent_roles.count("engineer") == 1, f"执行者 engineer 应通知 1 次, got {_sent_roles}"
+    assert len(_sent) == 3, f"去重后应共 3 次通知, got {len(_sent)}: {_sent_roles}"
     print("✅ fan-out 同事件同角色去重 ✓")
 
 
