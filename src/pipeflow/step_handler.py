@@ -57,6 +57,22 @@ def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
     send_to_role(step.target_role, msg)
 
 
+def _mentions(fact, wf_id: str) -> bool:
+    """消息是否真正提及该工作流实例（标题或正文，完整 id，词边界）。
+
+    只看标题会漏掉把实例 id 写在 evidence 里的产出；前缀匹配会在
+    wf_sub_4…/wf_sub_b… 这类同前缀实例间串味（实测 31 次宽松推进有 29 次
+    是别的工作流的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
+    边界用负向断言而非分隔符白名单：角色照抄的提示是 `[实例] wf_xxx（…）`，
+    全角括号紧邻，白名单永远列不全。
+    """
+    if not wf_id:
+        return False
+    bare = wf_id.replace('wf_', '', 1)
+    pat = rf'(?<![\w-])({re.escape(wf_id)}|{re.escape(bare)})(?![\w-])'
+    return bool(re.search(pat, f"{fact.t}\n{getattr(fact, 'e', '') or ''}"))
+
+
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
     """角色 tmux pane 显示越界操作 → 注入停止指令（安全护栏，不 cancel 工作流）。"""
     ops = "、".join(commands[:3])
@@ -566,6 +582,11 @@ class StepHandlerMixin:
                         _role_msgs = self._bb.read(limit=500)
                         _wf_id = run.id
                         _notified_ts = self._step_sd(run, step).get("notified_at", 0)
+                        # 归属校验必须看消息正文（t+e）：角色产出标题常不含实例 id，
+                        # 只在 evidence 里写「实例 wf_xxx」。只看标题会把自家产出当别人的。
+                        # 且必须匹配**完整 id**：wf_sub_4…/wf_sub_b… 这类前缀在
+                        # [:8] 截断下大面积碰撞（实测 31 次宽松推进 29 次是别的工作流
+                        # 的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
                         _relaxed = [
                             {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
                             for f in _role_msgs
@@ -573,10 +594,11 @@ class StepHandlerMixin:
                             and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                             and f.ts > _notified_ts
                             and f.ts < time.time() + 60  # 防未来时间戳
+                            and _mentions(f, _wf_id)
                         ]
-                        # task_spec 锚点确认确实是本工作流任务
+                        # task_spec 锚点确认确实是本工作流任务（同样是完整 id，不做前缀匹配）
                         _has_anchor = any(
-                            _wf_id[:8] in str(f.t) and f.cat == "task_spec"
+                            f.cat == "task_spec" and _mentions(f, _wf_id)
                             for f in _role_msgs
                         )
                         if _relaxed and _has_anchor:
