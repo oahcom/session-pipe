@@ -15,12 +15,31 @@ writer / closer / curator / pm 九个角色在 `_FORBIDDEN_MAP` 里没有条目 
 第二个缺陷：禁区定义有磁盘缓存，改了 roles.py 但缓存不失效 → 修复不生效。
 """
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, str(Path.home() / "session-launcher" / "src"))
+
+_LAUNCHER_SRC = Path.home() / "session-launcher" / "src"
+
+
+def _launcher_roles():
+    """按文件路径直接加载 launcher 的 routing.roles。
+
+    不能靠 sys.path.insert：全量测试里其他用例会改写 sys.path / sys.modules，
+    单独跑通过、混跑时 ModuleNotFoundError。按 spec 加载不受污染。
+    """
+    mod = sys.modules.get("_lp_routing_roles")
+    if mod is not None:
+        return mod
+    spec = importlib.util.spec_from_file_location(
+        "_lp_routing_roles", _LAUNCHER_SRC / "routing" / "roles.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_lp_routing_roles"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 # 测试角色：既要有产出能力（engineer/reviewer 必须能跑测试），
 # 又要有决策角色（coordinator/architect 不该自己跑测试）。
@@ -32,7 +51,7 @@ _ROLES_THAT_MUST_NOT_WRITE_CODE = ("scout", "writer", "pm")
 
 def test_engineer_and_reviewer_can_run_tests():
     """跑测试是 engineer/reviewer 的本职，不得判越界。"""
-    from routing.roles import _FORBIDDEN_MAP
+    _FORBIDDEN_MAP = _launcher_roles()._FORBIDDEN_MAP
     for role in _ROLES_THAT_MUST_RUN_TESTS:
         ops = _FORBIDDEN_MAP.get(role)
         assert ops is not None, (
@@ -43,7 +62,7 @@ def test_engineer_and_reviewer_can_run_tests():
 
 def test_decision_roles_still_forbid_tests():
     """决策角色不该自己跑测试（该派给 qa），禁区必须保留。"""
-    from routing.roles import _FORBIDDEN_MAP
+    _FORBIDDEN_MAP = _launcher_roles()._FORBIDDEN_MAP
     for role in _ROLES_THAT_MUST_NOT_RUN_TESTS:
         assert "run_tests" in (_FORBIDDEN_MAP.get(role) or []), \
             f"{role} 应保留 run_tests 禁区"
@@ -51,7 +70,7 @@ def test_decision_roles_still_forbid_tests():
 
 def test_content_roles_still_forbid_write_code():
     """只产出内容/文档的角色仍禁写代码 —— 放宽 run_tests 不得把 write_code 一并放开。"""
-    from routing.roles import _FORBIDDEN_MAP
+    _FORBIDDEN_MAP = _launcher_roles()._FORBIDDEN_MAP
     for role in _ROLES_THAT_MUST_NOT_WRITE_CODE:
         assert "write_code" in (_FORBIDDEN_MAP.get(role) or []), \
             f"{role} 应保留 write_code 禁区"
