@@ -396,29 +396,34 @@ class StepHandlerMixin:
                             if _completed_via_busy:
                                 return
                 _queued = self._step_sd(run, step).get("queued", 0) + 1
-                # 排队上限: 连续排队超过上限（约 3 小时未响应）说明角色
-                # 活跃但卡死（pm 类故障）→ 升级 coordinator 而非无限排队
-                if _queued >= 6:
+                # 判据必须按**时长**而非次数：本分支每 tick（10s）递增一次，
+                # `_queued>=10` 实际只有 ~100 秒，而角色正常执行一步就是几分钟。
+                # 实测 2026-10-19 17:37-17:43 三条返工链在角色被别的任务占用
+                # ~70s 后即被自动取消（queued_since→cancel 97~121s），子链全灭。
+                # 与 engine.py 的排队回收对齐为 30 分钟（queued_since 不随 ts 刷新）。
+                _q_since = self._step_sd(run, step).get("queued_since") or time.time()
+                # 升级只在首次达到阈值时发一次，避免 6→10 每 tick 重发 coordinator
+                if _queued == 6:
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} "
                         f"排队 {_queued} 次仍未响应（角色 {_eff} 活跃但可能卡死），请介入",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
-                    # 排队上限 = 角色被其他工作流占用，子链无法执行 → auto-cancel
-                    if _queued >= 10:
-                        LOGGER.warning("auto-cancel subflow: %s queued=%d，角色 %s 活跃占用",
-                                       run.id[:12], _queued, _eff)
-                        try:
-                            self._lifecycle.close_wf(run.id, status="cancelled")
-                            self._bb.write("workflow",
-                                f"[workflow] {run.workflow_name} 排队超限自动取消: "
-                                f"角色 {_eff} 被其他工作流占用，"
-                                f"排队 {_queued} 次后自动回收",
-                                src="workflow_engine")
-                        except Exception as _cancel_e:
-                            LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
-                        # 已取消的工作流不应再继续排队递增与 timeout_count，
-                        # 否则达阈值时会再 close_wf 一次，并对已取消实例发"超时自动回收"假告警。
-                        return
+                # 排队上限 = 角色被其他工作流长期占用，子链无法执行 → auto-cancel
+                if _queued >= 10 and time.time() - _q_since >= 1800:
+                    LOGGER.warning("auto-cancel subflow: %s queued=%d 已排队 %d 分钟，角色 %s 长期占用",
+                                   run.id[:12], _queued, int((time.time() - _q_since) / 60), _eff)
+                    try:
+                        self._lifecycle.close_wf(run.id, status="cancelled")
+                        self._bb.write("workflow",
+                            f"[workflow] {run.workflow_name} 排队超限自动取消: "
+                            f"角色 {_eff} 被其他工作流占用，"
+                            f"排队 {_queued} 次后自动回收",
+                            src="workflow_engine")
+                    except Exception as _cancel_e:
+                        LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
+                    # 已取消的工作流不应再继续排队递增与 timeout_count，
+                    # 否则达阈值时会再 close_wf 一次，并对已取消实例发"超时自动回收"假告警。
+                    return
                 run.step_results[step.id] = {
                     **self._step_sd(run, step),
                     "ts": time.time(),  # 重置计时器，等待角色空闲
