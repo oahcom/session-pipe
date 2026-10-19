@@ -4,6 +4,7 @@
 从 engine.py 拆出，方法签名和 self 访问完全不变。
 """
 
+import filecmp
 import json
 import time
 import uuid
@@ -839,8 +840,8 @@ class WorkflowLifecycleMixin:
     def _deploy_production_outputs(self, wf_id: str):
         """全链路完成后自动部署产出物到 ~/.hermes/bin/。
 
-        扫描 engineer workspace 下的 cli/*.py，复制到生产路径。
-        部署后写 bus cat=code_fix 通知维护者。
+        扫描 engineer workspace 下的 cli/*.py，内容有变化才复制；
+        有文件实际部署时写 bus cat=code_fix 通知维护者。
         """
         try:
             eng_ws = _CCS_WORKSPACES / "engineer" / "cli"
@@ -854,6 +855,13 @@ class WorkflowLifecycleMixin:
                     continue
                 import shutil
                 dest = deploy_dir / f.name
+                # 按内容字节比对，不能按 mtime：copy2 保留源 mtime，目标文件
+                # 的 mtime 永远等于源的旧时间，判据会永久失真。原实现无条件
+                # 复制 + 无条件广播：实测 [deploy] 共 182 条、全部是同一组 4 个
+                # 文件；源文件最后变更 2026-10-17 12:34，此后 70 条皆为字节
+                # 相同的空部署（bus #417679/#418378）。
+                if dest.exists() and filecmp.cmp(str(f), str(dest), shallow=False):
+                    continue
                 shutil.copy2(str(f), str(dest))
                 deployed.append(f.name)
             if deployed:
