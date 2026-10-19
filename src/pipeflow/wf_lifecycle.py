@@ -41,10 +41,13 @@ def _value_audit_failed(text: str) -> bool:
     _lines = text.strip().splitlines()
     if _lines and _lines[0].strip().upper() in ("FAIL", "REJECT"):
         return True
+    # 扫完前 50 行：首个 verdict 行不一定是结论（模板里可能先写
+    # "verdict: PASS|FAIL" 说明再由真正的结论行覆盖）。任一 FAIL/REJECT 即判负。
     for _line in _lines[:50]:
         if _line.lower().startswith("verdict:"):
             _v = _line.split(":", 1)[1].strip().upper()
-            return _v in ("FAIL", "REJECT")
+            if _v in ("FAIL", "REJECT"):
+                return True
     return False
 
 
@@ -422,6 +425,7 @@ class WorkflowLifecycleMixin:
                     return
 
         completed_now = False
+        _vg_fail_wf = ""   # 价值审计 FAIL 收尾标记：bus 写入放在锁外阶段
         try:
             with lm._conn_tx() as conn:
                 # 防重闭合守卫：launcher wf complete 全量覆写 step_results 会把已
@@ -459,8 +463,10 @@ class WorkflowLifecycleMixin:
                         _vg_passed = True
                         LOGGER.info("wf %s [%s] 末位值门禁 PASS（文件 %s），允许收尾",
                                     wf_id[:8], wf_name, _audit_path.name)
-                        break
-                    if _vg_passed:
+                        # 不 break：value_gate.file 可逗号分隔多份审计，任一 FAIL
+                        # 都要判失败（food_chain_loop 旧配置即多文件形态）。
+                    if _vg_passed and not _vg_failed:
+                        # 任一文件 FAIL 即整体失败，不得被先扫到的 PASS 覆盖
                         # 直接跳到 close（跳过子链扫描——子链 cancelled 已在下面兼容）
                         LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
                         self._lifecycle.close_wf(wf_id, status='completed')
@@ -477,20 +483,14 @@ class WorkflowLifecycleMixin:
                         # 缺失本身由 exit_schema 的 required 约束兜底。
                         LOGGER.warning("wf %s [%s] 价值审计 FAIL → 按 failed 收尾（不推进为 completed）",
                                        wf_id[:8], wf_name)
+                        # 子链必须先级联取消：close_wf 不做级联，失败后留下的
+                        # running 子链会继续派活，产出无人认领（与 fail_step 的
+                        # 规范失败路径对齐）。同事务内调用 *_unsafe，避免
+                        # fail_step 自己 BEGIN IMMEDIATE 撞外层事务。
+                        self._lifecycle._cascade_cancel_unsafe(wf_id, "价值审计 FAIL")
                         self._lifecycle.close_wf(wf_id, status='failed')
                         conn.commit()
-                        # bus 必须写：本分支的结论只有 coordinator/lr 能处置，
-                        # 而他们读 bus 不读 journal。
-                        try:
-                            self._bb.write(
-                                "blocker",
-                                f"[workflow] {wf_id[:12]}/{wf_name} 价值审计 FAIL，"
-                                f"已按 failed 收尾（不是 completed）",
-                                src="workflow_engine",
-                                evidence=f"价值门禁文件 {_vg.get('file')} 判定 FAIL。"
-                                         f"本轮无收益，需 coordinator 决定重排或降级需求。")
-                        except Exception as _bwe:
-                            LOGGER.debug("value-gate blocker 写入失败: %s", _bwe)
+                        _vg_fail_wf = wf_id
                         return
                     _all_subs_done = True
                     _forced: list = []  # 被强制取消的子链 (step_id, subflow_id, 原状态)
@@ -601,6 +601,21 @@ class WorkflowLifecycleMixin:
             return
 
         # ── 锁外阶段：subprocess / IO 不再持锁 ──
+        if _vg_fail_wf:
+            # bus 必须在锁外写：Blackboard 用独立连接、timeout=10s，锁内写会把
+            # 同进程其他推进/收尾一起阻塞。结论只有 coordinator/lr 能处置，
+            # 而他们读 bus 不读 journal。
+            try:
+                self._bb.write(
+                    "blocker",
+                    f"[workflow] {_vg_fail_wf[:12]}/{wf_name} 价值审计 FAIL，"
+                    f"已按 failed 收尾（不是 completed）",
+                    src="workflow_engine",
+                    evidence=f"价值门禁文件 {_vg.get('file')} 判定 FAIL。"
+                             f"本轮无收益，需 coordinator 决定重排或降级需求。")
+            except Exception as _bwe:
+                LOGGER.debug("value-gate blocker 写入失败: %s", _bwe)
+            return
         if completed_now:
             # 部署自动闭环：把产出 cli/*.py 安装到 ~/.hermes/bin/，让工具可被
             # cron/daemon/角色直接调用（"有实际收益"的最后一环——部署）。
