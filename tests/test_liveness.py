@@ -310,6 +310,33 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
         result, _ = self._run_stdout(str(int(time.time()) - 5000) + "\n")
         self.assertIs(result, False, "静默超窗应判不活跃")
 
+    def test_silent_but_cli_busy_is_true(self):
+        """长工具调用（codex review）静默 8~12min，但 CLI 仍在跑 → 不得判死亡。
+
+        2026-10-19 P0：只按 window_activity 判活，reviewer 跑 codex review 时
+        被判 False → 条件4 auto-cancel 杀掉 wf_sub_8de33/wf_sub_fb975。
+        """
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        busy = MagicMock(returncode=0, stdout="⏵⏵ bypass permissions on · esc to interrupt")
+        with patch("liveness.subprocess.run", side_effect=[ts, busy]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIs(result, True, "CLI 忙态被当成死亡：长工具调用期间会误杀工作流")
+
+    def test_silent_and_cli_idle_is_false(self):
+        """静默超窗且底栏无忙态标记 → 真空闲/已死，保留回收路径。"""
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        idle = MagicMock(returncode=0, stdout="❯ \n⏵⏵ bypass permissions on")
+        with patch("liveness.subprocess.run", side_effect=[ts, idle]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIs(result, False, "真空闲被误判为忙：回收路径失效，卡死实例永驻")
+
+    def test_busy_probe_failure_is_unknown(self):
+        """忙态二次探测失败 → None（保守不杀），不把探测故障翻译成死亡。"""
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        with patch("liveness.subprocess.run", side_effect=[ts, FileNotFoundError]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIsNone(result)
+
     def test_empty_output_is_unknown_not_busy(self):
         """恒空输出（旧代码失败的形态）必须返回 None，不能返回 True。"""
         result, _ = self._run_stdout("\n")

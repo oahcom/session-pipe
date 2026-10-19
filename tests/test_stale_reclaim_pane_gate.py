@@ -29,6 +29,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 import liveness                                              # noqa: E402
+import pipeflow.wf_lifecycle as wf_lifecycle                 # noqa: E402
 from pipeflow.wf_lifecycle import WorkflowLifecycleMixin     # noqa: E402
 
 _SRC_FILE = _ROOT / "src" / "pipeflow" / "wf_lifecycle.py"
@@ -65,11 +66,16 @@ def _run(step_sd, pane_state, assignee="reviewer"):
     inst._lifecycle = SimpleNamespace(complete_step=lambda *a, **k: None)
     lm = _FakeLM(row)
     orig = liveness.tmux_pane_active
+    orig_prod = wf_lifecycle._role_producing_recently
     liveness.tmux_pane_active = lambda role, **k: pane_state
+    # 第二道门（转录新鲜度）与本用例无关，固定为 False 让结论只由 pane 状态决定；
+    # 否则同一实例在跑测试的机器上可能因真实 transcript 新鲜而豁免，测试不确定。
+    wf_lifecycle._role_producing_recently = lambda role, **k: False
     try:
         WorkflowLifecycleMixin._cleanup_stale_workflows(inst, lm)
     finally:
         liveness.tmux_pane_active = orig
+        wf_lifecycle._role_producing_recently = orig_prod
     return [s for s in lm.executed if "cancelled" in s]
 
 

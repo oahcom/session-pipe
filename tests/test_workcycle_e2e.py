@@ -31,13 +31,26 @@ _TAG = ""
 
 
 def _new_tag():
-    """每个用例一份唯一后缀，隔开跨用例的同名 bus 消息（见 _done）。"""
     global _TAG
     _SEQ[0] += 1
     _TAG = f"u{_SEQ[0]}"
 
 
 _SEQ = [0]
+
+
+def _token(step_id):
+    """步骤完成 token —— exit 条件与完成消息共用同一份。
+
+    _check_exit 按子串匹配（step_handler.py:1352 `text_filter not in f.t`）：
+    条件若写成裸前缀 "DONE_S1"，则任何写 "DONE_S1*" 的消息都能点亮它。
+    全量跑时同进程共用一个临时 blackboard（tests/conftest.py:54），
+    test_engine_e2e.py 写的裸 "DONE_S1" 与本文件的同前缀消息互相点亮 ——
+    实测 test_review_requires_confirm flaky，/tmp/full.log:17 中 s1 的
+    exit_messages 混入三个用例 tag（u3/u4/u5）即现场证据。
+    每用例一份 _TAG 且 token 两侧一致，故互不构成子串。
+    """
+    return f"TAG{_TAG}_{step_id.upper()}_DONE"
 
 def _write_wf(wf_dir, name, steps):
     data = {"name": name, "title": name, "description": "", "steps": steps}
@@ -48,8 +61,10 @@ def _step(step_id, **overrides):
     base = {
         "id": step_id, "title": step_id, "target_role": "test_role",
         "prompt_template": f"do {step_id}",
+        # 条件与消息共用 _token：裸前缀条件会被同进程其它用例写的
+        # 同前缀消息点亮（见 _token 的 WHY）。
         "exit_condition": {"bus_category": "notice",
-                           "text_contains": f"DONE_{step_id.upper()}",
+                           "text_contains": _token(step_id),
                            "timeout_minutes": 30},
         "max_retries": 1, "type": "single",
     }
@@ -58,15 +73,15 @@ def _step(step_id, **overrides):
 
 
 def _done(eng, step_id, src="test_role", extra=""):
-    """写步骤完成消息。文本带本次用例唯一后缀。
+    """写步骤完成消息。文本与 exit 条件共用 _token（见其 WHY）。
 
-    WHY: 整个 pytest 进程共用一个临时 blackboard，而 bus 写入是按文本 UPSERT
+    整个 pytest 进程共用一个临时 blackboard，而 bus 写入是按文本 UPSERT
     —— 同文本重写不刷新 facts.ts。而 _check_exit 的 _birth 屏障取 log 表
     MIN(ts)（首次写入时刻）→ 用例 B 复用用例 A 的文本时，该消息的 birth 恒早于
     B 的工作流 created_at，匹配永久为空。实测：HEAD 版同一份代码稳定 4 failed,
-    本文用例从第二个起连锁失败。text_contains 是子串匹配，故后缀不破坏匹配。
+    本文用例从第二个起连锁失败。
     """
-    eng._bb.write("notice", f"DONE_{step_id.upper()}{_TAG} {extra}", src=src)
+    eng._bb.write("notice", f"{_token(step_id)} {extra}", src=src)
 
 
 
@@ -418,6 +433,60 @@ def test_gate_rejection_blocks_advance(mock_run):
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
+def test_review_gate_persists_rejected_then_rework_reflows(mock_run):
+    """驳回门禁必须落库 rejected，返工链完成后才能回流重审。
+
+    codex D10/D20：旧实现命中驳回只 `return`，step 仍停在 step_done_ready
+    → engine 的 rejected 消费分支永远看不见 → 建不了返工链、无回流入口。
+    本用例直接调 `_advance_production_wf` 走引擎 tick 门禁路径，再验证
+    rejected → 建链 → 链完成后 requeue 的完整闭环。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "arc", [_step("s1", type="review"), _step("s2")])
+    _write_wf(d, "engineer_feature", [_step("s1", target_role="engineer")])
+    _write_wf(d, "maintainer_health_monitor", [_step("s1", target_role="maintainer")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("arc", {})
+
+    # 模拟「产出已落盘、引擎 tick 看到 step_done_ready + 驳回文本」的现场
+    sr = {"s1": {"status": "step_done_ready", "exit_messages": [{
+        "text": "CHANGES_REQUESTED",
+        "evidence": "【业务问题→engineer】\n- P1 | 返回值错误 | chain.py:68"}]}}
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET status='step_done_ready', step_results=? "
+        "WHERE instance_id=?", (json.dumps(sr), rid))
+    eng._advance_production_wf(rid, eng._lifecycle, "arc", "s1", sr)
+
+    row = eng._lifecycle.query_one(
+        "SELECT current_step_id, step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+    s1 = json.loads(row["step_results"])["s1"]
+    assert s1["status"] == "rejected", f"门禁命中后必须落库 rejected，实际 {s1}"
+    assert row["current_step_id"] == "s1", "驳回不得推进"
+
+    # 下一 tick 消费 rejected → 建返工链，父步仍不推进
+    eng.run_once()
+    row = eng._lifecycle.query_one(
+        "SELECT current_step_id, step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+    s1 = json.loads(row["step_results"])["s1"]
+    ids = s1.get("rework_ids") or []
+    assert len(ids) == 1, f"rejected 应建 1 条返工链，实际 {ids}"
+    assert row["current_step_id"] == "s1"
+
+    # 返工链完成 → 回流重审原步（status 清空，current_step 不变）
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET status='completed' WHERE instance_id=?", (ids[0],))
+    eng.run_once()
+    row = eng._lifecycle.query_one(
+        "SELECT current_step_id, step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+    s1 = json.loads(row["step_results"])["s1"]
+    assert s1.get("status") == "", f"链完成后应重投原步，实际 {s1}"
+    assert row["current_step_id"] == "s1"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
 def test_gate_approved_advances(mock_run):
     """gate 型评审通过 → 正常推进（防止上一用例修过头成永久卡死）。"""
     signal.alarm(_TEST_TIMEOUT)
@@ -436,6 +505,71 @@ def test_gate_approved_advances(mock_run):
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed" and s["current_step"] == "s2", \
         f"APPROVED 应推进到 s2，s1={s['results']['s1']} current={s.get('current_step')}"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_rework_dispatch_follows_review_arrow(mock_run):
+    """评审标注「→角色」时，返工链必须派给该角色对应的模板。
+
+    生产原形（bus #415594）：reviewer 写【业务问题→product_architect】指
+    DESIGN.md 缺陷，旧实现一律建 engineer_feature → 工程改代码、文档没动
+    → 必然再驳回。本用例喂真实驳回文本锁死派发目标，并对照无箭头回退。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "src", [_step("s1", type="review")])
+    _write_wf(d, "architect_full_design", [_step("s1", target_role="product_architect")])
+    _write_wf(d, "engineer_feature", [_step("s1", target_role="engineer")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("src", {})
+    _review = eng._workflows["src"].steps[0]
+
+    def _add_rework(text):
+        eng._create_rework_subflow(rid, eng._lifecycle, "src", "s1", _review, None,
+                                   {"s1": {"exit_messages": [{"text": text}]}})
+        row = eng._lifecycle.query_one(
+            "SELECT step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+        return json.loads(row["step_results"])["s1"].get("rework_ids", [])
+
+    def _inst(wid):
+        return eng._lifecycle.query_one(
+            "SELECT template_id, assignee FROM workflow_instances WHERE instance_id=?",
+            (wid,))
+
+    # 1) 箭头指向 product_architect → 文档返工模板
+    ids = _add_rework("CHANGES_REQUESTED\n【业务问题→product_architect】\n"
+                      "- P1 | AC6 无对应步骤 | DESIGN.md:121")
+    assert len(ids) == 1, f"应建 1 条返工链，实际 {ids}"
+    assert _inst(ids[0])["template_id"] == "architect_full_design", \
+        f"箭头指向 PA 应走文档模板，实际 {_inst(ids[0])}"
+    assert _inst(ids[0])["assignee"] == "product_architect"
+
+    # 2) 同类重复驳回不重复建链（逐模板防重）
+    ids = _add_rework("CHANGES_REQUESTED\n【业务问题→product_architect】\n"
+                      "- P1 | AC7 仍缺步骤 | DESIGN.md:130")
+    assert len(ids) == 1, f"同类返工不得重复建链，实际 {ids}"
+
+    # 3) 无箭头业务问题 → 回退 engineer_feature
+    ids = _add_rework("CHANGES_REQUESTED\n【业务问题】\n- P1 | 返回值错误 | chain.py:68")
+    assert len(ids) == 2, f"无箭头业务问题应另建一条，实际 {ids}"
+    assert _inst(ids[1])["template_id"] == "engineer_feature"
+    assert _inst(ids[1])["assignee"] == "engineer"
+
+    # 4) 同一份驳回里两类问题都指向同一模板 → 只建一条
+    # （2026-10-19 codex D7：循环内 _tpl_exists 只查循环前的 _existing_reworks，
+    #  不看本轮已建链 → sys/biz 都指向 engineer_feature 时建出两条相同链）
+    rid2 = eng.start("src", {})
+    eng._create_rework_subflow(rid2, eng._lifecycle, "src", "s1", _review, None,
+                               {"s1": {"exit_messages": [{"text":
+                                 "CHANGES_REQUESTED\n【系统问题→engineer】\n- P1 | 缺日志 | a.py:1\n"
+                                 "【业务问题→engineer】\n- P1 | 返回值错误 | chain.py:68"
+                                 }]}})
+    row2 = eng._lifecycle.query_one(
+        "SELECT step_results FROM workflow_instances WHERE instance_id=?", (rid2,))
+    ids2 = json.loads(row2["step_results"])["s1"].get("rework_ids", [])
+    assert len(ids2) == 1, f"两类问题同模板应只建 1 条链，实际 {ids2}"
     _cleanup(d)
 
 
@@ -551,6 +685,42 @@ def test_last_step_runs_engine_closeout(mock_run):
 
     assert s["status"] == "completed", f"应完成，实际 {s}"
     assert deployed == [rid], f"末步收尾必须跑部署（实测被旁路），deployed={deployed}"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_exit_condition_ignores_foreign_message(mock_run):
+    """本步骤的完成条件不得被「同前缀的别处消息」点亮。
+
+    旧条件是与消息同前缀的裸 token，而 _check_exit 按子串匹配
+    （step_handler.py:1352）→ 同进程其它用例写的 DONE_S1uN 会点亮本文件的
+    DONE_S1 条件，反之亦然。实测 test_review_requires_confirm flaky
+    （/tmp/full.log:17：s1 混入三个用例 tag）。本用例锁死这一隔离。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "iso", [_step("s1"), _step("s2")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("iso", {})
+
+    eng.run_once()
+    # 模拟「同进程另一个用例」写下的同前缀消息（旧代码下 DONE_S1 是其子串）
+    eng._bb.write("notice", f"DONE_S1{_TAG}", src="test_role")
+    for _ in range(6):
+        time.sleep(0.05)
+        eng.run_once()
+    assert eng.status(rid)["current_step"] == "s1", \
+        f"s1 不得被同前缀消息点亮: {eng.status(rid)}"
+
+    _done(eng, "s1")
+    for _ in range(20):
+        time.sleep(0.05)
+        eng.run_once()
+        if eng.status(rid)["current_step"] != "s1":
+            break
+    assert eng.status(rid)["current_step"] == "s2", \
+        f"本步骤自己的完成消息必须点亮 s1: {eng.status(rid)}"
     _cleanup(d)
 
 

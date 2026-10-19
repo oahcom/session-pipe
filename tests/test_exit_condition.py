@@ -122,6 +122,61 @@ class TestCheckExitNoCat(unittest.TestCase):
         self.assertTrue(ts)
 
 
+
+class TestCheckExitStrictWfOwnership(unittest.TestCase):
+    """require_wf 严格归属：消息必须含当前实例 id。
+
+    旧实现 "'wf_' in t" 才校验 → 标题无 wf_ 的消息一律放行，两条同模板
+    返工链被同一条 code_fix 同时闭合（生产 #415562 实测）。
+    """
+
+    def test_message_without_wf_id_not_matched(self):
+        eng = _make_eng()
+        marker = f"STRICT_{_UNIQUE}"
+        eng._bb.write("code_fix", f"engineer_feature/s1-complete {marker}", src="engineer")
+        ts, msgs = eng._check_exit("code_fix", "engineer", marker, wf_id="wf_aaaa1111")
+        self.assertFalse(ts, "无实例 id 的消息不应匹配 require_wf 步骤")
+
+    def test_message_with_wf_id_matched(self):
+        eng = _make_eng()
+        marker = f"STRICT_{_UNIQUE}"
+        eng._bb.write("code_fix", f"engineer_feature/s1-complete ({marker} wf_bbbb2222/s1)",
+                      src="engineer")
+        ts, msgs = eng._check_exit("code_fix", "engineer", marker, wf_id="wf_bbbb2222")
+        self.assertTrue(ts)
+
+    def test_bare_substring_does_not_match_longer_id(self):
+        eng = _make_eng()
+        marker = f"STRICT_{_UNIQUE}"
+        eng._bb.write("code_fix", f"{marker} wf_cccc33334/s1", src="engineer")
+        ts, msgs = eng._check_exit("code_fix", "engineer", marker, wf_id="wf_cccc3333")
+        self.assertFalse(ts, "abc123 不应误中 abc1234")
+
+    def test_wait_roles_branch_also_strict(self):
+        """协作门补查路径与主路径同源：无 id 消息不能一票满足缺失角色。"""
+        eng = _make_eng()
+        marker = f"STRICT_{_UNIQUE}"
+        eng._bb.write("code_fix", f"{marker} wf_dddd5555/s1", src="engineer")
+        eng._bb.write("code_fix", f"{marker} 无实例标记", src="qa")
+        ts, msgs = eng._check_exit("code_fix", "engineer", marker,
+                                   wf_id="wf_dddd5555", wait_roles=["engineer", "qa"])
+        self.assertFalse(ts, "qa 的消息不带实例 id，协作门不应被满足")
+
+    def test_cjk_punctuation_adjacent_id_matched(self):
+        """引擎注入的 header 是「（完成消息标题必须含此 id）」，角色照抄即全角紧邻。"""
+        eng = _make_eng()
+        marker = f"STRICT_{_UNIQUE}"
+        eng._bb.write("code_review", f"{marker} wf_eeee6666（完成）产出已交付", src="reviewer")
+        ts, _ = eng._check_exit("code_review", "reviewer", marker, wf_id="wf_eeee6666")
+        self.assertTrue(ts, "全角标点紧邻的实例 id 必须命中")
+
+    def test_cjk_fullwidth_brackets_both_sides_matched(self):
+        eng = _make_eng()
+        marker = f"STRICT_{_UNIQUE}"
+        eng._bb.write("code_review", f"【完成】{marker}（wf_ffff7777）", src="reviewer")
+        ts, _ = eng._check_exit("code_review", "reviewer", marker, wf_id="wf_ffff7777")
+        self.assertTrue(ts, "两侧全角括号包裹的实例 id 必须命中")
+
 class TestValidateExitSchema(unittest.TestCase):
     def test_empty_schema_passes(self):
         eng = _make_eng()

@@ -129,6 +129,10 @@ def _has_output_schema(role_name: str) -> bool:
 # review_gate 的 target 是文件名(user_intent_reminder.py) — 三者粒度不同，
 # 需统一映射到 persona name 才能让 add_output_schema 对角色真生效。
 _ROLE_ALIAS: dict[str, str] = {}
+# 缓存绑定的 PERSONAS_DIR —— 目录变了必须重建，否则首建结果永久生效。
+# 实测（2026-10-19）：src/test_routing_daemon.py 用 mock.patch 把 PERSONAS_DIR 指到
+# 单 persona 临时目录，填出残缺映射后所有用例复用 → 5 条 contract_updater 测试全量失败。
+_ALIAS_DIR: object = None
 
 
 # 已知別稱漂移補丁: eval_passrate 的 role_filter 用詞(维护者) 與 persona title(运维者)
@@ -144,9 +148,12 @@ _ROLE_DRIFT_PATCH = {
 
 
 def _build_role_alias_map() -> dict[str, str]:
-    """从 persona JSON 构建 中文title/英文name → name 的别名表 (幂等缓存)。"""
-    if _ROLE_ALIAS:
+    """从 persona JSON 构建 中文title/英文name → name 的别名表 (按目录缓存)。"""
+    global _ALIAS_DIR
+    if _ROLE_ALIAS and _ALIAS_DIR == PERSONAS_DIR:
         return _ROLE_ALIAS
+    _ROLE_ALIAS.clear()
+    _ALIAS_DIR = PERSONAS_DIR
     for f in PERSONAS_DIR.glob("persona_*.json"):
         try:
             d = json.loads(f.read_text())

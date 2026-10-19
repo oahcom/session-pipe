@@ -35,6 +35,18 @@ _KICK_COOLDOWN_SEC = 600
 # 同一角色在冷却窗内不重复拉起。
 _RESTART_COOLDOWN_SEC = 300
 
+# 上下文溢出措辞。pane 与 transcript 两条检测路径共用一份，避免措辞漂移：
+# 2026-10-19 实测 reviewer 撞的是 "maximum context length"/"context_length_exceeded"
+# （Anthropic 400 原文），旧清单只认另外三种 → 溢出角色永不自愈，投递 3 次
+# 失败后子链 failed、父链空等。新措辞由上游 API 决定，宁可宽匹配。
+_OVERFLOW_PATTERNS = (
+    "Prompt is too long",
+    "Context limit reached",
+    "Context low",
+    "maximum context length",
+    "context_length_exceeded",
+)
+
 # 溢出报错的时效（秒）：超过此年龄不再触发 /compact。
 # 按"多久前"而非"距文件尾多少字节"判断：实测错误行距文件尾 7.8KB~10.8MB
 # （35 会话样本）、最远 4111 行，任何固定字节/行数窗口都会漏。
@@ -61,7 +73,7 @@ def _transcript_shows_overflow(role: str, max_age: float = _OVERFLOW_ERR_MAX_AGE
         files = sorted(_glob.glob(str(_d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
         if not files:
             return False
-        _pat = ("Prompt is too long", "Context limit reached", "Context low")
+        _pat = _OVERFLOW_PATTERNS
         cutoff = time.time() - max_age
         # 尾读 64KB 即可覆盖"本轮"错误：溢出后角色无法继续产出，错误必落在文件尾
         with open(files[0], "rb") as fh:
@@ -173,18 +185,13 @@ class RoleLifecycleMixin:
                 continue
             output = r.stdout or ""
 
-            # 信号匹配：Context limit reached / Context low / Context (数字% remaining)
-            # "Prompt is too long" 是实测最高频的溢出措辞（全库 18 次 vs
-            # Context limit reached 13 / Context low 10），此前漏检导致角色
-            # 溢出后无人 compact（maintainer/scout/closer 各 1 次，closer 的
-            # transcript 累积到 4MB 才爆）。措辞由 Claude Code 版本决定，故一并匹配。
+            # 信号匹配走共享清单 _OVERFLOW_PATTERNS（与 transcript 路径同源）。
+            # 另加状态栏百分比形态（"Context (数字% remaining)"）。
             has_overflow = (
-                "Context limit reached" in output
-                or "Context low" in output
-                or "Prompt is too long" in output
+                any(_p in output for _p in _OVERFLOW_PATTERNS)
                 or ("Context" in output and "remaining" in output and "compact" in output.lower())
             )
-            # pane 跑在 claude TUI 的**备用屏**（alternate_on=1），该屏无 scrollback——
+
             # `-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，故溢出报错一旦滚出
             # 视口就再也抓不到。transcript 是落盘事实，不受视口与进程存活影响。
             #
@@ -196,18 +203,18 @@ class RoleLifecycleMixin:
                 _m = __import__("re").search(r"↓\s*([\d.]+)\s*k tokens", output)
                 if _m:
                     _used_k = float(_m.group(1))
-                    if _used_k >= _CONTEXT_WARN_K:
+                    if _used_k >= self._CONTEXT_WARN_K:
                         with self._COMPACT_LOCK:
                             _last_warn = self._last_context_warn.get(role, 0.0)
-                            if now - _last_warn >= _CONTEXT_WARN_COOLDOWN:
+                            if now - _last_warn >= self._CONTEXT_WARN_COOLDOWN:
                                 self._last_context_warn[role] = now
                                 LOGGER.warning("上下文预警: %s 已用 %.1fk tokens (阈值 %.0fk)",
-                                               role, _used_k, _CONTEXT_WARN_K)
+                                               role, _used_k, self._CONTEXT_WARN_K)
                                 self._bb.write("blocker",
-                                    f"[context_warn] {role} 上下文已用 {_used_k:.0f}k（阈值 {_CONTEXT_WARN_K:.0f}k）"
+                                    f"[context_warn] {role} 上下文已用 {_used_k:.0f}k（阈值 {self._CONTEXT_WARN_K:.0f}k）"
                                     f" — 建议在任务间隙安排 /compact，避免溢出后排队",
                                     src="workflow_engine")
-            # 实测（2026-10-17）"Prompt is too long" 全角色累计 252 次，
+
             # 而本函数从未触发过一次 /compact——只有 pane 单路时角色溢出后永久卡死
             # （product-architect 90 次 / consumer 35 次）。CLAUDE.md 早已声明本路存在，
             # 实为缺失实现。
@@ -218,6 +225,13 @@ class RoleLifecycleMixin:
 
             LOGGER.info("上下文溢出: %s 检测到溢出信号，发送 /compact", role)
             try:
+                # 先清输入行：溢出时角色常卡在未提交的半截 prompt 上，
+                # 直接发 /compact 会被拼到该行尾变成普通文本而非斜杠命令
+                # （实测遗留文本 + "/compact" → 不执行，角色继续溢出）。
+                _engine_mod._sp.run(
+                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
+                    capture_output=True, timeout=5,
+                )
                 _engine_mod._sp.run(
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "/compact", "Enter"],
                     capture_output=True, timeout=5,
@@ -302,7 +316,7 @@ class RoleLifecycleMixin:
                     _prev_sid = _wf_steps[_idx - 1].id
                 _prompt = self._fill_prompt_vars(
                     _step.prompt_template, _step, row["template_id"],
-                    _tt, _td, _results, _prev_sid)
+                    _tt, _td, _results, _prev_sid, wf_id=row["instance_id"])
                 if _UNMATCHED_VAR_RE.search(_prompt):
                     LOGGER.warning("kick-stalled 跳过 %s/%s: 含未替换变量 %s",
                                    row["template_id"], _sid, _UNMATCHED_VAR_RE.findall(_prompt))
@@ -612,11 +626,13 @@ class RoleLifecycleMixin:
             prompt = "/goal " + prompt
         # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
         # 用正则剥掉 /goal 前缀（lstrip 字符集会误伤内容开头的 g/o/a/l）
-        # 阈值 10→4：10 会误杀「请调研 Python」这类 6 字合法中文任务；
-        # 4 仍能拦住空/占位符（[]、p、x），继续防 #141691 死循环
+        # 旧实现按字符数 <4 判定，会误杀「调研x」这类合法短任务；改为判「有无实质内容」。
+        # 仍拦空目标、单字符与纯占位符（[]、p、x），继续防 #141691 死循环。
         _goal_content = _re.sub(r"^/goal(?:\s+|$)", "", prompt, count=1, flags=_re.IGNORECASE).strip()
-        if len(_goal_content) < 4:
-            LOGGER.warning("send-to-role %s 拒绝: goal 内容过短 (len=%d, wf=%s step=%s)",
+        _is_placeholder = (len(_goal_content) < 2
+                           or _re.fullmatch(r"[\[\](){}<>\s*_\-./\\|]+", _goal_content) is not None)
+        if _is_placeholder:
+            LOGGER.warning("send-to-role %s 拒绝: goal 无实质内容 (len=%d, wf=%s step=%s)",
                           role, len(_goal_content), wf_id[:12] if wf_id else "?", step_id)
             self._bb.write("blocker",
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
@@ -766,6 +782,19 @@ class RoleLifecycleMixin:
                  "--from", "workflow_engine"],
                 capture_output=True, timeout=30,
             )
+        except _engine_mod._sp.TimeoutExpired as _te:
+            # ccs send 超时（实测长 prompt 2299 字符 > 30s，19:53/19:57/20:54/21:19 共 8 次）：
+            # TimeoutExpired 不是 ValueError/KeyError/TypeError 的子类，原先直接冒泡出
+            # _send_to_role → 冒泡出 run_once → 被 engine.py:1332 的 sqlite_block 兜住，
+            # **中断整个 tick 的生产工作流扫描**（所有工作流停一步），且本步拿不到
+            # False → 不重投。按红线（投递失败必须返回 False）收口为正常失败分支：
+            # 不盖戳、不计 delivery_fail_count，下轮重试。
+            LOGGER.warning("send-to-role %s ccs send 超时 (wf=%s step=%s)：%s",
+                           role, wf_id[:12] if wf_id else "?", step_id, _te)
+            self._bb.write("blocker",
+                f"[workflow] {role} ccs send 超时（prompt {len(prompt)} 字符）",
+                evidence=str(_te)[:300], src="workflow_engine")
+            return "busy"  # 超时是临时状态，非投递失败：排队等下轮，不灌 delivery_blocked
         except (ValueError, KeyError, TypeError):
             try:
                 ccs_cli = _CCS_CLI

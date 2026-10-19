@@ -22,3 +22,6 @@ delivery_chain_status.lock
 # 工作流引擎本地库（workflows.db-shm/-wal 已由上方 *.db-shm / *.db-wal 覆盖）
 pipeflow.db
 .coverage
+
+tmp_out_*.txt
+_codex_verify.txt

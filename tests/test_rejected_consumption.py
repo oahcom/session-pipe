@@ -32,15 +32,17 @@ class TestParseReviewIssuesEvidence:
     """
 
     def test_arrow_annotation_parsed(self):
-        sys_txt, biz_txt = W._parse_review_issues(
+        sys_txt, biz_txt, sys_role, biz_role = W._parse_review_issues(
             "【系统问题→maintainer】\n- P1 | exit_condition 与 prompt 不一致"
         )
         assert sys_txt == ["P1 | exit_condition 与 prompt 不一致"]
+        assert sys_role == "maintainer", "箭头角色必须解析出来用于返工派发"
+        assert biz_role == ""
         assert biz_txt == []
 
     def test_single_line_compressed_parsed(self):
         """单行压缩形态（bus evidence 常见）。"""
-        sys_txt, biz_txt = W._parse_review_issues(
+        sys_txt, biz_txt, _, _ = W._parse_review_issues(
             "【系统问题】P2|任务未注入 wf_id; P2|引擎 s4 text 带模板前缀契约漂移"
         )
         assert "P2|任务未注入 wf_id" in sys_txt

@@ -142,8 +142,8 @@ class TestGuardWatchInvalidType(unittest.TestCase):
                 "prompt_template": ("## 目标\n执行代码扫描并记录发现，"
                     "输出格式符合团队规范要求。详细列出每个扫描维度，"
                     "包括边界情况和异常路径的处理验证。\n\n## 完成\n"
-                    "写 bus cat=scan_result，标题含 s1-complete。"),
-                "exit_condition": {"bus_category": "scan_result"},
+                    "写 bus cat=code_fix，标题含 s1-complete。"),
+                "exit_condition": {"bus_category": "code_fix"},
                 "guard": {"watch": "scout"}  # 字符串，非法
             }]
         }))
@@ -151,6 +151,7 @@ class TestGuardWatchInvalidType(unittest.TestCase):
         eng._collab_mtime = None
         eng._load_workflows()
         wf = eng._workflows.get("bad_guard")
+        self.assertIsNotNone(wf, "非法 guard 不应导致整份模板被拒")
         step = wf.steps[0]
         self.assertIsNone(step.guard, "非法 guard 应被丢弃")
 

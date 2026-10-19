@@ -179,6 +179,51 @@ def test_transcript_overflow_recent_detected(tmp_path, monkeypatch):
     assert rl._transcript_shows_overflow("qa") is True
 
 
+def test_transcript_anthropic_400_detected(tmp_path, monkeypatch):
+    """Anthropic 400 原文（maximum context length）→ 必须检测为溢出。
+
+    2026-10-19 生产实测：reviewer 撞此措辞，旧清单只认另外三种 → 永不自愈。
+    """
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(
+        tmp_path, "reviewer", age_sec=30,
+        text='API Error: 400 [400]: {"error":{"message":"Your request resulted in '
+             'more tokens than this model\'s maximum context length allows.",'
+             '"type":"invalid_request_error","code":"context_length_exceeded"}}')
+    assert rl._transcript_shows_overflow("reviewer") is True
+
+def test_anthropic_400_pane_triggers_compact():
+    """pane 含 Anthropic 400 原文（maximum context length）→ 必须发 /compact。
+
+    2026-10-19 生产实测：reviewer pane 命中该措辞，旧 pane 检测漏掉；且同函数
+    的 _CONTEXT_WARN_K 被当全局名引用 → NameError 被 engine 的静默 except 吞掉，
+    整轮检测对所有角色失效。两条都必须修复。
+    """
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    send_keys = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-reviewer\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=(
+                "API Error: 400 ... more tokens than this model's maximum context "
+                "length allows ... context_length_exceeded"))
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    assert any("/compact" in c for c in send_keys), f"应发 /compact, got {send_keys}"
+    assert eng._last_compact.get("reviewer") is not None
+
+
+
 def test_transcript_overflow_stale_ignored(tmp_path, monkeypatch):
     """超时效的旧溢出 → False（防旧错误无限期重发 /compact）。"""
     from pipeflow import role_lifecycle as rl

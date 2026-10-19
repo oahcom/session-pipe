@@ -330,9 +330,11 @@ class TestLoopValueGate(unittest.TestCase):
         eng._lifecycle._conn_tx = MagicMock(return_value=ctx)
         eng._lifecycle._conn_tx.return_value.__enter__ = MagicMock(return_value=ctx)
         eng._lifecycle._conn_tx.return_value.__exit__ = MagicMock(return_value=False)
-
         import pipeflow.wf_lifecycle as wfl
-        with patch.object(wfl, "_CCS_WORKSPACES", Path(tmp)):
+        # 生产者重启走模块级 _engine_mod._sp（见 wf_lifecycle._handle_wf_loop），
+        # 只 mock 实例属性拦截不到 → 真的去跑 ccs start，30s 超时。
+        with patch.object(wfl, "_CCS_WORKSPACES", Path(tmp)), \
+                patch.object(wfl._engine_mod, "_sp", MagicMock()):
             eng._handle_wf_loop(wf_def, "wf_loop", eng._lifecycle)
 
         # PASS → 应执行 INSERT（新迭代创建）

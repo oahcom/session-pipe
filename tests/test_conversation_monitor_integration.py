@@ -30,7 +30,7 @@ class FakeEngine(StepHandlerMixin):
         self._has_live_subflow = MagicMock(return_value=False)
 
     def _fill_prompt_vars(self, prompt, step, wf_name, title, desc, results,
-                          prev_step_id=""):
+                          prev_step_id="", wf_id=""):
         """桩：真实实现在 WorkflowLifecycleMixin（本类只继承 StepHandlerMixin）。
 
         超时重推路径会调它做 {title}/{description} 等变量替换；此处只需原样返回，

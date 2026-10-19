@@ -211,6 +211,10 @@ def test_engine_advance_to_completion():
         # 推进 s2
         bb.write("code_fix", f"test-header: 跨组件s2完成_{int(time.time())&0xffff:04x}", src="engineer")
         eng.run_once()
+        # 末步：complete_step 只置 completed，收尾（close_wf）由下一 tick 的
+        # _advance_production_wf is_last 分支完成（manager._advance_unsafe 明确
+        # 不在末步自行 close，否则子链/loop/部署收尾全被绕过）。
+        eng.run_once()
         assert eng.status(rid)["status"] == "completed"
         # NOTE: engine 完成时不写 reflexion_lesson（设计决定，非测试覆盖范围）
 

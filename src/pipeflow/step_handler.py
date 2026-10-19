@@ -484,7 +484,8 @@ class StepHandlerMixin:
                         _eff,
                         self._fill_prompt_vars(
                             step.prompt_template, step, run.workflow_name,
-                            _rt_title, _rt_desc, run.step_results, _rt_prev),
+                            _rt_title, _rt_desc, run.step_results, _rt_prev,
+                            wf_id=run.id),
                         wf_id=run.id, step_id=step.id, force=True)
                     self._send_to_role("coordinator",
                         f"[workflow] {run.workflow_name}/{run.current_step} 已超时 1 次，等待角色响应",
@@ -1352,21 +1353,20 @@ class StepHandlerMixin:
                 continue
             if created_after and _birth.get(f.id, f.ts) < created_after:
                 continue
-            # wf 归属校验：消息含别的 wf_id → 串消息 → 过滤；
-            # 消息不含 wf_id 时放行（时间窗口已保证属于当前实例）。
-            # 角色写消息通常不带 wf_id（2026-08-10 观测：scout/pm 的完成消息无 wf 前缀），
-            # 但 require_wf=true 是引擎硬校验，必须严格：无 wf_id 的消息不能匹配，
-            # 否则旧工作流的同分类消息会串入新工作流（观测 wf_7f37 匹配到 wf_cde32 的
-            # s1-complete，跨工作流误推进，2026-08-10）。
-            # 归属性校验：消息含别的 wf_id → 串消息 → 过滤；
-            # 用分隔符边界匹配，避免裸子串串扰（如 "abc123" 误中 "abc1234"）。
-            # wf_id 形如 "wf_abc123"；同时允许去前缀的裸 id "abc123"，两种形态均需边界包裹。
-            if wf_id and f.t and 'wf_' in f.t:
-                import re as _re
+            # wf 归属校验（require_wf 严格模式）：消息必须提到本实例 id。
+            # 旧实现只在标题含 'wf_' 时才校验 —— 标题不带 wf_ 的消息一律放行，
+            # 于是两条同模板的返工链（wf_rw_fd0826/wf_rw_439523）被同一条
+            # pg 的 code_fix 同时闭合，第二条的文档缺陷未修即通过（实测 #415562）。
+            # 现在：require_wf=true 时“不含本 id”就是一个不匹配，而不是放行。
+            # 边界用负向断言而非分隔符白名单：引擎自己注入的提示是
+            # `[实例] wf_xxx（完成消息标题必须含此 id）`，角色照抄即全角括号紧邻；
+            # 白名单永远列不全全角标点（实测「wf_xxx（完成）」恒 MISS）。
+            if wf_id:
                 _bare = wf_id.replace('wf_', '', 1)
-                _pat = r'(?:^|[\s"\',:;/])(' + _re.escape(wf_id) + r'|' + _re.escape(_bare) + r')(?:[\s"\',:;/]|$)'
-                if not _re.search(_pat, f.t):
+                _pat = rf'(?<![\w-])({re.escape(wf_id)}|{re.escape(_bare)})(?![\w-])'
+                if not f.t or not re.search(_pat, f.t):
                     continue
+
             # evidence 必须一并带上：驳回分类段【系统问题→maintainer】写在 evidence 里，
             # 旧实现只取 t（标题）→ _parse_review_issues 拿不到分类 → 返工链恒建不出
             # （实测生产 3/3 条真实 reviewer 驳回全部解析为空）。
@@ -1393,9 +1393,13 @@ class StepHandlerMixin:
                         continue
                     if created_after and _birth.get(_f.id, _f.ts) < created_after:
                         continue
-                    if wf_id and _f.t and 'wf_' in _f.t and wf_id not in _f.t \
-                            and wf_id.replace('wf_', '') not in _f.t:
-                        continue
+                    # 与主路径同源的严格归属校验（旧 "'wf_' in t" 写法会放行无 id 消息，
+                    # 协作门因此被跨实例消息一票满足）。
+                    if wf_id:
+                        _bare_r = wf_id.replace('wf_', '', 1)
+                        _pat_r = rf'(?<![\w-])({re.escape(wf_id)}|{re.escape(_bare_r)})(?![\w-])'
+                        if not _f.t or not re.search(_pat_r, _f.t):
+                            continue
                     _rmsg = {"id": _f.id, "text": _f.t[:200], "ts": _f.ts, "src": _f.src}
                     break
                 if _rmsg is None:

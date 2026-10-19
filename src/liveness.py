@@ -407,7 +407,14 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
 
     #{window_activity} 是 pane 最后一次输出的 unix 时间戳，实测随输出递增，
     与 survival_monitor._l2_check 同源（该处 2026-10-16 已从 pane_activity 修正）。
-    返回值：True=近期有活动；False=tmux 可达但已静默超窗；None=探测不可用（不判忙）。
+
+    超窗后还要看"CLI 是否仍在运行"：codex review 这类长工具调用期间 pane 零输出
+    （实测 reviewer 静默 8.5~11.7min），只按时间戳会把正在干活判成死亡 →
+    auto-cancel 杀掉工作流（实测 wf_sub_8de33/s1、wf_sub_fb975/s1）。
+    Claude Code 忙态底栏带 `esc to interrupt`，空闲态不带——这是与"已死"
+    区分的唯一可靠视口信号。
+    返回值：True=近期有活动或 CLI 忙；False=tmux 可达、静默超窗且 CLI 空闲；
+    None=探测不可用（不判忙）。
     """
     try:
         r = subprocess.run(
@@ -418,8 +425,31 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
         raw = r.stdout.strip().split("\n")[0] if r.stdout.strip() else ""
         if not raw or raw == "0":
             return None  # 无数据 ≠ 不活跃，交调用方按未知处理
-        return (time.time() - float(raw)) < window
+        if (time.time() - float(raw)) < window:
+            return True
+        # 仅在耗时阶段付这次额外 capture-pane（正常路径不增加 tmux 调用）
+        return _pane_cli_busy(role, timeout)
     except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
         return None
     except OSError:
         return None  # tmux socket 不可达/权限不足（review P3）
+
+
+_CLI_BUSY_MARKERS = ("esc to interrupt", "esc to cancel", "ctrl+b to run in background")
+
+
+def _pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
+    """pane 静默超窗后，判断 CLI 是否仍在执行（忙态底栏标记）。
+
+    返回 None 表示探测失败——调用方按"不可用不判死"处理。
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", f"ccs-{role}"],
+            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+        tail = r.stdout[-2000:].lower()
+        return any(m in tail for m in _CLI_BUSY_MARKERS)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None

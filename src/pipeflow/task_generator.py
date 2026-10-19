@@ -184,31 +184,62 @@ class TaskGeneratorMixin:
                                                 self._advance_production_wf(wfid, lm, tpl, sid, sr)
                                         )
                             elif _sub_status and _sub_status['status'] in ('failed', 'cancelled'):
-                                # 子链建不出来/跑挂了 → 父步永远等不到回流信号，
-                                # 只能熬到 exit_condition 超时兜底。实测 wf_e50bbe5664
-                                # 三个子链全 failed，父链 running/s3 毫无感知。
-                                # 不改推进语义（与上面驳回分支同原则：硬推/硬停都会制造
-                                # 新的静默卡死），只记账 + 写 bus 让「卡住」可被外部观测。
-                                # 幂等：只在首次检测到时落库/写 bus，否则每 tick 重写 = bus 洪泛。
-                                if not _sdata.get("subflow_failed_at"):
+                                # 子链终态（failed/cancelled）→ 父步无出口，只能等 exit
+                                # 超时被 auto-cancel（实测 wf_59263/s5：子链 cancelled 后
+                                # 父步 notified 悬空 40min）。重置父步状态让它重走投递。
+                                # 按 subflow_id 去重：同一子链只重置一次，否则每 tick 重写。
+                                # 前 2 次连 subflow_id 一起清 → _subflow_takeover 重建子链（首选，
+                                # 实测 writer_document 因此走通并让 wf_59263 推进到 s6）。
+                                # 之后保留 subflow_id：_subflow_takeover 见子链不在活跃白名单
+                                # 即返回 False 交还父步自投（wf_lifecycle.py 终态分支）。
+                                # **不可**置父步 delivery_blocked 收口：_recover_delivery_blocked
+                                # 只扫行级 status=delivery_blocked 的实例，而父链行级是
+                                # running，看不见步骤级标记 → 父步永久悬空（实测 wf_22b96/s3）。
+                                if _sdata.get("subflow_failed_id") != _sf:
+                                    _sdata["subflow_failed_id"] = _sf
                                     _sdata["subflow_failed_at"] = time.time()
                                     _sdata["subflow_failed_status"] = _sub_status["status"]
+                                    # 命中 _subflow_takeover 三步：前 2 次清 subflow_id 重建子链；
+                                    # 2 次用完父步自投一次（子链重建失败说明该角色/链路持续异常，
+                                    # 再建只是同型空转），之后保留 subflow_id 并交人工——
+                                    # 无限自投只会让同一失败模式每 tick 重演（实测 wf_22b96/s3
+                                    # reviewer 子链连建 5 条全部 delivery_blocked）。
+                                    _n = int(_sdata.get("subflow_retry", 0) or 0) + 1
+                                    _sdata["subflow_retry"] = _n
+                                    if _n <= 2:
+                                        _sdata.pop("subflow_id", None)
+                                    _sdata.pop("notified_at", None)
+                                    _sdata.pop("poll_since", None)
+                                    _sdata["status"] = ""
+                                    if _n > 3:
+                                        # 保留 status="" 但不重建：engine 的派发分支会看到
+                                        # subflow_id 仍指向终态子链 → _subflow_takeover 返回
+                                        # False → 父步自投；自投失败才落到 delivery_blocked 收口。
+                                        _sdata["subflow_escalated"] = True
+                                        self._bb.write(
+                                            "blocker",
+                                            f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                            f"子链 {_n} 次失败，停止自动重建",
+                                            src="workflow_engine",
+                                            evidence=(f"子链 {_sf} status={_sub_status['status']}；"
+                                                      f"同一父步已重建 {_n - 1} 次。需人工排查"
+                                                      f"该角色/模板链路，自动重建已停止。"))
                                     conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                                         (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
                                     conn.commit()
+                                    _note = (f"已重置重投(第 {_n} 次)" if _n <= 2
+                                             else "保留 subflow_id，交还父步自投")
                                     try:
                                         self._bb.write(
                                             "blocker",
                                             f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
-                                            f"子链 {_sf[:12]} {_sub_status['status']}，父步空等",
+                                            f"子链 {_sf[:12]} {_sub_status['status']}，{_note}",
                                             src="workflow_engine",
-                                            evidence=f"子链 {_sf} status={_sub_status['status']}，"
-                                                     f"父步 {_step_id} 收不到完成回流，将熬到超时兜底。"
-                                                     f"需人工确认返工或取消。")
+                                            evidence=f"子链 {_sf} status={_sub_status['status']}。父步 {_step_id} {_note}。")
                                         LOGGER.warning(
-                                            "子链 %s %s → 父 %s/%s 空等（已写 blocker）",
+                                            "子链 %s %s → 父 %s/%s %s",
                                             _sf[:12], _sub_status["status"],
-                                            _sub_row["instance_id"][:12], _step_id)
+                                            _sub_row["instance_id"][:12], _step_id, _note)
                                     except Exception as _bwe:
                                         LOGGER.debug("subflow-failed blocker 写入失败: %s", _bwe)
 
@@ -395,7 +426,8 @@ class TaskGeneratorMixin:
                             _hf_prev = wf.steps[_hf_idx - 1].id if _hf_idx > 0 else ""
                             _prompt = self._fill_prompt_vars(
                                 _sf.prompt_template, _sf, _hf_name, _hf_title,
-                                inst.get("description") or "", results, _hf_prev)
+                                inst.get("description") or "", results, _hf_prev,
+                                wf_id=inst["instance_id"])
                             # 锁外执行：投递成功才盖戳 last_heal（投递失败不下轮重试，不误标已自愈）
                             _deferred.append(lambda role=_role, p=_prompt, i=inst, s=_sid:
                                 self._heal_send(role, p, i["instance_id"], s))

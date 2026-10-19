@@ -223,6 +223,18 @@ def daemon_loop(interval: int):
 
     idled = 0
     starve_rounds = 0
+    # ── 源码热加载守卫 ──
+    # 本进程启动后永不重读源文件，分支上的修复对运行中的 daemon 完全不生效。
+    # 实测 2026-10-19：判活守卫 _role_producing_recently 已写在工作区，daemon
+    # 仍按旧代码误杀正在写报告的 reviewer。判据 = 源码 mtime 晚于本进程启动。
+    # 处理：优雅退出，由 systemd Restart=always 用新代码拉起。
+    # 连续两次探测到同一新 mtime 才退出 —— 编辑器保存瞬时态不触发重启。
+    _src_dir = Path(__file__).resolve().parent
+    _seen_mtime = max((p.stat().st_mtime for p in _src_dir.glob("*.py")), default=0.0)
+    _pending_mtime = 0.0
+    _reload_probe = 0
+    _PROBE_EVERY = max(1, 60 // max(interval, 1))
+
     try:
         while not shutdown:
             try:
@@ -244,6 +256,21 @@ def daemon_loop(interval: int):
                         starve_rounds = 0
             except Exception as e:
                 LOGGER.warning("饥饿检测异常: %s", e)
+            _reload_probe += 1
+            if _reload_probe >= _PROBE_EVERY:
+                _reload_probe = 0
+                try:
+                    _now_mtime = max(
+                        (p.stat().st_mtime for p in _src_dir.glob("*.py")), default=0.0)
+                    if _now_mtime > _seen_mtime:
+                        if _pending_mtime == _now_mtime:
+                            LOGGER.info("源码已更新 (mtime=%.0f)，退出由 systemd 重启以加载新代码",
+                                        _now_mtime)
+                            shutdown = True
+                        else:
+                            _pending_mtime = _now_mtime
+                except OSError as _e:
+                    LOGGER.debug("源码 mtime 探测失败: %s", _e)
             time.sleep(interval)
     except KeyboardInterrupt:
         LOGGER.info("收到 KeyboardInterrupt，正在关闭...")

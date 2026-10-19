@@ -179,6 +179,10 @@ class Step:
     # 仲裁模式：wait_roles 声明协作门——所有角色都产出匹配消息才推进
     # （_check_exit 门控；source_contains/relaxed-advance/tmux 信号均不绕过）
     wait_roles: list = None  # 协作门：等这些角色都产出匹配消息才推进（仲裁/对等模式）
+    # 模板元数据。必须在此声明，否则 engine 加载时的
+    # `k in Step.__dataclass_fields__` 过滤会静默丢弃它们（模板写了等于没写）。
+    approval_prompt: str = ""
+    estimated_hours: float = 0.0
 
 
 @dataclass
@@ -874,10 +878,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     task_header = (
                         f"[任务] {task_title}\n"
                         f"[工作流] {wf_name} | 步骤: {step.id} — {step.title}\n"
+                        # 实例 id 必须进 prompt：exit_condition 带 require_wf 的模板
+                        # 只认含本 id 的完成消息。角色不知道 id 就永远写不出匹配消息
+                        # → 步骤熬到超时（返工子链即此形态）。
+                        f"[实例] {inst['instance_id']}（完成消息标题必须含此 id）\n"
                         f"[工作流目标] {step.title}\n"
                         + (f"[任务描述] {task_desc}\n" if task_desc else "")
                         + "\n"
                     )
+
                     # 剥离模板自带的 /goal：它是指令语法，由 role_lifecycle._send_to_role
                     # 按 force 语义统一注入。模板正文里的 /goal 被 header 顶到中段，
                     # 下游 re.sub(r"^/goal", count=1) 看不见它 → 最前面再加一个，
@@ -1050,8 +1059,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 于是审批密钥机制形同虚设：全库 413 个步骤发放过 token，消费 0 次，
                 # 335 个"需审批"步骤全部无审批完成。handoff/review/subflow 步骤的
                 # 设计意图是"等 assigner 用 token 确认"（见 step_handler._tick 注释），
-                # 这里必须尊重它，否则闸门不存在。
-                # 豁免：无 token 的步骤（系统发起/无审批人）与 confirmed 过的步骤照常推进。
                 # 判据只看"token 已发放且未被消费"这一条：confirm_step 通过时会把
                 # approval_token 置 None 并写 approval_consumed_at（manager.py:396-397），
                 # 故 token 存在 ⟺ 尚未审批。无 token 的步骤（无审批人/系统发起/
@@ -1081,6 +1088,19 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                 LOGGER.warning(
                                     "approval_timeout_fallback %s/%s: token 超时未消费（ttl=%s），自动 approve",
                                     wf_name, step_id, _ttl)
+                                # confirm_step 改的是它自己 load 的 results；本 tick 的
+                                # results 仍是 762 行读的旧快照。落到 1054 后 _persist_step_done
+                                # 会把它**整份**写回 → 刚落的 completed 被打回 step_done_ready、
+                                # approval_token 复活，而 current_step_id 已推进 → 步骤 JSON 与
+                                # 行级彻底脱节。实测 wf_rw_46e42f725e74/s1: 19:33:36 confirm
+                                # 落库 completed, 19:33:58 旧快照覆写回 step_done_ready, 父链
+                                # _rework_exit 永久判 wait 卡 7h。重读 DB 消除快照分歧。
+                                _fresh_rows = lm.query(
+                                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                                    (inst["instance_id"],))
+                                if _fresh_rows:
+                                    results = json.loads(_fresh_rows[0]["step_results"] or "{}")
+                                    step_status = "completed"
                             except Exception as _af:
                                 # confirm 失败（如角色 wf complete 改写了 status）
                                 # 若仍等，就是永久 step_done_ready 死锁。累计 3 次
@@ -1256,12 +1276,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
                     self._bb.write("blocker",
                         f"[workflow] {inst['instance_id'][:12]}/{step_id} 被驳回但无返工链"
-                        f" → 回退重投（第 {_reset['rejected_retry']} 次）",
+                        f" → 回退重投（第 {_retry} 次）",
                         evidence=(f"驳回理由: {(_rej_sr.get('rejection_reason') or '')[:200]}\n"
                                   f"未见【系统问题】/【业务问题】分类，建不出返工链。"),
                         src="workflow_engine")
                     LOGGER.warning("rejected → 无返工链，回退重投 %s/%s (retry=%d)",
-                                   inst["instance_id"][:12], step_id, _reset["rejected_retry"])
+                                   inst["instance_id"][:12], step_id, _retry)
                     continue
 
 

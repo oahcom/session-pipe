@@ -226,6 +226,8 @@ def test_tick_completes_on_last_step():
     eng.run_once()
     eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
     eng.run_once()
+    # 末步收尾需额外一 tick：_advance_unsafe 不在末步 close，交 _advance_production_wf
+    eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
 
@@ -299,6 +301,8 @@ def test_advance_finishes():
     # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
     eng.run_once()
     eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
+    eng.run_once()
+    # 末步收尾需额外一 tick（同上）
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
