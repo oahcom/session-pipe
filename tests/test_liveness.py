@@ -382,5 +382,71 @@ class TestStaleRoleNotBusyWhenSilent(unittest.TestCase):
         self.assertIs(gate, True)
 
 
+class TestL4EffectiveRoleOverride(unittest.TestCase):
+    """开发角色池分流后，忙检测必须按实际执行者判定（不是模板 target_role）。
+
+    生产事故（2026-10-20 02:07~03:2x）：wf_sub_4e63ad633d39 / wf_sub_b548d0e2495a
+    分流到 pg、effective_roles={"s1":"pg"}，模板 target_role 仍是 engineer。
+    只比对模板值 → engineer 被两个自己不执行的子链永久判忙 →
+    父链 WL-food_chain_loop/s4 与 WF-product_delivery/s4 停滞 75min+
+    （journal 每 tick: liveness: skip engineer busy with wf_sub_b548/s1）。
+    """
+
+    def _conn(self, effective_roles: str):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE workflow_instances(instance_id TEXT, template_id TEXT, "
+            "step_results TEXT, assigner TEXT, parent_wf_id TEXT, effective_roles TEXT, "
+            "status TEXT)")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        conn.execute("INSERT INTO workflow_templates('template_id','steps_json') VALUES('tpl',?)",
+                      (json.dumps({"steps": [{"id": "s1", "target_role": "engineer"}]}),))
+        conn.execute(
+            "INSERT INTO workflow_instances VALUES('wf_sub_x','tpl',?,'workflow_engine',"
+            "'wf_main',?,'running')",
+            (json.dumps({"s1": {"status": "notified", "timeout_count": 0}}), effective_roles))
+        return conn
+
+    def test_engineer_not_busy_when_step_reassigned_to_pg(self):
+        conn = self._conn(json.dumps({"s1": "pg"}))
+        s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
+        self.assertFalse(s["busy"], "步骤已改投 pg，engineer 不应被判忙")
+        conn.close()
+
+    def test_pg_busy_when_step_reassigned_to_pg(self):
+        conn = self._conn(json.dumps({"s1": "pg"}))
+        s = _s4_stepping("pg", conn, exclude_wf_id="wf_other")
+        self.assertTrue(s["busy"], "实际执行者 pg 应被判忙")
+        conn.close()
+
+    def test_engineer_busy_without_override(self):
+        conn = self._conn("{}")
+        s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
+        self.assertTrue(s["busy"], "无覆盖时仍按模板 target_role 判忙")
+        conn.close()
+
+    def test_bare_name_template_resolves_with_wf_prefix(self):
+        """实例写裸名 engineer_feature，注册表存 WF-engineer_feature → 需回退查到。
+
+        不回退时 _load_steps_json 返回 None → 该实例在忙检测中被静默跳过
+        （实测 wf_sub_4e63/wf_sub_b548 在 running 中却从未被 pg 判忙）。
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE workflow_instances(instance_id TEXT, template_id TEXT, "
+            "step_results TEXT, assigner TEXT, parent_wf_id TEXT, effective_roles TEXT, "
+            "status TEXT)")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        conn.execute("INSERT INTO workflow_templates VALUES('WF-engineer_feature',?)",
+                      (json.dumps([{"step_id": "s1", "target_role": "engineer"}]),))
+        conn.execute(
+            "INSERT INTO workflow_instances VALUES('wf_sub_y','engineer_feature',?,"
+            "'workflow_engine','wf_main','{}','running')",
+            (json.dumps({"s1": {"status": "notified", "timeout_count": 0}}),))
+        s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
+        self.assertTrue(s["busy"], "裸名模板应回退到 WF- 前缀后判忙")
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

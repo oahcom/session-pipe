@@ -129,7 +129,15 @@ def effective_role(inst: dict, step_id: str, fallback: str = "") -> str:
     """
     if inst is None:
         return fallback
-    _er = inst.get("effective_roles") if isinstance(inst, dict) else getattr(inst, "effective_roles", None)
+    if isinstance(inst, dict):
+        _er = inst.get("effective_roles")
+    elif hasattr(inst, "keys"):  # sqlite3.Row：支持按键访问
+        try:
+            _er = inst["effective_roles"]
+        except (IndexError, KeyError):
+            _er = None
+    else:
+        _er = getattr(inst, "effective_roles", None)
     if isinstance(_er, str):
         import json as _json
         try:
@@ -165,6 +173,17 @@ def _load_steps_json(template_id: str, db_conn) -> list | None:
         rows = _db_fetch(db_conn,
             "SELECT steps_json FROM workflow_templates WHERE template_id=?", (template_id,))
         if not rows:
+            # 同仓两条命名并存：实例行写裸名（engineer_feature），注册表存
+            # WF- 前缀（WF-engineer_feature）。查不到即整块跳过 → 忙检测对
+            # 这些实例永久静默失效（实测 wf_sub_4e63/wf_sub_b548 的
+            # engineer_feature 在 running 中却从未被 pg 判忙）。
+            # 与 wf_lifecycle._subflow_takeover 同款回退。
+            _alt = (template_id[3:] if template_id.startswith("WF-")
+                    else f"WF-{template_id}")
+            rows = _db_fetch(db_conn,
+                "SELECT steps_json FROM workflow_templates WHERE template_id=?",
+                (_alt,))
+        if not rows:
             return None
         raw = rows[0][0]
         if not raw:
@@ -193,9 +212,17 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
     if db_conn is None:
         return {"available": False, "busy": False}
     try:
-        rows = _db_fetch(db_conn,
-            "SELECT instance_id, template_id, step_results, assigner, parent_wf_id "
-            "FROM workflow_instances WHERE status='running'")
+        # effective_roles 用 COALESCE 兜底：旧测试库/旧 schema 无此列时，
+        # 查询整体失败会让 _s4_stepping 返回 unavailable → 忙检测静默失效。
+        try:
+            rows = _db_fetch(db_conn,
+                "SELECT instance_id, template_id, step_results, assigner, parent_wf_id, "
+                "effective_roles "
+                "FROM workflow_instances WHERE status='running'")
+        except Exception:
+            rows = _db_fetch(db_conn,
+                "SELECT instance_id, template_id, step_results, assigner, parent_wf_id "
+                "FROM workflow_instances WHERE status='running'")
         # exclude 自身的父链 id：下面要豁免「父链占用同角色」——子链投递时
         # 父链的同角色步骤正卡在 notified，原单向判据看不见反向，子链被判忙。
         _exclude_parent = ""
@@ -260,9 +287,20 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
             if not isinstance(step_results, dict):
                 continue
             for _s in steps:
-                if _s.get("target_role") != role:
+                _sid = _s.get("step_id") or _s.get("id") or ""
+                # 开发角色池分流后执行者是 pg，但模板 target_role 仍是 engineer。
+                # 只比对模板值 → 已改投 pg 的实例仍被算作"engineer 忙"，
+                # engineer 被两个自己根本不执行的子链永久堵死，父链 s4 停滞
+                # （实测 wf_sub_4e63/wf_sub_b548 effective_roles={"s1":"pg"}，
+                # 03:25 起每 tick 打 liveness: skip engineer busy）。
+                # effective_role() 与 engine 投递侧解析同一真相源。
+                # 行类型三态（dict / sqlite3.Row / 裸 tuple）统一按列名取值，
+                # 不把行对象直接交给 effective_role——裸 tuple 无 .keys()，
+                # 会让覆盖读不到、静默退回模板值（本修复自身的第一个 bug）。
+                _er_row = {"effective_roles": _row_get(r, "effective_roles", 5)}
+                if effective_role(_er_row, _sid, fallback=_s.get("target_role")) != role:
                     continue
-                _sdata = step_results.get(_s.get("step_id") or _s.get("id") or "", {})
+                _sdata = step_results.get(_sid, {})
                 if not isinstance(_sdata, dict):
                     continue
                 if _sdata.get("status") in _ACTIVE_STEP_STATUS:
