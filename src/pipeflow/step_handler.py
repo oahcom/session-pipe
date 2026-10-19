@@ -57,8 +57,11 @@ def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
     send_to_role(step.target_role, msg)
 
 
-def _mentions(fact, wf_id: str) -> bool:
-    """消息是否真正提及该工作流实例（标题或正文，完整 id，词边界）。
+def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
+    """消息是否真正提及该工作流实例（完整 id，词边界）。
+
+    fields 决定查标题(t)、正文(e)或两者，默认两者；严格归属路径传 "t"
+    保持既有标题语义，避免正文顺带提及本 id 就放行。
 
     只看标题会漏掉把实例 id 写在 evidence 里的产出；前缀匹配会在
     wf_sub_4…/wf_sub_b… 这类同前缀实例间串味（实测 31 次宽松推进有 29 次
@@ -70,7 +73,12 @@ def _mentions(fact, wf_id: str) -> bool:
         return False
     bare = wf_id.replace('wf_', '', 1)
     pat = rf'(?<![\w-])({re.escape(wf_id)}|{re.escape(bare)})(?![\w-])'
-    return bool(re.search(pat, f"{fact.t}\n{getattr(fact, 'e', '') or ''}"))
+    body = "\n".join(
+        str(v) for k, v in (("t", getattr(fact, "t", "")), ("e", getattr(fact, "e", "") or ""))
+        if k in fields
+    )
+    return bool(re.search(pat, body))
+
 
 
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
@@ -1295,14 +1303,10 @@ class StepHandlerMixin:
             # 于是两条同模板的返工链（wf_rw_fd0826/wf_rw_439523）被同一条
             # pg 的 code_fix 同时闭合，第二条的文档缺陷未修即通过（实测 #415562）。
             # 现在：require_wf=true 时“不含本 id”就是一个不匹配，而不是放行。
-            # 边界用负向断言而非分隔符白名单：引擎自己注入的提示是
-            # `[实例] wf_xxx（完成消息标题必须含此 id）`，角色照抄即全角括号紧邻；
-            # 白名单永远列不全全角标点（实测「wf_xxx（完成）」恒 MISS）。
-            if wf_id:
-                _bare = wf_id.replace('wf_', '', 1)
-                _pat = rf'(?<![\w-])({re.escape(wf_id)}|{re.escape(_bare)})(?![\w-])'
-                if not f.t or not re.search(_pat, f.t):
-                    continue
+            # 归属边界统一由 _mentions 判定（标题+正文、完整 id）。
+            # 严格归属：只认标题，与旧语义一致（正文顺带提及不放行）。
+            if wf_id and not _mentions(f, wf_id, fields="t"):
+                continue
 
             # evidence 必须一并带上：驳回分类段【系统问题→maintainer】写在 evidence 里，
             # 旧实现只取 t（标题）→ _parse_review_issues 拿不到分类 → 返工链恒建不出
@@ -1330,13 +1334,9 @@ class StepHandlerMixin:
                         continue
                     if created_after and _birth.get(_f.id, _f.ts) < created_after:
                         continue
-                    # 与主路径同源的严格归属校验（旧 "'wf_' in t" 写法会放行无 id 消息，
-                    # 协作门因此被跨实例消息一票满足）。
-                    if wf_id:
-                        _bare_r = wf_id.replace('wf_', '', 1)
-                        _pat_r = rf'(?<![\w-])({re.escape(wf_id)}|{re.escape(_bare_r)})(?![\w-])'
-                        if not _f.t or not re.search(_pat_r, _f.t):
-                            continue
+                    # 与主路径同源：同用 _mentions（旧 "'wf_' in t" 会放行无 id 消息）。
+                    if wf_id and not _mentions(_f, wf_id, fields="t"):
+                        continue
                     _rmsg = {"id": _f.id, "text": _f.t[:200], "ts": _f.ts, "src": _f.src}
                     break
                 if _rmsg is None:

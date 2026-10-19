@@ -64,3 +64,9 @@ if __name__ == "__main__":
             fn()
             print(f"✓ {name} PASS")
     print("all relaxed-advance ownership checks passed")
+
+def test_strict_ownership_ignores_body_mentions():
+    # 严格路径（t 字段）不得因正文顺带提及本 id 而放行
+    f = _F("无关标题", e="顺带提到 wf_sub_4e63ad633d39")
+    assert not _mentions(f, "wf_sub_4e63ad633d39", fields="t"), "严格路径只看标题"
+    assert _mentions(f, "wf_sub_4e63ad633d39"), "宽松路径含正文"
