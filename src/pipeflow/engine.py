@@ -99,6 +99,40 @@ _REMINDER_INTERVAL = _TUNING.get("reminder_interval", 120)
 # StopHook 条件时 bool([]) 为 False → 死循环
 UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
 
+# 驳回重投上限：超过则升级给 coordinator 而非继续重投。
+# 为什么必须封顶：重投把同一步再推给不接单/不会改的角色，产物不变 → 必然再
+# 被驳回 → 再建链，形成自旋（实测 wf_3f71a2a78 17:36→17:44 八分钟 retry 6 次，
+# 每次建一条返工链、每次都被排队回收）。封顶后转为对 coordinator 显式升级，
+# 由人/协调角色决定改模板还是换执行者。
+_MAX_REJECTED_RETRY = 3
+
+# 等返工链的超时上限：返工链自身无 timeout（实测全 31 个模板 timeout=None），链内
+# 任一步卡住（如 s1 停在 step_done_ready 等审批）父链就永远 wait——实测
+# wf_256be862ea86 已等 147 分钟，出路只剩 24h 全局兜底 cancel，届时父链已推进的
+# 产物全部陪葬。超限只升级一次（与 rework 未交付共用锚），不停止等待：链晚到总比
+# 丢产物好。
+_REJECTED_WAIT_MAX = 3600
+
+_REWORK_TERMINAL = ("completed", "failed", "cancelled")
+
+# 回退重投须清掉的 step_result 键：exit_messages 残留会让 tick-rescue 立即二次
+# complete；rework_ids 是「当前活跃返工链」集合，链已终结仍留着会让下轮
+# `not _rework_ids` 为假 → 跳过建链，只重投不返工；rework_escalated_at 是升级
+# 幂等锚，跨重投周期留着会让下一轮升级被永久抑制（该发的消息一条不发）。
+# 测试直引本常量防两处漂移。
+_REQUEUE_DROP = ("status", "rejected_at", "rejected_by", "rejection_reason",
+                 "poll_since", "bus_anchor", "notified_at", "exit_messages", "rework_ids",
+                 "rework_escalated_at")
+
+
+def _rework_exit(sts: list) -> str:
+    """返工链状态集 → 出口：wait / escalate_unfixed / requeue。"""
+    if sts and not all(s in _REWORK_TERMINAL for s in sts):
+        return "wait"                # 链仍在跑
+    if sts and any(s != "completed" for s in sts):
+        return "escalate_unfixed"    # failed/cancelled = 修复未交付，重投徒劳
+    return "requeue"                 # 已交付（或链已删）→ 重审原步
+
 
 @dataclass
 class Step:
@@ -676,6 +710,34 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self.run_once()
         return 0
 
+    def _escalate_rejected(self, inst: dict, step_id: str, sr: dict, results: dict,
+                           lm, reason: str) -> None:
+        """驳回步骤停重投 → 升级 coordinator。reason 说明为何放弃继续等/重投。
+
+        幂等锚 rework_escalated_at：无它则每 tick 重发一条。锚只在投递确实成功
+        （True）时落——busy 是排队、False 是守卫拦下，都非送达，下轮重试；否则
+        coordinator 没收到消息锚却已置位，升级永久丢失。
+        """
+        wf_id = inst["instance_id"]
+        if sr.get("rework_escalated_at"):
+            return
+        _ok = self._send_to_role(
+            "coordinator",
+            f"[workflow] {wf_id[:12]}/{step_id} {reason}，已停重投，待协调处置",
+            wf_id=wf_id, step_id=step_id, force=True)
+        if _ok is not True:      # busy=排队、False=守卫拦下，两者都非送达
+            LOGGER.warning("升级投递未成功(%s) %s/%s → 下轮重试", _ok, wf_id[:12], step_id)
+            return
+        sr["rework_escalated_at"] = time.time()
+        results[step_id] = sr
+        lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                   (json.dumps(results, ensure_ascii=False), wf_id))
+        self._bb.write("blocker",
+                       f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
+                       evidence=f"驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
+                       src="workflow_engine")
+        LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
+
     def run_once(self):
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
@@ -1098,30 +1160,62 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                 f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
                                 tuple(_rework_ids))]
                         except Exception as _q:
-                            LOGGER.debug("rework 状态查询失败 %s/%s: %s",
-                                         inst["instance_id"][:12], step_id, _q)
-                            _sts = []
-                        if _sts and any(s not in ("completed", "failed", "cancelled")
-                                        for s in _sts):
-                            continue  # 返工链仍在跑，本步保持等它
-                        LOGGER.warning("rework 全部终态 %s/%s: %s → 重审原步",
-                                       inst["instance_id"][:12], step_id, _sts)
-                        # 落回重投路径（下方统一处理），但清掉 rework_ids：
-                        # 不清则下轮再被驳回时 _create_rework_subflow 的逐类防重
-                        # 恒命中 → 建不出新链 → 只重投不返工（修复闭环断半环）。
-                        _rej_sr = {k: v for k, v in _rej_sr.items() if k != "rework_ids"}
-                        results[step_id] = _rej_sr
+                            # 查询失败 ≠ 链不存在：置空会落进下面的「无返工链→重投
+                            # 原步」，与仍在跑的返工链并发推进同一个 step。
+                            # 当作状态未知：本步保持等，下轮重查。
+                            LOGGER.warning("rework 状态查询失败 %s/%s: %s",
+                                           inst["instance_id"][:12], step_id, _q)
+                            continue
+                        # 回调分类：completed 才是「返工已交付，可重审」。
+                        # failed/cancelled = 修复根本没做完 —— 重投父步徒劳：产物一字未改
+                        # → 被再驳回 → 再建链，形成自旋。实测 wf_3f71a2a78：3 条返工链
+                        # 同时压单线程 maintainer，2 条排队 10 tick 后被回收，我的回流把
+                        # cancelled 当「已处理」→ 8 分钟内 retry 从 3 涨到 6 仍在涨。
+                        _exit = _rework_exit(_sts)
+                        if _exit == "wait":
+                            # 返工链仍在跑：等它，但有上限（返工链自身无 timeout，
+                            # 链内卡一步父链就永远等）。超限只喊一次、不停止等。
+                            if (time.time() - (_rej_sr.get("rejected_at") or time.time())
+                                    > _REJECTED_WAIT_MAX):
+                                self._escalate_rejected(
+                                    inst, step_id, _rej_sr, results, lm,
+                                    f"返工链等待超 {_REJECTED_WAIT_MAX // 60} 分钟仍未完成"
+                                    f"（{_rework_ids} / {_sts}）")
+                            continue
+                        if _exit == "escalate_unfixed":
+                            self._escalate_rejected(
+                                inst, step_id, _rej_sr, results, lm,
+                                f"驳回后返工链未交付（{_sts}）")
+                            continue
+                        LOGGER.warning("rework 全部完成 %s/%s → 重审原步",
+                                       inst["instance_id"][:12], step_id)
 
                     # ── 无返工链（分类解析不出/末步）→ 回退重投原步 ──
                     # 复用首投路径：清空 status → 下轮 `if not step_status` 重发。
                     # 同时清 rejected_at/by/reason 与 bus 锚点：不清锚点则重投后
                     # _tick 的 created_after 屏障停在旧时刻，同一条驳回消息会被
                     # 再次消费 → 立即二次 rejected（无限循环）。
+                    _retry = (_rej_sr.get("rejected_retry", 0) or 0) + 1
+                    if _retry > _MAX_REJECTED_RETRY:
+                        # 封顶：重投把同一步反复推给同一批角色，产物不变则驳回必然
+                        # 重现（实测 wf_e50bbe566 retry 涨到 4、wf_3f71a2a78 涨到 6）。
+                        # 与 rework 未交付同路：停重投，交给 coordinator 决定改模板
+                        # 还是换执行者。
+                        self._escalate_rejected(
+                            inst, step_id, _rej_sr, results, lm,
+                            f"驳回重投 {_retry - 1} 次仍未通过")
+                        continue
+                    # 复用首投路径：清空 status → 下轮 `if not step_status` 重发。
+                    # DROP 列表同时包含 exit_messages：tick-rescue（step_handler.py:224）
+                    # 见"有 exit_messages 且 status≠completed"就 complete_step，残留旧
+                    # 消息会让重投后立即二次 complete → 二次 rejected，2 tick/轮自旋。
+                    # 实测：清掉后不再自旋（探针 A2）；生产残留证据 wf_3f71a2a78f76
+                    # retry=6、wf_e50bbe5664 retry=4，两者 exit_msgs 均=1。
+                    # rework_ids 一并清：它是「当前活跃返工链」集合。链已终结还留着，
+                    # 再次驳回会因 `not _rework_ids` 为假跳过建链 → 只重投不返工。
                     _reset = {k: v for k, v in _rej_sr.items()
-                              if k not in ("status", "rejected_at", "rejected_by",
-                                           "rejection_reason", "poll_since", "bus_anchor",
-                                           "notified_at")}
-                    _reset["rejected_retry"] = (_rej_sr.get("rejected_retry", 0) or 0) + 1
+                              if k not in _REQUEUE_DROP}
+                    _reset["rejected_retry"] = _retry
                     _reset["status"] = ""
                     results[step_id] = _reset
                     lm.execute(
