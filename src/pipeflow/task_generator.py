@@ -12,6 +12,7 @@ import hashlib
 import threading
 import re  # 修复: _scan_tasks 用 re.match 但漏 import, 导致每 tick NameError 使任务生成静默死亡
 from pathlib import Path
+from types import SimpleNamespace
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 
@@ -92,6 +93,34 @@ class TaskGeneratorMixin:
     _BACKLOG_ALERT_TS: dict[str, float] = {}
     _BACKLOG_ALERT_COOLDOWN_S = 1800
 
+    def _parent_contract_errs(self, conn, wf_id: str, step_id: str) -> list:
+        """父步（handoff 容器）自身 exit_schema 尚未满足的项。
+
+        子链完成不代父步履行契约：子链模板与父模板是两个独立文件，父步要的
+        产物子链未必产出。校验失败返回空表（守卫自身不得成为新的卡死源）。
+        """
+        try:
+            _row = conn.execute(
+                "SELECT template_id, created_at, effective_roles, step_results "
+                "FROM workflow_instances WHERE instance_id=?", (wf_id,)).fetchone()
+            if not _row:
+                return []
+            _wf = (self._workflows.get(_row["template_id"])
+                   or self._workflows.get(f"WF-{_row['template_id']}"))
+            _st = next((s for s in (_wf.steps if _wf else []) if s.id == step_id), None)
+            if not _st or not _st.exit_schema:
+                return []
+            # effective_roles 一并带上：等价角色分流后产出落在实际执行者目录
+            _run = SimpleNamespace(
+                id=wf_id, created_at=_row["created_at"],
+                effective_roles=_row["effective_roles"],
+                step_results=json.loads(_row["step_results"] or "{}"))
+            ok, errs = self._validate_exit_schema(_st, _run)
+            return [] if ok else errs
+        except Exception as _e:
+            LOGGER.debug("parent contract check failed %s/%s: %s", wf_id, step_id, _e)
+            return []
+
     def _scan_tasks(self):
         lm = self._lifecycle
         try:
@@ -149,7 +178,35 @@ class TaskGeneratorMixin:
                             if _step_id != _sub_row["current_step_id"]:
                                 continue
                             _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
+                            # 子链跑完 ≠ 父步交付契约达成：父步自己的 exit_schema 才是这一
+                            # 阶段的交付物清单，而子链模板未必产出其中每一项。实测
+                            # wf_26f108c663e4/s2（architect_review 要 REVIEW.md，子链
+                            # architect_full_design 从不产出该文件）子链全绿、REVIEW.md 从未
+                            # 落盘，父步照样 completed。全历史 161 个「有 schema 且已推进」的
+                            # 父步中 23 个契约未达成 —— 全部静默。
                             if _sub_status and _sub_status['status'] in ('completed', 'step_done_ready'):
+                                # 幂等：本步已记过账就不再重复写 bus（每 tick 重扫同一子链）
+                                if not _sdata.get("contract_unmet"):
+                                    _cerrs = self._parent_contract_errs(conn, _sub_row["instance_id"], _step_id)
+                                    if _cerrs:
+                                        # 与 _subflow_verdict_rejected 同一处置：不改完成语义
+                                        # （硬拦会制造静默卡死），只记账 + 写 bus 让缺失可观测。
+                                        _sdata["contract_unmet"] = _cerrs
+                                        _sdata["contract_unmet_at"] = time.time()
+                                        try:
+                                            self._bb.write(
+                                                "blocker",
+                                                f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                                f"子链完成但父步交付契约未达成",
+                                                src="workflow_engine",
+                                                evidence=(f"子链 {_sf[:12]} status={_sub_status['status']}，"
+                                                          f"但父步 exit_schema 未满足: {'; '.join(_cerrs[:5])}。"
+                                                          f"父链仍按 completed 推进，该步产出实际缺失，"
+                                                          f"请核查父模板 schema 与子链模板产出是否对齐。"))
+                                            LOGGER.warning("父步契约未达成 %s/%s: %s",
+                                                           _sub_row["instance_id"][:12], _step_id, _cerrs[:3])
+                                        except Exception as _cwe:
+                                            LOGGER.debug("contract-unmet blocker 写入失败: %s", _cwe)
                                 _sdata["status"] = "completed"
                                 _sdata["completed_at"] = time.time()
                                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
