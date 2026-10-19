@@ -193,6 +193,15 @@ class RoleLifecycleMixin:
                 continue
             output = r.stdout or ""
             if not any(p in output for p in self._RATE_LIMIT_PATTERNS):
+                # 角色已恢复：清掉退避状态，否则下一次真 403 会从最大退避档
+                # （1800s）起步，恢复要等半小时。
+                self._last_rate_recover.pop(role, None)
+                continue
+            # 追加箭头只在**生成中**出现（空闲时底部只有 bypass 提示）：
+            # -S -60 里残留的旧错误行不能当作"当前仍被拒"，否则会给正在干活的
+            # 角色发 C-u +「继续」，把当前轮打断。
+            _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
+            if any("esc to interrupt" in ln for ln in _tail):
                 continue
 
             with self._COMPACT_LOCK:

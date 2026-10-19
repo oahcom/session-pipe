@@ -68,6 +68,64 @@ def test_healthy_role_not_touched():
     assert sent == [], f"健康角色不应被打扰, got {sent}"
 
 
+def test_generating_role_not_interrupted_by_stale_error_text():
+    """pane 里残留旧 403 文案但角色正在生成 → 不发 C-u/「继续」。
+
+    -S -60 会带上滚出视口的旧错误行；只按"含错误文案"判会把正在干活的角色
+    打断（C-u 清输入行）。
+    """
+    eng = _engine()
+    sent = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=(
+                "● Please run /login · API Error: 403 FreeTierError\n"
+                "✻ Gesticulating… (13s · ↓ 492 tokens)\n"
+                "────────\n❯ \n────────\n"
+                "  bypass permissions on (shift+tab to cycle) · esc to interrupt"))
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert sent == [], f"生成中的角色不应被打断, got {sent}"
+
+
+def test_recovery_resets_backoff_after_healthy_tick():
+    """403 → 恢复 → 再次 403：第二次仍从 attempt=1 起步，而不是累加到 2。
+
+    不清退避时档位只增不减，反复的间歇性 403 会把等待推到 1800s 封顶，
+    恢复一次要等半小时。
+    """
+    eng = _engine()
+    state = {"mode": "403"}
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            if state["mode"] == "403":
+                return MagicMock(returncode=0, stdout="API Error: 403 FreeTierError")
+            return MagicMock(returncode=0, stdout="✻ Cogitated for 3m\n❯ ")
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()            # 首次 403 → attempt=1
+        assert eng._last_rate_recover["lr"][1] == 1
+        state["mode"] = "ok"
+        eng._recover_rate_limited_roles()            # 恢复 → 清退避
+        assert "lr" not in eng._last_rate_recover, "恢复后应清掉退避状态"
+        state["mode"] = "403"
+        eng._recover_rate_limited_roles()            # 再次 403
+
+    assert eng._last_rate_recover["lr"][1] == 1, "退避应重新从第 1 档起步"
+
+
 def test_backoff_blocks_immediate_retry():
     """第二次调用落在退避窗口内 → 不再发。"""
     eng = _engine()
