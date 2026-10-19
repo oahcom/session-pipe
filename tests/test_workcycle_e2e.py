@@ -313,6 +313,47 @@ def test_review_self_audit_no_deadlock(mock_run):
     assert s["current_step"] == "s2", f"自审 review 应直接推进, got {s}"
     _cleanup(d)
 
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_rework_chain_first_step_review_no_token(mock_run):
+    """首步 review 的 assigner 不是执行者时，也不得发 token。
+
+    生产原形：返工链由引擎自建，assigner 写死 "reviewer"，而首步 review 的
+    执行者不是它（如 maintainer）——reviewer 从不知道这条链存在。
+    首步 review 无「上一步产出」可审 = 自审，直接放行。
+
+    变异验证：删掉 manager._get_assigner_for_step 的 `if i == 0: return ""`
+    后本用例必须失败（曾用 assigner==target_role 写过一版，两条路径都返回空，
+    删守卫照样通过 → 无区分度）。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "selfeq", [_step("s1", type="review"), _step("s2")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("selfeq", {})
+    # 复刻返工链：引擎建链时 assigner 固定 reviewer，与首步执行者不同
+    eng._lifecycle.execute(
+        "UPDATE workflow_instances SET assigner=? WHERE instance_id=?",
+        ("reviewer", rid))
+
+    eng.run_once()
+    _done(eng, "s1")
+    for _ in range(20):
+        time.sleep(0.05)
+        eng.run_once()
+        if eng.status(rid)["current_step"] != "s1":
+            break
+
+    s = eng.status(rid)
+    assert not eng._lifecycle.get_approval_token(rid, "s1"), \
+        "首步 review 无上一步产出可审，不得发给不知情的 reviewer"
+    assert s["current_step"] == "s2", f"自审应直接推进, got {s}"
+    _cleanup(d)
+
+
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 4. Review rejection
 # ═══════════════════════════════════════════════════════════════════

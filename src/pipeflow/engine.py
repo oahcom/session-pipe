@@ -865,17 +865,21 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         )
                         LOGGER.debug("run_once: %s/%s 角色忙，排队 %s 次，跳过计数",
                                      inst["instance_id"][:12], step_id, _q_n)
-                        # 排队上限：超过仍无进展说明不是"暂时忙"，而是角色被长期占死
-                        # （或本步依赖的子链从未创建）。此分支不递增 timeout_count，
-                        # 而 _tick 的降级出口对 status="" 不可达 → 无出口会永久悬空，
-                        # 实测 queued=21 且停滞 235 分钟。与 _tick 的 queued>=10 对齐。
-                        if _q_n >= 10:
-                            LOGGER.warning("run_once: %s/%s 排队 %d 次无进展，回收",
-                                           inst["instance_id"][:12], step_id, _q_n)
+                        # 排队上限：按**时长**判，不按 tick 次数。daemon 每 10s 一轮，
+                        # `_q_n>=10` 只有 100 秒——而角色正常执行一步就是几分钟，
+                        # 会把合法排队误杀（三方审查 D4 FAIL）。queued_since 记录
+                        # 真实排队起点，30 分钟与默认 timeout_minutes 对齐。
+                        # 此分支不递增 timeout_count，status="" 又进不了 _tick，
+                        # 无出口会永久悬空（实测 queued=21 停滞 235 分钟）。
+                        _q_since = _q_sr.get("queued_since") or time.time()
+                        if time.time() - _q_since >= 1800:
+                            LOGGER.warning("run_once: %s/%s 排队 %d 分钟无进展，回收",
+                                           inst["instance_id"][:12], step_id,
+                                           int((time.time() - _q_since) / 60))
                             try:
                                 self._bb.write("blocker",
                                     f"[workflow] {inst['instance_id'][:12]}/{step_id} "
-                                    f"排队 {_q_n} 次仍未投出（角色长期被占用），已自动回收",
+                                    f"排队超 30 分钟仍未投出（角色长期被占用），已自动回收",
                                     src="workflow_engine")
                                 self._lifecycle.close_wf(inst["instance_id"], status="cancelled")
                             except Exception as _e:
@@ -958,15 +962,21 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 故 token 存在 ⟺ 尚未审批。无 token 的步骤（无审批人/系统发起/
                 # 角色 wf complete 主动声明）不受影响，保持原有放行语义。
                 #
-                # 超时兜底不走 _tick：_tick 仅在 step_status ∈ {notified, running} 时调用，
-                # 而等待审批的步骤是 step_done_ready —— 两者互斥，TTL grace 那段永远进不去。
-                # 故这里自行实现同样的 grace 兜底，否则 assigner 不响应 = 永久卡死。
                 _awaiting_approval = False
                 if step_status == "step_done_ready":
-                    _sr_now = results.get(step_id) or {}
+                    _sr_now = results.get(step_id)
+                    # 非 dict 值实测 599 个（'summary'/'files' 等键）——不加守卫
+                    # 会 AttributeError 冒泡到 run_once 的 except，整轮 for 中止
+                    # （与 step_handler.py:206-212 记录的历史缺陷同型）。
+                    if not isinstance(_sr_now, dict):
+                        _sr_now = {}
                     if _sr_now.get("approval_token"):
                         _ttl = _sr_now.get("approval_token_ttl", 0)
-                        if _ttl > 0 and time.time() > _ttl + 1800:
+                        # 无 ttl（旧数据/手写 token）不能当作"永远等"：
+                        # 原实现 `_ttl>0 and ...` 为假 → else → 永久卡死。
+                        # 视为已过期，走同一条兜底放行。
+                        _expired = _ttl <= 0 or time.time() > _ttl + 1800
+                        if _expired:
                             try:
                                 lm.confirm_step(inst["instance_id"], step_id,
                                                 token=_sr_now["approval_token"],
@@ -974,12 +984,37 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                                 reason="daemon approval_timeout_fallback",
                                                 allow_expired=True)
                                 LOGGER.warning(
-                                    "approval_timeout_fallback %s/%s: token 超时 30min 未消费，自动 approve",
-                                    wf_name, step_id)
+                                    "approval_timeout_fallback %s/%s: token 超时未消费（ttl=%s），自动 approve",
+                                    wf_name, step_id, _ttl)
                             except Exception as _af:
-                                LOGGER.debug("approval fallback failed %s/%s: %s",
-                                             inst["instance_id"][:12], step_id, _af)
-                                _awaiting_approval = True  # confirm 失败 → 仍等
+                                # confirm 失败（如角色 wf complete 改写了 status）
+                                # 若仍等，就是永久 step_done_ready 死锁。累计 3 次
+                                # 失败后清 token 放行，让步骤能推进而不是烂在库里。
+                                _n = (_sr_now.get("approval_fallback_fail", 0) or 0) + 1
+                                _sr_now["approval_fallback_fail"] = _n
+                                results[step_id] = _sr_now
+                                try:
+                                    lm.execute(
+                                        "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                        (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                                except Exception:
+                                    pass
+                                LOGGER.warning("approval fallback failed %s/%s (%d/3): %s",
+                                               inst["instance_id"][:12], step_id, _n, _af)
+                                if _n >= 3:
+                                    _sr_now.pop("approval_token", None)
+                                    results[step_id] = _sr_now
+                                    try:
+                                        lm.execute(
+                                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                            (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                                    except Exception:
+                                        pass
+                                    LOGGER.warning(
+                                        "approval fallback 连续失败 %d 次 → 清 token 放行 %s/%s",
+                                        _n, wf_name, step_id)
+                                else:
+                                    _awaiting_approval = True
                         else:
                             _awaiting_approval = True
                     if _awaiting_approval:

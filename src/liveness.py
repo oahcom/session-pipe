@@ -185,7 +185,8 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
     与 _is_role_busy 信号2 完全一致：
     - 跳过 exclude_wf_id 自身
     - 跳过 wf_sub_ 子链（仅当 parent_wf_id == exclude_wf_id，codex 三维度审查 P2 修复）
-    - step_results[step].status in ('notified','running','step_done_ready')
+    - step_results[step].status in _ACTIVE_STEP_STATUS（notified/running；
+      step_done_ready 等审批时角色已空闲，见常量注释）
     - queued>=6 且同一工作流 → 豁免
     - timeout_count<3 才判忙
     """
