@@ -139,16 +139,8 @@ class RoleLifecycleMixin:
     _BUS_WRITE_LOCK = threading.Lock()
 
 
-    def _recover_rate_limited_roles(self) -> None:
-        """角色被模型额度拒绝（403/429）时按退避发「继续」重试。
-
-        WHY 不能只判 pane 空闲：403/429 时角色进程活着、pane 有内容（错误文案），
-        与"正在干活"在存活判据上完全一样；_EXCLUDE_IDLE 只是避免误判死，
-        没有任何恢复动作 → 步骤空等到超时取消。
-
-        WHY 发「继续」而不是重启：错误是上游额度/出口 IP 问题，重启进程
-        不改变额度；角色上下文里的任务还在，一句「继续」就能让它重试该请求。
-        """
+    def _active_roles(self) -> set[str]:
+        """活跃角色集合：DB 工作流 assignee ∪ 实际存在的 ccs-* tmux 会话。"""
         roles = set()
         try:
             for row in self._lifecycle.query(
@@ -158,6 +150,32 @@ class RoleLifecycleMixin:
                     roles.add(row["assignee"])
         except Exception:
             pass
+        try:
+            r = _engine_mod._sp.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                roles |= {n[4:] for n in r.stdout.split() if n.startswith("ccs-") and len(n) > 4}
+        except Exception:
+            pass
+        return roles
+
+    def _recover_rate_limited_roles(self) -> None:
+        """角色被模型额度拒绝（403/429）时按退避发「继续」重试。
+
+        WHY 不能只判 pane 空闲：403/429 时角色进程活着、pane 有内容（错误文案），
+        与"正在干活"在存活判据上完全一样；_EXCLUDE_IDLE 只是避免误判死，
+        没有任何恢复动作 → 步骤空等到超时取消。
+
+        WHY 发「继续」而不是重启：错误是上游额度/出口 IP 问题，重启进程
+        不改变额度；角色上下文里的任务还在，一句「继续」就能让它重试该请求。
+
+        WHY 角色来源不能只看 DB assignee：403 发生在“收到任务前的最后一次调用”
+        时，该角色可能不在任何 running/pending 工作流里（curator/maintainer
+        实测挂 403 数小时无人管），tmux 兜底才能覆盖到。
+        """
+        roles = self._active_roles()
         if not roles:
             return
 
@@ -212,33 +230,7 @@ class RoleLifecycleMixin:
         - DB 中 running/pending workflow 的角色
         - 所有实际存在的 ccs-* tmux session（覆盖非 workflow 启动的角色）
         """
-        roles = set()
-        # 来源1: DB
-        try:
-            for row in self._lifecycle.query(
-                "SELECT DISTINCT assignee FROM workflow_instances WHERE status IN ('running','pending')"
-            ):
-                if row["assignee"]:
-                    roles.add(row["assignee"])
-        except Exception:
-            pass
-
-        # 来源2: 实际 tmux 会话（兜底：覆盖手动启动或 DB 查不到的角色）
-        try:
-            r = _engine_mod._sp.run(
-                ["tmux", "list-sessions", "-F", "#{session_name}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                for name in r.stdout.strip().split("\n"):
-                    name = name.strip()
-                    if name.startswith("ccs-"):
-                        role_name = name[4:]
-                        if role_name:
-                            roles.add(role_name)
-        except Exception:
-            pass
-
+        roles = self._active_roles()
         if not roles:
             return
 
