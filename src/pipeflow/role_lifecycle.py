@@ -255,8 +255,8 @@ class RoleLifecycleMixin:
         now = time.time()
         try:
             rows = lm.query(
-                "SELECT instance_id, template_id, current_step_id, step_results, assignee "
-                "FROM workflow_instances WHERE status='running'"
+                "SELECT instance_id, template_id, current_step_id, step_results, assignee, "
+                "effective_roles FROM workflow_instances WHERE status='running'"
             )
             for row in rows:
                 _results = json.loads(row["step_results"] or "{}")
@@ -274,8 +274,12 @@ class RoleLifecycleMixin:
                 _step = next((s for s in _wf.steps if s.id == _sid), None)
                 if not _step:
                     continue
-                # 用当前步骤的 target_role（同其他修复一致），不是 assignee
-                _role = _step.target_role
+                # 实际执行角色：等价角色池分流后可能是 pg 而非模板写死的 engineer。
+                # 用模板角色判 busy 会拦错人 —— 实测 wf_sub_4e63ad633d39/s1
+                # （target_role=engineer, effective_roles={"s1":"pg"}）在 s1 停 78min
+                # 未重推，因为 engineer 正被另一条链占用；而真正该干的 pg 一直空闲。
+                from liveness import effective_role as _er
+                _role = _er(dict(row), _sid, fallback=_step.target_role)
                 if not _role or _role in ("coordinator",):
                     continue
                 # 角色最近有产出 → 正在干活，不打扰（2026-08-10 观测：
