@@ -1039,14 +1039,21 @@ class LifecycleManager:
         # (handoff) 与 wf_0830e5a05e/s1 (single) 判"未通过"/REJECTED 后仍推进至 completed。
         # 驳回语义由 exit_messages 文本判定，与 type 无关。
         _sr = self._parse_results(wf)
+        _cur_sr = _sr.get(current, {}) or {}
         _msgs = " ".join(
             m.get("text", "") for m in
-            (_sr.get(current, {}).get("exit_messages") or [])
+            (_cur_sr.get("exit_messages") or [])
             if isinstance(m, dict)
         ).lower()
         # 词表与 wf_lifecycle.py:312 保持一致："未通过"/"驳回"/"not_approved"
         # 此前只在后者存在，本路径漏检（wf_3565289ca783/s3 用"判定: 未通过"表达驳回）。
-        if any(kw in _msgs for kw in
+        # 已确认的步骤不再判驳回：confirm_step 先写 status=completed 再调本函数，
+        # 而 exit_messages 是第一轮的驳回文本、确认时不会清除 → 同一份文本被二次
+        # 判成驳回，把刚落的 completed 当场改写回 rejected。步骤一旦被驳回过就
+        # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
+        # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
+        _confirmed = bool(_cur_sr.get("confirmed_at"))
+        if not _confirmed and any(kw in _msgs for kw in
                ("changes_requested", "rejected", "需修复", "回退",
                 "未通过", "not_approved", "驳回")):
             _sr.setdefault(current, {})["status"] = "rejected"

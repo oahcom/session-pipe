@@ -119,10 +119,12 @@ _REWORK_TERMINAL = ("completed", "failed", "cancelled")
 # complete；rework_ids 是「当前活跃返工链」集合，链已终结仍留着会让下轮
 # `not _rework_ids` 为假 → 跳过建链，只重投不返工；rework_escalated_at 是升级
 # 幂等锚，跨重投周期留着会让下一轮升级被永久抑制（该发的消息一条不发）。
+# confirmed_at/by 同理：两条推进路径的返工门禁已能区分「审批已确认」与「新出
+# 文本判驳」，但重投后旧确认记录仍在 → 新一轮真实驳回被误判为「已确认」放行。
 # 测试直引本常量防两处漂移。
 _REQUEUE_DROP = ("status", "rejected_at", "rejected_by", "rejection_reason",
                  "poll_since", "bus_anchor", "notified_at", "exit_messages", "rework_ids",
-                 "rework_escalated_at")
+                 "rework_escalated_at", "confirmed_at", "confirmed_by")
 
 
 def _rework_exit(sts: list) -> str:

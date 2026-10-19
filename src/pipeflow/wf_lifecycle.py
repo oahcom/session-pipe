@@ -382,17 +382,22 @@ class WorkflowLifecycleMixin:
         # 推进至 completed）。驳回语义由 exit_messages 文本判定，与 type 无关。
         # 末步仍不拦——无 next_step 可退回，且无 rework 承接方。
         if not is_last:
+            _step_sr = ((results or {}).get(step_id, {}) or {})
             # evidence 也要拼入：分类段在其中，只拼 text 会让 _has_issue_classification
             # 恒为 False → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
             _msgs = " ".join(
                 (m.get("text", "") or "") + " " + (m.get("evidence", "") or "")
-                for m in (((results or {}).get(step_id, {}) or {}).get("exit_messages") or [])
+                for m in (_step_sr.get("exit_messages") or [])
                 if isinstance(m, dict)
             ).lower()
 
             # "未通过"/"驳回" 补入：实测 s3 用"判定: 未通过"表达驳回，旧词表不含它
             # → 漏检（wf_3565289ca783）。
-            if any(kw in _msgs for kw in
+            # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
+            # 不会清除它 → 同一份文本被二次判成驳回。与 manager._advance_unsafe
+            # 同一缺陷（实测 wf_256be862ea86/s3 确认后卡死 5h）。
+            _confirmed = bool(_step_sr.get("confirmed_at"))
+            if not _confirmed and any(kw in _msgs for kw in
                    ("changes_requested", "rejected", "需修复", "回退",
                     "未通过", "not_approved", "驳回")):
                 LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
