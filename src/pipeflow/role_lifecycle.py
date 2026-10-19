@@ -677,7 +677,15 @@ class RoleLifecycleMixin:
                         _existing = tasks_file.read_text(encoding="utf-8", errors="ignore")
                         # 精确边界匹配：只在 "工作流 wf_id /" 格式中匹配，防止 UUID 前缀碰撞
                         # （如 wf_abc123 不误匹配 wf_abc123def456）
-                        _wf_in_existing = f"工作流 {wf_id} /" in _existing or wf_id in _existing.split("## 来源")[-1] if "## 来源" in _existing else False
+                        # 本任务是否已在文中。原写法 `A or B if C else False` 被 Python
+                        # 解析为 `(A or B) if C else False`：文件无 "## 来源" 段时整个表达式
+                        # 恒为 False，**无论 wf_id 是否真在文件里** → 引擎永远当作"别的
+                        # 任务占了文件" → 本任务只追加 [排队]、不写入 → ccs send 退出码 1
+                        # → 投递失败 3 次 → 子链 failed → 父链断。
+                        # 实测 reviewer/engineer/qa 的 TASKS.md 均无 "## 来源" 段（该段
+                        # 只在角色产出含来源元数据时才有）→ 三角色中招率 100%。
+                        _wf_in_existing = (f"工作流 {wf_id} /" in _existing
+                                           or wf_id in _existing.split("## 来源")[-1])
                         # 僵尸主任务检测：主 wf 不在权威库，或在库但**已终态**，都
                         # 说明它不是"活跃占用"，允许被新任务覆盖。
                         # 只判"不在库"时，已完成的主任务会永久占住文件 → 新任务永远

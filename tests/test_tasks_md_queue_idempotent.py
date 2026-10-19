@@ -99,3 +99,24 @@ def test_stale_main_includes_terminal_status():
     eng = (Path(__file__).resolve().parents[1] / "src/pipeflow/engine.py").read_text(encoding="utf-8")
     assert "'pending', 'running', 'step_done_ready'" in eng, \
         "engine.py 活跃状态集已变，需同步 _ACTIVE_WF_STATUSES"
+
+
+def test_wf_in_existing_no_operator_precedence_trap():
+    """_wf_in_existing 不得退回 `A or B if C else False` 写法。
+
+    中文：Python 把它解析为 `(A or B) if C else False`，TASKS.md 无 "## 来源" 段
+    时整个表达式恒为 False，**无论 wf_id 是否真在文中** → 引擎永远误判"别的任务
+    占了文件" → 本任务只写 [排队] 不写正文 → ccs send 退出码 1 → 投递失败 3 次
+    → 子链 failed → 父链断。实测 reviewer/engineer/qa 的 TASKS.md 均无该段（只在
+    角色产出含来源元数据时才写），是 reviewer 连挂 7 条子链的直接原因之一。
+    """
+    code = (Path(__file__).resolve().parents[1] / "src/pipeflow/role_lifecycle.py").read_text(
+        encoding="utf-8")
+    assert not re.search(r'_wf_in_existing = .* if "## 来源" in _existing else False', code), \
+        "_wf_in_existing 退回优先级陷阱写法（无 '## 来源' 段时恒 False）"
+
+    # 行为校验：无 '## 来源' 段、wf_id 在文中 → 必须判为已存在
+    existing = "# 工作流任务\n\n工作流 wf_dead00000001 / 步骤 s1\n"
+    assert ("工作流 wf_dead00000001 /" in existing
+            or "wf_dead00000001" in existing.split("## 来源")[-1]), \
+        "修复后的表达式未能识别本任务已写入"
