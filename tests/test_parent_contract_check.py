@@ -107,6 +107,33 @@ def test_parent_contract_errs_fail_open_on_bad_input():
     assert eng._parent_contract_errs(None, "wf_x", "s1") == []
 
 
+def test_effective_role_redirect_uses_executor_workspace():
+    """equivalent-role split: effective_roles={"s1":"pg"} → 按 pg 目录校验。
+
+    回归保护：_contract_run 必须把 DB 里的字符串包进 _inst_row，否则
+    _eff_role 回退模板角色，pg 的产出被当成缺失（假 contract_unmet）。
+    """
+    from paths import CCS_WORKSPACES as _WSROOT
+    name = f"{_UNIQUE}_REROUTE.md"
+    pg = _WSROOT / "pg"
+    pg.mkdir(parents=True, exist_ok=True)
+    (pg / name).write_text("x" * 200, encoding="utf-8")
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE workflow_instances "
+                 "(instance_id TEXT PRIMARY KEY, template_id TEXT, created_at REAL, "
+                 " effective_roles TEXT, step_results TEXT)")
+    conn.execute("INSERT INTO workflow_instances VALUES (?,?,?,?,?)",
+                 ("wf_pc2", "tpl", 1.0, '{"s1":"pg"}', "{}"))
+    # 模板角色 scout 目录没有该文件；只有按 pg 校验才会 PASS
+    eng = _Eng(workflows={"tpl": SimpleNamespace(steps=[_step({"required": [name]})])})
+    errs = eng._parent_contract_errs(conn, "wf_pc2", "s1")
+    try:
+        assert not errs, f"pg 产出不应报缺失: {errs}"
+    finally:
+        (pg / name).unlink(missing_ok=True)
+
+
 def teardown_module(module):
     for p in _WS.glob(f"{_UNIQUE}*"):
         p.unlink(missing_ok=True)

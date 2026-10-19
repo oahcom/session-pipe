@@ -110,20 +110,25 @@ class TaskGeneratorMixin:
             _st = next((s for s in (_wf.steps if _wf else []) if s.id == step_id), None)
             if not _st or not _st.exit_schema:
                 return []
-            # _inst_row 而非 effective_roles：_eff_role 先取 _inst_row，
-            # 拿到字符串形式的 effective_roles 时 effective_role() 走
-            # getattr(str, "effective_roles") → None → 回退模板角色。
-            # 等价角色分流（engineer→pg）后产出落在 pg 目录，按 engineer 校验
-            # 会把真实交付报成缺失（假 contract_unmet）。
-            _run = SimpleNamespace(
-                id=wf_id, created_at=_row["created_at"],
-                _inst_row={"effective_roles": _row["effective_roles"]},
-                step_results=json.loads(_row["step_results"] or "{}"))
-            ok, errs = self._validate_exit_schema(_st, _run)
+            ok, errs = self._validate_exit_schema(_st, self._contract_run(_row, wf_id))
             return [] if ok else errs
         except Exception as _e:
             LOGGER.debug("parent contract check failed %s/%s: %s", wf_id, step_id, _e)
             return []
+
+    @staticmethod
+    def _contract_run(row, wf_id: str) -> SimpleNamespace:
+        """把 DB 行包装成 _validate_exit_schema 需要的 run 形态。
+
+        _inst_row 而非 effective_roles：_eff_role 先取 _inst_row，直接给字符串
+        effective_roles 会让 effective_role() 走 getattr(str, "effective_roles")
+        → None → 回退模板角色。等价角色分流（engineer→pg）后产出落在 pg 目录，
+        按 engineer 校验会把真实交付报成缺失（假 contract_unmet）。
+        """
+        return SimpleNamespace(
+            id=wf_id, created_at=row["created_at"],
+            _inst_row={"effective_roles": row["effective_roles"]},
+            step_results=json.loads(row["step_results"] or "{}"))
 
     def _scan_tasks(self):
         lm = self._lifecycle
@@ -220,7 +225,16 @@ class TaskGeneratorMixin:
                                 # 不改完成语义（wf_lifecycle.py:302 有意不拦末步，硬拦会
                                 # 制造静默卡死），只记账 + 写 bus 让缺失可被外部观测，
                                 # 与同文件 _forced 子链超时的做法一致。
-                                if _subflow_verdict_rejected(_sr):
+                                #
+                                # 必须查**子链**的 step_results：原实现传 _sr（父链的），
+                                # 于是判据恒在看父步自己的历史文案 —— 子链驳回永远检不出，
+                                # 而父步早前某步的驳回文案会一直误报。
+                                _sub_row_sr = conn.execute(
+                                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                                    (_sf,)).fetchone()
+                                _sub_verdict_sr = (json.loads(_sub_row_sr["step_results"] or "{}")
+                                                   if _sub_row_sr else {})
+                                if _subflow_verdict_rejected(_sub_verdict_sr):
                                     try:
                                         self._bb.write(
                                             "blocker",
