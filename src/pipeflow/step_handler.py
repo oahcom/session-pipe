@@ -24,6 +24,14 @@ from conversation_monitor import get_conversation_signal
 # 故不能用 300s——该规模下必然超时，闸门回落人工审查。
 import os as _os
 _CODEX_REVIEW_TIMEOUT = int(_os.environ.get("CODEX_REVIEW_TIMEOUT", "900"))
+
+# text_contains 必须保持子串语义，不要加词边界/lookaround。两条实证（2026-10-19）：
+# (1) dual_node 宽匹配用 re.sub(r"-complete$", "-") 生成 filter（下方 _wide_filter），
+#     "s1-" 靠后面的 "c" 属于 \w 才匹配成功；加 (?!\w) 后 node2 消息恒不命中 →
+#     food_chain_loop/WL-food_chain_loop 的 dual_node 步骤永久卡死。
+# (2) 词边界并不拦跳步：bus #411347「security_audit_scan/s2-complete s3-complete — …」
+#     两个 filter 在词边界语义下依然同时命中（该消息确实含两个标记）。防跳步靠
+#     _check_exit 的 created_after 屏障（生产 272 实例满足、0 违反），不靠匹配算法。
 from pipeflow.integrity import (
     DIMENSIONS as _integ_dimensions,
     load_state as _integ_load,
@@ -137,6 +145,44 @@ class StepHandlerMixin:
                 _inst = None
         return _er(_inst, step.id, fallback=step.target_role)
 
+    def _has_live_subflow(self, run, step) -> bool:
+        """当前步骤是否有"未死"的子链（父步的产出由子链承担）。
+
+        父步骤下的子链运行期间，角色 pane 里没有"父步新产出"是正常态，
+        不是卡死——据此触发的 tmux 空闲 cancel 会误杀整条父链：
+        实测 wf_3f6128f1b3db/s2 于 11:31:58 被取消，而其子链
+        wf_sub_c5274c45c967 (pm_requirements) 的 s2/s3 分别 11:32:27/
+        11:34:57 才完成，即被取消时子链仍在跑。
+        更糟：cancel_step 会整体覆写 step_results[step]（manager.py:503）
+        从而抹掉 subflow_id，父链再也收不到子链完成回流通道
+        （task_generator._scan_tasks 只扫 status='running' 的父链）。
+
+        返回 True = 子链存在且未死 → 不可按空闲取消父步。
+        子链 cancelled/failed = 已死，父步空闲取消维持原语义。
+        """
+        try:
+            _lm = self._lifecycle
+            _sf = self._step_sd(run, step).get("subflow_id", "")
+            if not _sf:
+                # subflow_id 可能已被历史 cancel 覆写抹掉，退回用 parent 链接查
+                # （parent_wf_id/subflow_source_step_id 权威且不被覆写）。
+                _row = _lm.query_one(
+                    "SELECT instance_id FROM workflow_instances "
+                    "WHERE parent_wf_id=? AND subflow_source_step_id=?",
+                    (run.id, step.id))
+                _sf = _row["instance_id"] if _row else ""
+            if not _sf:
+                return False
+            _st = _lm.query_one(
+                "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
+            return bool(_st) and _st["status"] not in ("cancelled", "failed")
+        except Exception as _e:
+            # 检查失败回退原行为（可取消），避免守卫本身成为新的静默卡死源
+            LOGGER.debug("live-subflow check failed %s/%s: %s",
+                         run.workflow_name, step.id, _e)
+            return False
+
+
     def _tick(self, run: WorkflowRun, step: Step):
         """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
@@ -228,7 +274,7 @@ class StepHandlerMixin:
         if sig and sig.idle_complaint:
             _idle_n = _sig_state.get("idle_count", 0) + 1
             _idle_cool = _sig_state.get("idle_cool_until", 0)
-            if _idle_n >= 5:
+            if _idle_n >= 5 and not self._has_live_subflow(run, step):
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
                     LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次空闲", run.workflow_name, step.id, _idle_n)
@@ -248,7 +294,7 @@ class StepHandlerMixin:
             _sig_state["idle_count"] = _idle_n
         if sig and sig.violation_found:
             _viol_n = _sig_state.get("violation_count", 0) + 1
-            if _viol_n >= 5:
+            if _viol_n >= 5 and not self._has_live_subflow(run, step):
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
                     LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次越界", run.workflow_name, step.id, _viol_n)
@@ -486,8 +532,11 @@ class StepHandlerMixin:
             #    匹配策略：先找引擎发的 task_spec（含 wf 前缀）→ 再匹配该角色在
             #    task_spec 之后写的任意消息（标题可能不含 wf 前缀，按时间窗匹配）。
             # codex P2-1：wait_roles 协作步骤不走 relaxed-advance（避免绕过协作门控）
-            # 新增：handoff/review 且有真人 assigner 时，禁止宽松推进，必须等真人审批
-            _is_review_or_handoff = step.type in ("handoff", "review")
+            # 新增：review 且有真人 assigner 时，禁止宽松推进，必须等真人审批。
+            # handoff 不在此列（2026-10-19）：宽松推进是 exit 未匹配时的兜底，
+            # 把 handoff 挡在这里 → 角色写了产出但分类不匹配时既不推进也不兜底，
+            # 直接等超时 auto-cancel（与 R95 要根除的"每步白等 90min"同一症状）。
+            _needs_human_approval = step.type == "review"
             # 排队降级路径（_QUEUE_DEGRADE_AT）下来的 timeout_count 首次变 1，此时
             # 角色并未"超时未响应"，只是排了很久队。若不排除，会立即命中下面的
             # relaxed-advance（它只要求角色写过任意同 wf 消息，不限分类）→ 误推进。
@@ -503,9 +552,9 @@ class StepHandlerMixin:
                 _assigner = self._lifecycle._get_assigner_for_step(
                     self._lifecycle._get_wf_unsafe(run.id) or {},
                     {"type": step.type, "target_role": _eff}, step.id)
-                if _is_review_or_handoff and _assigner:
-                    # handoff/review 且有真人 assigner → 禁止宽松推进，必须等真人审批
-                    LOGGER.debug("skip relaxed-advance %s/%s: handoff/review with human assigner=%s",
+                if _needs_human_approval and _assigner:
+                    # review 且有真人 assigner → 禁止宽松推进，必须等真人审批
+                    LOGGER.debug("skip relaxed-advance %s/%s: review with human assigner=%s",
                                  run.workflow_name, step.id, _assigner)
                 else:
                     try:
@@ -899,12 +948,17 @@ class StepHandlerMixin:
             except Exception as _idle_err:
                 LOGGER.debug("idle detection skipped: %s", _idle_err)
 
-            # ── handoff/review/subflow 步骤：默认等真人角色审批 ──
-            # 设计意图：这类步骤的产出需 assigner 角色确认（manager._get_assigner_for_step
+            # ── review/subflow 步骤：等真人角色审批 ──
+            # 设计意图：这类步骤的产出需 assigner 确认（manager._get_assigner_for_step
             # 已算好审批人，_issue_approval_token 已通过 ccs send-safe 把 token 推给审批人）。
-            # daemon 不再抢先 auto-advance —— 那会让 review 质量闸门形同虚设。
+            # daemon 不抢先 auto-advance —— 那会让 review 质量闸门形同虚设。
             # 仅当模板显式 auto_advance:true（如自驱动 food_chain_loop）才保留 daemon 自动推进。
-            if step.type in ("handoff", "review", "subflow"):
+            #
+            # handoff 已移出本分支（2026-10-19）：交接不是审批。原实现使每步都等
+            # confirm，而真实 confirm 率仅 1.4% → 每步白等 TTL+grace 90min，
+            # 超过步骤超时上限先被 auto-cancel。无 token 时 _get_assigner_for_step
+            # 返回空 → 本分支的 `if not _token: return` 仍会拦住，故必须一并移出。
+            if step.type in ("review", "subflow"):
                 _tpl = self._workflows.get(run.workflow_name)
                 _auto_advance = getattr(_tpl, "auto_advance", False)
                 if _auto_advance:
@@ -1267,6 +1321,25 @@ class StepHandlerMixin:
         分类 6 条全部 src=qa），精确匹配可行。
         """
         facts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
+        # 屏障锚定「首次写入」而非 facts.ts：facts.t 是 UNIQUE，同文本重写走 UPSERT
+        # 会把 ts/cat 原地抬高（blackboard_legacy.py:238-242）。实测 1698 条 fact 被重写、
+        # 36 条 exit_message 因此从屏障前移到屏障后 → 旧消息复活被后序步骤消费。
+        # log 表留存每次写入，取 MIN(ts) 即真实产生时刻。
+        _birth = {}
+        if created_after:
+            _ids = [f.id for f in facts]
+            if _ids:
+                _ph = ",".join("?" * len(_ids))
+                try:
+                    # log 表在 blackboard.db，不是 lifecycle 的 workflows.db
+                    with self._bb._conn() as _c:
+                        for _row in _c.execute(
+                                f"SELECT fid, MIN(ts) AS b FROM log WHERE typ IN ('write','add','upd') "
+                                f"AND fid IN ({_ph}) GROUP BY fid", tuple(_ids)):
+                            _birth[_row["fid"]] = _row["b"]
+                except Exception:
+                    # 查不到首次写入时退化为 facts.ts（旧行为），不阻断匹配
+                    LOGGER.debug("birth-time lookup failed; falling back to facts.ts")
         earliest = 0.0
         matched = []
         for f in facts:
@@ -1277,7 +1350,7 @@ class StepHandlerMixin:
                     continue
             if text_filter and text_filter not in f.t:
                 continue
-            if created_after and f.ts < created_after:
+            if created_after and _birth.get(f.id, f.ts) < created_after:
                 continue
             # wf 归属校验：消息含别的 wf_id → 串消息 → 过滤；
             # 消息不含 wf_id 时放行（时间窗口已保证属于当前实例）。
@@ -1294,7 +1367,12 @@ class StepHandlerMixin:
                 _pat = r'(?:^|[\s"\',:;/])(' + _re.escape(wf_id) + r'|' + _re.escape(_bare) + r')(?:[\s"\',:;/]|$)'
                 if not _re.search(_pat, f.t):
                     continue
-            matched.append({"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src})
+            # evidence 必须一并带上：驳回分类段【系统问题→maintainer】写在 evidence 里，
+            # 旧实现只取 t（标题）→ _parse_review_issues 拿不到分类 → 返工链恒建不出
+            # （实测生产 3/3 条真实 reviewer 驳回全部解析为空）。
+            matched.append({"id": f.id, "text": f.t[:200],
+                            "evidence": (getattr(f, "e", "") or "")[:2000],
+                            "ts": f.ts, "src": f.src})
             if earliest == 0 or f.ts < earliest:
                 earliest = f.ts
         # 多角色协作门：所有声明角色都有匹配消息才通过（仲裁模式）
@@ -1313,7 +1391,7 @@ class StepHandlerMixin:
                         continue
                     if text_filter and text_filter not in _f.t:
                         continue
-                    if created_after and _f.ts < created_after:
+                    if created_after and _birth.get(_f.id, _f.ts) < created_after:
                         continue
                     if wf_id and _f.t and 'wf_' in _f.t and wf_id not in _f.t \
                             and wf_id.replace('wf_', '') not in _f.t:

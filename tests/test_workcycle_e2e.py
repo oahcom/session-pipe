@@ -23,8 +23,21 @@ _TEST_TIMEOUT = 20
 def _make_env():
     d = Path(tempfile.mkdtemp())
     (d / "runs").mkdir(parents=True)
+    _new_tag()
     return d
 
+
+_TAG = ""
+
+
+def _new_tag():
+    """每个用例一份唯一后缀，隔开跨用例的同名 bus 消息（见 _done）。"""
+    global _TAG
+    _SEQ[0] += 1
+    _TAG = f"u{_SEQ[0]}"
+
+
+_SEQ = [0]
 
 def _write_wf(wf_dir, name, steps):
     data = {"name": name, "title": name, "description": "", "steps": steps}
@@ -42,6 +55,28 @@ def _step(step_id, **overrides):
     }
     base.update(overrides)
     return base
+
+
+def _done(eng, step_id, src="test_role", extra=""):
+    """写步骤完成消息。文本带本次用例唯一后缀。
+
+    WHY: 整个 pytest 进程共用一个临时 blackboard，而 bus 写入是按文本 UPSERT
+    —— 同文本重写不刷新 facts.ts。而 _check_exit 的 _birth 屏障取 log 表
+    MIN(ts)（首次写入时刻）→ 用例 B 复用用例 A 的文本时，该消息的 birth 恒早于
+    B 的工作流 created_at，匹配永久为空。实测：HEAD 版同一份代码稳定 4 failed,
+    本文用例从第二个起连锁失败。text_contains 是子串匹配，故后缀不破坏匹配。
+    """
+    eng._bb.write("notice", f"DONE_{step_id.upper()}{_TAG} {extra}", src=src)
+
+
+def _poll(eng, rid, step_id, tries=20):
+    """轮询等待步骤推进。固定 sleep(0.1)+单次 run_once 在负载下不够：
+    advance 走两阶段（锁内 commit + 锁外 _send_to_role），实测 1/6 概率未完成。"""
+    for _ in range(tries):
+        time.sleep(0.05)
+        eng.run_once()
+        if eng.status(rid)["current_step"] != step_id:
+            return
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -69,7 +104,7 @@ def test_single_step_lifecycle(mock_run):
     assert s["results"]["s1"]["status"] == "notified", s
 
     # Bus exit -> run_once -> complete
-    eng._bb.write("notice", "DONE_S1 done", src="test_role")
+    _done(eng, "s1")
     time.sleep(0.1)
     eng.run_once()
     s = eng.status(rid)
@@ -95,7 +130,7 @@ def test_two_step_sequential(mock_run):
 
     # Notify + exit s1
     eng.run_once()
-    eng._bb.write("notice", "DONE_S1 done", src="test_role")
+    _done(eng, "s1")
     time.sleep(0.1)
     eng.run_once()
 
@@ -106,7 +141,7 @@ def test_two_step_sequential(mock_run):
     # 否则消息被 s2 的 created_after 过滤，永远无法推进
     eng.run_once()
     # Exit s2
-    eng._bb.write("notice", "DONE_S2 done", src="test_role")
+    _done(eng, "s2")
     time.sleep(0.1)
     eng.run_once()
 
@@ -116,13 +151,20 @@ def test_two_step_sequential(mock_run):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 3. Handoff approval
+# 3. Handoff auto-advance (no approval gate)
+# ═══════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
-def test_handoff_approval(mock_run):
-    """handoff -> step_done_ready -> confirm -> advance."""
+def test_handoff_advances_without_confirm(mock_run):
+    """handoff 是交接不是审批：exit 命中后直接推进，不发 token、不等 confirm。
+
+    2026-10-19 实测：旧行为给 handoff 发 approval_token + 置 step_done_ready，
+    engine 审批门控遂拦住每一步等 confirm，而真实 confirm 率仅 1.4%
+    （1347 步中 425 步持未消费 token、真 confirm 8 次）→ 每步白等 TTL+grace
+    90min，WL-full_dev_pipeline 21 实例全 cancelled、0 走完。
+    """
     signal.alarm(_TEST_TIMEOUT)
     d = _make_env()
     _write_wf(d, "ho", [_step("s1", type="handoff"), _step("s2")])
@@ -130,40 +172,158 @@ def test_handoff_approval(mock_run):
     rid = eng.start("ho", {})
 
     eng.run_once()
-    eng._bb.write("notice", "DONE_S1 done", src="test_role")
+    _done(eng, "s1", src="pm")
+    # 轮询而非固定 sleep：advance 走 _advance_production_wf 两阶段（锁内 commit
+    # + 锁外 _send_to_role），单次 100ms 在高负载下不够 → 间歇性误判。
+    for _ in range(20):
+        time.sleep(0.05)
+        eng.run_once()
+        if eng.status(rid)["current_step"] != "s1":
+            break
+
+    s = eng.status(rid)
+    assert s["results"]["s1"]["status"] == "completed", s
+    assert s["current_step"] == "s2", f"handoff 应自动推进到 s2, got {s}"
+    assert not eng._lifecycle.get_approval_token(rid, "s1"), \
+        "handoff 不应发放审批密钥"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_handoff_chain_auto_flows(mock_run):
+    """四步 handoff 链全程无人工 confirm 自行贯通（用户核心诉求）。
+
+    场景：pm → 架构 → 开发 → 测试 全链交接，每步完成即自动交给下一步。
+    旧行为每步发 token 等 confirm（实测真实 confirm 率 1.4%）→ 每步白等
+    90min，而步骤超时上限 30min×2 先到 → 工作流被 auto-cancel，
+    21 个 WL-full_dev_pipeline 实例无一走完。本用例锁死"自发贯通"。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    roles = ["pm", "product_architect", "engineer", "qa"]
+    steps = [_step(f"s{i+1}", type="handoff", target_role=r)
+             for i, r in enumerate(roles)]
+    _write_wf(d, "chain", steps)
+    eng = WorkflowEngine(d)
+    rid = eng.start("chain", {})
+
+    for i in range(1, len(steps) + 1):
+        assert eng.status(rid)["current_step"] == f"s{i}", \
+            f"第 {i} 步应已接手: {eng.status(rid)}"
+        eng.run_once()  # 投递本步
+        _done(eng, f"s{i}", src=roles[i - 1])
+        for _ in range(20):
+            time.sleep(0.05)
+            eng.run_once()
+            if eng.status(rid)["current_step"] != f"s{i}":
+                break
+
+    s = eng.status(rid)
+    assert s["status"] == "completed", f"全链应跑完，实际 {s}"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_review_requires_confirm(mock_run):
+    """review 有独立审批人时仍是质量闸门：发 token，需 confirm 才推进。
+
+    s2 由 reviewer 执行、上一步 s1 由 pm 执行 → assigner=pm，是真审批。
+    同角色自审不发 token（见 test_review_self_audit_no_deadlock）。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "rv", [
+        _step("s1", target_role="pm"),
+        _step("s2", type="review", target_role="reviewer"),
+        _step("s3"),
+    ])
+    eng = WorkflowEngine(d)
+    rid = eng.start("rv", {})
+
+    eng.run_once()
+    _done(eng, "s1", src="pm")
+
+    eng.run_once()
+    # s2 必须先被投递（notified）再写完成消息，否则消息早于步骤接管，
+    # _check_exit 的 created_after 屏障会把旧消息挡在外面。
+    for _ in range(20):
+        time.sleep(0.05)
+        eng.run_once()
+        _sr2 = eng.status(rid)["results"].get("s2") or {}
+        if _sr2.get("status") == "notified":
+            break
+    assert (eng.status(rid)["results"].get("s2") or {}).get("status") == "notified", \
+        f"s2 应已投递: {eng.status(rid)}"
+    _done(eng, "s2", src="reviewer")
+    time.sleep(0.1)
+    eng.run_once()
     time.sleep(0.1)
     eng.run_once()
 
     s = eng.status(rid)
-    assert s["results"]["s1"]["status"] == "step_done_ready", s
-
-    # Token-based confirm
-    token = eng._lifecycle.get_approval_token(rid, "s1")
-    assert token, "handoff must produce approval token"
-    ok = eng._lifecycle.confirm_step(rid, "s1", token=token, approved=True)
-    assert ok
+    assert s["results"]["s2"]["status"] == "step_done_ready", s
+    token = eng._lifecycle.get_approval_token(rid, "s2")
+    assert token, "有独立审批人的 review 必须发放审批密钥"
+    assert s["current_step"] == "s2", f"未 confirm 不得推进, got {s}"
+    eng._lifecycle.confirm_step(rid, "s2", token=token, approved=True)
 
     s = eng.status(rid)
-    assert s["current_step"] == "s2", f"expected s2, got {s}"
+    assert s["current_step"] == "s3", f"confirm 后应推进到 s3, got {s}"
     _cleanup(d)
 
 
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_review_self_audit_no_deadlock(mock_run):
+    """自审 review 不发 token，直接推进——否则死等 TTL(1h)+grace(30min)。
+
+    生产事故：architect_full_design/s4 的 target_role=product_architect，
+    assigner 也返回它自己 → token 无人消费，步骤 step_done_ready 卡 61 分钟；
+    同时 liveness 把它算作 busy，锁死同角色 3 个其它工作流（排队 7~21 次）。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "selfrv", [_step("s1", type="review"), _step("s2")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("selfrv", {})
+
+    eng.run_once()
+    _done(eng, "s1")
+    for _ in range(20):
+        time.sleep(0.05)
+        eng.run_once()
+        if eng.status(rid)["current_step"] != "s1":
+            break
+
+    s = eng.status(rid)
+    assert s["results"]["s1"]["status"] == "completed", s
+    assert not eng._lifecycle.get_approval_token(rid, "s1"), \
+        "自审 review 不得发放审批密钥（否则无人消费，卡死 90 分钟）"
+    assert s["current_step"] == "s2", f"自审 review 应直接推进, got {s}"
+    _cleanup(d)
+
 # ═══════════════════════════════════════════════════════════════════
-# 4. Handoff rejection
+# 4. Review rejection
 # ═══════════════════════════════════════════════════════════════════
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
-def test_handoff_rejection(mock_run):
-    """handoff -> step_done_ready -> reject -> still running."""
+def test_review_rejection_keeps_running(mock_run):
+    """review -> step_done_ready -> reject -> still running.
+
+    驳回走 confirm_step(approved=False)，置 rejected 且不推进。handoff 不再有
+    token 通道，故本用例改用 review 型步骤覆盖同一拒绝语义。
+    """
     signal.alarm(_TEST_TIMEOUT)
     d = _make_env()
-    _write_wf(d, "hr", [_step("s1", type="handoff")])
+    _write_wf(d, "hr", [_step("s1", type="review")])
     eng = WorkflowEngine(d)
     rid = eng.start("hr", {})
 
     eng.run_once()
-    eng._bb.write("notice", "DONE_S1 done", src="test_role")
+    _done(eng, "s1")
     time.sleep(0.1)
     eng.run_once()
 
@@ -175,6 +335,57 @@ def test_handoff_rejection(mock_run):
     s = eng.status(rid)
     assert s["status"] == "running"
     assert s["results"]["s1"]["status"] == "rejected"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_gate_rejection_blocks_advance(mock_run):
+    """gate 型评审驳回 → 不推进（回归守卫）。
+
+    2026-10-17 实测：wf_98a18e738d 的 s3 是 type=gate，reviewer 判
+    "CHANGES_REQUESTED (0 P0, 3 P1, 2 P2)"，引擎却推进到了 s4 —— 因为返工
+    门禁原判据只认 type=="review"。模板里 reviewer 步骤有 review(9) 与
+    gate(3) 两类，只认其一会让 3 个模板的评审意见被无视。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "gate_r", [
+        _step("s1", type="gate"),
+        _step("s2"),
+    ])
+    eng = WorkflowEngine(d)
+    rid = eng.start("gate_r", {})
+
+    eng.run_once()
+    _done(eng, "s1", extra="CHANGES_REQUESTED: 3 P1 需修复")
+    _poll(eng, rid, "s1")
+
+    s = eng.status(rid)
+    assert s["current_step"] == "s1", f"gate 驳回不得推进，实际到了 {s['current_step']}"
+    _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_gate_approved_advances(mock_run):
+    """gate 型评审通过 → 正常推进（防止上一用例修过头成永久卡死）。"""
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "gate_a", [
+        _step("s1", type="gate"),
+        _step("s2"),
+    ])
+    eng = WorkflowEngine(d)
+    rid = eng.start("gate_a", {})
+
+    eng.run_once()
+    _done(eng, "s1", extra="APPROVED: 0 P0, 0 P1")
+    _poll(eng, rid, "s1")
+
+    s = eng.status(rid)
+    assert s["results"]["s1"]["status"] == "completed" and s["current_step"] == "s2", \
+        f"APPROVED 应推进到 s2，s1={s['results']['s1']} current={s.get('current_step')}"
     _cleanup(d)
 
 
@@ -193,10 +404,8 @@ def test_cancel_mid_workflow(mock_run):
     rid = eng.start("cw", {})
 
     eng.run_once()
-    eng._bb.write("notice", "DONE_S1 done", src="test_role")
-    time.sleep(0.1)
-    eng.run_once()
-
+    _done(eng, "s1")
+    _poll(eng, rid, "s1")
     s = eng.status(rid)
     assert s["current_step"] == "s2"
 
@@ -285,8 +494,10 @@ if __name__ == "__main__":
     tests = [
         ("单步生命周期", test_single_step_lifecycle),
         ("两步顺序推进", test_two_step_sequential),
-        ("Handoff 审批通过", test_handoff_approval),
-        ("Handoff 拒绝", test_handoff_rejection),
+        ("Handoff 自动交接（无审批）", test_handoff_advances_without_confirm),
+        ("Handoff 链自发贯通", test_handoff_chain_auto_flows),
+        ("Review 需审批确认", test_review_requires_confirm),
+        ("Review 驳回不推进", test_review_rejection_keeps_running),
         ("中途取消", test_cancel_mid_workflow),
         ("无效工作流名", test_start_invalid_workflow),
         ("空步骤", test_start_empty_steps),

@@ -41,10 +41,20 @@ def sync_task_status(conn, task_id: Optional[str]) -> None:
         task_status = "cancelled"
     elif any(s in ("running", "pending", "step_done_ready") for s in statuses):
         task_status = "in_progress"
+    elif any(s in ("delivery_blocked", "delivery_failed", "blocked") for s in statuses):
+        # 投递没发生 = 活没干：既非 running 也非 completed。
+        # 原实现落在 else 里被默认判 completed，实测日志
+        # 「sync_task_status(task_sub_80bd6be1): unmatched statuses
+        #  ['delivery_blocked'], default completed」—— 子链投递失败反被记成
+        # 完成，主链据此误判推进，用户要的「二级工作流严格要求」被打穿。
+        task_status = "in_progress"
     else:
-        task_status = "completed"
+        # 未知状态一律 fail-safe 为 in_progress，不得默认 completed：
+        # 把没见过的状态判成成功是单向的（后续无人复查），判成进行中最多
+        # 多等一轮，且下面会告警暴露新状态。
+        task_status = "in_progress"
         logging.getLogger("workflow.sync").warning(
-            "sync_task_status(%s): unmatched statuses %s, default completed",
+            "sync_task_status(%s): unknown statuses %s → in_progress (fail-safe)",
             task_id, statuses)
 
     conn.execute(

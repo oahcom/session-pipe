@@ -253,6 +253,74 @@ def test_tmux_signal_proceeds_when_schema_satisfied():
     eng._lm.complete_step.assert_called_once()
 
 
+
+# ── 8c. 子链存活门：空闲取消不得误杀有活子链的父步 ─────────────────
+
+def _fake_sig_idle():
+    from conversation_monitor import ConversationSignal
+    s = ConversationSignal()
+    s.idle_complaint = True
+    s.idle_evidence = "等待输入"
+    return s
+
+
+def _idle_run(**extra):
+    sd = {"status": "notified", "ts": time.time(),
+          "subflow_id": "wf_sub_child1",
+          "tmux_signals": {"idle_count": 4}}  # 本轮 +1 → 5 命中取消阈值
+    sd.update(extra)
+    return _make_run(step_results={"s1": sd})
+
+
+def test_idle_cancel_deferred_when_subflow_live():
+    """子链仍在跑 → 不得按空闲取消父步。
+
+    实测 wf_3f6128f1b3db/s2: 11:31:58 被空闲取消，子链 wf_sub_c5274c45c967
+    的 s2/s3 分别 11:32:27/11:34:57 才完成——取消时子链仍活。
+    """
+    eng = _build_eng()
+    eng._lm.query_one.return_value = {"status": "running"}
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(_idle_run(), _make_step())
+    eng._lm.cancel_step.assert_not_called()
+
+
+def test_idle_cancel_uses_parent_link_when_subflow_id_gone():
+    """subflow_id 已被历史 cancel 抹掉 → 退回 parent_wf_id 链接仍识别活子链。"""
+    eng = _build_eng()
+    eng._lm.query_one.side_effect = [
+        {"instance_id": "wf_sub_child1"}, {"status": "running"}]
+    run = _make_run(step_results={"s1": {"status": "notified", "ts": time.time(),
+                                         "tmux_signals": {"idle_count": 4}}})
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(run, _make_step())
+    eng._lm.cancel_step.assert_not_called()
+
+
+def test_idle_cancel_when_subflow_dead():
+    """子链已 cancelled（死）→ 父步空闲取消维持原语义。"""
+    eng = _build_eng()
+    eng._lm.query_one.return_value = {"status": "cancelled"}
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(_idle_run(), _make_step())
+    eng._lm.cancel_step.assert_called_once()
+
+
+def test_idle_cancel_no_subflow_unchanged():
+    """无子链 → 空闲取消行为不变（守卫不误伤普通步骤）。"""
+    eng = _build_eng()
+    eng._lm.query_one.return_value = None  # 无 parent 链接子链
+    run = _make_run(step_results={"s1": {"status": "notified", "ts": time.time(),
+                                         "tmux_signals": {"idle_count": 4}}})
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(run, _make_step())
+    eng._lm.cancel_step.assert_called_once()
+
+
 # ── 9. 空 exit_condition ──────────────────────────────────────────
 
 def test_tick_empty_exit_condition():
@@ -386,6 +454,10 @@ if __name__ == "__main__":
         ("7.  timeout_count 递增",          test_tick_timeout_increments_count),
         ("8.  每 3 次超时 escalation",      test_tick_escalation_every_third),
         ("10. 空 exit_condition",           test_tick_empty_exit_condition),
+        ("8c. 子链活→空闲取消延后",          test_idle_cancel_deferred_when_subflow_live),
+        ("8d. subflow_id 抹掉→parent 链接",  test_idle_cancel_uses_parent_link_when_subflow_id_gone),
+        ("8e. 子链死→空闲取消不变",          test_idle_cancel_when_subflow_dead),
+        ("8f. 无子链→空闲取消不变",          test_idle_cancel_no_subflow_unchanged),
         ("11. PID 锁首次获取",              test_acquire_pid_lock_first),
         ("12. PID 锁过期清理",              test_acquire_pid_lock_stale),
         ("13. PID 锁损坏清理",              test_acquire_pid_lock_corrupted),

@@ -2,6 +2,19 @@
 
 审查时间：2026-10-16 | HEAD：`e2fd23c` | 生产 DB：`~/.hermes/data/state/workflows.db`
 
+> ⚠️ **本单条目多为建单时快照，其后 17 个提交已修复其中多项。核实前不要直接开工。**
+> 核实方法：`git log -S "<缺陷特征串>" -- <文件>` 查是否有修复提交。
+> 已由 R71 session 复核确认修复的条目见下表（2026-10-16 23:40 复核）：
+>
+> | 条目 | 状态 | 复核依据 |
+> |------|------|----------|
+> | G1 | ✅ 已修 | `grep run.workspace step_handler.py` 无匹配；代码注释注明"旧代码在此抛 AttributeError" |
+> | G2 | ✅ 已修 | `survival_monitor.py:232` 已改进程内 `self._bb.read(src=role)` |
+> | G3 | ✅ 已修 | `wf_lifecycle.py:88` SELECT 已含 `current_step_id`（注释说明修复原因） |
+> | G7 | ✅ 已修 | `task_generator.py:126` 已有 `_HEAL_COOLDOWN_SEC = 600` |
+>
+> 未复核条目不等同于未修 —— 开工前请自行 `git log -S` 确认。
+
 标注说明：**[已验证]** = 本机实际执行复现；**[代码确认]** = 读码确认逻辑缺陷，未构造运行时复现。
 
 生产 DB 现状：`workflow_instances` 87 条（cancelled=45 / completed=41 / delivery_blocked=1），无积压；freelist ratio 0.0%（无膨胀）。以下缺陷多为"尚未踩中"的潜伏缺口，非当前故障。

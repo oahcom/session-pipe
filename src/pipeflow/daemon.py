@@ -19,6 +19,13 @@ import os
 import signal
 import subprocess
 import sys
+
+# 不写新的 .pyc。WHY: 与源文件落在同一秒的 .pyc 会让 Python 的 (mtime, size)
+# 失效校验误判命中，加载**过期字节码** —— 实测 WorkflowLifecycleMixin 因此丢失
+# _handle_wf_loop 等 10 个方法（AST 显示类完整 12 方法，hasattr 却为 False），
+# 引擎静默跑在不同版本上。不写新字节码可消除这个同秒窗口。
+# 必须放在其它项目模块导入之前才生效。
+sys.dont_write_bytecode = True
 import threading
 import time
 from pathlib import Path
@@ -102,6 +109,10 @@ def _starve_signal(eng: WorkflowEngine) -> None:
         # 失败时间戳过旧（迁移前脏数据/首次触碰）→ 允许创建一次以重置计数
         if last_failure_ts > 0 and now - last_failure_ts < _STARVE_FAIL_BACKOFF:
             return  # 24h 内有失败记录 → 退避
+        # 退避期已过 → 重置计数重新尝试。缺此重置则失败计数永久 ≥ 阈值，
+        # 每次退避到期都只是再退避一次，饥饿恢复路径永不重试
+        # （实测 2026-10-17：consecutive_failures 卡在 5，last_active_ts 停在 8-08）。
+        consec_fails = 0
     else:
         if now - last_fire < _STARVE_COOLDOWN:
             return  # 成功冷却期内

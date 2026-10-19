@@ -8,6 +8,7 @@ import json
 import time
 import uuid
 import logging
+import re
 from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
@@ -69,6 +70,35 @@ def _resolve_loop_max_iter(max_iter: int, value_gate_file: str, wf_id: str, logg
 class WorkflowLifecycleMixin:
     """WorkflowEngine 的工作流生命周期 mixin。"""
 
+    def _cleanup_orphan_tasks(self, lm) -> int:
+        """回收孤儿任务：落库了但 workflow_instance 从未建成的残骸。
+
+        成因是 client.py 的 Gate 顺序缺陷（校验旧 assignee → 落库 → 对齐 → 二次
+        校验失败）；该缺陷已修，但存量的 39 条 created 孤儿无任何回收路径——
+        _scan_tasks 用 INNER JOIN workflow_instances、_cleanup_stale_workflows
+        只扫实例表，两者都看不见它们。只增不减会污染背压计数。
+
+        判据保守：非终态 + 无任何实例 + 超过 1h。终态任务不动（它们是正常历史）。
+        """
+        _where = ("status NOT IN ('completed','failed','cancelled') "
+                  "AND current_workflow_id IS NULL AND created_at < ? "
+                  "AND NOT EXISTS (SELECT 1 FROM workflow_instances wi "
+                  "                WHERE wi.task_id = tasks.task_id)")
+        try:
+            # 先数后改：LifecycleManager.execute 不返回 cursor，拿不到 rowcount。
+            n = lm.query_one(f"SELECT COUNT(*) FROM tasks WHERE {_where}",
+                             (time.time() - 3600,))
+            n = n[0] if n else 0
+            if n:
+                lm.execute(f"UPDATE tasks SET status='cancelled', updated_at=? WHERE {_where}",
+                           (time.time(), time.time() - 3600))
+                LOGGER.info("孤儿任务回收: %d 条（落库但无实例）", n)
+            return n
+        except Exception as _e:
+            LOGGER.warning("孤儿任务回收失败: %s", _e)
+            return 0
+
+
     def _cleanup_stale_workflows(self, lm):
         """自动取消僵尸 workflow。
 
@@ -118,8 +148,11 @@ class WorkflowLifecycleMixin:
                 # ponytail: 72h 天花板；升级路径→加 loop.max_duration_hours 覆盖模板级阈值
                 _loop_wf = self._workflows.get(tpl) if hasattr(self, "_workflows") else None
                 if _loop_wf is not None:
+                    # 默认必须为 False：24 个模板无 loop 字段（loop=None → {}），默认 True 会让
+                    # 它们全部命中豁免 → 24h 兜底从未对普通模板生效（实测 28/28 全部拿到 72h）。
+                    # 豁免的本意只给显式声明 loop.enabled 的长跑工作流（food_chain_loop 等）。
                     _loop_cfg = _loop_wf.loop or {} if isinstance(_loop_wf.loop, dict) else {}
-                    if _loop_cfg.get("enabled", True):
+                    if _loop_cfg.get("enabled", False):
                         _global_limit_h = 72
 
                 _auto_cancel_at = 6
@@ -288,6 +321,53 @@ class WorkflowLifecycleMixin:
         is_last = idx + 1 >= len(steps)
         next_step = None if is_last else steps[idx + 1]
 
+        # 返工门禁前置：必须在推进前判。原实现把门禁放在推进之后（锁外阶段），
+        # 推进已 commit → return 撤不回来，驳回被无视、流水线继续下滑
+        # （回归守卫 tests/test_workcycle_e2e.py::test_gate_rejection_blocks_advance）。
+        # 姊妹路径 lifecycle/manager._advance_unsafe 有同款门禁 —— 两条推进
+        # 实现必须都装，只装一条的另一条会放行驳回（实测 wf_98a18e738d）。
+        # 关键词 "fix" 不列入：正常文案高频出现（bugfix/prefix/fixture）会误判。
+        #
+        # 不限定 step.type（R41, 2026-10-19）：旧实现只查 review/gate，实测近 800
+        # 实例中 21/35 条驳回票因此被吞——单一 type 白名单让 handoff/notify/single
+        # 的驳回无人消费（如 wf_3565289ca783/s3 handoff 判定"未通过"后，s4/s5 照常
+        # 推进至 completed）。驳回语义由 exit_messages 文本判定，与 type 无关。
+        # 末步仍不拦——无 next_step 可退回，且无 rework 承接方。
+        if not is_last:
+            # evidence 也要拼入：分类段在其中，只拼 text 会让 _has_issue_classification
+            # 恒为 False → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
+            _msgs = " ".join(
+                (m.get("text", "") or "") + " " + (m.get("evidence", "") or "")
+                for m in (((results or {}).get(step_id, {}) or {}).get("exit_messages") or [])
+                if isinstance(m, dict)
+            ).lower()
+
+            # "未通过"/"驳回" 补入：实测 s3 用"判定: 未通过"表达驳回，旧词表不含它
+            # → 漏检（wf_3565289ca783）。
+            if any(kw in _msgs for kw in
+                   ("changes_requested", "rejected", "需修复", "回退",
+                    "未通过", "not_approved", "驳回")):
+                LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
+                               wf_id[:8], step_id)
+                try:
+                    self._create_rework_subflow(wf_id, lm, wf_name, step_id,
+                                                steps[idx], next_step, results)
+                except Exception as _rw_err:
+                    LOGGER.warning("rework subflow 创建失败 %s: %s", wf_id[:8], _rw_err)
+                # 拦下推进的默认语义：命中驳回关键词就不推进——与原实现一致。
+                # 例外只给「产出本就不带分类标记」的步骤：_create_rework_subflow
+                # 靠【系统问题】【业务问题】建返工链，非 review 模板不写它，
+                # 若也硬拦则既不返工也不推进 = 静默卡死。
+                # 注意**模板缺失不算该例外**：实测模板不存在时走 fail-open 会把
+                # 真实驳回放行（回归守卫 test_r41_gate_fail_closed）。
+                _cls = _has_issue_classification(_msgs)
+                if not _cls:
+                    LOGGER.warning(
+                        "rejected 但产出无【系统问题】/【业务问题】分类 %s/%s"
+                        " → 放行推进（fail-open）", wf_id[:8], step_id)
+                else:
+                    return
+
         completed_now = False
         try:
             with lm._conn_tx() as conn:
@@ -387,8 +467,15 @@ class WorkflowLifecycleMixin:
                 else:
                     # 推进到下一步
                     # 条件更新：仅当当前步骤仍是 step_id 时才推进（并发防重）
-                    _adv = conn.execute("UPDATE workflow_instances SET current_step_id=? WHERE instance_id=? AND current_step_id=?",
-                                (next_step.id, wf_id, step_id))
+                    # assignee 必须一并更新：它只在建实例时设一次（首步角色），
+                    # 不更新则背压计数（query DISTINCT assignee）与任务生成配额长期失真
+                    # ——实测 7 个活跃实例 5 个不一致（71%），s2 要求 product_architect
+                    # 却仍归 pm → pm 记 3 个活跃、架构师记 0 个。姊妹路径
+                    # manager._advance_unsafe:1024 已在做这件事，此处是遗漏的另一半。
+                    _adv = conn.execute(
+                        "UPDATE workflow_instances SET current_step_id=?, assignee=? "
+                        "WHERE instance_id=? AND current_step_id=?",
+                        (next_step.id, next_step.target_role or None, wf_id, step_id))
                     if _adv.rowcount == 0:
                         LOGGER.debug("advance skipped: %s/%s 已被其他路径推进", wf_id[:12], step_id)
                         return
@@ -451,39 +538,7 @@ class WorkflowLifecycleMixin:
         except Exception as _audit_err:
             LOGGER.debug("step_output audit failed %s/%s: %s", wf_id[:8], step_id, _audit_err)
 
-        # ── 返工门禁：评审步骤被拒绝 → 不推进，保持当前步，引擎下一轮 tick
-        # 自动重查 exit 匹配（修复后新评审结果会正常推进）。
-        # 同时创建 engineer 返工子链（若已有则不重复创建）。
-        #
-        # 类型判据含 gate：模板里 reviewer 步骤有 review(9) 与 gate(3) 两类，
-        # 而原判据只认 "review" → gate 型评审的 CHANGES_REQUESTED 被无视，
-        # 流水线带着未修复的设计继续往下走（实测 wf_98a18e738d：s3 判
-        # "CHANGES_REQUESTED (0 P0, 3 P1, 2 P2)" 却推进到了 s4）。
-        # 门禁的语义是"产出需被把关"，与该步叫 review 还是 gate 无关。
-        _REVIEW_TYPES = ("review", "gate")
-        _reject = False
-        try:
-            _done_sr = results.get(step_id, {}) if isinstance(results, dict) else {}
-            _msgs_text = " ".join(
-                m.get("text", "") for m in _done_sr.get("exit_messages", [])
-                if isinstance(m, dict)
-            ).lower()
-            # 关键词 "fix" 已移除：它在正常文案里高频出现（bugfix/prefix/配置文件/
-            # fixture），实测会把「已修复并通过」的正常评审误判为驳回 → 无谓返工。
-            if any(kw in _msgs_text for kw in ("changes_requested", "rejected", "需修复", "回退")):
-                _reject = True
-        except Exception:
-            pass
-        if _reject and getattr(steps[idx], "type", "") in _REVIEW_TYPES:
-            LOGGER.warning("review rejected: %s/%s → 返工门禁触发，s%s 保持 notified",
-                           wf_id[:8], step_id, step_id)
-            # 创建 engineer 返工子链（复用 engineer_feature 模板）
-            try:
-                self._create_rework_subflow(wf_id, lm, wf_name, step_id,
-                                            steps[idx], next_step, results)
-            except Exception as _rw_err:
-                LOGGER.warning("rework subflow 创建失败 %s: %s", wf_id[:8], _rw_err)
-            return  # 不推进到下一步，等修复后重新触发
+        # （返工门禁已前置到本函数上半部：驳回时不会走到这里。）
 
         # 变量完整 → 已提交推进，通知目标角色
         # 修复：_send_to_role 因角色忙/变量未替换返回 False 时，投递并未发生。
@@ -543,7 +598,20 @@ class WorkflowLifecycleMixin:
                 _db_sdata = (json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"]
                              else {}).get(tgt_step.id, {})
                 if isinstance(_db_sdata, dict) and _db_sdata.get("subflow_id"):
-                    return
+                    # 子链终态不回流 → 交还父步自投，否则该步永久悬空。
+                    # 裸 return 是 falsy，调用方会当"未接管"重复投父步 → 与子链抢
+                    # 同一角色（实测 wf_5d6bf3bf79/s1 queued=241）。
+                    #
+                    # 用**活跃状态白名单**而非「非 failed/cancelled 即活着」：
+                    # 生产步骤级 status 实测 7 种取值，delivery_blocked(233 条)是
+                    # 投递连败/角色无响应的停滞态——它非 failed 也非 cancelled，若当
+                    # 活着则父步永不自投，而子链要等 _recover_delivery_blocked 恢复
+                    # （角色持续离线时永不恢复）→ 父步永久悬空。
+                    _sub_row = conn2.execute(
+                        "SELECT status FROM workflow_instances WHERE instance_id=?",
+                        (_db_sdata["subflow_id"],)).fetchone()
+                    return bool(_sub_row and _sub_row["status"] in (
+                        "pending", "running", "step_done_ready", "completed"))
                 # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
                 # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
                 # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
@@ -576,9 +644,15 @@ class WorkflowLifecycleMixin:
                     _task_id = f"task_sub_{uuid.uuid4().hex[:8]}"
                     _wf_id = f"wf_sub_{uuid.uuid4().hex[:12]}"
                     conn2.execute("INSERT OR IGNORE INTO tasks (task_id,title,description,assigner,assignee,status,created_at,updated_at,template_id) VALUES (?,?,?,?,?,'in_progress',?,?,?)",
-                        # 子链任务描述：用步骤自身信息（方法内无调用方的 task_desc 作用域）
+                        # 子链任务描述：**只写步骤标题**。原实现拼接父模板正文
+                        # [:500]，把未替换的 {title}/{description} 字面量带进
+                        # tasks.description，engine 首步分支再把它以 [任务描述] 注入
+                        # prompt → 守卫拦下 → 3 次 delivery_fail → 子链
+                        # delivery_blocked 终态（实测 task_sub_80bd6be1 逐字含
+                        # 「标题: {title}」，blocker #397347）。子链正文由子链
+                        # **自己的** prompt_template 提供，无需父步骤正文。
                         (_task_id, f"{wf_name}/{tgt_step.id}: {tgt_step.title}",
-                         f"{tgt_step.title}\n{(getattr(tgt_step, 'prompt_template', '') or '')[:500]}",
+                         tgt_step.title,
                          _prev_done, tgt_step.target_role, time.time(), time.time(), tgt_step.subflow_template))
                     # 兼容迁移前的表（template_id 列可能缺失）——子工作流 tasks 行的 template_id
                     # 只做溯源用途，缺列时静默降级为 parent_task_id 记录父工作流（2026-08-10 观测）
@@ -673,7 +747,7 @@ class WorkflowLifecycleMixin:
             LOGGER.debug("deploy_production_outputs failed: %s", e)
 
     def _create_rework_subflow(self, wf_id: str, lm, wf_name: str, review_step_id: str,
-                               review_step, next_step, results: dict):
+                               review_step, next_step, results: dict) -> bool:
         """review 被拒绝 → 解析【系统问题】/【业务问题】分类，分别创建修复子链。
 
         系统问题 → maintainer_health_monitor（维护者修引擎/模板缺陷）
@@ -682,17 +756,36 @@ class WorkflowLifecycleMixin:
         reviewer 模板要求在完成消息中用 【系统问题】【业务问题】标记分类列出，
         引擎据此分别创建子链——同一份 review 可同时触发两条返工链。
         防重：review 步骤的 step_results 若已有 rework_ids → 不重复创建。
+
+        返回是否真的创建了至少一条返工链。调用方据此决定要不要拦下推进：
+        解析不出分类（非 review 模板的产出）时返回 False，让步骤正常推进，
+        避免"既不返工也不推进"的静默卡死。
         """
-        _done_sr = results.get(getattr(review_step, "id", ""), {}) if isinstance(results, dict) else {}
+        # 分类段在 bus evidence，而 exit_messages 只存了 text（标题）+ id。
+        # 两条取用路径：新记录已带 evidence（step_handler 一并写入）；旧记录没有，
+        # 按 id 回查 bus。只读 text 则分类永远解析不出（生产 3/3 复现）。
+        _done_sr = results.get(review_step_id, {}) or {}
         _msgs_text = "\n".join(
-            m.get("text", "") for m in _done_sr.get("exit_messages", [])
+            (m.get("text", "") or "") + "\n" + (m.get("evidence", "") or "")
+            for m in _done_sr.get("exit_messages", [])
             if isinstance(m, dict)
         )
+        # text 只有标题，分类段在 bus evidence —— 存量记录的 exit_messages
+        # （写于本修复之前）不含 evidence 字段，只能按 id 回查 bus 补齐。
+        # 必须放在解析调用之前：放在之后等于没补，实测仍 parse=False。
+        if not self._has_issue_classification(_msgs_text):
+            _ids = [m.get("id") for m in _done_sr.get("exit_messages", [])
+                    if isinstance(m, dict) and m.get("id")]
+            if _ids:
+                try:
+                    _msgs_text += "\n" + "\n".join(self._bb_evidence(_ids))
+                except Exception as _ev_e:
+                    LOGGER.debug("rework: bus evidence 回查失败 %s: %s", wf_id[:8], _ev_e)
         # 从结构化分类中提取问题列表
         _sys_issues, _biz_issues = self._parse_review_issues(_msgs_text)
         if not _sys_issues and not _biz_issues:
             LOGGER.info("rework: %s/%s review 无分类问题，跳过返工", wf_id[:8], review_step_id)
-            return
+            return False
         # 问题类型 → (模板, 角色, 分类标签)
         _rework_map = [
             (_sys_issues, "maintainer_health_monitor", "maintainer", "系统/引擎问题"),
@@ -705,7 +798,7 @@ class WorkflowLifecycleMixin:
                 ).fetchone()
                 if _db_res is None:
                     LOGGER.warning("rework: %s 不存在于 DB，跳过返工", wf_id[:8])
-                    return
+                    return False
                 _sr = json.loads(_db_res["step_results"]) if _db_res["step_results"] else {}
                 _review_sdata = _sr.get(review_step.id, {})
                 _existing_reworks = set(
@@ -784,10 +877,37 @@ class WorkflowLifecycleMixin:
                             conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                                          (json.dumps(_fresh_sr, ensure_ascii=False), wf_id))
                 conn.commit()
+            return bool(_new_reworks)
         except Exception as _e:
             LOGGER.warning("rework subflow creation failed %s: %s", wf_id[:8], _e)
+            return False
+
+    @staticmethod
+    def _has_issue_classification(msgs_text: str) -> bool:
+        """产出里是否含【系统问题】/【业务问题】分类段——返工路由的判据。
+
+        复用 _parse_review_issues：它已封装该分类的解析规则，
+        另写一套关键词匹配会与它漂移。
+        """
+        _sys, _biz = WorkflowLifecycleMixin._parse_review_issues(msgs_text)
+        return bool(_sys or _biz)
+
+    def _bb_evidence(self, fact_ids: list) -> list:
+        """按 fact id 从 bus 回查 evidence。
+
+        exit_messages 只存 text+id（分类段在 evidence）——存量记录靠这条补齐；
+        新记录由 step_handler._check_exit 一并写入，不走这里。
+        """
+        if not fact_ids:
+            return []
+        _ph = ",".join("?" * len(fact_ids))
+        with self._bb._conn() as _c:
+            _rows = _c.execute(
+                f"SELECT e FROM facts WHERE id IN ({_ph})", tuple(fact_ids)).fetchall()
+        return [r["e"] for r in _rows if r["e"]]
 
     def _rework_tpl_for(self, rework_id: str) -> str:
+
         """从 DB 查 rework 工作流实例的模板（用于逐类防重判断）。"""
         try:
             rows = self._lifecycle.query(
@@ -800,51 +920,43 @@ class WorkflowLifecycleMixin:
 
     @staticmethod
     def _parse_review_issues(msgs_text: str) -> tuple:
-        """从 review 完成消息中解析【系统问题】和【业务问题】两个分类的问题列表。
+        """从 review 产出文本里解析【系统问题】/【业务问题】清单。"""
+        # 标记用前缀匹配：角色实际写【系统问题→maintainer】（带流向标注），
+        # 旧实现要求全串「【系统问题】」独占一行 —— 生产 3/3 条真实驳回全部解析为空。
+        # 段内取条目先按行；单行压缩形态（bus evidence 常被压成一行）再按分号切。
+        _sys, _biz = [], []
+        _hits = []
+        for _mark, _kind in (("【系统问题", "sys"), ("【业务问题", "biz")):
+            _p = 0
+            while True:
+                _i = msgs_text.find(_mark, _p)
+                if _i < 0:
+                    break
+                _hits.append((_i, _kind, _mark))
+                _p = _i + len(_mark)
+        _hits.sort()
+        for _n, (_i, _kind, _mark) in enumerate(_hits):
+            _end = _hits[_n + 1][0] if _n + 1 < len(_hits) else len(msgs_text)
+            _close = msgs_text.find("】", _i)
+            _body = _i + len(_mark)
+            if 0 <= _close < _end:
+                _body = _close + 1
+            _seglines = [x.strip() for x in msgs_text[_body:_end].splitlines() if x.strip()]
+            if len(_seglines) == 1:
+                _seglines = [x.strip() for x in re.split("[;；]", _seglines[0]) if x.strip()]
+            for _line in _seglines:
+                _l = _line.strip()
+                if not _l or _l.startswith(("##", "#", "---", "|--", "｜--")):
+                    continue
+                _is_p = len(_l) > 1 and _l[0] == "P" and _l[1].isdigit()
+                if not (_l.startswith(("-", "|", "｜", "·")) or _is_p):
+                    continue
+                _item = _l.lstrip("-|｜· ").strip()
+                if len(_item) < 10:
+                    continue
+                (_sys if _kind == "sys" else _biz).append(_item)
+        return (_sys, _biz)
 
-        返回 (system_issues, business_issues)。
-        """
-        _sys = []
-        _biz = []
-        _sys_keywords = (
-            "exit_condition", "变量", "busy", "polling", "rework", "daemon",
-            "引擎", "engine", "exit schema", "verify", "timeout", "deadlock",
-            "tmux", "pane", "survival", "workflow_engine", "模板", "template",
-            "竞态", "race", "卡死", "死循环", "防污", "推送", "notify", "step_result",
-        )
-        in_sys = False
-        in_biz = False
-        for line in msgs_text.splitlines():
-            _line = line.strip()
-            if "【系统问题】" in _line:
-                in_sys = True
-                in_biz = False
-                continue
-            if "【业务问题】" in _line:
-                in_sys = False
-                in_biz = True
-                continue
-            if not _line or _line.startswith(("##", "#", "---")):
-                continue
-            # 跳过分类标记行（【系统问题】|无 ）和表头分隔行
-            if _line.startswith("【") or _line.startswith("|--"):
-                continue
-            # 提取问题条目（跳过表头/空行）
-            if not (_line.startswith("-") or _line.startswith("|")):
-                continue
-            _item = _line.lstrip("-|").strip()
-            if not _item or len(_item) < 10:
-                continue
-            # 根据位置（已在系统/业务块中）直接归类；位置不明则用关键词判断
-            if in_sys:
-                _sys.append(_item)
-            elif in_biz:
-                _biz.append(_item)
-            elif any(kw in _item.lower() for kw in _sys_keywords):
-                _sys.append(_item)
-            else:
-                _biz.append(_item)
-        return _sys, _biz
 
     def _record_step_output(self, wf_id: str, step, step_data: dict):
         """记录步骤产出审计：产出文件列表 + 内容预览 + git 改动，写 workflow_logs。

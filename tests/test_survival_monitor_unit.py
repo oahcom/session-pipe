@@ -23,7 +23,6 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import pytest
-import http.client
 
 # Use a fixture to isolate SENTINEL_DIR and _ROLE_TARGETS_CACHE
 from routing import survival_monitor as sm
@@ -184,15 +183,12 @@ class TestL2Check:
                 m.stdout = ""
             return m
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        # Disable HTTP call
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
 
         result = monitor._l2_check("qa")
         assert result["thinking"] is True
 
     def test_l2_stale_pane(self, monitor, monkeypatch):
-        """pane 活动超过 5 分钟 + 无 token → thinking=False。"""
+        """pane 活动超过 5 分钟 → thinking=False。"""
         def fake_run(cmd, **kw):
             m = MagicMock()
             m.returncode = 0
@@ -204,38 +200,33 @@ class TestL2Check:
                 m.stdout = ""
             return m
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
 
         result = monitor._l2_check("qa")
         assert result["thinking"] is False
 
-    def test_l2_token_activity_shows_thinking(self, monitor, monkeypatch):
-        """0 token 但 pane 在活动 → thinking=True。"""
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            if "list-panes" in cmd:
-                m.stdout = f"{time.time() - 10}\n"
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        # Mock 9Router returns tokens > 0
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = b'{"total_tokens": 500}'
-        mock_conn = MagicMock()
-        mock_conn.getresponse.return_value = mock_resp
-        monkeypatch.setattr(http.client, "HTTPConnection", lambda *a, **kw: mock_conn)
+    def test_l2_reads_window_activity_not_pane_activity(self, monitor, monkeypatch):
+        """回归守卫: #{pane_activity} 在 tmux 3.4 恒为空 → 必须用 #{window_activity}。
 
-        result = monitor._l2_check("qa")
-        assert result["thinking"] is True
+        问错变量会让 last_activity 恒为 0 → thinking 恒 None → overall 恒 unknown，
+        三层存活检测整体失效而不报错（实测 2026-10-16）。
+        """
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            return MagicMock(returncode=0, stdout=f"{time.time() - 10}\n")
+
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
+        monitor._l2_check("qa")
+
+        assert any("#{window_activity}" in c for c in seen), "L2 必须查 window_activity"
+        assert not any("#{pane_activity}" in c for c in seen), "pane_activity 在 tmux 3.4 恒空"
 
     def test_l2_tmux_error_fallback(self, monitor, monkeypatch):
         """tmux 命令出错不崩溃。"""
         def raise_error(*a, **kw):
             raise FileNotFoundError("no tmux")
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
 
         result = monitor._l2_check("qa")
         assert "thinking" in result  # no crash
@@ -301,6 +292,13 @@ class TestOverall:
     def test_overall_stale(self, monitor):
         assert monitor._overall({"status": "ALIVE"}, {"thinking": False}, {}) == "stale"
 
+    def test_overall_thinking_false_but_recent_output_is_healthy(self, monitor):
+        # 回归锁定：pane 静默（thinking=False）不应掩盖最近的 bus 产出。
+        # 实测：qa 交付 112 passed 后仍被判 stale（pane 静默 >300s，但 L3 producing=True）。
+        assert monitor._overall(
+            {"status": "ALIVE"}, {"thinking": False}, {"producing": True}
+        ) == "healthy"
+
     def test_overall_idle(self, monitor):
         assert monitor._overall({"status": "ALIVE"}, {"thinking": True}, {"producing": False}) == "idle"
 
@@ -321,9 +319,6 @@ class TestTick:
 
         # Mock L1 → ALIVE
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: MagicMock(returncode=0, stdout=""))
-        # Disable HTTP
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
         # Mock bus
         monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
 
@@ -334,8 +329,6 @@ class TestTick:
     def test_tick_caches_l2_l3(self, monitor, monkeypatch):
         _make_sentinel("qa", sm.SENTINEL_DIR)
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: MagicMock(returncode=0, stdout=""))
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
         monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
 
         # First tick populates cache

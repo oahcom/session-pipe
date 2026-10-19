@@ -25,6 +25,20 @@ from output_validator import validate_output
 # 系统内通知分类：这些是路由信号而非任务，创建 workflow 会引发级联风暴
 # _SYSTEM_CATEGORIES: 跳过 workflow 创建的分类（路由信号）
 # _NON_TASK_CATEGORIES: 跳过路由分发的分类（纯通知/心跳，无任务语义）
+# 产出类分类：承载的是**已完成产出**的回报（PRD/设计/测试报告/部署结果），
+# 不是待办请求。缺它们时完成汇报被 mint 成新工作流 —— 实测 product_architect
+# 的 prd/system_design 两条完成信号各生成一个 echo pipeline（wf_6a9ad42282 /
+# wf_3366899dfe，2026-10-19）。
+# 判定依据是 bus_canonical.json 的 description：这些分类描述为「XX 文档/报告/结果」，
+# 即角色产出的落盘通知；「问题/发现/建议」类（bug_report/design_issue/optimization）
+# 不在此列——它们需要后续动作。
+_OUTPUT_CATEGORIES = frozenset({
+    "prd", "system_design", "documentation", "test_report", "deployment_report",
+    "test_plan", "deployment_plan", "root_cause_analysis", "vuln_report",
+    "tech_decision", "sprint_report", "evolution_report", "changelog",
+    "reflexion_lesson", "skill_audit", "report", "knowledge_distill", "memory_store",
+})
+
 _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker", "task_spec",
                                        "feedback", "code_review", "verification",
                                        # scheduler: 定时器心跳，206 条中 196 条同文（95% 重复），
@@ -38,7 +52,13 @@ _SYSTEM_CATEGORIES = frozenset({"architecture", "notice", "ccs_health", "blocker
                                        # （"[deploy] wf_x 产出已部署"、"CODE_FIX: wf_x/sN ... 已落地并验证"），
                                        # 不是待办请求。缺它导致 24h 内 99 条 [deploy] 回报被 mint 成新任务
                                        # 派给 maintainer（maintainer→maintainer 自喂环 80 实例）。
-                                       "scheduler", "session_log", "monitor_audit", "code_fix"})
+                                       #
+                                       # security_audit（2026-10-19 补）：同 code_fix 的形态，承载的是
+                                       # **已完成事件**的回报（"security_audit_scan/s2-complete —
+                                       # 漏洞分析完成"）。“分析”在内容词表里 → 被判成待办请求。
+                                       # 实测 24h 内 39 条此类回报被 mint 成任务，均因 client.py
+                                       # 的 Gate 顺序缺陷落库即孤儿（task_aff8dbb4 等）。
+                                       "scheduler", "session_log", "monitor_audit", "code_fix", "security_audit"}) | _OUTPUT_CATEGORIES
 _NON_TASK_CATEGORIES = frozenset({"notice", "verification+notice", "heartbeat", "metrics", "ccs_send_fallback"})
 SYSTEM_CATEGORIES = _NON_TASK_CATEGORIES  # 向后兼容别名
 

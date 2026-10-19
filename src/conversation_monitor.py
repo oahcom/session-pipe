@@ -129,7 +129,11 @@ _SHELL_SIGNATURES: dict[str, list[str]] = {
         r"\bnano .*\.(json|yaml|yml|conf|env)",
     ],
     "edit_persona_json": [r"persona_.*\.json"],
-    "write_other_workspace": [r"/home/[^/]+/ccs-workspaces/(?!engineer)[^/]+/"],
+    # 角色豁免必须按**调用角色**动态注入：静态写死 (?!engineer) 只免了 engineer，
+    # 而 write_other_workspace 实际只配给 pg（session-launcher/src/routing/roles.py:54）
+    # —— pg 读写自己的 ccs-workspaces/pg/ 每次都命中 → 判越界 → 注入撤销指令耗掉
+    # 一轮（实测 5 角色收到误报）。{_self} 在 check_violations 里替换为角色名。
+    "write_other_workspace": [r"/home/[^/]+/ccs-workspaces/(?!{_self})[^/]+/"],
 }
 
 # ── 信号 1：步骤完成 ──
@@ -149,8 +153,20 @@ _IDLE_PATTERNS = [
     r"(无.*任务.*待办)",
     r"(休眠|idle|Idle)",
 ]
-# 排除（有意义的等待 → 不是空闲）
-_EXCLUDE_IDLE = [r"waiting for", r"等待.*回复|等待.*确认|等待.*修复|waiting.*coordinator"]
+# 排除（有意义的等待 / 外部阻塞 → 不是角色空闲）。
+# API 限流类：9router 免费额度耗尽后角色 pane 只剩 429/403 错误文案，
+# 无新内容 → 旧逻辑判 idle → 连续 5 次触发 cancel_step，把「等配额恢复」
+# 误判成「角色卡死」而掐断步骤（实测 29 个步骤被 tmux 信号取消，
+# 其中 WL-dev_with_collab 15 台、maintainer_health_monitor 8 台）。
+# 角色仍在消耗算力（pane 有 ↓Nk tokens 计数器）也一并排除。
+_EXCLUDE_IDLE = [
+    r"waiting for",
+    r"等待.*回复|等待.*确认|等待.*修复|waiting.*coordinator",
+    r"Rate limit exceeded|rate.?limit",
+    r"API Error: 4\d\d",
+    r"Please run /login",
+    r"↓\s*\d+(\.\d+)?k tokens",
+]
 
 # ── 内容 hash 去重（pane 无变化时跳过解析）──
 _last_hash: dict[str, str] = {}
@@ -244,7 +260,10 @@ def parse_conversation_signals(pane_text: str, role: str) -> ConversationSignal:
         _cmd = line.split("$", 1)[1]
         for op_type in forbidden_ops:
             for pat in _SHELL_SIGNATURES.get(op_type, []):
-                for m in re.findall(pat, _cmd, re.IGNORECASE):
+                # {_self} 按调用角色展开，使 workspace 禁区豁免"本角色自己"；
+                # re.escape 防止角色名含正则元字符时改变语义。
+                _pat = pat.replace("{_self}", re.escape(role))
+                for m in re.findall(_pat, _cmd, re.IGNORECASE):
                     found.append(f"{op_type}: {m}")
     if found:
         sig.violation_found = True

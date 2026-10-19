@@ -269,6 +269,11 @@ _TAUTOLOGY_PATTERNS = (
     "echo \"PASS\"", "echo 'PASS'", "echo PASS",
     "echo \"pass\"", "echo 'pass'", "echo pass",
     "exit 0", "exit(0)", "import sys; print",
+    # 2026-10-17 实测：persona eval_criteria 用这些命令当"验证"，
+    # 输出与角色职责无关（Python 版本 / sqlite 版本 / 文件计数），
+    # 任何角色跑一句就通过质量门禁 → 假成功。
+    "print(\"DONE\")", "print('DONE')", "print(\"done\")", "print('done')",
+    "sys.version_info", "sqlite3.sqlite_version",
 )
 
 
@@ -496,22 +501,9 @@ def _is_critical(criterion: str) -> bool:
 from eval_shared_loader import _load_roles
 
 
-def run_eval_check(role_filter: str | None = None) -> dict:
-    """主入口：加载角色 JSON，按权重轮询挑 1-2 个，
-    对每个执行前 3 条 eval_criteria。
-    权重 = 该角色可执行 eval 数量（含"验证:"的 criterion 数），最少 1。
-    参数 role_filter: 只检查指定角色名。
-    返回 {checked, passed, failed, skipped, notices, blockers, avg_score}。
-    avg_score 为 0-1 连续均分 (DeepEval 范式), 不影响 passed/failed 计数。
-    """
-    roles = _load_roles()
-    if not roles:
-        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
-
-    # 按角色名过滤
-    if role_filter:
-        filtered = [r for r in roles if r["name"] == role_filter]
-        # ── Real evaluation checkers (replacing tautological verification) ──
+# 注：此处原有第二个 `run_eval_check` 定义（504-519，含完整 docstring），被 :1031 的
+# 同名定义在 import 时覆盖而永不执行 —— docstring 反而留在死副本上，说明后续编辑
+# 改错了副本。已删，docstring 移至活版本。
 
 class OutputSemanticChecker:
     """产出语义检查器：检测模板桩/空洞产出。
@@ -888,10 +880,27 @@ class TrajectoryQualityChecker:
                 continue
             missing = [k for k in req if k not in inp]
             if missing:
-                findings.append({
-                    "issue": "schema_missing_keys", "tool": name,
-                    "id": c["id"], "missing": missing,
-                })
+                # 自纠判定：模型偶发用错键名（实测 scout 3 次把 file_path 写成
+                # path，Claude Code 运行时即返回 InputValidationError），收到报错后
+                # 它立刻用正确键名重试了同样三个文件并成功。此时判整轨 FAIL 无意义
+                # ——轨迹已恢复。判据只统计"是否发生过"，不看"是否已自纠"，于是
+                # 74 分钟前的一次偶发错误会在 23:21 仍触发 blocker/notice 喂给
+                # monitor（102 个 session 累计扫描，永久追责）。
+                # 与同文件 orphan_call 的 tail_use_ids 排除同范式（那里排除
+                # "会话边界"误报，这里排除"已自纠"误报）。
+                # 保守性：仅当**同工具**在此后存在一次带全必需键的调用才豁免；
+                # 否则仍报出（真·不会用该工具的角色照样被抓）。
+                _selfhealed = any(
+                    (o["name"] or "") == name
+                    and o["order"] > c["order"]
+                    and all(k in (o["input"] or {}) for k in req)
+                    for o in calls if o["kind"] == "use"
+                )
+                if not _selfhealed:
+                    findings.append({
+                        "issue": "schema_missing_keys", "tool": name,
+                        "id": c["id"], "missing": missing,
+                    })
 
         # ── 2. 盲改 + 3. 孤儿调用 + 4. 抖动循环 ──
         read_files: set[str] = set()
@@ -1007,6 +1016,13 @@ class TrajectoryQualityChecker:
 
 
 def run_eval_check(role_filter: str | None = None) -> dict:
+    """主入口：加载角色 JSON，按权重轮询挑 1-2 个，对每个执行前 3 条 eval_criteria。
+
+    权重 = 该角色可执行 eval 数量（含"验证:"的 criterion 数），最少 1。
+    参数 role_filter: 只检查指定角色名。
+    返回 {checked, passed, failed, skipped, notices, blockers, avg_score}。
+    avg_score 为 0-1 连续均分 (DeepEval 范式), 不影响 passed/failed 计数。
+    """
     roles = _load_roles()
     if not roles:
         return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}

@@ -23,6 +23,11 @@ class FakeEngine(StepHandlerMixin):
         self._consumed_exit_ids = set()
         self._bb = MagicMock()  # Blackboard mock（timeout 路径依赖）
         self._workflows = MagicMock()  # step_handler 末位值门禁访问 self._workflows
+        # 显式声明无活跃子流：_tick 的 idle/violation cancel 分支都带
+        # `and not self._has_live_subflow(...)` 守卫（bus #407499 父步误杀子流修复）。
+        # 不覆写则 MagicMock 返回 truthy → 永远走 else，cancel_step 永不调用，
+        # 测试结论与生产逻辑相反（2 例假失败）。本测试组语义即"无子流"路径。
+        self._has_live_subflow = MagicMock(return_value=False)
 
     def _fill_prompt_vars(self, prompt, step, wf_name, title, desc, results,
                           prev_step_id=""):

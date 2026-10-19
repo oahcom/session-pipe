@@ -26,8 +26,15 @@ SYSTEM_PREFIXES = ("CLAUDE.md.", "TASKS.md.")
 def _is_system_file(name: str) -> bool:
     return name in SYSTEM_FILES or any(name.startswith(p) for p in SYSTEM_PREFIXES)
 
-# 产出收益判定不依赖部署路径：文档类产出留在 workspace 即为交付
+# 评估结果幂等守卫：task_id → 上轮评估签名。
+# WHY: 本函数由 daemon 每 10s 调用，而 bus 写入是 ON CONFLICT(t) DO UPDATE（刷新 ts），
+# 重复写会把已沉底的旧 fact 顶回 unread 列表，实测单条 fact 被写 1091 次。
+# 已知边界：签名存进程内存，daemon 重启后首轮会对窗口内任务重写一次
+# （实测 24h 内非计划重启 0 次，代价是可接受的几次重复写）。
+# 若将来重启频率上升，改用 workflow_logs 表存签名（action='evidence_assessed'）。
+_LAST_ASSESSMENT: dict[str, str] = {}
 
+# 产出收益判定不依赖部署路径：文档类产出留在 workspace 即为交付
 
 def _output_files(role, t_created=None, t_updated=None):
     """角色 workspace 下的真实产出文件（排除系统文件、目录、空文件）。
@@ -213,15 +220,28 @@ def _evaluate_with(db):
     # 汇总写 bus
     _bus = BUS_CLIENT
     for a in assessments:
-        try:
-            subprocess.run(
-                [str(_bus), "write", "feedback",
-                 f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
-                 "--evidence", json.dumps(a),
-                 "--src", "task_evidence"],
-                capture_output=True, timeout=10)
-        except Exception:
-            pass
+        # 评估签名未变则跳过 feedback 写入：任务完成后 1h 内每 tick 重评估结果完全相同，
+        # 重复写不产生新信息，只把旧 fact 的 ts 刷新、重新顶进 unread。
+        # 注意：只跳过 bus feedback，不跳过下方的 negative 复盘分支——
+        # 复盘与 TASKS.md 回写自带幂等（_append_role_feedback 按 task_id 去重），
+        # 被 continue 连带跳过会让角色的学习信号永久丢失。
+        _sig = f"{a['quality']}|{a['output_count']}|{a['output_size']}|{a['evidence_type']}"
+        _already_reported = _LAST_ASSESSMENT.get(a["task_id"]) == _sig
+        # 签名只在写入**成功后**落账（codex P1-1）。先记后写会让瞬时失败
+        # （bus 锁冲突/超时）在 1h 窗口内永不重试——原实现每 tick 重写恰好
+        # 有自愈性，守卫不能把自愈性一并消掉。
+        if not _already_reported:
+            try:
+                _r = subprocess.run(
+                    [str(_bus), "write", "feedback",
+                     f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
+                     "--evidence", json.dumps(a),
+                     "--src", "task_evidence"],
+                    capture_output=True, timeout=10)
+                if _r.returncode == 0:
+                    _LAST_ASSESSMENT[a["task_id"]] = _sig
+            except Exception:
+                pass
         # R2-2 self-reflection（Reflexion 洞察 3）: 无产出任务写 code_fix 根因总结，
         # 供后续 session 消费避免同类错误重复（失败后语言化复盘 > 纯重试）
         if a["quality"] == "negative":
@@ -237,18 +257,38 @@ def _evaluate_with(db):
                     ],
                     "quality": "negative",
                 }
-                subprocess.run(
-                    [str(_bus), "write", "code_fix",
-                     f"[self-reflect] 任务《{a['title'][:40]}》无产出 — 需根因排查",
-                     "--evidence", json.dumps(_reflect, ensure_ascii=False),
-                     "--src", "task_evidence"],
-                    capture_output=True, timeout=10)
+                # self-reflect 与 feedback 各写一条，但共享同一签名。
+                # 必须用**本轮开始时**的 _already_reported 判断，不能用
+                # _LAST_ASSESSMENT 现查 —— 上面的 feedback 分支刚把自己落账，
+                # 现查会恒为 True 而永远跳过 self-reflect（实测回归）。
+                if not _already_reported:
+                    _r2 = subprocess.run(
+                        [str(_bus), "write", "code_fix",
+                         f"[self-reflect] 任务《{a['title'][:40]}》无产出 — 需根因排查",
+                         "--evidence", json.dumps(_reflect, ensure_ascii=False),
+                         "--src", "task_evidence"],
+                        capture_output=True, timeout=10)
+                    # 失败则注销签名，让下一轮两条一起重试
+                    if _r2.returncode != 0:
+                        _LAST_ASSESSMENT.pop(a["task_id"], None)
+                # TASKS.md 回写无条件执行：它自身按 task_id 幂等，
+                # 且上一轮可能因文件缺失失败，早退会丢掉学习信号。
                 # 回写评分信号到 role TASKS.md（闭环补全 —— 评分→prompt学习）
                 # WHY: evaluate_and_feedback 原仅写 bus，role 无法从 negative 教训学习。
                 # CLAUDE.md 禁止回写 CLAUDE.md，仅 TASKS.md 足矣。
                 _append_role_feedback(a["role"], a["title"][:60], a["task_id"])
             except Exception:
                 pass
+
+    # 修剪只按 1h 窗口，不按本轮 LIMIT 结果集：窗口内实测 13 个 completed 任务
+    # 竞争 LIMIT 10 槽位，排序翻转时被挤出的任务签名会被删，下一轮回到窗口
+    # 又重写一遍。实测同一 fact 每 tick 重写一发（写放大 88.6×，R42）。
+    # 按窗口修剪后：落出 TOP10 的任务保留签名，回来时命中 _already_reported。
+    _window_ids = {r[0] for r in db.execute(
+        "SELECT task_id FROM tasks WHERE status='completed' AND updated_at > ?",
+        (_cutoff,)).fetchall()}
+    for _k in [k for k in _LAST_ASSESSMENT if k not in _window_ids]:
+        del _LAST_ASSESSMENT[_k]
 
     return {"evaluated": len(assessments), "assessments": assessments}
 

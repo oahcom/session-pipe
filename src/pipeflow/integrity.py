@@ -217,10 +217,16 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     # {task_definition}/{topic}/{acceptance_criteria} 为 JSON 模板源可能出现的同义变量）。
     # 每个都以 title 兜底：tasks.description 91% 为空（616/675 实测），
     # 只填 description 会让绝大多数提醒仍带未替换变量并被守卫拦下。
+    # 末级兜底用 prompt_template 原文摘要而非固定字串：两个 bypass 调用点用
+    # SimpleNamespace 构造 run/step，**不传 context/workflow_name/title**
+    # （engine.py:858、wf_lifecycle.py:208），前四级全部落空 —— 退回固定字串会让
+    # 提醒变成"需求：请针对 步骤 输出 步骤"，发得出但零信息量。模板里带着真实
+    # 任务语义（【做什么】【怎么做】），截断一段远比占位符有用。
+    _tpl_fb = " ".join((getattr(step, "prompt_template", "") or "").split())[:120]
     _title_fb = (_ctx.get("title") or _ctx.get("description")
                  or _ctx.get("task_title")
                  or getattr(run, "workflow_name", "") or getattr(step, "title", "")
-                 or "步骤")
+                 or _tpl_fb or "未知任务")
     for _var, _val in (
         ("{description}", _ctx.get("description") or _title_fb),
         ("{title}", _title_fb),

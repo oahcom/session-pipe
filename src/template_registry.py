@@ -19,6 +19,18 @@ from paths import WORKFLOWS_DB as DB_PATH, SESSION_ROLES_PERSONAS, HERMES_WORKFL
 
 LOGGER = logging.getLogger("template_registry")
 
+# 合法 bus 分类：从权威白名单导入，不在本模块复制一份。
+# WHY: WL-02/需求流转 曾用 exit_condition.bus_category="review"、WL-01 用 "design"，
+# 二者都不在 CATEGORIES 中 → bus_client 拒绝角色写入该类消息 → exit 永远匹配不到，
+# 步骤只能等超时甚至永久卡死（实测 wf_65d679197b/s2 卡 60min）。此前无任何校验
+# 拦得住这类笔误，只能等运行时暴露。
+try:
+    from bus_protocol import CATEGORIES as _BUS_CATEGORIES
+    _LEGAL_BUS_CATS: frozenset | None = frozenset(_BUS_CATEGORIES.keys())
+except Exception as _e:  # noqa: BLE001 - 白名单不可得时降级放行，绝不阻断注册
+    LOGGER.warning("bus_protocol 不可用，跳过 bus_category 合法性校验: %s", _e)
+    _LEGAL_BUS_CATS = None
+
 # ── 有效角色列表（从 persona JSON 动态加载） ──────
 _ROLE_REGISTRY: list[str] = []
 
@@ -176,6 +188,7 @@ def _validate_schema(template: dict, allow_minimal: bool = False) -> ValidationR
                     report.add_error(f"steps[{i}] 缺少 exit_condition")
                 if not step.get("prompt_template"):
                     report.add_error(f"steps[{i}] 缺少 prompt_template")
+                _validate_bus_categories(step, i, report)
         return report
 
     # 完整 Schema：检查所有必填字段
@@ -225,6 +238,7 @@ def _validate_schema(template: dict, allow_minimal: bool = False) -> ValidationR
     else:
         for i, step in enumerate(steps):
             _validate_step(step, i, report)
+            _validate_bus_categories(step, i, report)
 
     # max_duration_hours
     mdh = template.get("max_duration_hours")
@@ -359,10 +373,44 @@ def _validate_step_content(step: dict, index: int, report: ValidationReport):
     # ## 完成 中的 bus_category 与 exit_condition 一致
     # 只检查 '## 完成' 段之后的 bus 写入（步骤中途的中间产出不算 exit）
     _done_pt = pt.partition("## 完成")[2] or pt
-    _wc = __import__("re").search(r'写 bus cat=(\w+)', _done_pt)
+    # 允许 "写" 与 "cat=" 之间存在 "入"/"到" 等动词后缀：实际模板写的是
+    # "写入 bus cat=X"，旧正则 r'写 bus cat=' 恒不匹配 → 本检查自建立起从未
+    # 生效过（死码）。用 \S{0,2} 吸收后缀，同时保留 "写 bus cat=" 形态。
+    _wc = re.search(r'写\S{0,2}\s+bus\s*cat=(\w+)', _done_pt)
     _ec = step.get("exit_condition", {}).get("bus_category", "")
     if _wc and _ec and _wc.group(1) != _ec:
         report.add_error(f"steps[{index}] ## 完成 writes bus cat='{_wc.group(1)}' but exit_condition expects '{_ec}'")
+
+    # 非法分类的阻断由 _validate_bus_categories 在结构层完成（register/validate/
+    # engine 加载三条路径都走结构层；质量层只打 warning，拦不住）。
+
+
+def _validate_bus_categories(step: dict, index: int, report: ValidationReport):
+    """校验步骤声明的 bus 分类真实可写（结构层，阻断注册/加载）。
+
+    检查 exit_condition 与 track 两处。非法分类 = 角色写不出该类消息 →
+    exit 永远匹配不到 → 步骤卡死（实测 WL-02/s2 用 'review' 卡 60min）。
+    放在结构层而非质量层：这是运行期必然故障，不是文体建议。
+    """
+    if _LEGAL_BUS_CATS is None:
+        return
+    for _field, _path in (("exit_condition", "exit_condition.bus_category"),
+                          ("track", "track.bus_category")):
+        _decl = step.get(_field)
+        if not isinstance(_decl, dict):
+            continue
+        _cat = _decl.get("bus_category")
+        if _cat and _cat not in _LEGAL_BUS_CATS:
+            report.add_error(
+                f"steps[{index}].{_path}='{_cat}' 不是合法 bus 分类，角色无法写入该类消息，"
+                f"该步骤将永远无法完成（见 bus_protocol.CATEGORIES）")
+    # 注意：不校验 wait_roles 的类型。引擎已有专门处理（engine.py:300 "wait_roles
+    # 结构非法，丢弃"），把非法类型降级为丢弃该字段而非拒绝模板；在此重复校验
+    # 会让模板整体不可加载，比原行为更糟（tests/test_collab_modes 有回归守卫）。
+    #
+    # wait_roles 的**语义**风险（声明了某角色，但该角色从不写 exit 要求的分类 →
+    # 永久卡死，实测 dev_with_collab/s4 令 75 个实例 0 完成）无法在结构层静态判定，
+    # 属模板作者责任，不在此处拦。
 
 
 def _validate_step(step: dict, index: int, report: ValidationReport):

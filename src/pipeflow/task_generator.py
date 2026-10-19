@@ -59,6 +59,27 @@ def _is_test_harness_template(template_id: str | None) -> bool:
     return _strip_wf_prefix(template_id).startswith(_TEST_HARNESS_PREFIXES)
 
 
+# 子链驳回判据。子链末步驳回不拦（wf_lifecycle.py:302「末步仍不拦」是有意设计：
+# 无 next_step 可退回、也无返工承接方，硬拦即静默卡死），于是子链仍报 completed
+# → 本文件回流处把父步标 completed → 驳回信号在父链彻底丢失。
+# 实测 3 例（wf_sub_9e3d0b017f29 / wf_sub_9b5329785ab9 / wf_sub_fda79b387821）：
+# 子链 s1 文案为 REJECTED / CHANGES_REQUESTED，父链 wf_5412acef35 照常推进到 s5/s6。
+# 词表与 wf_lifecycle.py:312、lifecycle/manager.py 的门禁保持三方一致。
+_REJECT_KEYWORDS = ("changes_requested", "rejected", "需修复", "回退",
+                   "未通过", "not_approved", "驳回")
+
+
+def _subflow_verdict_rejected(sr: dict) -> bool:
+    """子链 step_results 的 exit_messages 是否含驳回文案（即其 completed 掩盖了驳回）。"""
+    _txt = " ".join(
+        str(m.get("text", ""))
+        for _sd in sr.values() if isinstance(_sd, dict)
+        for m in (_sd.get("exit_messages") or []) if isinstance(m, dict)
+    ).lower()
+    return any(k in _txt for k in _REJECT_KEYWORDS)
+
+
+
 class TaskGeneratorMixin:
     """WorkflowEngine 的任务生成 mixin。"""
 
@@ -101,9 +122,20 @@ class TaskGeneratorMixin:
                             (ts, time.time(), task_id))
                         conn.commit()
                 # 子工作流完成 → 推进父工作流
+                # 子链完成 → 推进父链。这是唯一的回流通道，它此前用
+                # `template_id IN (SELECT template_id FROM workflow_templates)` 做过滤，
+                # 而两侧键空间不一致：子链实例写的是**裸名**（tgt_step.subflow_template，
+                # 见 wf_lifecycle._subflow_takeover），而 workflow_templates 里注册的是
+                # **WF- 前缀名**（engine 启动 upsert 时 `tid = 'WF-' + tid`）。
+                # 裸名不在子查询结果里 → 6/7 条子链被静默排除 → 子链建得出、也跑得动，
+                # 但父链永远收不到完成信号（实测 food_chain_loop s2 是稳定死点，
+                # 历史 12 个实例 s2 从未突破，唯一能做到 s7 的是旧模板版本）。
+                # 修法：两侧都剥掉 WF- 前缀再比，兼容两种命名，不改写入端（存量实例
+                # 已经是裸名，改消费端可同时覆盖存量与新增）。
                 for _sub_row in conn.execute(
                     "SELECT wi.instance_id, wi.current_step_id, wi.step_results FROM workflow_instances wi "
-                    "WHERE wi.status='running' AND wi.template_id IN (SELECT template_id FROM workflow_templates)"
+                    "WHERE wi.status='running' AND REPLACE(wi.template_id,'WF-','') IN "
+                    "(SELECT REPLACE(template_id,'WF-','') FROM workflow_templates)"
                 ).fetchall():
                     _sr = json.loads(_sub_row["step_results"] or "{}")
                     for _step_id, _sdata in _sr.items():
@@ -123,6 +155,25 @@ class TaskGeneratorMixin:
                                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                                     (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
                                 conn.commit()
+                                # 子链完成但其末步文案是驳回 → 父步「完成」是假象。
+                                # 不改完成语义（wf_lifecycle.py:302 有意不拦末步，硬拦会
+                                # 制造静默卡死），只记账 + 写 bus 让缺失可被外部观测，
+                                # 与同文件 _forced 子链超时的做法一致。
+                                if _subflow_verdict_rejected(_sr):
+                                    try:
+                                        self._bb.write(
+                                            "blocker",
+                                            f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                            f"子链 {_sf[:12]} 末步驳回，父步完成不可信",
+                                            src="workflow_engine",
+                                            evidence=f"子链 {_sf} status={_sub_status['status']} "
+                                                     f"但 exit_messages 含驳回文案，父链仍按 completed 推进。"
+                                                     f"该步产出未通过审查，请核查是否需要返工。")
+                                        LOGGER.warning(
+                                            "子链 %s 末步驳回但报 completed → 父 %s/%s 完成不可信",
+                                            _sf[:12], _sub_row["instance_id"][:12], _step_id)
+                                    except Exception as _bwe:
+                                        LOGGER.debug("subflow-verdict blocker 写入失败: %s", _bwe)
                                 # 推进父工作流（advance 内部自带锁内 DB + 锁外 subprocess）
                                 _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
                                 if _tmpl:
@@ -132,6 +183,34 @@ class TaskGeneratorMixin:
                                             lambda wfid=_sub_row["instance_id"], tpl=_tmpl["template_id"], sid=_step_id, sr=_sr:
                                                 self._advance_production_wf(wfid, lm, tpl, sid, sr)
                                         )
+                            elif _sub_status and _sub_status['status'] in ('failed', 'cancelled'):
+                                # 子链建不出来/跑挂了 → 父步永远等不到回流信号，
+                                # 只能熬到 exit_condition 超时兜底。实测 wf_e50bbe5664
+                                # 三个子链全 failed，父链 running/s3 毫无感知。
+                                # 不改推进语义（与上面驳回分支同原则：硬推/硬停都会制造
+                                # 新的静默卡死），只记账 + 写 bus 让「卡住」可被外部观测。
+                                # 幂等：只在首次检测到时落库/写 bus，否则每 tick 重写 = bus 洪泛。
+                                if not _sdata.get("subflow_failed_at"):
+                                    _sdata["subflow_failed_at"] = time.time()
+                                    _sdata["subflow_failed_status"] = _sub_status["status"]
+                                    conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                        (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                                    conn.commit()
+                                    try:
+                                        self._bb.write(
+                                            "blocker",
+                                            f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                            f"子链 {_sf[:12]} {_sub_status['status']}，父步空等",
+                                            src="workflow_engine",
+                                            evidence=f"子链 {_sf} status={_sub_status['status']}，"
+                                                     f"父步 {_step_id} 收不到完成回流，将熬到超时兜底。"
+                                                     f"需人工确认返工或取消。")
+                                        LOGGER.warning(
+                                            "子链 %s %s → 父 %s/%s 空等（已写 blocker）",
+                                            _sf[:12], _sub_status["status"],
+                                            _sub_row["instance_id"][:12], _step_id)
+                                    except Exception as _bwe:
+                                        LOGGER.debug("subflow-failed blocker 写入失败: %s", _bwe)
 
                 conn.commit()
                 self._check_anomalies(conn, deferred)

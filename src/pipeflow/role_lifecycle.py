@@ -20,6 +20,10 @@ from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 
 LOGGER = logging.getLogger("workflow.engine")
 
+# 工作流活跃状态：与 engine.py 的 _count_active 同集。用非活跃判据清理
+# TASKS.md 主任务块时，"已终态"与"不在库"等价 —— 两者都不是活跃占用。
+_ACTIVE_WF_STATUSES = ("pending", "running", "step_done_ready")
+
 # kick-stalled 重推冷却（秒）：原实现每个 daemon tick 都重推，实测 33 分钟
 # 398 次（约 5s 一次），把同一 prompt 灌满角色队列 —— pane 显示
 # "Press up to edit queued messages"，角色被自己的重复指令淹没。
@@ -433,11 +437,26 @@ class RoleLifecycleMixin:
                     _env = _os.environ.copy()
                     _env.pop("VIRTUAL_ENV", None)
                     _env.pop("CONDA_PREFIX", None)
-                    _engine_mod._sp.run(
+                    _st = _engine_mod._sp.run(
                         ["python3", str(_CCS_CLI), "start", role, "--no-attach",
                          "--drive", "infinite", "--no-auto-send"],
                         capture_output=True, timeout=60, env=_env
                     )
+                    # ccs start 的失败是**静默**的：返回码非 0 且 stderr/stdout 说明
+                    # 原因（实测 writer：swap 仅剩 0MB，跳过启动），但原实现丢弃整个
+                    # 返回值 → 上层只能看到"tmux 没起来"，日志还错报 tmux alive
+                    # → 空转 90s → 排队 14 次 → 子链被回收 → 父链断链。
+                    # 这里把真实原因抬到日志与 blocker，使资源类阻断可被外部观测。
+                    _err = (_st.stderr or _st.stdout or b"").decode("utf-8", "replace")[:300]
+                    if _st.returncode != 0 or "\"success\": false" in _err:
+                        LOGGER.error("_wait_for_role_ready: ccs start %s 失败 (rc=%s): %s",
+                                     role, _st.returncode, _err[:200])
+                        try:
+                            self._bb.write("blocker",
+                                f"[workflow] 角色 {role} 启动失败，工作流无法投递",
+                                evidence=_err, src="workflow_engine")
+                        except Exception:
+                            LOGGER.debug("role-start blocker 写入失败: %s", role)
                     # 等待 tmux session 启动
                     for _ in range(10):
                         time.sleep(1)
@@ -454,7 +473,7 @@ class RoleLifecycleMixin:
 
             # 2. 检查 claude 进程是否存活
             if not self._is_agent_alive(role):
-                LOGGER.info("Role %s tmux alive but no claude process, waiting...", role)
+                LOGGER.info("Role %s 无 claude 进程，等待就绪（若持续则角色未被拉起）", role)
                 time.sleep(5)
                 continue
 
@@ -584,7 +603,11 @@ class RoleLifecycleMixin:
         # integrity 提醒同病：条件含"（简答）请回答"类无法自证的疑问句，且 60s 节流
         # 反复重推 → 同样永久锁定。故：仅真实任务 (force=False) 加前缀。
         import re as _re
-        prompt = _re.sub(r"^/goal(?:\s+|$)", "", prompt, count=1, flags=_re.IGNORECASE)
+        # 剥离**所有**位置的 /goal，不只行首：模板正文自带 /goal 时会被 header 顶到
+        # 中段，`^` 锚定看不见它 → 下面再补一个前缀 → 角色收到双 /goal。
+        # 实测全角色 jsonl 含 >=2 个 /goal 的消息 1239 条（R41, 2026-10-19）。
+        # 全量剥离 + 重新加前缀后，无论调用方传什么形态都恰好一个。
+        prompt = _re.sub(r"(?m)^/goal(?:\s+|$)", "", prompt).lstrip("\n")
         if not force:
             prompt = "/goal " + prompt
         # 第二层防护：拒绝空目标或前缀污染（bus #141691 根因：q/goal [] 导致死循环）
@@ -609,10 +632,16 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} goal 缺完成形态动词，建议补充「输出XX」类描述",
                 evidence=prompt[:200], src="workflow_engine")
         # 自动注入搜索提醒（非 coordinator、非 force 模式才注入）
-        # 让所有角色在每次接收任务时，习惯性地用 WebSearch 查证信息
+        # 让所有角色在每次接收任务时，习惯性地先查证信息。
+        # WHY 用 CLI 而非 WebSearch：角色以 `claude --bare` 启动，该模式不提供
+        # WebSearch/WebFetch 工具。旧文案教一个不存在的工具，实测角色目录 0 次调用、
+        # 213 次自述"没有该工具"，engineer/pg/security_auditor 三方向空转声明 N/A。
+        # 短查询（≤5 词）才有效：长整句（如 8 词以上）实测返回 NO_RESULTS。
         if role != "coordinator" and not force:
-            _search_prefix = "（网络求证）开始工作前先用 WebSearch 搜索1次关键信息：事实数据、最新进展、可行性确认。搜不到的标注为「假设」。\n\n"
-            if not prompt.startswith("（网络求证）"):
+            _search_prefix = ("先查证：`python3 ~/.hermes/scripts/web_search.py \"关键词\" -n 5`"
+                              "（关键词 2-5 词，长查询会 NO_RESULTS）。"
+                              "搜不到的标注为「假设」。\n\n")
+            if not prompt.startswith("先查证："):
                 prompt = _search_prefix + prompt
         # coordinator 只接收真实任务（task_spec 语义），排队/超时/告警升级消息
         # 写 blocker 即可，不 ccs send —— 避免 /goal 前缀注入 coordinator 死锁
@@ -649,29 +678,39 @@ class RoleLifecycleMixin:
                         # 精确边界匹配：只在 "工作流 wf_id /" 格式中匹配，防止 UUID 前缀碰撞
                         # （如 wf_abc123 不误匹配 wf_abc123def456）
                         _wf_in_existing = f"工作流 {wf_id} /" in _existing or wf_id in _existing.split("## 来源")[-1] if "## 来源" in _existing else False
-                        # 僵尸主任务检测：现有 TASKS.md 的主 wf 若不在权威库，说明它早就
-                        # 被清理/从未落库（测试 fixture 残留等），不是"活跃占用"。
-                        # 不加此判据时守卫只追加 [排队] 永不覆盖，而**全库无排空代码** →
-                        # TASKS.md 无限增长、新任务标题/描述永不写入、模板"读 TASKS.md"
-                        # 拿不到正文（scout #372332 次生风险，实测 9 角色 19 条幽灵残留）。
+                        # 僵尸主任务检测：主 wf 不在权威库，或在库但**已终态**，都
+                        # 说明它不是"活跃占用"，允许被新任务覆盖。
+                        # 只判"不在库"时，已完成的主任务会永久占住文件 → 新任务永远
+                        # 只能追加 [排队]，而排队行无任何排空路径 → 无界增长
+                        # （实测 engineer 458 行 / qa 211 行，全部指向终态 wf）。
                         _main_wf = re.search(r"工作流 (wf_[0-9a-f]{12})", _existing)
                         _stale_main = False
                         if _main_wf:
                             _mw = _main_wf.group(1)
                             try:
-                                _stale_main = not self._lifecycle.query(
-                                    "SELECT 1 FROM workflow_instances WHERE instance_id=?", (_mw,))
+                                _row = self._lifecycle.query(
+                                    "SELECT status FROM workflow_instances WHERE instance_id=?",
+                                    (_mw,))
+                                _stale_main = (not _row
+                                               or _row[0]["status"] not in _ACTIVE_WF_STATUSES)
                             except Exception:
                                 _stale_main = False  # 查询失败 → 保守按活跃处理（不覆盖）
                         if (_existing and "工作流任务" in _existing and not _wf_in_existing
                                 and not _stale_main):
-                            # 已有其他工作流的任务文件 → 不覆盖，追加排队标记
-                            LOGGER.info("TASKS.md 防污染: %s 已有其他任务，本任务 %s 排队（不覆盖）", role, wf_id)
-                            tasks_file.write_text(
-                                _existing.rstrip() +
-                                f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",
-                                encoding="utf-8")
-                            _skip_write = True
+                            # 已有其他工作流的任务文件 → 不覆盖，追加排队标记。
+                            # 幂等：引擎每 tick 重推同一步骤，无此守卫则同一 wf 被追加
+                            # 数十行（实测 engineer/scout TASKS.md 各 27 行重复）。
+                            # 尾随空格是必需边界：标记恒为 "{wf}/{step} 待当前任务..."，
+                            # 无空格则 s1 会误命中 s10（实测 step_id 当前止于 s7，尚未触发）。
+                            if f"[排队] 新任务 {wf_id}/{step_id} " in _existing:
+                                _skip_write = True
+                            else:
+                                LOGGER.info("TASKS.md 防污染: %s 已有其他任务，本任务 %s 排队（不覆盖）", role, wf_id)
+                                tasks_file.write_text(
+                                    _existing.rstrip() +
+                                    f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",
+                                    encoding="utf-8")
+                                _skip_write = True
                         elif _stale_main:
                             LOGGER.info("TASKS.md 僵尸主任务 %s 不在权威库，覆盖为新任务 %s",
                                         _main_wf.group(1), wf_id)

@@ -151,15 +151,21 @@ class WorkflowClient:
             if not _candidates:
                 raise ValueError(f"无法为任务 '{title}' 匹配到工作流模板，请显式指定 template_id")
             template_id = _candidates[0]["template_id"]
-        from workflow.gateway import Gate
-        gate = Gate(str(self.db_path) if hasattr(self, 'db_path') and self.db_path else None)
-        gate.validate_create_task(template_id, initiator_role, assignee)
         # assignee 对齐模板首步目标：路由自动创建时 assignee 是"路由消费者"，
         # 而多角色链（如 WL-01: product_architect→pg→reviewer→qa→devops）的
         # 首步目标可能完全不同。错配的实例永远做不了自己那一步，只会堆积。
         # 实测（2026-10-17）：活跃实例 107 个错配 / 48 个正确，其中
         # WL-01 被误派给 devops(42) 和 qa(39) —— 两者完成率均为 0%。
         assignee = self._align_assignee_to_first_step(template_id, assignee)
+        # Gate 必须在对齐**之后**校验：原顺序是先校验旧 assignee、再对齐、再落库、
+        # 最后由 _create_workflow_instance 用新 assignee 二次校验 —— 新值不过闸时
+        # task 已 COMMIT，异常抛出后无人回收，成为永久孤儿。实测 39 条
+        # status='created' 孤儿（task_aff8dbb4 等）全部源于此：推荐器选中裸名
+        # full_dev_pipeline（executors 不含 product_architect），对齐又写回
+        # product_architect → 二次校验必失败。
+        from workflow.gateway import Gate
+        gate = Gate(str(self.db_path) if hasattr(self, 'db_path') and self.db_path else None)
+        gate.validate_create_task(template_id, initiator_role, assignee)
         task_id = self._create_task_impl(title, description, assignee, 0, template_id)
         if parent_task_id:
             # 写入父子关联

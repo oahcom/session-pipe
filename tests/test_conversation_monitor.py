@@ -317,3 +317,26 @@ def test_scan_and_propose_skips_test_persona():
         assert out == [], "测试 persona 不应產出治理提案"
         assert not m_run.called
 
+
+
+def test_write_other_workspace_exempts_self_per_role():
+    """workspace 禁区必须豁免**本角色自己**，而非硬编码单一角色。
+
+    原正则写死 `(?!engineer)`，而 write_other_workspace 实际只配给 pg
+    （session-launcher/src/routing/roles.py:54）→ pg 读写自己的
+    ccs-workspaces/pg/ 每次命中，被判越界，引擎注入撤销指令耗掉一轮。
+    断言：同一路径，本角色不命中、他人命中。
+    """
+    import re as _re
+    from conversation_monitor import _SHELL_SIGNATURES
+    tpl = _SHELL_SIGNATURES["write_other_workspace"][0]
+
+    def hits(role, path):
+        return bool(_re.search(tpl.replace("{_self}", _re.escape(role)), path))
+
+    WS = "/home/administrator/ccs-workspaces/"
+    assert not hits("pg", f"{WS}pg/x.py"), "pg 读写自己的 workspace 不应判越界"
+    assert hits("pg", f"{WS}qa/x.py"), "pg 写他人 workspace 应判越界"
+    assert not hits("engineer", f"{WS}engineer/x.py"), "engineer 读写自己应豁免"
+    assert not hits("maintainer", f"{WS}maintainer/x.py"), "任意角色都该豁免自己"
+    assert hits("maintainer", f"{WS}qa/x.py"), "写他人仍须拦截"

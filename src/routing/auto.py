@@ -7,7 +7,6 @@ Auto Route — 自动感知 bus 新消息并通知下游角色。
 import json
 import sys
 
-# sys.path 由 paths.py 集中管理。list_sentinels 延迟注入 launcher 路径为例外。
 
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
@@ -16,21 +15,6 @@ from reliability import (
 
 
 from routing import router as _rt_mod
-from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
-# 延迟导入 launcher.sentinel（避免模块级循环依赖）
-_list_sentinels = None
-def list_sentinels():
-    """读取 CCS 哨兵列表。延迟导入 sentinel（可能不存在于当前 sys.path）。"""
-    global _list_sentinels
-    if _list_sentinels is None:
-        import importlib
-        # 确保 session-launcher/src 在 sys.path 中
-        _launcher_src = str(_LAUNCHER_SRC)
-        if _launcher_src not in sys.path:
-            sys.path.insert(0, _launcher_src)
-        _sentinel_mod = importlib.import_module("sentinel")
-        _list_sentinels = getattr(_sentinel_mod, "list_sentinels", lambda: [])
-    return _list_sentinels()
 
 
 def poll_unconsumed(category: str | None = None, consumer: str | None = None, instance_id: str = "", limit: int = 100) -> list[dict]:

@@ -348,6 +348,45 @@ def test_fail_open后步骤能推进():
     assert state.complete is False
 
 
+def test_完整性激活分支当前不可达_已知缺陷():
+    """表征测试：锁定"exit 路径可达，但 integrity 激活不可达"这一已知缺陷（R71 根因 B）。
+
+    _integ_activate 嵌在 `if _integ_state.complete` 门内，而 complete 只能由门内
+    advance_index 置真 —— 循环依赖，step_handler.py L492-626 整段不可达。
+    activate() 是 integrity_pending 的唯一写入者，故该字段在生产 DB 恒为 0
+    （实测 88 个 step 有 integrity_reminder_sent_bypass，0 个有 integrity_pending）。
+
+    断言必须同时成立才有意义（缺一即不可证伪）：
+      1. exit 路径确实跑通（exit_messages 已写 + complete_step 被调用）
+         —— 否则 step 根本没走完，pending=False 只是"什么都没发生"的恒真值。
+      2. 同一轮内 pending 仍为 False —— 即真缺陷。
+
+    修好该分支时断言 2 会失败，届时连同本测试一起更新。
+    """
+    from types import SimpleNamespace
+    eng = _build_eng()
+    run = _make_run(step_results={
+        "s1": {"status": "notified", "ts": time.time() - 5,
+               "notified_at": time.time() - 10}
+    })
+    step = _make_step()  # dual_node=False → 若可达应走 integrity 激活分支
+    eng._bb.read.return_value = [
+        SimpleNamespace(id="msg_1", t=f"s1-DONE {run.id}",
+                        ts=time.time(), src="scout")
+    ]
+    eng._tick(run, step)
+
+    # 断言 1：exit 路径可达（证明本轮真的走完了，而非空转）
+    assert run.step_results.get("s1", {}).get("exit_messages"), \
+        "exit 路径未跑通，本测试不可证伪——请检查 mock 的 bus 消息"
+    assert eng._lm.complete_step.called, "exit 匹配后未调用 complete_step"
+
+    # 断言 2：同一轮内 integrity 仍未被激活（缺陷本体）
+    from pipeflow.integrity import load_state
+    assert load_state(run.step_results, "s1").pending is False, (
+        "activate 分支重启了？请更新本测试与 R71 的根因 B 结论")
+
+
 def test_bypass_flag回复后重置():
     """bypass flag 在 reply 后重置（rollback 后二次执行允许重新提醒）。"""
     results = {"s1": {"integrity_pending": True, "integrity_complete": True,

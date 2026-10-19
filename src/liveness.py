@@ -39,8 +39,12 @@ SENTINEL_DIR = Path(os.environ.get("CCS_SENTINEL_DIR", str(Path.home() / ".herme
 # 保证"两处对同一 pane 是否在动"的结论一致。
 PANE_ACTIVE_WINDOW = float(os.environ.get("CCS_PANE_ACTIVE_WINDOW", "300"))
 
-# 活跃步骤状态：与 _is_role_busy 信号2 一致
-_ACTIVE_STEP_STATUS = ("notified", "running", "step_done_ready")
+# 活跃步骤状态：角色正被该步骤占用。step_done_ready 不在其中——它表示
+# 「产出已落盘，等审批」，角色本身已空闲。曾把它算作忙，导致一个等审批的
+# review 步骤锁死整个角色 90 分钟（TTL+grace），同角色其它工作流排队 7~21 次
+# 全部饿死（实测 wf_sub_60e96bbdef28/s4 → product_architect 被锁，
+# wf_3f71a2a78f76 停滞 235 分钟）。
+_ACTIVE_STEP_STATUS = ("notified", "running")
 
 
 def _tmux_has_session(role: str, timeout: float = 3.0) -> bool | None:
@@ -191,12 +195,37 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
         rows = _db_fetch(db_conn,
             "SELECT instance_id, template_id, step_results, assigner, parent_wf_id "
             "FROM workflow_instances WHERE status='running'")
+        # exclude 自身的父链 id：下面要豁免「父链占用同角色」——子链投递时
+        # 父链的同角色步骤正卡在 notified，原单向判据看不见反向，子链被判忙。
+        _exclude_parent = ""
+        if exclude_wf_id:
+            try:
+                _er = _db_fetch(db_conn,
+                    "SELECT parent_wf_id FROM workflow_instances WHERE instance_id=?",
+                    (exclude_wf_id,))
+                _exclude_parent = (_row_get(_er[0], "parent_wf_id", 0) if _er else "") or ""
+            except Exception as _e:
+                _exclude_parent = ""
+                # 静默降级会丢掉反向豁免，表现为「偶发判忙」——难归因。
+                LOGGER.warning("_s4_stepping: 查 %s 的 parent_wf_id 失败，"
+                               "反向豁免失效（保守判忙）: %s", exclude_wf_id[:12], _e)
         for r in rows:
             inst_id = _row_get(r, "instance_id", 0)
             if exclude_wf_id and inst_id == exclude_wf_id:
                 continue
+            # 父子链豁免必须**双向**（原实现只有单向：子链 parent == exclude）：
+            #   (a) 本实例是 exclude 的子链 → 父链投递时不被自己的子链堵
+            #   (b) 本实例是 exclude 的父链 → 子链投递时不被父链堵。实测子链
+            #       wf_sub_f3621 投递 pm/s1 时，父链 wf_e50bb 的 s1 同角色卡在
+            #       notified → 判忙 → 子链投不出 → delivery_blocked（日志
+            #       「send-to-role pm 跳过: 有其他 workflow 在进行中」每 30s 重复）。
+            #       父子同角色的链（WF-product_delivery s1 是 pm，其子链
+            #       pm_requirements 首步也是 pm）必然命中 → 子链机制天然失效。
+            _parent = _row_get(r, "parent_wf_id", 4)
             if str(inst_id or "").startswith("wf_sub_") and _row_get(r, "assigner", 3) == "workflow_engine" \
-                    and (exclude_wf_id and _row_get(r, "parent_wf_id", 4) == exclude_wf_id):
+                    and (exclude_wf_id and _parent == exclude_wf_id):
+                continue
+            if _exclude_parent and inst_id == _exclude_parent:
                 continue
             template_id = _row_get(r, "template_id", 1)
             # workflows 参数：优先用内存 WorkflowDef 缓存（_is_role_busy 委托时传入）。
