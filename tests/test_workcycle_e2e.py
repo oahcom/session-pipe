@@ -208,7 +208,7 @@ def test_handoff_advances_without_confirm(mock_run):
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed", s
     assert s["current_step"] == "s2", f"handoff 应自动推进到 s2, got {s}"
-    assert not eng._lifecycle.get_approval_token(rid, "s1"), \
+    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
         "handoff 不应发放审批密钥"
     _cleanup(d)
 
@@ -288,7 +288,7 @@ def test_review_requires_confirm(mock_run):
 
     s = eng.status(rid)
     assert s["results"]["s2"]["status"] == "step_done_ready", s
-    token = eng._lifecycle.get_approval_token(rid, "s2")
+    token = eng._lifecycle.get_approval_token_raw(rid, "s2")
     assert token, "有独立审批人的 review 必须发放审批密钥"
     assert s["current_step"] == "s2", f"未 confirm 不得推进, got {s}"
     eng._lifecycle.confirm_step(rid, "s2", token=token, approved=True)
@@ -323,7 +323,7 @@ def test_review_self_audit_no_deadlock(mock_run):
 
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed", s
-    assert not eng._lifecycle.get_approval_token(rid, "s1"), \
+    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
         "自审 review 不得发放审批密钥（否则无人消费，卡死 90 分钟）"
     assert s["current_step"] == "s2", f"自审 review 应直接推进, got {s}"
     _cleanup(d)
@@ -361,7 +361,7 @@ def test_rework_chain_first_step_review_no_token(mock_run):
             break
 
     s = eng.status(rid)
-    assert not eng._lifecycle.get_approval_token(rid, "s1"), \
+    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
         "首步 review 无上一步产出可审，不得发给不知情的 reviewer"
     assert s["current_step"] == "s2", f"自审应直接推进, got {s}"
     _cleanup(d)
@@ -392,7 +392,7 @@ def test_review_rejection_keeps_running(mock_run):
     time.sleep(0.1)
     eng.run_once()
 
-    token = eng._lifecycle.get_approval_token(rid, "s1")
+    token = eng._lifecycle.get_approval_token_raw(rid, "s1")
     ok = eng._lifecycle.confirm_step(rid, "s1", token=token, approved=False,
                                       reason="no good")
     assert not ok

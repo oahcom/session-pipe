@@ -411,6 +411,26 @@ class WorkflowClient:
         self._log(wf_id=wf_id, action="step_confirmed" if approved else "step_rejected",
                   detail=f"{step_id} by {self.role}: {reason}")
 
+    def pull_approval(self, wf_id: str, step_id: str) -> dict:
+        """审批人拉取自己的审批密钥（推送失败时的唯一可用路径）。
+
+        bus #427318：`ccs send` 因「角色思考中」失败时，降级写 bus 的 token 被
+        脱敏成 ***，审批人拿不到钥匙 → 只能等 TTL+30min 自动放行，闸门失效。
+        本接口让审批人用 `wf -r <role> approval <wf_id> <step_id>` 自行取回。
+        鉴权在 LifecycleManager.get_approval_token(requester=self.role) 内 fail-closed。
+        """
+        from lifecycle.manager import LifecycleManager
+        lm = LifecycleManager(role=self.role, db_path=self.db_path)
+        try:
+            token = lm.get_approval_token(wf_id, step_id, requester=self.role)
+            if not token:
+                return {"ok": False, "error": "该步骤当前无可用审批密钥"
+                        "（已消费 / 已过期 / 状态已推进）"}
+            return {"ok": True, "token": token,
+                    "ttl_remaining": lm.approval_ttl_remaining(wf_id, step_id)}
+        finally:
+            lm.close()
+
     def _sync_task_from_workflows(self, task_id: str):
         from workflow.sync import sync_task_status
         sync_task_status(self._conn, task_id)

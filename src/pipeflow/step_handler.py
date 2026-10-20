@@ -165,6 +165,37 @@ def _bump_violation_count(state: dict, commands: list) -> int:
 class StepHandlerMixin:
     """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _check_exit。"""
 
+    # 首次提醒不早于签发后 2 分钟，避免与首次投递撞车。
+    _NUDGE_BACKOFF_SEC = (120, 300, 600, 1200, 2400)
+
+    def _nudge_within_ttl(self, run, step, token: str, ttl: float):
+        """TTL 内的退避提醒（bus #427435/R04）。
+
+        每档只推一次，档位由「签发至今」的跨度决定。用 step_results 里的
+        nudges_sent 计数而不是内存状态：daemon 重启后计数不丢，不同 tick 的
+        run 对象也不共享内存。
+        只在 TTL 内推 token；TTL 外由 _nudge_assigner 继续负责。
+        """
+        # 计数一律从 DB 读：run.step_results 是 tick 开头的旧快照，用它会让
+        # 本 tick 刚写的 nudges_sent 在下一 tick 读不到（同 wf_rw_46e42f725e74
+        # 的旧快照覆写问题）——退避退化成每 tick 一次。
+        _db = self._lifecycle._parse_results(self._lifecycle._get_wf_unsafe(run.id))
+        _sd = _db.get(step.id) or {}
+        sent = int(_sd.get("nudges_sent") or 0)
+        if sent >= len(self._NUDGE_BACKOFF_SEC):
+            return
+        # 签发时刻优先取落库值；老数据没有该字段时按 1h 有效期反推。
+        _issued = float(_sd.get("approval_issued_at") or (ttl - 3600))
+        age = time.time() - _issued
+        if age < self._NUDGE_BACKOFF_SEC[sent]:
+            return
+        self._nudge_assigner(run, step, token)
+        _db.setdefault(step.id, {})["nudges_sent"] = sent + 1
+        self._lifecycle.execute(
+            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+            (json.dumps(_db, ensure_ascii=False), run.id))
+        self._lifecycle.commit()
+
     def _nudge_assigner(self, run: WorkflowRun, step: Step, token: str):
         """审批超时保护：把审批请求重新推给 assigner 角色，唤醒它审批。
 
@@ -1042,7 +1073,7 @@ class StepHandlerMixin:
                 if _auto_advance:
                     # 豁免模板：沿用原 daemon 自动推进（维持自治闭环）
                     try:
-                        _token = self._lifecycle.get_approval_token(run.id, step.id)
+                        _token = self._lifecycle.get_approval_token_raw(run.id, step.id)
                         if _token:
                             self._lifecycle.confirm_step(run.id, step.id, token=_token,
                                                           approved=True, reason="daemon auto-advance")
@@ -1053,7 +1084,7 @@ class StepHandlerMixin:
                     return
                 # 非豁免：等角色审批。超时处理 = 重新拉起审批人，而非静默自动通过。
                 try:
-                    _token = self._lifecycle.get_approval_token(run.id, step.id)
+                    _token = self._lifecycle.get_approval_token_raw(run.id, step.id)
                     if not _token:
                         return  # 无 token（如系统角色发起、无审批人）→ 保持现状
                     _db_results = self._lifecycle._parse_results(
@@ -1080,6 +1111,14 @@ class StepHandlerMixin:
                         self._sync_step_results(run.id, run.step_results)
                         return
                     # 第一阶段超时（TTL 过期但未过 grace）：重新把审批请求推给审批人，唤醒它响应
+                    # TTL 内也要重推：只等过期才推 = 整个 1 小时有效窗口内
+                    # 审批人无任何提醒，TTL 一到就只剩 30min grace，实际等于
+                    # 自动放行（bus #427435/R04：13 个已完成 s4 中 8 个恰在
+                    # ttl+30.0~30.2min 被 fallback 通过，人未参与）。
+                    # 退避排程 2/5/10/20/40min 后各推一次，避免 10-17 那种
+                    # 44 分钟 33 次的刷屏。
+                    if _ttl > 0 and time.time() <= _ttl:
+                        self._nudge_within_ttl(run, step, _token, _ttl)
                     if _ttl > 0 and time.time() > _ttl:
                         self._nudge_assigner(run, step, _token)
                 except Exception as _e:

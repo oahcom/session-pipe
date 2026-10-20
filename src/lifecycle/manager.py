@@ -407,13 +407,54 @@ class LifecycleManager:
         return ""
 
 
-    def get_approval_token(self, wf_id: str, step_id: str) -> Optional[str]:
-        """获取步骤的当前审批密钥（测试辅助）。"""
+    def get_approval_token(self, wf_id: str, step_id: str,
+                           requester: str = "") -> Optional[str]:
+        """审批人拉取自己的审批密钥（带鉴权与状态门控）。
+
+        为什么需要拉取通道（bus #427318/#427380）：token 只有 `ccs send` 一条
+        推送路径，角色正在思考时 tmux 拒绝注入 → 降级写 bus 时 token 被脱敏成
+        *** → 审批人拿不到钥匙，闸门形同虚设（全库 426 个 token 消费率 0）。
+        推送失败时审批人必须能自己取回。
+
+        fail-closed：requester 为空、无审批人、非审批人一律 PermissionError。
+        引擎自身判断「token 免了没」用 get_approval_token_raw()。
+        """
         wf = self._get_wf_unsafe(wf_id)
         if not wf:
             return None
-        results = self._parse_results(wf)
-        return results.get(step_id, {}).get("approval_token")
+        step = self.get_step(wf_id, step_id)
+        # 只认显式请求人：空串不是「内部调用」，是没鉴权。
+        assigner = self._get_assigner_for_step(wf, step or {}, step_id)
+        if not assigner or requester != assigner:
+            raise PermissionError(
+                f"仅审批人可拉取密钥: {requester!r} != {assigner or '无审批人'}")
+        cur = self._parse_results(wf).get(step_id, {})
+        # 只对「等审批」的步骤放行：已消费/已过期/状态已推进的 token 一律不返回，
+        # 否则审批人拿着死钥匙反复 confirm，错误信息还会掩盖真原因。
+        if cur.get("status") != "step_done_ready":
+            return None
+        if cur.get("approval_consumed_at"):
+            return None
+        if cur.get("approval_token_ttl", 0) > 0 and time.time() > cur["approval_token_ttl"]:
+            return None
+        return cur.get("approval_token")
+
+    def get_approval_token_raw(self, wf_id: str, step_id: str) -> Optional[str]:
+        """无鉴权读取（引擎内部：判断该步是否还在等审批，不可作对外入口）。"""
+        wf = self._get_wf_unsafe(wf_id)
+        if not wf:
+            return None
+        return self._parse_results(wf).get(step_id, {}).get("approval_token")
+
+    def approval_ttl_remaining(self, wf_id: str, step_id: str) -> float:
+        """审批密钥剩余有效秒数；无 token 返回 0。"""
+        wf = self._get_wf_unsafe(wf_id)
+        if not wf:
+            return 0.0
+        cur = self._parse_results(wf).get(step_id, {})
+        if not cur.get("approval_token") or cur.get("approval_consumed_at"):
+            return 0.0
+        return max(0.0, float(cur.get("approval_token_ttl", 0)) - time.time())
 
     def confirm_step(self, wf_id: str, step_id: str, token: str = "",
                      approved: bool = True, reason: str = "", allow_expired: bool = False) -> bool:
@@ -810,6 +851,9 @@ class LifecycleManager:
         step_results.setdefault(step_id, {}).update({
             "approval_token": token,
             "approval_token_ttl": time.time() + ttl,
+            # 签发时刻单独落库：提醒退避按「签发至今」算，从 ttl 反推需要
+            # 硬编码有效期常量，改 ttl 就会算错（下发时间点也要可追溯）。
+            "approval_issued_at": time.time(),
             "approval_consumed_at": None,
         })
         self._conn.execute(
@@ -878,20 +922,26 @@ class LifecycleManager:
             logger.warning("approval token CCS send error: %s", e)
 
     def _bb_write_fallback(self, wf_id, step_id, token, approval_prompt, assigner):
-        """ccs send 失败时的 bus 降级写入（WL-P2-03 通知降级）。
+        """ccs send 失败时的 bus 降级通知（WL-P2-03）。
 
-        确保审批请求不因 send 失败而丢失：写入 bus cat=workflow，
-        assigner 角色通过 bus 轮询可收到。
-        token 脱敏：bus 为共享通道，明文泄漏 = 任意角色可伪造 confirm_step。
+        通知的职责只是「告诉审批人有待批」— 凭证由审批人自己用
+        `wf approval <wf_id> <step_id>` 拉取。把 token 塞进共享 bus 再脱敏，
+        等于两件事都没做成：既没人能读到（标题无 @role），也没人能拿到钥匙。
         """
-        # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token L648）
+        # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token）
         safe_prompt = approval_prompt.replace(token, "***")
         from hermes_bus.blackboard import Blackboard
         bb = Blackboard()
         bb.write(
             "workflow",
-            f"[审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求（ccs send 失败，经 bus 投递）",
-            evidence=f"审批人: {assigner}\n密钥: ***(仅通过 ccs send 安全投递)\n有效期: 1小时\n提示: {safe_prompt}",
+            # 标题必须带 @<assigner>：bus_client._addressed_to() 只匹配标题里的
+            # '@role'，缺了这句降级就等于没投递（估计 #427280 从未被 engineer 读到）。
+            f"@{assigner} [审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求"
+            f"（ccs send 失败，经 bus 投递）",
+            evidence=(
+                f"审批人: {assigner}\n密钥: 不在此处（共享 bus 不得承载一次性凭证）\n"
+                f"取回命令: wf -r {assigner} approval {wf_id} {step_id}\n"
+                f"有效期: 1小时（剩余见命令输出）\n提示: {safe_prompt}"),
             src="workflow_engine",
         )
 
