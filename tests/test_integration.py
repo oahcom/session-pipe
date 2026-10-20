@@ -30,6 +30,14 @@ sys.path.insert(0, _src_dir)
 
 import tempfile
 
+# 隔离：本文件只验证协议行为，不需要生产总线。旧实现 6 处 Blackboard() 直写
+# ~/.hermes/sister_bus/blackboard.db，每跑一次 run.py 就留下 6 条 src=test 的假 fact。
+# 用官方环境变量覆盖默认库，让 router 内部 new 出来的 Blackboard() 也一起隔离。
+os.environ.setdefault(
+    "HERMES_BLACKBOARD_DB",
+    str(Path(tempfile.mkdtemp(prefix="integration_bus_")) / "blackboard.db"),
+)
+
 
 def test_bus_write_and_unconsumed():
     """bus 写入 → unconsumed 能读到。"""
