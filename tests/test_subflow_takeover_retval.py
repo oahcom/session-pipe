@@ -46,6 +46,10 @@ class _FakeConn:
         self._sub_status = sub_status
 
     def execute(self, sql, params=()):
+        # 子链并发上限（wf_lifecycle._subflow_takeover）：0 条活跃子链 → 不拦截。
+        # 该用例验的是建链后的排队账本清理，不能让上限先把它拦住。
+        if "COUNT(*)" in sql and "parent_wf_id IS NOT NULL" in sql:
+            return _FakeCur({"c": 0})
         if "step_results FROM workflow_instances" in sql:
             return _FakeCur(None if self._sr is None else {"step_results": self._sr})
         if "SELECT status FROM workflow_instances" in sql:

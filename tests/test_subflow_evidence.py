@@ -123,10 +123,18 @@ def test_subflow_task_desc_carries_root_requirement():
             if sql.strip().startswith("INSERT OR IGNORE INTO tasks"):
                 inserted.append(params[2])          # description
             m = MagicMock()
+            # 子链并发上限（_subflow_takeover）：0 条活跃子链 → 不拦截
+            if "COUNT(*)" in sql and "parent_wf_id IS NOT NULL" in sql:
+                m.fetchone.return_value = {"c": 0}
+                m.fetchall.return_value = []
+                return m
             if "FROM tasks t" in sql:
                 m.fetchone.return_value = {
                     "title": "高质量产品落地页",
                     "description": "响应式三档 + 无障碍 + 渐进增强"}
+            elif "parent_wf_id=?" in sql:
+                # 权威链接兜底查询：本用例现场没有已存在的子链
+                m.fetchone.return_value = None
             elif "FROM workflow_instances" in sql:
                 m.fetchone.return_value = {"step_results": "{}", "status": "running",
                                            "assigner": "pm"}
@@ -160,11 +168,86 @@ def test_subflow_task_desc_carries_root_requirement():
     assert "响应式三档" in inserted[0], f"需求正文未下传: {inserted[0]!r}"
 
 
+def test_takeover_reuses_authoritative_child_link():
+    """指针被 pop 后，按 (parent_wf_id, subflow_source_step_id) 找回活跃子链而非新建。
+
+    子链失败重试会主动 pop 掉 step_results[step].subflow_id，此后旧防重失明，
+    每 tick 新建一条兄弟链（实测 wf_bf5721557a/s1 同挂 cancelled 与 running）。
+    """
+    from pipeflow.engine import WorkflowEngine, WorkflowDef, Step
+
+    eng = WorkflowEngine(workflows_dir=_WORKFLOWS_DIR)
+    inserts = []
+    updates = []
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            m = MagicMock()
+            if "INSERT INTO tasks" in sql:
+                inserts.append(params)
+            elif "UPDATE workflow_instances" in sql:
+                updates.append(params)
+            if "COUNT(*)" in sql and "parent_wf_id IS NOT NULL" in sql:
+                m.fetchone.return_value = {"c": 0}
+                m.fetchall.return_value = []
+                return m
+            if "parent_wf_id=?" in sql:
+                m.fetchone.return_value = {"instance_id": "wf_sub_deadbeef01"}
+            elif "FROM workflow_instances" in sql:
+                m.fetchone.return_value = {"step_results": "{}"}
+            else:
+                m.fetchone.return_value = None
+            m.fetchall.return_value = []
+            return m
+        def commit(self): pass
+
+    class _Lm:
+        def _conn_tx(self):
+            class C:
+                def __enter__(s): return _Conn()
+                def __exit__(s, *a): return False
+            return C()
+
+    wf = WorkflowDef(name="WF-product_delivery", title="t", description="d",
+                     steps=[Step(id="s1", title="需求确认", target_role="pm",
+                                 prompt_template="x", exit_condition={},
+                                 subflow_template="pm_requirements")])
+    eng._workflows = {"WF-product_delivery": wf}
+    eng._is_role_busy = lambda *a, **k: False
+
+    results = {}
+    took = eng._subflow_takeover(_Lm(), "wf_parent", "WF-product_delivery",
+                                 wf.steps[0], -1, results, "s0")
+    assert took is True, "已有活跃子链应判为接管"
+    assert not inserts, f"不得新建子链任务: {inserts!r}"
+    assert results["s1"]["subflow_id"] == "wf_sub_deadbeef01", "应写回权威子链 id"
+    assert updates and "wf_sub_deadbeef01" in updates[0][0], "应持久化子链指针"
+
+
+def test_takeover_fallback_only_claims_live_links():
+    """兜底查询只认活跃子链，且排除返工链。
+
+    带上 completed 会让 R105 的「pop 指针 = 交还父步自投」失效：驳回重投时
+    旧 completed 子链被写回 → _scan_tasks 读其末步驳回文案又压回 rejected。
+    wf_rw_ 返工链同样写 parent_wf_id+source_step_id，被兜底认领会和
+    engine.py 的 rework_ids 通道双消费同一条链。
+    """
+    import inspect
+    from pipeflow.engine import WorkflowEngine
+
+    src = inspect.getsource(WorkflowEngine._subflow_takeover)
+    fallback = src.split("_link = conn2.execute")[1].split("fetchone()")[0]
+    assert "'completed'" not in fallback, f"兜底不得认 completed 子链:\n{fallback}"
+    assert "NOT LIKE 'wf_rw_%'" in fallback, f"兜底必须排除返工链:\n{fallback}"
+
+
 if __name__ == "__main__":
     for fn in (test_container_step_drills_into_subflow,
                test_own_exit_messages_win_over_subflow,
                test_no_evidence_returns_empty_not_raise,
                test_prompt_vars_use_subflow_evidence,
                test_render_includes_evidence_body,
-               test_prompt_carries_instance_scoped_artifact_convention):
+               test_prompt_carries_instance_scoped_artifact_convention,
+               test_takeover_reuses_authoritative_child_link,
+               test_takeover_fallback_only_claims_live_links):
         fn()

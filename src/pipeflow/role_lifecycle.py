@@ -321,19 +321,22 @@ class RoleLifecycleMixin:
                 # （1800s）起步，恢复要等半小时。
                 self._last_rate_recover.pop(role, None)
                 continue
-            # 追加箭头只在**生成中**出现（空闲时底部只有 bypass 提示）：
-            # -S -60 里残留的旧错误行不能当作"当前仍被拒"，否则会给正在干活的
-            # 角色发 C-u +「继续」，把当前轮打断。
-            # 但「生成中」不等于有进展：上游断连后 CLI 会一直挂着 spinner
-            # （实测 coordinator 卡在 Compacting 52% 55min，transcript 末事件是
-            # 一条没有 tool_result 的 tool_use）。所以判据从"是否生成中"改成
-            # "生成中且 transcript 已 _STOPPED_PROGRESS_SEC 没落任何事件"——
-            # 后者才是卡死；有进展的轮次照旧跳过。
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
+            # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt
+            # 计数重置回 1，把快恢复的角色重新推回 10/10（实测 devops/closer/qa
+            # 的 attempt 在收到「继续」后从 4 回升到 9）。
+            # 判据扫 _recent（20 行）而非 _tail（4 行）：`Retrying in 5s · attempt 9/10`
+            # 后面还跟着 tip/分隔线/输入框，实测 closer 的该行就不在最后 4 行内
+            # → 漏检 → 误发「继续」（06:31:32 日志）。
+            if any("Retrying" in ln and "attempt" in ln for ln in _recent.splitlines()):
+                continue
+            # 能走到这里说明 _recent 已命中错误文案（:319 的前置过滤），
+            # 所以只需再判"生成中且 transcript 停滞"：两者同时成立才是卡死。
+            # 纯生成中的长推理（consumer 813s、maintainer 686s）在前面就退出了。
             if any("esc to interrupt" in ln for ln in _tail):
                 if not _transcript_stalled(role):
                     continue
-                LOGGER.warning("角色卡死: %s 生成中但 transcript %.0fs 无事件",
+                LOGGER.warning("角色卡死: %s 生成中+错误信号+transcript %.0fs 无事件",
                                role, _STOPPED_PROGRESS_SEC)
             with self._COMPACT_LOCK:
                 last, attempt = self._last_rate_recover.get(role, (0.0, 0))

@@ -346,13 +346,6 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         # 实测 24h 内 62 条 @engineer 有 26 条（42%）因分类不在 consume 列表被丢，
         # 其中 notice×13、blocker×4；两条独立的角色复核各自查到同一处。
         # 这条过滤本意是防止「blocker 被广播给全部 32 个角色」，定向消息不会广播。
-        #
-        # 唯一豁免 task_spec：它是「派发记录」而非「找人办事」，三个写入者
-        # （launcher client:229 / pipeline client:247 / role_lifecycle:958）写完都
-        # 自己 ccs send 正文，路由再投一遍就是双投。实测 product_architect 存量
-        # 528 条 @它 的 task_spec 中位年龄 100h、最老 111h，全是引擎早已投过的重放。
-        if directed and msg.get("category") == "task_spec":
-            return False
         if not directed and _my_cats and "*" not in _my_cats \
                 and msg.get("category") not in _my_cats:
             return False

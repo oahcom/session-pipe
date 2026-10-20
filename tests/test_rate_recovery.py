@@ -119,7 +119,7 @@ def test_healthy_role_not_touched():
     assert sent == [], f"健康角色不应被打扰, got {sent}"
 
 
-def test_generating_role_not_interrupted_by_stale_error_text():
+def test_generating_role_not_interrupted_by_stale_error_text(tmp_path):
     """pane 里残留旧 403 文案但角色正在生成 → 不发 C-u/「继续」。
 
     -S -60 会带上滚出视口的旧错误行；只按"含错误文案"判会把正在干活的角色
@@ -141,10 +141,58 @@ def test_generating_role_not_interrupted_by_stale_error_text():
             sent.append(cmd)
         return MagicMock(returncode=0, stdout="")
 
-    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+    # 判据已从"是否生成中"改为"生成中且 transcript 无进展"：本条要验的是
+    # "有进展就不打断"，必须给出新鲜 transcript，否则会落进卡死分支。
+    import os, time
+    from pipeflow import role_lifecycle as _rl
+    _d = tmp_path / "-home-administrator-ccs-workspaces-lr"
+    _d.mkdir(parents=True, exist_ok=True)
+    _f = _d / "sess.jsonl"
+    _f.write_text("{}\n", encoding="utf-8")
+    os.utime(_f, (time.time(), time.time()))
+    with patch.object(_rl, "_TRANSCRIPT_ROOT", tmp_path), \
+         patch("pipeflow.engine._sp.run", side_effect=fake_run):
         eng._recover_rate_limited_roles()
 
     assert sent == [], f"生成中的角色不应被打断, got {sent}"
+
+
+def test_client_retry_in_progress_not_interrupted(tmp_path):
+    """429 客户端重试进行中（`Retrying in 5s · attempt 9/10`）→ 不发「继续」。
+
+    2026-10-21 实测：devops/closer/qa 收到「继续」后 attempt 从 4 回升到 9。
+    CLI 自己在退避，插入新消息会把计数重置，把快恢复的角色重新推回 10/10。
+    """
+    eng = _engine()
+    sent = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-devops\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=(
+                "❯ 继续\n"
+                '✻ 429 [429]: {"type":"error"} · Retrying in 5s · attempt 9/10\n'
+                "────────\n❯ \n────────\n"
+                "  bypass permissions on · esc to interrupt"))
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    # transcript 已停滞（否则会落到另一条 continue）——要验的正是 429 分支先拦住
+    from pipeflow import role_lifecycle as _rl
+    _d = tmp_path / "-home-administrator-ccs-workspaces-devops"
+    _d.mkdir(parents=True, exist_ok=True)
+    _f = _d / "sess.jsonl"
+    _f.write_text("{}\n", encoding="utf-8")
+    import os, time
+    old = time.time() - 900
+    os.utime(_f, (old, old))
+    with patch.object(_rl, "_TRANSCRIPT_ROOT", tmp_path), \
+         patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert sent == [], f"429 客户端重试中不应被打断, got {sent}"
 
 
 def test_recovery_resets_backoff_after_healthy_tick():

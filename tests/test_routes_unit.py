@@ -690,22 +690,3 @@ def test_undirected_unsubscribed_category_still_filtered(mock_metrics, mock_hb):
         mock_rt_mod.get_router.return_value = _engineer_router()
         result = route_to_ccs("engineer", dry_run=True)
     assert result["total"] == 0, "未点名的无关分类不应投递给 engineer"
-
-
-@patch("routing.routes.HEARTBEAT")
-@patch("routing.routes.METRICS")
-def test_directed_task_spec_not_routed(mock_metrics, mock_hb):
-    """task_spec 是派发记录：写入者自己已 ccs send，路由再投就是双投。
-
-    实测 product_architect 存量 528 条 @它 的 task_spec 中位年龄 100h，
-    绕过分类过滤会把这批早已投过的锚点整批重放。
-    """
-    from routing.routes import route_to_ccs
-    msgs = [{"id": 90, "category": "task_spec",
-             "text": "needs_implementation @engineer 工作流任务: wf_abc123/s1",
-             "priority": 1}]
-    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
-         patch("routing.routes._rt_mod") as mock_rt_mod:
-        mock_rt_mod.get_router.return_value = _engineer_router()
-        result = route_to_ccs("engineer", dry_run=True)
-    assert result["total"] == 0, "task_spec 锚点不得经路由重投"

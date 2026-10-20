@@ -80,9 +80,10 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     _sf = step_sd.get("subflow_id") or ""
     if not _sf:
         return False
+    from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
     _rows = lm.query(
         "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
-    return bool(_rows) and _rows[0]["status"] in ("pending", "running", "step_done_ready")
+    return bool(_rows) and _rows[0]["status"] in _ACTIVE_WF_STATUSES
 
 
 def _role_producing_recently(role: str, window: float = 300.0) -> bool:
@@ -734,8 +735,39 @@ class WorkflowLifecycleMixin:
                     _sub_row = conn2.execute(
                         "SELECT status FROM workflow_instances WHERE instance_id=?",
                         (_db_sdata["subflow_id"],)).fetchone()
-                    return bool(_sub_row and _sub_row["status"] in (
-                        "pending", "running", "step_done_ready", "completed"))
+                    if _sub_row and _sub_row["status"] in (
+                            "pending", "running", "step_done_ready", "completed"):
+                        return True
+                # 指针不可信时的回退：子链失败重试会主动 pop 掉 subflow_id
+                # （task_generator.py 的重建分支），此后上面那道防重失明，每轮
+                # 新建一条兄弟链（实测 wf_bf5721557a/s1 同挂 cancelled 与 running）。
+                # 权威链接 (parent_wf_id, subflow_source_step_id) 无人改写，用它兜底：
+                # 已有活跃子链就写回指针并接管，而不是再造一条。
+                #
+                # 只认活跃状态：带上 completed 会让 R105 的「pop 指针 = 交还父步
+                # 自投」失效——驳回重投时旧 completed 子链被重新写回，_scan_tasks
+                # 读其末步驳回文案又压回 rejected，白烧 _MAX_REJECTED_RETRY 预算。
+                # 排除 wf_rw_：返工链同样写 parent_wf_id+source_step_id，被这里认领
+                # 会和 engine.py 的 rework_ids 通道双消费同一条链。
+                _link = conn2.execute(
+                    "SELECT instance_id FROM workflow_instances "
+                    "WHERE parent_wf_id=? AND subflow_source_step_id=? "
+                    "AND status IN ('pending','running','step_done_ready') "
+                    "AND instance_id NOT LIKE 'wf_rw_%' "
+                    "ORDER BY created_at DESC LIMIT 1", (wf_id, tgt_step.id)).fetchone()
+                if _link:
+                    if not isinstance(results.get(tgt_step.id), dict):
+                        results[tgt_step.id] = {}
+                    _psr = results[tgt_step.id]
+                    if _psr.get("subflow_id") != _link["instance_id"]:
+                        _psr["subflow_id"] = _link["instance_id"]
+                        _psr["queued"] = 0
+                        _psr.pop("queued_since", None)
+                        conn2.execute(
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(results, ensure_ascii=False), wf_id))
+                        conn2.commit()
+                    return True
                 # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
                 # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
                 # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
@@ -750,6 +782,23 @@ class WorkflowLifecycleMixin:
                                       pane_fallback=False):
                     LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
                                 tgt_step.target_role, tgt_step.subflow_template)
+                    return
+                # 并发上限：忙判据只看"当下是否在跑"，看不到"已经堆了多少条"。
+                # 角色每空出来一瞬就建一条新子链，堆到 9 条 running（实测
+                # product_architect）→ 6 个父链的 s1 全部排队等同一个角色。
+                # 与 _can_assign_role 的 MAX_RUNNING_PER_ROLE 同源：子链创建是
+                # 第二条派发路径，不走那里，所以必须在这里自己查。
+                # 满额时 return（falsy）→ 父步自投；等现有子链消化完自然恢复建链。
+                from pipeflow.task_generator import MAX_RUNNING_PER_ROLE
+                _active_sub = conn2.execute(
+                    "SELECT COUNT(*) c FROM workflow_instances "
+                    "WHERE assignee=? AND parent_wf_id IS NOT NULL "
+                    "AND status IN ('pending','running','step_done_ready')",
+                    (tgt_step.target_role,)).fetchone()["c"]
+                if _active_sub >= MAX_RUNNING_PER_ROLE:
+                    LOGGER.info("subflow skip: %s 已有 %d 条活跃子链（上限 %d），%s 不创建",
+                                tgt_step.target_role, _active_sub,
+                                MAX_RUNNING_PER_ROLE, tgt_step.subflow_template)
                     return
                 # 模板名兼容：同仓两条命名并存（裸名 architect_full_design /
                 # WF- 前缀 WF-architect_full_design，见 manager.py:174 同款回退）。
@@ -939,6 +988,16 @@ class WorkflowLifecycleMixin:
                     _msgs_text += "\n" + "\n".join(self._bb_evidence(_ids))
                 except Exception as _ev_e:
                     LOGGER.debug("rework: bus evidence 回查失败 %s: %s", wf_id[:8], _ev_e)
+        # 子链判定驳回时（task_generator 压 status=rejected + rejected_by=subflow_verdict），
+        # 父步 exit_messages **必然为空**——那个路径有意只压状态、不搬子链文案
+        # （搬了 tick-rescue 会把 rejected 当场抹成 completed）。于是上面两条取用路径
+        # 都是空字符串 → 分类解析必空 → 建不出返工链 → 退回重投已完成子链 →
+        # 产物未变必然再驳回 → 3 次封顶升级。实测 wf_bf5721557a/s4：子链已 completed，
+        # 驳回文案在子链末步 exit_messages（bus #428488）且含完整【系统问题】段，
+        # 返工链可从 1 条系统问题+4 条业务问题建出，却因读错来源全部丢失。
+        # 只读子链，不往父步搬文案（理由同上）。
+        if not self._has_issue_classification(_msgs_text):
+            _msgs_text += self._subflow_last_step_text(wf_id, review_step_id, _done_sr)
         # 从结构化分类中提取问题列表
         _sys_issues, _biz_issues, _sys_role, _biz_role = self._parse_review_issues(_msgs_text)
         if not _sys_issues and not _biz_issues:
@@ -1083,6 +1142,47 @@ class WorkflowLifecycleMixin:
             _rows = _c.execute(
                 f"SELECT e FROM facts WHERE id IN ({_ph})", tuple(fact_ids)).fetchall()
         return [r["e"] for r in _rows if r["e"]]
+
+    def _subflow_last_step_text(self, wf_id: str, step_id: str, step_sdata: dict) -> str:
+        """取父步名下子链**末步**的 exit_messages 文本（text + bus evidence）。
+
+        只为返工分类解析服务：子链判定驳回时父步没有文案，真正的审查结论在子链
+        末步。只读，不回写父步——回写会让 tick-rescue 把 rejected 抹成 completed。
+        """
+        _sf = (step_sdata or {}).get("subflow_id")
+        if not _sf:
+            return ""
+        try:
+            _rows = self._lifecycle.query(
+                "SELECT current_step_id, step_results FROM workflow_instances "
+                "WHERE instance_id=?", (_sf,))
+        except Exception as _e:
+            LOGGER.debug("rework: 子链 %s 读取失败: %s", _sf[:12], _e)
+            return ""
+        if not _rows:
+            return ""
+        _last_id = _rows[0]["current_step_id"]
+        try:
+            _all = json.loads(_rows[0]["step_results"] or "{}")
+        except (TypeError, ValueError):
+            return ""
+        _last = _all.get(_last_id) if isinstance(_all, dict) else None
+        if not isinstance(_last, dict):
+            return ""
+        _msgs = [m for m in (_last.get("exit_messages") or []) if isinstance(m, dict)]
+        _text = "\n".join((m.get("text", "") or "") + "\n" + (m.get("evidence", "") or "")
+                           for m in _msgs)
+        if self._has_issue_classification(_text):
+            return _text
+        # 旧记录只有 text+id，分类段在 bus evidence
+        _ids = [m.get("id") for m in _msgs if m.get("id")]
+        if not _ids:
+            return _text
+        try:
+            return _text + "\n" + "\n".join(self._bb_evidence(_ids))
+        except Exception as _ev_e:
+            LOGGER.debug("rework: 子链 evidence 回查失败 %s: %s", _sf[:12], _ev_e)
+            return _text
 
     def _rework_tpl_for(self, rework_id: str) -> str:
 
