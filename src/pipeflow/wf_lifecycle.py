@@ -85,7 +85,11 @@ def _role_producing_recently(role: str, window: float = 300.0) -> bool:
     不因新信号引入而放过真僵尸。
     """
     try:
-        _d = Path.home() / ".claude" / "projects" / f"-home-administrator-ccs-workspaces-{role}"
+        # 目录名由工作区路径转义而来：ccs-workspaces-product-architect（下划线→连字符）。
+        # 不做替换时带下划线的角色（product_architect 等）恒找不到目录 → 恒 False，
+        # 第二判活信号对这些角色完全失效（实测 2026-10-20，本机 projects/ 下无下划线变体）。
+        _slug = role.replace("_", "-")
+        _d = Path.home() / ".claude" / "projects" / f"-home-administrator-ccs-workspaces-{_slug}"
         if not _d.is_dir():
             return False
         _mtime = max((f.stat().st_mtime for f in _d.glob("*.jsonl")), default=0.0)

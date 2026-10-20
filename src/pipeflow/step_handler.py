@@ -113,6 +113,21 @@ def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role
     send_to_role(role, msg)
 
 
+def _bump_violation_count(state: dict, commands: list) -> int:
+    """越界计数：同一批命令只算一次。
+
+    pane 回显会保留旧命令多轮，逐 tick 累加会让「一次越界」在 5 个 tick 内
+    触发 cancel_step（bus #418065 要求去重）。命令集合变化才视为新一次越界。
+    """
+    key = "|".join(sorted(set(commands or [])))[:500]
+    if key and key == state.get("violation_last_key"):
+        return state.get("violation_count", 0)
+    state["violation_last_key"] = key
+    count = state.get("violation_count", 0) + 1
+    state["violation_count"] = count
+    return count
+
+
 class StepHandlerMixin:
     """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _check_exit。"""
 
@@ -341,7 +356,7 @@ class StepHandlerMixin:
                 _sig_state["idle_cool_until"] = _now + 300  # 5 分钟冷却
             _sig_state["idle_count"] = _idle_n
         if sig and sig.violation_found:
-            _viol_n = _sig_state.get("violation_count", 0) + 1
+            _viol_n = _bump_violation_count(_sig_state, sig.violation_commands)
             if _viol_n >= 5 and not self._has_live_subflow(run, step):
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
