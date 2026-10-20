@@ -645,3 +645,48 @@ def test_route_to_ccs_thinking_role_is_deferred_not_failed(mock_metrics, mock_hb
     mock_bb.return_value.mark_consumed.assert_not_called()
     # 不建任务
     mock_wf.return_value.create_task_v2.assert_not_called()
+
+
+# ── 定向消息绕过分类过滤 ──
+
+def _engineer_router():
+    """真实的 engineer 订阅表：不含 notice/blocker（生产 routes 表原值）。"""
+    mock = MagicMock()
+    mock.routing = {"engineer": {"consume": [
+        "architecture", "task_spec", "user_story", "code_review", "bug_report",
+        "test_report", "test_plan", "documentation", "security_audit",
+        "system_design", "code_fix", "scheduler"]}}
+    return mock
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_directed_mention_bypasses_consume_filter(mock_metrics, mock_hb):
+    """@engineer 的 notice 不在 engineer 的 consume 列表，但点名了就必须送到。
+
+    实测 24h 内 62 条 @engineer 中 26 条（42%）被分类过滤丢弃，
+    其中 notice×13、blocker×4 —— 都是点名发给 engineer 的。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 88, "category": "notice", "text": "@engineer 你的修复没生效",
+             "priority": 2}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod:
+        mock_rt_mod.get_router.return_value = _engineer_router()
+        result = route_to_ccs("engineer", dry_run=True)
+    assert result["total"] == 1, "定向消息被分类过滤丢弃"
+    assert result["details"][0]["action"] == "dry_run"
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_undirected_unsubscribed_category_still_filtered(mock_metrics, mock_hb):
+    """没有 @ 的消息仍受分类过滤约束——广播抑制不能被这次改动拆掉。"""
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 89, "category": "notice", "text": "系统广播：某服务重启了",
+             "priority": 2}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod:
+        mock_rt_mod.get_router.return_value = _engineer_router()
+        result = route_to_ccs("engineer", dry_run=True)
+    assert result["total"] == 0, "未点名的无关分类不应投递给 engineer"

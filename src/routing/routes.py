@@ -336,17 +336,20 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     except Exception:
         _my_cats = []
     def _is_for_me(msg):
-        # 分类过滤：只投递该角色声明消费的分类（route_all 走
-        # get_consumers_prioritized 同一语义，此处原先缺失）。
-        # 缺此过滤则 blocker 等消息被投给全部 32 个角色，其中 24 个不消费它。
-        if _my_cats and "*" not in _my_cats and msg.get("category") not in _my_cats:
-            return False
         # 回声抑制：role 自己写的消息不推回给它自己（与 route_all 同语义）。
         if _is_self_echo(msg, role_name):
             return False
         text = msg.get("text", "")
         tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", text)
-        return not tags or role_name in tags
+        directed = role_name in tags
+        # 定向消息绕过分类过滤：有人明确 @ 你，比你的默认订阅列表优先级高。
+        # 实测 24h 内 62 条 @engineer 有 26 条（42%）因分类不在 consume 列表被丢，
+        # 其中 notice×13、blocker×4；两条独立的角色复核各自查到同一处。
+        # 这条过滤本意是防止「blocker 被广播给全部 32 个角色」，定向消息不会广播。
+        if not directed and _my_cats and "*" not in _my_cats \
+                and msg.get("category") not in _my_cats:
+            return False
+        return not tags or directed
     messages = [m for m in raw_msgs if _is_for_me(m)]
     if not messages or "error" in messages[0]:
         return {"role": role_name, "routed": 0, "total": 0, "dry_run": dry_run, "details": []}
