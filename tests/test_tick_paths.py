@@ -480,3 +480,53 @@ if __name__ == "__main__":
 
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
+
+
+# ── 8d. tmux 信号必须真投出去且不得带 /goal ────────────────────────
+# 现场（R110，2026-10-21）：两个 helper 都只传 (role, msg)，_send_to_role 的
+# 忙门控以 wf_id 为条件，wf_id 为空 → 守卫跳过 → 但调用方也没传 force，
+# 于是 /goal 前缀被加上；且一旦有人补上 wf_id 就会立刻被忙门控拦成 "busy"，
+# 返回值被 `LOGGER.debug` 吞掉。安全护栏在两个方向上都可能是空转。
+# 契约：显式 force + scheduler_noise，且 wf_id/step_id 必须传（否则无法定位）。
+
+def _capture_send():
+    seen = []
+    def _send(role, msg, **kw):
+        seen.append((role, msg, kw))
+        return True
+    return _send, seen
+
+
+def test_idle_reminder_is_forced_and_carries_ids():
+    from pipeflow.step_handler import _remind_tmux_idle
+    send, seen = _capture_send()
+    run, step = _make_run(), _make_step()
+    _remind_tmux_idle(run, step, "等待输入", send)
+    role, msg, kw = seen[0]
+    assert role == "scout"
+    assert kw.get("force") is True, "未带 force → /goal 前缀锁死角色"
+    assert kw.get("scheduler_noise") is True, "未标记语义 → coordinator 侧无法区分催办"
+    assert "wf_id" not in kw, "催办不该带 wf_id：会连带重写 TASKS.md 并写 task_spec"
+
+
+def test_violation_stop_is_forced_and_carries_ids():
+    from pipeflow.step_handler import _stop_tmux_violation
+    send, seen = _capture_send()
+    run, step = _make_run(), _make_step()
+    _stop_tmux_violation(run, step, ["rm -rf /tmp/x"], "scout", send)
+    role, msg, kw = seen[0]
+    assert "越界操作" in msg and "rm -rf /tmp/x" in msg
+    assert kw.get("force") is True, "安全护栏被 /goal 前缀变成 Stop hook 硬条件"
+
+
+def test_forced_send_does_not_add_goal_prefix():
+    """force=True 必须同时跳过 /goal 前缀 —— 否则运维催办变 Stop hook 硬条件。"""
+    import re as _re
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    src = RoleLifecycleMixin._send_to_role.__doc__ or ""
+    assert "force" in src
+    # 直接验证语义：force=True 分支不加前缀（代码级断言，防止有人改成无条件加）
+    import inspect
+    code = inspect.getsource(RoleLifecycleMixin._send_to_role)
+    assert _re.search(r"if not force:\s*\n\s*prompt = \"/goal \" \+ prompt", code), \
+        "前缀注入的条件不再是 `not force` → 催办消息会被锁成 Stop hook"

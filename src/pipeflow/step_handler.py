@@ -68,11 +68,22 @@ def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> f
     return max(_QUEUE_BUDGET_FLOOR, declared * 60 * max(int(attempts), 1))
 
 
+# tmux 信号是**运维催办**，不是任务派发。两个 helper 原先只传 (role, msg)，
+# force 默认 False → _send_to_role 给它加上 `/goal ` 前缀，而 /goal 是会话级
+# Stop hook 硬条件：「请继续完成当前步骤」永远无法自证，角色因此被永久锁死
+# （R41 实测 qa 215 条该 hook、全角色累计 943 条）。越界停止指令同理。
+#
+# 为什么也不传 wf_id：忙门控的条件是 `not force and wf_id`，wf_id 为空时本就
+# 不拦；而 wf_id 非空会连带重写角色 TASKS.md 并往 bus 写一条 task_spec ——
+# 一条催办不该产生派发记录。只开 force（跳过前缀+忙门控+搜索提醒）+ 语义标记。
+_TMUX_SIGNAL_KW = {"force": True, "scheduler_noise": True}
+
+
 def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
     """角色 tmux pane 显示空闲 → 发一轮提醒 prompt（不 cancel，不递增超时）。"""
     msg = (f"[workflow] {run.workflow_name}/{step.id} 检测到角色空闲（pane 证据: {evidence[:80]}）。"
            f"请继续完成当前步骤 {step.id}。")
-    send_to_role(step.target_role, msg)
+    send_to_role(step.target_role, msg, **_TMUX_SIGNAL_KW)
 
 
 def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
@@ -128,7 +139,7 @@ def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role
     ops = "、".join(commands[:3])
     msg = (f"[workflow] {run.workflow_name}/{step.id} 检测到越界操作: {ops}。"
            f"请立即停止并撤销该操作，仅在当前工作流 {step.id} 范围内工作。")
-    send_to_role(role, msg)
+    send_to_role(role, msg, **_TMUX_SIGNAL_KW)
 
 
 # mustContain 的中英别名：qa 报告按语言习惯写「17 passed / 1 failed」或「通过 17 / 失败 1」，
