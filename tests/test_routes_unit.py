@@ -527,9 +527,11 @@ def test_route_to_ccs_prefix_is_idempotent(mock_metrics, mock_hb):
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
          patch("routing.routes._rt_mod") as mock_rt_mod, \
          patch("subprocess.run", side_effect=_fake_run), \
-         patch("workflow.client.WorkflowClient") as mock_wfc:
+         patch("routing.routes.WorkflowClient") as mock_wfc:
         mock_rt_mod.get_router.return_value = MagicMock()
-        mock_wfc.return_value.check_task.return_value = None   # 无活跃工作流 → 不 deferred
+        # WorkflowClient 直连实时生产 DB：不固定 check_task，本用例结果就取决于
+        # 当刻是否有 engineer 在跑工作流（全量套件里实测被判 deferred）。
+        mock_wfc.return_value.check_task.return_value = None
         route_to_ccs("engineer", dry_run=False)
 
     body = sent.get("body", "")
