@@ -347,8 +347,12 @@ class WorkflowLifecycleMixin:
                     try:
                         # 走 close_wf 而非裸 UPDATE：回收路径漏掉了 task 状态同步与
                         # 子链级联，任务永远停在 running、子链继续占角色（实测 76 条）。
+                        # reason 用条件分支算出的具体原因（timeout_count / 阈值 / 步骤已终态）：
+                        # 写死 "stale rescue" 只能证明"被回收"，说不出为什么被回收。
                         self._lifecycle.close_wf(wf_id, status="cancelled",
-                                                 reason="stale rescue")
+                                                 reason=f"stale rescue: {reason}")
+                        # 这条 action='cancelled' 行是 writer/TROUBLESHOOTING.md 与排障脚本
+                        # 的既有查询锚点，保留不动。
                         lm.execute(
                             "INSERT INTO workflow_logs (workflow_instance_id, task_id, action, actor, detail, ts) "
                             "VALUES (?, ?, 'cancelled', 'workflow_engine', ?, ?)",
