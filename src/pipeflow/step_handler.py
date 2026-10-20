@@ -113,6 +113,22 @@ def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role
     send_to_role(role, msg)
 
 
+# mustContain 的中英别名：qa 报告按语言习惯写「17 passed / 1 failed」或「通过 17 / 失败 1」，
+# 而模板 token 只写英文 → 同一份合格报告换个语言就被判缺内容（bus #413783）。
+# 引擎侧兜底：命中别名即视为该 token 已满足，模板不必逐条改数据。
+_TOKEN_ALIASES = {
+    "passed": ("通过", "PASS", "PASSED"),
+    "failed": ("失败", "FAIL", "FAILED"),
+    "coverage": ("覆盖率",),
+}
+
+
+def _token_hit(token: str, content: str) -> bool:
+    if token in content:
+        return True
+    return any(alias in content for alias in _TOKEN_ALIASES.get(token.lower(), ()))
+
+
 def _bump_violation_count(state: dict, commands: list) -> int:
     """越界计数：同一批命令只算一次。
 
@@ -1234,7 +1250,7 @@ class StepHandlerMixin:
             if "mustContain" in props:
                 for mf in matched:
                     content = mf.read_text(encoding="utf-8", errors="replace")
-                    missing = [kw for kw in props["mustContain"] if kw not in content]
+                    missing = [kw for kw in props["mustContain"] if not _token_hit(kw, content)]
                     if missing:
                         errs.append(f"{mf.name} 缺少必需内容: {missing}")
             if "mustNotContain" in props:
