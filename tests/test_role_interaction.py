@@ -9,11 +9,12 @@ Role Interaction Tests — 模拟角色间通过 Sister Bus 的完整交互链�
   cd /home/administrator && python3 session-pipeline/tests/test_role_interaction.py
 
 前提：
-  - Sister Bus blackboard.db 可写（不需要 daemon 运行）
   - session-pipeline/src 可导入
+  - 使用独立临时 DB（不写生产总线）
 """
 import json
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -30,6 +31,9 @@ from bus_protocol import Blackboard
 # ── 测试辅助 ──
 _PREFIX = f"test_role_interact_{uuid.uuid4().hex[:6]}"
 _CLEANUP_IDS: list[int] = []
+# 隔离到临时库：旧实现用 Blackboard() 直写 ~/.hermes/sister_bus/blackboard.db，
+# 清理只 mark_consumed 不删除 → 每跑一次留下假 fact（实测 96 条残留）。
+_TMP_DB = Path(tempfile.mkdtemp(prefix="role_interaction_bus_")) / "blackboard.db"
 
 
 def _tag(text: str) -> str:
@@ -61,7 +65,7 @@ def test_scenario_architect_receives_design_request():
     场景 1：架构师收到设计需求
     coordinator 写 bus cat=architecture → 架构师能读到
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
     fid = bb.write("architecture", _tag("需要设计告警聚合模块"),
                     evidence="需求: 多daemon告警需聚合\n优先级: P1",
                     src="coordinator", tags="needs_design")
@@ -77,7 +81,7 @@ def test_scenario_architect_publishes_prd():
     场景 2：架构师产出 PRD → 消费者可读到新分类
     product_architect 写 bus cat=prd → 系统能处理该分类
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
     fid = bb.write("prd", _tag("告警聚合模块 PRD"),
                     evidence="文件: workspace/alerts/PRD.md\nProblem: 多daemon重复告警\nStory数: 3",
                     src="product_architect")
@@ -92,7 +96,7 @@ def test_scenario_architect_publishes_system_design():
     """
     场景 3：架构师产出系统设计
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
     design_md = "## Architecture Diagram\n```mermaid\nflowchart TD\n    A[告警输入] --> B[聚合器] --> C[输出]\n```"
     fid = bb.write("system_design", _tag("告警聚合模块系统设计"),
                     evidence=f"文件: workspace/alerts/DESIGN.md\n{design_md[:80]}...",
@@ -111,7 +115,7 @@ def test_scenario_architect_publishes_task_spec():
     """
     场景 4：架构师产出任务分解 → developer 和 coordinator 可消费
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
     tasks = [
         {"id": "T1", "title": "告警输入解析器", "effort": "E2",
          "acceptance_criteria": ["python3 -m py_compile src/alert_parser.py"]},
@@ -178,7 +182,7 @@ def test_scenario_developer_consumes_tasks():
     场景 6：developer 消费 task_spec 并产出 code_fix
     模拟 developer 读到任务 → 实现 → 写 code_fix 通知
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
 
     # 先写一个 task_spec (模拟架构师产出)
     task_id = bb.write("task_spec", _tag("实现告警输入解析器"),
@@ -211,7 +215,7 @@ def test_scenario_closer_closes_loop():
     """
     场景 7：closer 闭环 — 验证 task_spec + code_fix 都完成后打合
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
 
     # 模拟 developer 完成所有任务
     final_fix = bb.write("code_fix", _tag("[developer] 告警聚合模块全部完成"),
@@ -236,7 +240,7 @@ def test_scenario_product_design_request_product_architect():
     场景 8：product_design 分类 → 架构师可消费
     其他角色可以通过 product_design 分类向架构师提交设计需求
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
 
     fid = bb.write("product_design", _tag("新功能: 告警聚合查询API"),
                     evidence="需求: 支持按时间/级别/来源查询聚合告警\n参考: 现有 dashboard API 模式",
@@ -258,7 +262,7 @@ def test_scenario_blocker_escalation():
     """
     场景 9：blocker 阻塞升级 — developer 遇到阻塞写 blocker 给架构师
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
 
     # developer 遇到设计阻塞
     blocker_id = bb.write("blocker", _tag("[developer] 告警聚合设计不清楚: 去重窗口策略"),
@@ -282,7 +286,7 @@ def test_scenario_design_issue_feedback():
     """
     场景 10：design_issue 分类 — developer 实现中发现设计问题反馈给架构师
     """
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
 
     # developer 发现设计问题
     issue_id = bb.write("design_issue", _tag("[developer] 告警聚合模块: 单点瓶颈风险"),
@@ -315,7 +319,7 @@ def main():
     print("=" * 60)
     print()
 
-    bb = Blackboard()
+    bb = Blackboard(_TMP_DB)
     print(f"  Bus 初始统计: {bb.stats()['total']} 条消息\n")
 
     tests = [
