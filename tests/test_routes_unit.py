@@ -461,6 +461,30 @@ def test_is_role_report_title_allows_real_tasks():
     assert _is_role_report_title(None) is False
 
 
+def test_is_role_report_title_allows_content_category_labels():
+    """标签复用总线分类名 = 内容型待办，必须建任务（#421072 被静默吞掉）。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[bug_report] [P1] s1/s2 缺 require_wf", "bug_report", "qa") is False
+    assert _is_role_report_title("[design_issue] 单点瓶颈风险", "design_issue", "engineer") is False
+
+
+def test_is_role_report_title_still_blocks_engine_audit():
+    """引擎自写审计压倒一切：放行会形成引擎写审计→建任务→再写审计的自喂环。
+
+    真实形态：`[workflow] lr_tech_decision 完成: 3 步`（cat=workflow, src=workflow_engine，
+    历史 35 条）—— 标签与分类同名，只靠 src 守卫拦下。
+    """
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[workflow] lr_tech_decision 完成: 3 步", "workflow", "workflow_engine") is True
+    assert _is_role_report_title("[step_output] wf_x/s3 reviewer 产出审计", "workflow", "workflow_engine") is True
+
+
+def test_is_role_report_title_blocks_when_label_differs_from_category():
+    """标签与分类不一致 = 角色汇报（[optimizer] cat=optimization）。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[optimizer] 本轮优化 3 项", "optimization", "optimizer") is True
+
+
 def test_is_self_echo_suppresses_only_own_messages():
     """回声抑制：只拦自己写的，不误杀他人（RFC 3834）。"""
     from routing.routes import _is_self_echo

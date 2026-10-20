@@ -81,16 +81,23 @@ _ROLE_REPORT_RE = re.compile(r"^\[([a-z0-9_\-]+)\]")
 
 
 
-def _is_role_report_title(title: str) -> bool:
-    """[标签] 开头的 title 是产出汇报或系统自述，不是任务派发。
+def _is_role_report_title(title: str, category: str = "", src: str = "") -> bool:
+    """[标签] 开头的 title 是否为产出汇报（拦截建 workflow）。
 
-    WHY: 这些 title 由角色完成后写 bus（如 `[engineer] s1-complete (wf_xxx)`、
-    `[deploy] wf_xxx 产出已部署`），routes 把它们当新任务再派给每个 consumer，
-    于是同一份"完成汇报"变成 7~9 个角色的新 workflow。实测 72h 数据：
-    92/92 个 [角色名] 开头实例全部 fan-out（同 title 多角色），无一例外。
+    WHY: 角色完成后写 bus 的汇报（`[engineer] s1-complete`、`[optimizer] 本轮...`）
+    若不拦，会被 fan-out 成 7~9 个角色各自的新 workflow（实测 92/92 全中）。
+
+    判据：标签复用总线分类名（`[bug_report] cat=bug_report`）的是**内容型待办**，
+    必须放行——否则真缺陷报告被静默吞掉、无人接手（#421072/#421074）；
+    标签与分类不一致的（`[step_output] cat=workflow`、`[optimizer] cat=optimization`）
+    是汇报/审计。引擎自写的一律拦，防引擎写审计→建任务→再写审计的自喂环。
     """
     m = _ROLE_REPORT_RE.match(title or "")
-    return bool(m)
+    if not m:
+        return False
+    if src == "workflow_engine":
+        return True
+    return m.group(1) != category
 
 
 
@@ -188,6 +195,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 # 按 title 去重会漏掉跨路径重复（60 vs 80 截断不等）
                 "title": (msg["text"] or "").split("\n")[0][:80],
                 "priority": msg["priority"],
+                "src": msg.get("src", ""),
                 "consumers": ordered,
             })
 
@@ -227,7 +235,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                 _t = assignment.get("title", "")
                                 if len(_t) < 8 or not _has_content_words(_t):
                                     LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_t), role)
-                                elif _is_role_report_title(_t):
+                                elif _is_role_report_title(_t, cat, assignment.get("src", "")):
                                     # [角色名] 开头的 title 是"某角色的产出汇报"，不是"给某角色的任务"。
                                     # 实测 72h 内 92/92 个 [角色名] 开头实例都是 fan-out（同 title 多角色），
                                     # 100% 是噪音。不创建 workflow。
@@ -468,7 +476,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     # 阈值与 route_all 对齐（len<8 或 无内容词）: 同消息两路径判定一致
                     if len(_title) < 8 or not _has_content_words(_title):
                         LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_title), role_name)
-                    elif _is_role_report_title(_title):
+                    elif _is_role_report_title(_title, _cat, msg.get("src", "")):
                         # 与 route_all 对齐：[角色名] 开头是产出汇报，不是派发任务。
                         # 缺此判定时同一份完成汇报被 fan-out 成 7~9 个角色各自的新 workflow。
                         LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _title[:40], role_name)
