@@ -1173,6 +1173,10 @@ class StepHandlerMixin:
                     if prop_key in props:
                         errs.append(f"缺少产出: {fname}")
                         break
+                # minCount 必须在此处单独判：零匹配时 continue 会跳过下方计数，
+                # fresh=0 的 schema 会凭空通过（实测 mc_zero_probe => (True, [])）。
+                if "*" in fname and "minCount" in props:
+                    errs.append(f"{fname} 本次产出 glob 匹配不足 (0<{props['minCount']})")
                 continue
 
             if "minLength" in props:
@@ -1225,13 +1229,11 @@ class StepHandlerMixin:
                     errs.append(f"缺少产出: {fname}")
 
             if "minCount" in props:
+                # 复用上方 matched（已按 run.created_at-2s 过滤）：旧实现用
+                # _gl.glob() 全量计数，历史遗留文件会让本次 fresh=0 也判通过。
                 if "*" in fname:
-                    import glob as _gl
-                    # ponytail: minCount 计数所有 glob 匹配，不受 mtime 过滤影响；
-                    # 升级路径：增加 minCount.created_after 配置项按需过滤
-                    all_cnt = len(_gl.glob(str(fpath)))
-                    if all_cnt < props["minCount"]:
-                        errs.append(f"{fname} glob 匹配不足 ({all_cnt}<{props['minCount']})")
+                    if len(matched) < props["minCount"]:
+                        errs.append(f"{fname} 本次产出 glob 匹配不足 ({len(matched)}<{props['minCount']})")
                 elif fpath.exists():
                     pass  # file exists but no glob → ok
 

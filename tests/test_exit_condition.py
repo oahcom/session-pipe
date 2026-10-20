@@ -399,6 +399,55 @@ class TestValidateExitSchema(unittest.TestCase):
             import shutil
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_min_count_ignores_stale_files(self):
+        """回归: 只有历史遗留文件（mtime 早于 run.created_at-2s）时 fresh=0 必须 FAIL。
+
+        旧实现用 _gl.glob() 全量计数，历史文件凑够 minCount 就判通过。
+        """
+        ws = _WS_SCOUT
+        d = ws / f"mc3_{_UNIQUE}"
+        d.mkdir(parents=True, exist_ok=True)
+        old = time.time() - 3600
+        for i in range(3):
+            p = d / f"stale{i}.py"
+            p.write_text("x = 1\n")
+            import os as _os
+            _os.utime(p, (old, old))
+        try:
+            eng = _make_eng()
+            step = _step(exit_schema={
+                "properties": {f"mc3_{_UNIQUE}/*.py": {"minCount": 1}},
+            })
+            # run.created_at=now → 3 个历史文件均在 2s 容差之外
+            ok, errs = eng._validate_exit_schema(step, _run())
+            self.assertFalse(ok, f"历史文件不应满足 minCount: {errs}")
+            self.assertTrue(any("glob 匹配" in e for e in errs), errs)
+
+            # 新鲜文件写入后应通过
+            (d / "fresh.py").write_text("y = 2\n")
+            ok2, errs2 = eng._validate_exit_schema(step, _run())
+            self.assertTrue(ok2, errs2)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_min_count_zero_matches_fails(self):
+        """回归: 通配符零匹配时 minCount 也必须判 FAIL（旧实现会被 early continue 跳过）。"""
+        ws = _WS_SCOUT
+        d = ws / f"mc4_{_UNIQUE}"
+        d.mkdir(parents=True, exist_ok=True)  # 空目录，零匹配
+        try:
+            eng = _make_eng()
+            step = _step(exit_schema={
+                "properties": {f"mc4_{_UNIQUE}/*.py": {"minCount": 1}},
+            })
+            ok, errs = eng._validate_exit_schema(step, _run())
+            self.assertFalse(ok, f"零匹配不应通过 minCount: {errs}")
+            self.assertTrue(any("glob 匹配" in e for e in errs), errs)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
 
 class TestTickExitSchemaBlocked(unittest.TestCase):
     def test_exit_schema_fail_blocks_advance(self):
