@@ -131,6 +131,10 @@ _REQUEUE_DROP = ("status", "rejected_at", "rejected_by", "rejection_reason",
                  # 永远轮不到 → retry 涨到封顶后误报"重投仍未通过"。
                  # 清掉后 _subflow_takeover 见子链不在活跃白名单即交还父步自投。
                  "subflow_id", "subflow_reject_reported_at",
+                 # 排队账本（bus #425410 判据 4）：父步重置=新一轮，旧 queued_since
+                 # 记的是上一个孩子的排队起点。实测 wf_d0baa302a6 父 q_since 17:54:49
+                 # 早于孩子死亡 17:54:39，重投后的新排队一落地就被旧账判超时。
+                 "queued", "queued_since",
                  # 注：**不**清 subflow_retry / subflow_failed_*。它们是"同一父步
                  # 重建子链的次数"预算，跨重投保留才不会让失败→驳回→重投无限
                  # 领取新预算（codex round3 P2）。subflow_escalated 同理保留作审计。
@@ -231,7 +235,7 @@ class WorkflowRun:
 
 # ── 混入模块：方法签名和 self 访问完全不变 ─────────────────────────
 # 注意：混入导入必须放在 dataclass 定义之后，mixin 顶层依赖这些类。
-from pipeflow.step_handler import StepHandlerMixin
+from pipeflow.step_handler import StepHandlerMixin, _queue_budget_sec
 from pipeflow.role_lifecycle import RoleLifecycleMixin
 from pipeflow.task_generator import TaskGeneratorMixin
 from pipeflow.wf_lifecycle import WorkflowLifecycleMixin
@@ -956,18 +960,34 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 排队上限：按**时长**判，不按 tick 次数。daemon 每 10s 一轮，
                         # `_q_n>=10` 只有 100 秒——而角色正常执行一步就是几分钟，
                         # 会把合法排队误杀（三方审查 D4 FAIL）。queued_since 记录
-                        # 真实排队起点，30 分钟与默认 timeout_minutes 对齐。
+                        # 真实排队起点；上限由本步声明推导（见下）。
                         # 此分支不递增 timeout_count，status="" 又进不了 _tick，
                         # 无出口会永久悬空（实测 queued=21 停滞 235 分钟）。
                         _q_since = _q_sr.get("queued_since") or time.time()
-                        if time.time() - _q_since >= 1800:
+                        # 预算按本步声明推导（bus #425410）：硬编码 1800 让声明 120min
+                        # 的长步与声明 5min 的短步共用同一上限，长步必被夹碎。
+                        _q_attempts = max(int(getattr(step, "max_retries", 0) or 0) + 3, 4)
+                        _q_budget = _queue_budget_sec(step.exit_condition or {}, _q_attempts,
+                                                      self._parent_step_minutes(inst))
+                        if time.time() - _q_since >= _q_budget:
                             LOGGER.warning("run_once: %s/%s 排队 %d 分钟无进展，回收",
                                            inst["instance_id"][:12], step_id,
                                            int((time.time() - _q_since) / 60))
                             try:
+                                # 判据 3：blocker 必须带 evidence，否则事后核验只能读标题
                                 self._bb.write("blocker",
                                     f"[workflow] {inst['instance_id'][:12]}/{step_id} "
-                                    f"排队超 30 分钟仍未投出（角色长期被占用），已自动回收",
+                                    f"排队超 {int(_q_budget // 60)} 分钟仍未投出"
+                                    f"（角色长期被占用），已自动回收",
+                                    evidence=(f"实例: {inst['instance_id']}\n"
+                                              f"步骤: {step_id}\n"
+                                              f"角色: {step.target_role}\n"
+                                              f"排队次数: {_q_n}\n"
+                                              f"排队起点: {time.strftime('%F %T', time.localtime(_q_since))}\n"
+                                              f"已排队: {int((time.time() - _q_since) / 60)} 分钟\n"
+                                              f"本步声明预算: {(step.exit_condition or {}).get('timeout_minutes', 30)} 分钟\n"
+                                              f"判定上限: {int(_q_budget // 60)} 分钟"
+                                              f"（= 声明 × 次数，下限 30 分钟）"),
                                     src="workflow_engine")
                                 self._lifecycle.close_wf(inst["instance_id"], status="cancelled")
                             except Exception as _e:

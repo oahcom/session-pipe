@@ -49,6 +49,24 @@ LOGGER = logging.getLogger("workflow.engine")
 # 双方 timeout_count 恒 0 → 永远 busy。此阈值把"被真占用"与"整链卡死"分开。
 _QUEUE_DEGRADE_AT = 3
 
+# 排队预算下限（秒）。角色正常执行一步就要几分钟，低于此值会把合法排队误杀
+# （2026-10-19 实测 queued_since→cancel 仅 97~121s）。上限由步声明推导，见下。
+_QUEUE_BUDGET_FLOOR = 1800
+
+
+def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> float:
+    """排队上限 = 该步声明的 timeout_minutes × 可重试次数，不低于下限。
+
+    bus #425410 判据 2：原实现是全局硬编码 1800s，与模板声明完全脱耦——
+    声明 5min 的 architect_full_design/s4 与声明 120min 的 WL-full_dev_pipeline/s2
+    共用同一个 30 分钟上限，长步被短上限夹碎（实测父步 60min 预算被两条
+    更短的上限各杀一次）。改为按声明计算，并把 1800 作为下限保留：
+    它防的是"排队几秒即杀"，不是业务预算。
+    parent_minutes: 子链传入父步声明的分钟数，保证子链预算不低于父步（判据 2）。
+    """
+    declared = max(float(ec.get("timeout_minutes", 30) or 30), float(parent_minutes or 0))
+    return max(_QUEUE_BUDGET_FLOOR, declared * 60 * max(int(attempts), 1))
+
 
 def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
     """角色 tmux pane 显示空闲 → 发一轮提醒 prompt（不 cancel，不递增超时）。"""
@@ -203,6 +221,37 @@ class StepHandlerMixin:
         """
         _v = run.step_results.get(step.id, {})
         return _v if isinstance(_v, dict) else {}
+
+    def _parent_step_minutes(self, run) -> float:
+        """子链所在父步声明的 timeout_minutes；非子链返回 0。
+
+        子链预算不得低于父步：子链模板声明 15min 的步骤，在同一条父链里干的
+        活对应父步声明 60min，按 15×次数算出来的预算必然在父步预算内先耗尽
+        （bus #425410 命令 7 实测：父步 60min 被两个更短上限各杀一次）。
+        """
+        # 调用方两种形态：_tick 传 WorkflowRun，engine.run_once 传 DB 行 dict
+        _iid = getattr(run, "id", None) or (run.get("instance_id") if isinstance(run, dict) else None)
+        if not _iid:
+            return 0.0
+        try:
+            _row = self._lifecycle.query_one(
+                "SELECT wi.parent_wf_id, wi.subflow_source_step_id, p.template_id "
+                "FROM workflow_instances wi "
+                "LEFT JOIN workflow_instances p ON p.instance_id = wi.parent_wf_id "
+                "WHERE wi.instance_id=?", (_iid,))
+        except Exception as _e:
+            LOGGER.debug("parent step minutes 查询失败 %s: %s", str(_iid)[:12], _e)
+            return 0.0
+        if not _row or not _row["parent_wf_id"]:
+            return 0.0
+        _parent_wf = self._workflows.get(_row["template_id"] or "")
+        if not _parent_wf or not _parent_wf.steps:
+            return 0.0
+        _src = _row["subflow_source_step_id"] or ""
+        for _s in _parent_wf.steps:
+            if _s.id == _src:
+                return float((_s.exit_condition or {}).get("timeout_minutes", 30) or 30)
+        return 0.0
 
     def _eff_role(self, run, step) -> str:
         """步骤的实际执行角色：实例 effective_roles 覆盖优先，否则模板值。
@@ -457,7 +506,7 @@ class StepHandlerMixin:
                 # `_queued>=10` 实际只有 ~100 秒，而角色正常执行一步就是几分钟。
                 # 实测 2026-10-19 17:37-17:43 三条返工链在角色被别的任务占用
                 # ~70s 后即被自动取消（queued_since→cancel 97~121s），子链全灭。
-                # 与 engine.py 的排队回收对齐为 30 分钟（queued_since 不随 ts 刷新）。
+                # 与 engine.py 的排队回收共用 _queue_budget_sec（queued_since 不随 ts 刷新）。
                 _q_since = self._step_sd(run, step).get("queued_since") or time.time()
                 # 升级只在首次达到阈值时发一次，避免 6→10 每 tick 重发 coordinator
                 if _queued == 6:
@@ -466,15 +515,32 @@ class StepHandlerMixin:
                         f"排队 {_queued} 次仍未响应（角色 {_eff} 活跃但可能卡死），请介入",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                 # 排队上限 = 角色被其他工作流长期占用，子链无法执行 → auto-cancel
-                if _queued >= 10 and time.time() - _q_since >= 1800:
+                _q_budget = _queue_budget_sec(
+                    ec, max(max_retries + 3, 4),
+                    parent_minutes=self._parent_step_minutes(run))
+                if _queued >= 10 and time.time() - _q_since >= _q_budget:
+                    _q_age_min = int((time.time() - _q_since) / 60)
                     LOGGER.warning("auto-cancel subflow: %s queued=%d 已排队 %d 分钟，角色 %s 长期占用",
-                                   run.id[:12], _queued, int((time.time() - _q_since) / 60), _eff)
+                                   run.id[:12], _queued, _q_age_min, _eff)
                     try:
                         self._lifecycle.close_wf(run.id, status="cancelled")
+                        # 判据 3（bus #425410）：回收必须留证。此前 blocker 只把正文写进
+                        # 标题，evidence 为空 → 事后按 e 字段检索的核验一条也取不到，
+                        # 今日 10 条 cap blocker 全部踩中。
                         self._bb.write("workflow",
                             f"[workflow] {run.workflow_name} 排队超限自动取消: "
                             f"角色 {_eff} 被其他工作流占用，"
                             f"排队 {_queued} 次后自动回收",
+                            evidence=(f"实例: {run.id}\n步骤: {run.current_step}\n"
+                                      f"角色: {_eff}\n排队次数: {_queued}\n"
+                                      f"排队起点: {time.strftime('%F %T', time.localtime(_q_since))}\n"
+                                      f"已排队: {_q_age_min} 分钟\n"
+                                      f"本步声明预算: {ec.get('timeout_minutes', 30)} 分钟\n"
+                                      f"判定上限: {int(_q_budget // 60)} 分钟"
+                                      f"（= 声明 × 次数，下限 30 分钟）\n"
+                                      f"复跑: sqlite3 -readonly ~/.hermes/state/workflows.db "
+                                      f"\"select step_results from workflow_instances "
+                                      f"where instance_id='{run.id}'\""),
                             src="workflow_engine")
                     except Exception as _cancel_e:
                         LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
@@ -498,12 +564,12 @@ class StepHandlerMixin:
                 # → 永远 busy（自我互锁）。实测积压 153 个 running 实例 timeout_count≡0。
                 # 破环：排队够多仍无进展，说明不是"被占用"而是"整条链卡死"，
                 # 降级走超时路径递增计数，让回收器能开工。
-                # 必须同时等满 30 分钟：降级路径会每 tick 递增 timeout_count，
+                # 必须同时等满排队预算：降级路径会每 tick 递增 timeout_count，
                 # 4 次（默认 _auto_cancel_at）即 cancel —— 若只看次数，排队
-                # ~50s 就绕过了上面的 30 分钟门槛，误杀原样复现（codex P1）。
-                # 互锁破环本身不受影响：30 分钟后仍会降级并回收。
+                # ~50s 就绕过了上面的预算门槛，误杀原样复现（codex P1）。
+                # 互锁破环本身不受影响：预算耗尽后仍会降级并回收。
                 if (_queued >= _QUEUE_DEGRADE_AT
-                        and time.time() - _q_since >= 1800):
+                        and time.time() - _q_since >= _q_budget):
                     LOGGER.warning("排队 %d 次、%d 分钟无进展 → %s/%s 降级为超时计数解锁回收",
                                    _queued, int((time.time() - _q_since) / 60),
                                    run.id[:12], step.id)

@@ -80,6 +80,41 @@ def test_long_queue_cancels():
     args, kwargs = eng._lifecycle.close_wf.call_args
     assert kwargs.get("status") == "cancelled", kwargs
 
+def test_budget_follows_declared_timeout():
+    """上限 = 声明 × 次数，不是全局 1800（bus #425410 判据 2）。"""
+    from pipeflow.step_handler import _queue_budget_sec
+    assert _queue_budget_sec({"timeout_minutes": 120}, 4) == 120 * 60 * 4
+    assert _queue_budget_sec({"timeout_minutes": 60}, 1) == 3600
+
+def test_budget_floor_and_parent_override():
+    """短步不得低于 1800s；子链预算不低于父步声明。"""
+    from pipeflow.step_handler import _queue_budget_sec
+    assert _queue_budget_sec({"timeout_minutes": 0.001}, 4) == 1800
+    assert _queue_budget_sec({}, 4) == 30 * 60 * 4   # 未声明按默认 30min
+    assert _queue_budget_sec({"timeout_minutes": 15}, 4, parent_minutes=60) == 60 * 60 * 4
+
+def test_requeue_clears_queue_ledger():
+    """父步重置后必须清 queued/queued_since，否则重投立刻撞旧账本（判据 4）。"""
+    from pipeflow.engine import _REQUEUE_DROP
+    sd = {"status": "rejected", "queued": 26, "queued_since": time.time() - 4000,
+          "subflow_retry": 2}
+    cleaned = {k: v for k, v in sd.items() if k not in _REQUEUE_DROP}
+    assert "queued" not in cleaned and "queued_since" not in cleaned
+    assert cleaned.get("subflow_retry") == 2, "重建预算跨重投保留"
+
+def test_parent_minutes_accepts_db_row():
+    """engine.run_once 传的是 DB 行 dict，不是 WorkflowRun（曾误调不存在的方法）。"""
+    from pipeflow.engine import WorkflowDef, Step as EStep
+    eng = _Eng()
+    eng._lifecycle.query_one.return_value = {
+        "parent_wf_id": "wf_p", "subflow_source_step_id": "s2", "template_id": "tpl_p"}
+    eng._workflows = {"tpl_p": WorkflowDef(name="tpl_p", title="t", description="d", steps=[
+        EStep(id="s2", title="t", target_role="engineer", prompt_template="t",
+              exit_condition={"timeout_minutes": 60})])}
+    assert eng._parent_step_minutes({"instance_id": "wf_c"}) == 60
+    assert eng._parent_step_minutes(object()) == 0.0, "无 id 的入参必须安全返回 0"
+
+
 def test_degrade_path_respects_30min_window():
     """降级为超时计数也必须等满 30 分钟，否则 4 个 tick 就绕过门槛。
 
