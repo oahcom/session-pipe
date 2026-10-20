@@ -65,7 +65,9 @@ def _reasoning_window_hours() -> float:
     if not DB_PATH.exists():
         return 0.0
     try:
-        ts = [r[2] for r in facts_last_n_days(1)
+        # 取 2 天：窗口长度 = now - 最早 fact，用 1 天查询必然 <24h → 本函数恒 <24，
+        # 三个 24h 断言永久 skip（实测 23.904h）。这是闸门失效，不是"数据还没铺满"。
+        ts = [r[2] for r in facts_last_n_days(2)
               if r[0] not in PULSE_CATS and r[1] not in DAEMON_SRCS]
     except (sqlite3.Error, OSError):
         return 0.0  # DB 存在但不可读/无表：同样按"窗口不足"处理（走 skip）
