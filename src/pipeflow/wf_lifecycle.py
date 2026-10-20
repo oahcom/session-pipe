@@ -245,6 +245,19 @@ class WorkflowLifecycleMixin:
                     if isinstance(_cur_sr, dict):
                         _cur_tc = _cur_sr.get("timeout_count", 0)
                         _cur_q = _cur_sr.get("queued", 0) or 0
+                        # 子链守卫（bus #425593 修法②）：父步的活由子链承担，父步
+                        # 自己没有新产出是正常态。子链活着时不得按停滞判死——否则
+                        # 子链结束的瞬间，冻结的 queued_since 让父步「停滞 = 从建
+                        # 子链至今」，整条父链被回收（实测 8 例，138min 子链工时
+                        # 无接收方）。
+                        _sf = _cur_sr.get("subflow_id") or ""
+                        if _sf:
+                            _sf_rows = lm.query(
+                                "SELECT status FROM workflow_instances WHERE instance_id=?",
+                                (_sf,))
+                            _sf_st = _sf_rows[0]["status"] if _sf_rows else ""
+                            if _sf_st in ("pending", "running", "step_done_ready"):
+                                continue
                         # 停滞时长起点优先用 queued_since（首次排队时刻，不随 ts 重置），
                         # 退回 ts（每次重推刷新），再退回实例创建时间。
                         # 为什么必须用 queued_since：排队分支每轮都重置 ts，用 ts 算停滞
@@ -795,7 +808,14 @@ class WorkflowLifecycleMixin:
                     # 另一个作用域，方法内引用会 NameError 被 except 吞掉，
                     # 导致子链创建静默失败（实测生产 journal：
                     # "subflow creation failed: name 'new_results' is not defined"）。
-                    results.setdefault(tgt_step.id, {})["subflow_id"] = _wf_id
+                    _psr = results.setdefault(tgt_step.id, {})
+                    _psr["subflow_id"] = _wf_id
+                    # 清排队账本（bus #425593 修法①）：子链接管后父步不再排队，
+                    # 冻结的 queued_since 会被条件4 当成"父步停滞至今"→ 子链一
+                    # 结束就整链判死（实测 8 例，138min 子链工时无接收方）。
+                    # 与投递成功路径（engine.py 清 queued+queued_since）同语义。
+                    _psr["queued"] = 0
+                    _psr.pop("queued_since", None)
                     conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                         (json.dumps(results, ensure_ascii=False), wf_id))
                     conn2.commit()

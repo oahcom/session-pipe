@@ -124,6 +124,52 @@ def test_pane_gate_is_load_bearing():
         "pane 状态不影响结论：门控未接入判定，静默/活跃无区别"
 
 
+def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect"):
+    """父步挂着子链时跑一次回收，返回 cancel SQL 列表。"""
+    now = time.time()
+    row = {
+        "instance_id": "wf_test_parent",
+        "template_id": _TPL,
+        "created_at": now - 7200,
+        "status": "running",
+        "current_step_id": "s1",
+        "assignee": assignee,
+        "step_results": json.dumps({"s1": step_sd}),
+    }
+
+    class _LM(_FakeLM):
+        def query(self, sql, params=()):
+            if "WHERE instance_id=?" in sql and params and params[0] != "wf_test_parent":
+                return [{"status": sub_status}] if sub_status else []
+            return [self._row]
+
+    inst = SimpleNamespace(_workflows={})
+    inst._lifecycle = SimpleNamespace(complete_step=lambda *a, **k: None)
+    lm = _LM(row)
+    orig = liveness.tmux_pane_active
+    orig_prod = wf_lifecycle._role_producing_recently
+    liveness.tmux_pane_active = lambda role, **k: pane_state
+    wf_lifecycle._role_producing_recently = lambda role, **k: False
+    try:
+        WorkflowLifecycleMixin._cleanup_stale_workflows(inst, lm)
+    finally:
+        liveness.tmux_pane_active = orig
+        wf_lifecycle._role_producing_recently = orig_prod
+    return [s for s in lm.executed if "cancelled" in s]
+
+def test_live_subflow_blocks_parent_reclaim():
+    """子链还在跑 → 父步没有新产出是正常态，不得按停滞判死（bus #425593）。"""
+    sd = {"subflow_id": "wf_sub_live", "queued": 20,
+          "queued_since": time.time() - 7200, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, "running", False) == [], \
+        "子链 running 时父链仍被回收：139min 子链工时落到空处"
+
+def test_dead_subflow_still_allows_reclaim():
+    """子链已终态 → 回收路径必须保留，否则真卡死父链永驻。"""
+    sd = {"subflow_id": "wf_sub_dead", "queued": 20,
+          "queued_since": time.time() - 7200, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, "cancelled", False), "子链已死却连父链也不回收"
+
 def test_select_includes_assignee():
     """主查询漏选 assignee → 角色解析恒空 → 探测恒 None → 条件4 静默失效。"""
     code = _SRC_FILE.read_text(encoding="utf-8")
@@ -143,6 +189,8 @@ if __name__ == "__main__":
             test_queued_branch_keeps_stall_gate,
             test_queued_branch_reclaims_when_silent_and_stalled,
             test_pane_gate_is_load_bearing,
+            test_live_subflow_blocks_parent_reclaim,
+            test_dead_subflow_still_allows_reclaim,
             test_select_includes_assignee)
     _fails = 0
     for _fn in _fns:

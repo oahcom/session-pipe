@@ -157,8 +157,49 @@ def test_no_subflow_returns_falsy():
     assert not r, f"期望 falsy（未接管），实际 {r!r}"
 
 
+# ── 建子链时清父步排队账本（bus #425593 修法①） ──────────────────
+
+def test_subflow_creation_clears_parent_queue_ledger():
+    """子链接管后父步不再排队：冻结的 queued_since 会被条件4 当"停滞至今"。
+
+    实测 8 条父链在子链仍推进时被整链判死（138min 子链工时无接收方）。
+    """
+
+    class _Cur2:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn2(_FakeConn):
+        def commit(self):
+            pass
+
+        def execute(self, sql, params=()):
+            if "assigner FROM workflow_instances" in sql:
+                return _Cur2({"assigner": "pm"})
+            if "t.title, t.description" in sql:
+                return _Cur2({"title": "需求", "description": "描述"})
+            if "SELECT template_id FROM tasks" in sql:
+                return _Cur2({"template_id": "x"})
+            return super().execute(sql, params)
+
+    sr = {"s1": {"queued": 20, "queued_since": 1700000000.0}}
+    m, lm = _taker(sr, None)
+    lm._conn_tx.return_value = _FakeTx(_Conn2(sr, None))
+    step = _step()
+    m._workflows = {"pm_requirements": type("W", (), {"steps": [step]})()}
+    results = {"s1": dict(sr["s1"])}
+    assert m._subflow_takeover(lm, "wf_parent", "wfname", step, -1, results, "s1") is True
+    assert results["s1"]["queued"] == 0, "建子链未清 queued：旧计数会让父步立即满足回收判据"
+    assert "queued_since" not in results["s1"], \
+        "建子链未清 queued_since：子链一结束父步就被判「停滞 = 从建链至今」"
+
+
 if __name__ == "__main__":
     tests = [
+        ("建子链清父步排队账本", test_subflow_creation_clears_parent_queue_ledger),
         ("子链 running → True（接管）", test_live_subflow_returns_true),
         ("子链 pending → True（接管）", test_pending_subflow_returns_true),
         ("子链 step_done_ready → True", test_step_done_ready_subflow_returns_true),
