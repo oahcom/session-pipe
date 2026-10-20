@@ -568,7 +568,9 @@ class StepHandlerMixin:
                     LOGGER.warning("auto-cancel subflow: %s queued=%d 已排队 %d 分钟，角色 %s 长期占用",
                                    run.id[:12], _queued, _q_age_min, _eff)
                     try:
-                        self._lifecycle.close_wf(run.id, status="cancelled")
+                        self._lifecycle.close_wf(
+                            run.id, status="cancelled",
+                            reason=f"subflow queued {_queued}x, {_q_age_min}min >= {int(_q_budget // 60)}min")
                         # 判据 3（bus #425410）：回收必须留证。此前 blocker 只把正文写进
                         # 标题，evidence 为空 → 事后按 e 字段检索的核验一条也取不到，
                         # 今日 10 条 cap blocker 全部踩中。
@@ -644,13 +646,16 @@ class StepHandlerMixin:
                         LOGGER.info("tick 末位值门禁 PASS %s/%s，直接收尾", run.id[:8], step.id)
                         try:
                             self._lifecycle.complete_step(run.id, step.id)
-                            self._lifecycle.close_wf(run.id, status="completed")
+                            self._lifecycle.close_wf(run.id, status="completed",
+                                                     reason="value gate PASS")
                         except Exception as _e:
                             LOGGER.warning("tick 末位收尾失败 %s/%s: %s", run.id[:8], step.id, _e)
             # 超限 → 自动 cancel，阻止死循环升级
             if timeout_count >= _auto_cancel_at:
                 try:
-                    self._lifecycle.close_wf(run.id, status="cancelled")
+                    self._lifecycle.close_wf(
+                        run.id, status="cancelled",
+                        reason=f"timeout_count={timeout_count} >= {_auto_cancel_at}")
                 except Exception as _e:
                     LOGGER.warning("auto-cancel close_wf failed: %s", _e)
                 self._notify_role("maintainer",

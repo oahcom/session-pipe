@@ -709,7 +709,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         if time.time() - _created < 300:
             LOGGER.warning("cancel rejected: %s 创建不足 5 分钟 (age=%.0fs)，拒绝取消", wid, time.time() - _created)
             return False
-        self._lifecycle.close_wf(wid, status="cancelled")
+        self._lifecycle.close_wf(wid, status="cancelled", reason="cli cancel")
         return True
 
     def tick(self) -> int:
@@ -818,7 +818,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     LOGGER.warning("wf %s/%s current_step=%s 不在模板中，自动回收",
                                    inst["instance_id"][:12], wf_name, step_id)
                     try:
-                        self._lifecycle.close_wf(inst["instance_id"], status="cancelled")
+                        self._lifecycle.close_wf(
+                            inst["instance_id"], status="cancelled",
+                            reason=f"current_step={step_id} 不在模板")
                     except Exception:
                         pass
                     continue
@@ -989,7 +991,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                               f"判定上限: {int(_q_budget // 60)} 分钟"
                                               f"（= 声明 × 次数，下限 30 分钟）"),
                                     src="workflow_engine")
-                                self._lifecycle.close_wf(inst["instance_id"], status="cancelled")
+                                self._lifecycle.close_wf(
+                                    inst["instance_id"], status="cancelled",
+                                    reason=(f"queue {int((time.time() - _q_since) / 60)}min"
+                                            f" >= {int(_q_budget // 60)}min"))
                             except Exception as _e:
                                 LOGGER.debug("queue-cap cancel failed: %s", _e)
                         continue
@@ -1033,7 +1038,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             # （需 completed/cancelled/failed）。step_results 终态已置 delivery_blocked，
                             # 此处把行级列也收口，消除软泄漏（三方审查 WARN-15）。
                             try:
-                                self._lifecycle.close_wf(inst["instance_id"], status="delivery_blocked")
+                                self._lifecycle.close_wf(
+                                    inst["instance_id"], status="delivery_blocked",
+                                    reason=f"delivery failed {_fail_count}x")
                             except Exception:
                                 LOGGER.debug("close_wf delivery_blocked 失败: %s", inst["instance_id"][:12])
                         else:

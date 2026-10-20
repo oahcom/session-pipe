@@ -85,6 +85,18 @@ def test_cancel_parent_cascades_to_child():
     _with_db(_run)
 
 
+def test_cascade_child_log_inherits_parent_reason():
+    """子链的 wf_cancelled 必须带父链原因，否则排查要回查父链才知道为什么死。"""
+    def _run(lm):
+        _start(lm, "wf_pr")
+        _add_child(lm, "wf_pr", "wf_cr")
+        lm.close_wf("wf_pr", status="cancelled", reason="queue 45min >= 30min")
+        d = lm._conn.execute(
+            "SELECT detail FROM workflow_logs WHERE workflow_instance_id='wf_cr'"
+            " AND action='wf_cancelled'").fetchone()["detail"]
+        assert "queue 45min >= 30min" in d, f"子链日志未继承父链原因: {d!r}"
+    _with_db(_run)
+
 def test_complete_parent_does_not_cancel_child():
     """completed 不级联：正常收尾时子链已自行完成，误杀会丢失产出。"""
     def _run(lm):

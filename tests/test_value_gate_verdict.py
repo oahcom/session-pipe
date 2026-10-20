@@ -65,7 +65,7 @@ def _drive_advance(audit_text: str | None) -> list:
     class _Lm:
         _conn = MagicMock()
         def __enter__(self): return self
-        def close_wf(self, wfid, status="completed"): closed.append(status)
+        def close_wf(self, wfid, status="completed", **_kw): closed.append(status)
         def _cascade_cancel_unsafe(self, wfid, reason=""): self.cascaded = True
         def _conn_tx(self):
             lm = self

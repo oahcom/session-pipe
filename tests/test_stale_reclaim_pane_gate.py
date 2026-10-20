@@ -60,7 +60,7 @@ class _LmStub:
     def complete_step(self, *a, **k):
         return None
 
-    def close_wf(self, wf_id, status="completed"):
+    def close_wf(self, wf_id, status="completed", **_kw):
         self.closed.append((wf_id, status))
         self._lm.execute(
             f"UPDATE workflow_instances SET status='{status}' WHERE instance_id=?", (wf_id,))

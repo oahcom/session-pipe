@@ -717,7 +717,7 @@ class LifecycleManager:
     # 终态白名单：拼错（canceled/cancel）会让行进入终态却不触发级联，子链成孤儿。
     _CLOSE_STATUSES = ("completed", "cancelled", "failed", "delivery_blocked")
 
-    def close_wf(self, wf_id: str, status: str = "completed"):
+    def close_wf(self, wf_id: str, status: str = "completed", reason: str = ""):
         if status not in self._CLOSE_STATUSES:
             raise ValueError(f"unknown close status: {status!r}")
         with self._lock:
@@ -755,7 +755,8 @@ class LifecycleManager:
                 # 放在幂等短路之前：父链已 cancelled 但子链仍是旧代码留下的孤儿时，
                 # 再次 close 应继续级联而不是直接返回。
                 if status != "completed":
-                    self._cascade_cancel_unsafe(wf_id, f"parent {status}")
+                    # 子链留痕继承父链原因：只写 "parent cancelled" 时排查仍要回查父链。
+                    self._cascade_cancel_unsafe(wf_id, reason or f"parent {status}")
                 # 幂等：多条收尾路径（step_handler 超时兜底 / _handle_wf_loop / 回收）
                 # 会先后关同一台，重复写入会把 completed_at 改成后一次时间并刷重复日志。
                 if _cur_st == status:
@@ -774,7 +775,10 @@ class LifecycleManager:
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
                 self._sync_task_unsafe(task_id)
-                self._log_unsafe(wf_id, task_id, "wf_closed", detail=f"workflow {status}")
+                # 只写 "workflow cancelled" 时，事后无法区分是人工 cancel、步骤缺失、
+                # 排队回收还是僵尸回收（curator #429188：05:23:40 同秒 6 条全部不可归因）。
+                self._log_unsafe(wf_id, task_id, "wf_closed",
+                                 detail=f"workflow {status}" + (f" ({reason})" if reason else ""))
                 if _own_tx:
                     self._conn.commit()
                 return True

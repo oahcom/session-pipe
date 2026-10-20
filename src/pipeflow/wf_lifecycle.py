@@ -347,7 +347,8 @@ class WorkflowLifecycleMixin:
                     try:
                         # 走 close_wf 而非裸 UPDATE：回收路径漏掉了 task 状态同步与
                         # 子链级联，任务永远停在 running、子链继续占角色（实测 76 条）。
-                        self._lifecycle.close_wf(wf_id, status="cancelled")
+                        self._lifecycle.close_wf(wf_id, status="cancelled",
+                                                 reason="stale rescue")
                         lm.execute(
                             "INSERT INTO workflow_logs (workflow_instance_id, task_id, action, actor, detail, ts) "
                             "VALUES (?, ?, 'cancelled', 'workflow_engine', ?, ?)",
@@ -499,7 +500,8 @@ class WorkflowLifecycleMixin:
                         # 任一文件 FAIL 即整体失败，不得被先扫到的 PASS 覆盖
                         # 直接跳到 close（跳过子链扫描——子链 cancelled 已在下面兼容）
                         LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
-                        self._lifecycle.close_wf(wf_id, status='completed')
+                        self._lifecycle.close_wf(wf_id, status='completed',
+                                                 reason="value gate PASS")
                         conn.commit()
                         completed_now = True
                         return
@@ -514,7 +516,8 @@ class WorkflowLifecycleMixin:
                         LOGGER.warning("wf %s [%s] 价值审计 FAIL → 按 failed 收尾（不推进为 completed）",
                                        wf_id[:8], wf_name)
                         # close_wf 已内置子链级联（除 completed 外的终态），无需预调。
-                        self._lifecycle.close_wf(wf_id, status='failed')
+                        self._lifecycle.close_wf(wf_id, status='failed',
+                                                 reason=f"value audit FAIL: {_audit_path.name}")
                         conn.commit()
                         _vg_fail_wf = wf_id
                         return
@@ -570,7 +573,8 @@ class WorkflowLifecycleMixin:
                     if not _all_subs_done:
                         return
                     LOGGER.info("wf %s [%s] 完成: %d 步", wf_id[:8], wf_name, len(steps))
-                    self._lifecycle.close_wf(wf_id, status='completed')
+                    self._lifecycle.close_wf(wf_id, status='completed',
+                                             reason="all steps done")
                     conn.commit()
                     completed_now = True
                 else:

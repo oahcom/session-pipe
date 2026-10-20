@@ -275,7 +275,7 @@ class TestCancelMinimumSurvival(_MockTestCase):
     def test_cancel_allows_workflow_older_than_300s(self):
         eng = self._cancel_eng(time.time() - 400)
         self.assertTrue(eng.cancel("wf_old"))
-        eng._lm.close_wf.assert_called_once_with("wf_old", status="cancelled")
+        eng._lm.close_wf.assert_called_once_with("wf_old", status="cancelled", reason="cli cancel")
 
     def test_cancel_boundary_exactly_300s_allowed(self):
         # 边界: age == 300s → time.time() - created < 300 为 False → 允许取消
