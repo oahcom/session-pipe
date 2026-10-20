@@ -162,6 +162,36 @@ def _transcript_context_k(role: str) -> float | None:
     return None
 
 
+# 生成中但 transcript 多久没落事件即判卡死（秒）。
+# 实测 2026-10-21 coordinator：末事件是 05:22:13Z 的 tool_use，之后 31 分钟
+# 无任何行（含 tool_result），pane 一直挂 `Compacting… 55% · esc to interrupt`。
+# 取 300s：正常工具调用（pytest 21min 那次是**一个** tool_use 内部在跑，
+# transcript 同样不落行）也会被误判——但误判的代价只是发一句「继续」，
+# 而漏判的代价是角色永久占位、全链排队（实测 3 个实例 queued 387）。
+_STOPPED_PROGRESS_SEC = 300
+
+
+def _transcript_stalled(role: str, max_age: float = _STOPPED_PROGRESS_SEC) -> bool:
+    """角色最新 transcript 是否已 max_age 秒没有新事件。
+
+    pane 的 `esc to interrupt` 只证明 CLI 还挂着 spinner，不证明有进展：
+    上游断连后工具调用悬空（tool_use 无 tool_result），spinner 照转。
+    transcript 的 mtime 是落盘事实，能区分「在跑」与「卡死」。
+
+    取不到 transcript（路径不存在/权限）→ False：宁可漏判，也不给
+    正在干活的角色发 C-u 打断当前轮。
+    """
+    import glob as _glob
+    try:
+        d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+        files = sorted(_glob.glob(str(d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
+        if not files:
+            return False
+        return (time.time() - _os.path.getmtime(files[0])) >= max_age
+    except OSError:
+        return False
+
+
 class RoleLifecycleMixin:
     """WorkflowEngine 的角色管理 mixin。"""
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
@@ -294,10 +324,17 @@ class RoleLifecycleMixin:
             # 追加箭头只在**生成中**出现（空闲时底部只有 bypass 提示）：
             # -S -60 里残留的旧错误行不能当作"当前仍被拒"，否则会给正在干活的
             # 角色发 C-u +「继续」，把当前轮打断。
+            # 但「生成中」不等于有进展：上游断连后 CLI 会一直挂着 spinner
+            # （实测 coordinator 卡在 Compacting 52% 55min，transcript 末事件是
+            # 一条没有 tool_result 的 tool_use）。所以判据从"是否生成中"改成
+            # "生成中且 transcript 已 _STOPPED_PROGRESS_SEC 没落任何事件"——
+            # 后者才是卡死；有进展的轮次照旧跳过。
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             if any("esc to interrupt" in ln for ln in _tail):
-                continue
-
+                if not _transcript_stalled(role):
+                    continue
+                LOGGER.warning("角色卡死: %s 生成中但 transcript %.0fs 无事件",
+                               role, _STOPPED_PROGRESS_SEC)
             with self._COMPACT_LOCK:
                 last, attempt = self._last_rate_recover.get(role, (0.0, 0))
                 wait = self._RATE_LIMIT_BACKOFF_SEC[

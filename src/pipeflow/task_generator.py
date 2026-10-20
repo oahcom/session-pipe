@@ -519,7 +519,9 @@ class TaskGeneratorMixin:
                 for _sid, _sr in results.items():
                     if not isinstance(_sr, dict):
                         continue
-                    if _sr.get("escalated"):
+                    # 写端是 subflow_escalated（:353），只读 escalated 时该抑制
+                    # 永不生效——子链连续失败后本步仍每轮被计入超时重推。
+                    if _sr.get("subflow_escalated") or _sr.get("escalated"):
                         _escalated = True
                     _tc = _sr.get("timeout_count", 0)
                     if _tc == 0:
