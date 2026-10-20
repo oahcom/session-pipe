@@ -289,7 +289,13 @@ class StepHandlerMixin:
             return 0.0
         if not _row or not _row["parent_wf_id"]:
             return 0.0
-        _parent_wf = self._workflows.get(_row["template_id"] or "")
+        # 模板名兼容：实例存裸名、_workflows 以 WF- 前缀注册（manager.py:174 同款回退）。
+        # 缺回退时 _parent_wf 恒 None → 父步预算保护静默失效，子链按自己的
+        # 短声明算预算（实测 architect_full_design/s1 15min 被当成上限，
+        # 父步 WL-full_dev_pipeline/s1 实际 30min，排队 60min 即被杀）。
+        _ptid = _row["template_id"] or ""
+        _parent_wf = (self._workflows.get(_ptid)
+                      or (self._workflows.get(f"WF-{_ptid}") if _ptid else None))
         if not _parent_wf or not _parent_wf.steps:
             return 0.0
         _src = _row["subflow_source_step_id"] or ""
