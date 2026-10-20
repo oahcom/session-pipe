@@ -482,6 +482,15 @@ class LifecycleManager:
                         raise PermissionError("token expired")
                     if token != stored_token:
                         raise PermissionError("invalid token")
+                    # 持钥即放行 = 任何拿到 DB 副本/日志的人都能越权确认。钥匙本来
+                    # 只发给审批人，这里必须再验一次身份（ccs-monitor #427818 实测：
+                    # 副本 DB 越权 confirm 可复现）。引擎自身的自动推进/超时兜底以
+                    # workflow_engine 身份调用，按系统角色豁免。
+                    _step = self.get_step(wf_id, step_id)
+                    _assigner = self._get_assigner_for_step(wf, _step or {}, step_id)
+                    if _assigner and self.role not in (_assigner, "workflow_engine", "system"):
+                        raise PermissionError(
+                            f"only assigner can confirm: {self.role} != {_assigner}")
                     current["approval_consumed_at"] = time.time()
                     current["approval_token"] = None
                 else:
@@ -721,6 +730,12 @@ class LifecycleManager:
                     "UPDATE workflow_instances SET status=?, completed_at=? "
                     "WHERE instance_id=?", (status, time.time(), wf_id)
                 )
+                # 父链判死 → 子链必须同时终止。子链持有角色占用与任务，父链消失后
+                # 没有任何一方消费它的产出，只能跑到自己的超时（实测 72h 76 条子链
+                # 挂在已死父链下，wf_sub_ee03a71c3 在父链 cancelled 后仍 running 21min）。
+                # 只在 cancelled/failed 级联：completed 的子链正常情况下已自行收敛。
+                if status in ("cancelled", "failed"):
+                    self._cascade_cancel_unsafe(wf_id, f"parent {status}")
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
                 self._sync_task_unsafe(task_id)

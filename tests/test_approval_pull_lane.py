@@ -52,6 +52,11 @@ def _lm(path):
     lm.start_wf("wf_pull", "s1", "tpl", initiator="engineer")
     return lm
 
+def _as_assigner(path):
+    """s2 的审批人 = 上一步 target_role = engineer。"""
+    return LifecycleManager("engineer", db_path=path)
+
+
 
 class _Env:
     """临时库 + 已签发 token 的 s2；ccs send 恒失败（复现角色忙）。"""
@@ -99,8 +104,39 @@ def test_pull_does_not_consume():
         t1 = e.lm.get_approval_token("wf_pull", "s2", requester="engineer")
         t2 = e.lm.get_approval_token("wf_pull", "s2", requester="engineer")
         assert t1 == t2, "拉取消费了 token：查看一次就作废"
-        assert e.lm.confirm_step("wf_pull", "s2", token=t1, approved=True, reason="ok")
+        aw = _as_assigner(e.path)
+        assert aw.confirm_step("wf_pull", "s2", token=t1, approved=True, reason="ok")
+        aw.close()
 
+
+def test_valid_token_from_wrong_role_is_denied():
+    """持钥也不等于有权：非审批人拿真 token confirm 必须拒绝（#427818）。
+
+    修前 token 分支只比对字符串 → 任何能读 DB 副本/日志的角色都能越权确认，
+    拉取鉴权被绕开（收窄未闭环）。
+    """
+    with _Env() as e:
+        t = e.lm.get_approval_token("wf_pull", "s2", requester="engineer")
+        try:
+            e.lm.confirm_step("wf_pull", "s2", token=t, approved=True)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError(
+                f"非审批人 {e.lm.role!r} 持真 token 越权 confirm 成功")
+        # 拒绝不得烧掉 token：审批人仍能用它
+        aw = _as_assigner(e.path)
+        assert aw.confirm_step("wf_pull", "s2", token=t, approved=True, reason="ok")
+        aw.close()
+
+def test_engine_auto_advance_is_exempt():
+    """引擎自身的自动推进（role=workflow_engine）不能被审批人校验挡住。"""
+    with _Env() as e:
+        t = e.lm.get_approval_token("wf_pull", "s2", requester="engineer")
+        eng = LifecycleManager("workflow_engine", db_path=e.path)
+        assert eng.confirm_step("wf_pull", "s2", token=t, approved=True,
+                                reason="daemon auto-advance")
+        eng.close()
 
 def test_expired_token_is_not_returned():
     """TTL 已过 → 不得再返回明文（否则签名过期形同虚设）。"""
@@ -118,7 +154,9 @@ def test_consumed_token_is_not_returned():
     """已消费 → 不得返回。"""
     with _Env() as e:
         t = e.lm.get_approval_token("wf_pull", "s2", requester="engineer")
-        e.lm.confirm_step("wf_pull", "s2", token=t, approved=True, reason="ok")
+        aw = _as_assigner(e.path)
+        aw.confirm_step("wf_pull", "s2", token=t, approved=True, reason="ok")
+        aw.close()
         assert e.lm.get_approval_token("wf_pull", "s2", requester="engineer") is None
 
 
@@ -149,6 +187,8 @@ if __name__ == "__main__":
         ("过期不返回", test_expired_token_is_not_returned),
         ("已消费不返回", test_consumed_token_is_not_returned),
         ("返回剩余 TTL", test_pull_reports_remaining_ttl),
+        ("持钥≠有权（越权拒绝）", test_valid_token_from_wrong_role_is_denied),
+        ("引擎自动推进豁免", test_engine_auto_advance_is_exempt),
         ("降级标题含 @审批人", test_fallback_title_is_addressable),
     ]
     passed = failed = 0
