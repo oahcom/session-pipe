@@ -77,9 +77,10 @@ def _extract_cmd(criterion: str) -> str | None:
     cmd_raw = re.sub(r"^bash -c '(.*)'\s*\d*$", r"bash -c '\1'", cmd_raw).strip()
     # 去掉残留的 " < N" 或 "< N" 比较符（含无等号形式：>48h, <24h）
     cmd_raw = re.sub(r'\s+[<>!]=?\s*\d+(?:\.\d+)?[a-zA-Z]?\s*', ' ', cmd_raw).strip()
-    # 去掉英文解释性残留（timestamp >48h / staged <24h / unread --all 后的说明词）
-    # 匹配: 裸词(如 timestamp/staged) 可选跟比较符(>/</>=/<=/!=) + 数字(可带字母后缀如 h/m/s)
-    cmd_raw = re.sub(r'\s+[a-zA-Z_][\w.-]*(?:\s*[<>!]=?\s*[\d.]+[a-zA-Z]*)?\s*$', '', cmd_raw).strip()
+    # 曾在此剥离"尾部英文说明词"，但正则无法区分说明词与命令的参数：
+    # `ps aux` → `ps`、`bus_client.py stats` → `bus_client.py`（后者只打印 usage
+    # 且 rc=0，恒通过）、`df -h / | head -1` → 同上。现只在 `输出` 标记处截断，
+    # 判据写法的容错交给 _check_passed 的文本/数字匹配。
     cmd_raw = re.sub(r'  +', ' ', cmd_raw)
     cmd_raw = re.sub(r'^\s*\|\s*', '', cmd_raw)
     cmd_raw = re.sub(r';$', '', cmd_raw).strip()
