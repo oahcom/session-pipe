@@ -513,6 +513,20 @@ def test_is_role_report_title_still_blocks_engine_audit():
     assert _is_role_report_title("[step_output] wf_x/s3 reviewer 产出审计", "workflow", "workflow_engine") is True
 
 
+def test_has_content_words_exempts_content_signal_categories():
+    """问题描述类分类不靠动词判定：无动词也必须放行（#423275/#422911 被吞）。"""
+    from routing.routes import _has_content_words
+    assert _has_content_words("[bug_report] cleanup_apply state_dir 仍取自计划", "bug_report") is True
+    assert _has_content_words("[bug_report] workflow_engine pipeflow 引擎链串味", "bug_report") is True
+
+
+def test_has_content_words_still_rejects_placeholders():
+    """豁免不外溢：普通分类仍要求内容词，纯占位标题依旧拦。"""
+    from routing.routes import _has_content_words
+    assert _has_content_words("ok", "workflow") is False
+    assert _has_content_words("[bug_report] cleanup 已完成", "code_fix") is False
+
+
 def test_is_role_report_title_blocks_when_label_differs_from_category():
     """标签与分类不一致 = 角色汇报（[optimizer] cat=optimization）。"""
     from routing.routes import _is_role_report_title

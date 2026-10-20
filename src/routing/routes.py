@@ -67,8 +67,19 @@ _CONTENT_WORDS = ("修复", "实现", "设计", "调研", "分析", "测试", "�
                   "fix", "implement", "design", "research", "analy", "test", "review",
                   "deploy", "monitor", "build", "optimi", "refactor", "investigate")
 
-def _has_content_words(title: str) -> bool:
-    """标题是否含内容性动词（防 'ok'/'hi'/'x' 这类纯占位标题生成无意义 workflow）。"""
+# 模块头注释里已声明的「问题/发现/建议」类：内容本身即待办，不靠动词判定。
+_CONTENT_SIGNAL_CATEGORIES = frozenset({"bug_report", "design_issue", "optimization"})
+
+def _has_content_words(title: str, category: str = "") -> bool:
+    """标题是否含内容性动词（防 'ok'/'hi'/'x' 这类纯占位标题生成无意义 workflow）。
+
+    内容信号分类（bug_report/design_issue/optimization）豁免：它们的标题本来就是
+    「问题描述」，很少带「修复/排查」等动词。实测 26 条 qa 缺陷报告（如
+    #423275 "state_dir 仍取自计划"、#422911 "引擎链串味"）因无动词被此门
+    静默丢弃，与 _is_role_report_title 是同一个丢弃面，需一并修。
+    """
+    if category in _CONTENT_SIGNAL_CATEGORIES:
+        return True
     t = title.lower()
     return any(w in t for w in _CONTENT_WORDS)
 
@@ -233,7 +244,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                 LOGGER.debug("Skipping workflow creation for system category %s", cat)
                             else:
                                 _t = assignment.get("title", "")
-                                if len(_t) < 8 or not _has_content_words(_t):
+                                if len(_t) < 8 or not _has_content_words(_t, cat):
                                     LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_t), role)
                                 elif _is_role_report_title(_t, cat, assignment.get("src", "")):
                                     # [角色名] 开头的 title 是"某角色的产出汇报"，不是"给某角色的任务"。
@@ -474,7 +485,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     _title = _raw.split("\n")[0] if _raw else ""
                     _title = _title[:80]
                     # 阈值与 route_all 对齐（len<8 或 无内容词）: 同消息两路径判定一致
-                    if len(_title) < 8 or not _has_content_words(_title):
+                    if len(_title) < 8 or not _has_content_words(_title, _cat):
                         LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_title), role_name)
                     elif _is_role_report_title(_title, _cat, msg.get("src", "")):
                         # 与 route_all 对齐：[角色名] 开头是产出汇报，不是派发任务。
