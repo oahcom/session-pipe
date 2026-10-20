@@ -277,6 +277,13 @@ class TestCancelMinimumSurvival(_MockTestCase):
         self.assertTrue(eng.cancel("wf_old"))
         eng._lm.close_wf.assert_called_once_with("wf_old", status="cancelled", reason="cli cancel")
 
+    def test_cancel_reason_lands_in_db(self):
+        """取消理由必须落库：05:23:40 六链同秒取消在库里零理由（coordinator #429916）。"""
+        eng = self._cancel_eng(time.time() - 400)
+        self.assertTrue(eng.cancel("wf_old", reason="清理 echo 任务"))
+        eng._lm.close_wf.assert_called_once_with(
+            "wf_old", status="cancelled", reason="cli cancel: 清理 echo 任务")
+
     def test_cancel_boundary_exactly_300s_allowed(self):
         # 边界: age == 300s → time.time() - created < 300 为 False → 允许取消
         eng = self._cancel_eng(time.time() - 300)

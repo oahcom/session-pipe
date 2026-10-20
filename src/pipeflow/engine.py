@@ -691,7 +691,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             "retries": {}, "results": results,
         }
 
-    def cancel(self, wid: str) -> bool:
+    def cancel(self, wid: str, reason: str = "") -> bool:
         try:
             rows = self._lifecycle.query(
                 "SELECT status, created_at FROM workflow_instances WHERE instance_id=?",
@@ -709,7 +709,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         if time.time() - _created < 300:
             LOGGER.warning("cancel rejected: %s 创建不足 5 分钟 (age=%.0fs)，拒绝取消", wid, time.time() - _created)
             return False
-        self._lifecycle.close_wf(wid, status="cancelled", reason="cli cancel")
+        # 人工取消必须留下"谁、为什么"：05:23:40 六链同秒取消只能靠 /tmp 的脚本
+        # 回显反推执行者（coordinator #429916），库里一条理由都没有。
+        self._lifecycle.close_wf(wid, status="cancelled",
+                                 reason=f"cli cancel: {reason}" if reason else "cli cancel")
         return True
 
     def tick(self) -> int:
@@ -1600,6 +1603,7 @@ def main():
 
     s3 = sub.add_parser("cancel")
     s3.add_argument("workflow_id")
+    s3.add_argument("--reason", default="", help="取消原因（落 workflow_logs，便于事后归因）")
 
     sub.add_parser("tick")
 
@@ -1648,7 +1652,7 @@ def main():
     elif args.cmd == "status":
         print(json.dumps(eng.status(args.workflow_id), ensure_ascii=False))
     elif args.cmd == "cancel":
-        ok = eng.cancel(args.workflow_id)
+        ok = eng.cancel(args.workflow_id, reason=args.reason)
         print("OK" if ok else "NOT FOUND")
     elif args.cmd == "tick":
         eng.run_once()
