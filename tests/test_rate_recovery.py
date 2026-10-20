@@ -48,6 +48,57 @@ def test_no_workflow_role_recovered_via_tmux():
     assert resumed == {"curator", "maintainer"}, f"应恢复两个孤儿角色, got {sent}"
 
 
+def test_upstream_connection_lost_is_recovered():
+    """pane 停在 "API Error: upstream connection lost" 也要恢复。
+
+    实测 curator 12:39 起 21min 无产出：进程活着、pane 停在错误，
+    恢复词表里没有这一种 → 引擎视而不见。
+    """
+    eng = _engine()
+    sent = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-curator\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0,
+                             stdout="● API Error: upstream connection lost\n✻ Sautéed for 48s")
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert any("继续" in c for c in sent), f"upstream 中断应发继续, got {sent}"
+
+
+def test_recovered_role_not_pinged_again_on_scrollback():
+    """错误滚到 -S -60 的旧内容里、角色已恢复 → 不得再发「继续」。
+
+    实测 6h 内 35 条 `[rate_limit] 已发继续`：按全文匹配，旧错误每档退避
+    都命中一次，每次换来一段无进展的自检长文。
+    """
+    eng = _engine()
+    sent = []
+    pane = ("● API Error: 403 FreeTierError\n" + "  " + "\n".join(["working…"] * 40)
+            + "\n✻ Cogitated for 2m\n❯ ")
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-curator\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=pane)
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert not any("继续" in c for c in sent), f"已恢复角色不应被重发继续, got {sent}"
+
+
 def test_healthy_role_not_touched():
     """pane 没有额度错误文案 → 不发「继续」。"""
     eng = _engine()

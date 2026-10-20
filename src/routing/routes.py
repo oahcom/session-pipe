@@ -383,9 +383,19 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     for msg in messages:
         if "error" in msg:
             continue
-        body = f"[{msg['category']}] {msg['text']}"
-        if msg.get("evidence"):
-            body += f"\n证据: {msg['evidence']}"
+        body = msg.get("text") or ""
+        _tag = f"[{msg['category']}]"
+        # 幂等：总线 fact 的 text 多数已自带 [category] 前缀，再拼一次会变成
+        # 「[test_report] [test_report] …」，角色读到的任务本身就是脏的。
+        if not body.startswith(_tag):
+            body = f"{_tag} {body}"
+        _ev = (msg.get("evidence") or "").strip()
+        # 同理：feed/bus 写入方的 evidence 常已带「证据: 」，再拼一次会出现
+        # 「证据: 证据: …」（实测 consumer pane）。
+        if _ev and not _ev.startswith("证据:"):
+            body += f"\n证据: {_ev}"
+        elif _ev:
+            body += f"\n{_ev}"
         body_facts.append({"id": msg["id"], "category": msg["category"],
                            "text": body[:500], "consumers": msg.get("consumers", [])})
 

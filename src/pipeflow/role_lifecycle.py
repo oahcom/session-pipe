@@ -115,6 +115,9 @@ class RoleLifecycleMixin:
         "Rate limit exceeded", "rate_limit_exceeded",
         "FreeTierError", "FreeUsageLimitError",
         "Please run /login",
+        # 上游流中断：pane 停在错误、进程活着，此前无任何恢复动作——
+        # 实测 curator 12:39 起 21min 无产出，引擎视而不见。
+        "upstream connection lost",
     )
 
     _last_compact: dict[str, float] = {}
@@ -192,7 +195,12 @@ class RoleLifecycleMixin:
             if r.returncode != 0:
                 continue
             output = r.stdout or ""
-            if not any(p in output for p in self._RATE_LIMIT_PATTERNS):
+            # 只看**近期**内容：-S -60 会捞回早已过去的错误，按全文匹配会
+            # 在角色已恢复后仍每档退避重发「继续」——实测 6h 内 35 条
+            # `[rate_limit] 已发继续`，每次换来一段无进展的自检长文。
+            _recent = "\n".join(
+                [ln for ln in output.splitlines() if ln.strip()][-20:])
+            if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS):
                 # 角色已恢复：清掉退避状态，否则下一次真 403 会从最大退避档
                 # （1800s）起步，恢复要等半小时。
                 self._last_rate_recover.pop(role, None)

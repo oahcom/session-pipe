@@ -501,3 +501,37 @@ def test_needs_investigation_no_marker_no_signal_is_false():
     assert _needs_investigation(_make_fact(
         1, "code_fix", "CODE_FIX: wf_x/s2 代码开发 — 部署件安全抽查固化",
         "新增 src/deploy_artifact_audit.py")) is False
+
+# ── 注入文本前缀幂等（R106）：角色不该收到「[cat] [cat]」「证据: 证据:」 ──
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_prefix_is_idempotent(mock_metrics, mock_hb):
+    """fact 自带 [cat] 前缀与「证据: 」时不得重复拼接。"""
+    from routing.routes import route_to_ccs
+    msgs = [{
+        "id": 40, "category": "test_report",
+        "text": "[test_report] qa 三文档口径收敛",
+        "priority": 2, "evidence": "证据: 实跑核对 4 项",
+    }]
+    sent = {}
+
+    def _fake_run(cmd, *a, **k):
+        # status-role 返回存活；ccs.py send 的最后一个参数是被投递的正文
+        if any("status-role" in str(c) for c in cmd):
+            return MagicMock(returncode=0, stdout='{"alive": true}')
+        if "send" in cmd:
+            sent["body"] = cmd[-1]
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("subprocess.run", side_effect=_fake_run), \
+         patch("workflow.client.WorkflowClient") as mock_wfc:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        mock_wfc.return_value.check_task.return_value = None   # 无活跃工作流 → 不 deferred
+        route_to_ccs("engineer", dry_run=False)
+
+    body = sent.get("body", "")
+    assert body.count("[test_report]") == 1, f"分类前缀重复: {body!r}"
+    assert body.count("证据:") == 1, f"证据前缀重复: {body!r}"
