@@ -714,7 +714,12 @@ class LifecycleManager:
                 self._conn.rollback()
                 raise
 
+    # 终态白名单：拼错（canceled/cancel）会让行进入终态却不触发级联，子链成孤儿。
+    _CLOSE_STATUSES = ("completed", "cancelled", "failed", "delivery_blocked")
+
     def close_wf(self, wf_id: str, status: str = "completed"):
+        if status not in self._CLOSE_STATUSES:
+            raise ValueError(f"unknown close status: {status!r}")
         with self._lock:
             # 可能已在调用方的事务中（_advance_production_wf 的 _conn_tx 块内先做过
             # DML，sqlite3 默认 isolation_level='' 已隐式 BEGIN）。此时再 BEGIN
@@ -726,16 +731,46 @@ class LifecycleManager:
             if _own_tx:
                 self._conn.execute("BEGIN IMMEDIATE")
             try:
+                _cur = self._conn.execute(
+                    "SELECT status FROM workflow_instances WHERE instance_id=?",
+                    (wf_id,)).fetchone()
+                # 终态不可逆：不同终态之间禁止覆写（实测 cancelled 可被后续
+                # close(completed) 改回 completed，把已判死的链复活成"完成"）。
+                # 必须先于级联：否则 close(completed) 打在已 cancelled 的父链上会
+                # 先杀掉它的子链、再因短路不改父链状态，留下"子死父活"的倒挂。
+                _cur_st = _cur["status"] if _cur else None
+                if _cur_st in self._CLOSE_STATUSES and _cur_st != status:
+                    import logging as _log
+                    _log.getLogger("lifecycle.manager").warning(
+                        "close_wf %s: 终态 %s 不可改为 %s，忽略",
+                        wf_id[:12], _cur_st, status)
+                    if _own_tx:
+                        self._conn.commit()
+                    return False
+                # 父链判死 → 子链必须同时终止。子链持有角色占用与任务，父链消失后
+                # 没有任何一方消费它的产出，只能跑到自己的超时（实测 72h 76 条子链
+                # 挂在已死父链下，wf_sub_ee03a71c3 在父链 cancelled 后仍 running 21min）。
+                # delivery_blocked 同属判死：投递达上限后无人再消费子链产出。
+                # 只在 completed 之外级联：completed 的子链正常情况下已自行收敛。
+                # 放在幂等短路之前：父链已 cancelled 但子链仍是旧代码留下的孤儿时，
+                # 再次 close 应继续级联而不是直接返回。
+                if status != "completed":
+                    self._cascade_cancel_unsafe(wf_id, f"parent {status}")
+                # 幂等：多条收尾路径（step_handler 超时兜底 / _handle_wf_loop / 回收）
+                # 会先后关同一台，重复写入会把 completed_at 改成后一次时间并刷重复日志。
+                if _cur_st == status:
+                    # task 同步不能跳：旧代码把实例关掉却漏同步 task（回收走裸
+                    # UPDATE 的存量），再次 close 正是唯一的自愈入口。该调用由
+                    # 实例行反推状态，重入无副作用。
+                    _wf = self.get_wf(wf_id)
+                    self._sync_task_unsafe(_wf.get("task_id") if _wf else None)
+                    if _own_tx:
+                        self._conn.commit()   # 级联可能已写入，commit 兼作无写时的空提交
+                    return True
                 self._conn.execute(
                     "UPDATE workflow_instances SET status=?, completed_at=? "
                     "WHERE instance_id=?", (status, time.time(), wf_id)
                 )
-                # 父链判死 → 子链必须同时终止。子链持有角色占用与任务，父链消失后
-                # 没有任何一方消费它的产出，只能跑到自己的超时（实测 72h 76 条子链
-                # 挂在已死父链下，wf_sub_ee03a71c3 在父链 cancelled 后仍 running 21min）。
-                # 只在 cancelled/failed 级联：completed 的子链正常情况下已自行收敛。
-                if status in ("cancelled", "failed"):
-                    self._cascade_cancel_unsafe(wf_id, f"parent {status}")
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
                 self._sync_task_unsafe(task_id)

@@ -47,11 +47,50 @@ class _FakeLM:
         return [self._row]
 
     def execute(self, sql, params=()):
-        self.executed.append(sql)
+        self.executed.append((sql, params))
+
+
+class _LmStub:
+    """回收路径已改为走 close_wf（级联子链 + task 同步）；stub 需实现它才验得到 cancel。"""
+
+    def __init__(self, lm):
+        self._lm = lm
+        self.closed = []
+
+    def complete_step(self, *a, **k):
+        return None
+
+    def close_wf(self, wf_id, status="completed"):
+        self.closed.append((wf_id, status))
+        self._lm.execute(
+            f"UPDATE workflow_instances SET status='{status}' WHERE instance_id=?", (wf_id,))
+        return True
+
+
+# 任何写实例状态的 UPDATE（参数化/换格式都覆盖）；日志 INSERT 不带这个前缀。
+_STATUS_WRITE = re.compile(r"UPDATE\s+workflow_instances\s+SET\s+.*?\bstatus\b", re.I | re.S)
+
+
+def _cancelled_wfs(inst, lm, wf_id):
+    """返回被置 cancelled 的 wf_id；泄漏 path 必须是经 close_wf 的那一条。
+
+    1) 未调 close_wf 却出现实例状态写 → 裸 UPDATE，task 同步与子链级联都
+       不会发生（旧缺陷形态）。用正则而非字面量前缀，参数化 SQL 也逃不掉。
+    2) 有调用时校验状态为 cancelled 且**目标就是这台**——只要求"曾调用过
+       close_wf"会让误杀别的实例照样通过。
+    """
+    _raw = [s for s, _p in lm.executed if _STATUS_WRITE.search(s)]
+    _closed = inst._lifecycle.closed
+    if not _closed:
+        assert not _raw, f"回收未经 close_wf 就写了实例状态: {_raw}"
+        return []
+    assert all(_st == "cancelled" for _, _st in _closed), \
+        f"回收传给 close_wf 的状态不是 cancelled: {_closed}"
+    return [_w for _w, _st in _closed if _st == "cancelled" and _w == wf_id]
 
 
 def _run(step_sd, pane_state, assignee="reviewer"):
-    """跑一次 _cleanup_stale_workflows，stub 掉 pane 探测，返回 cancel SQL 列表。"""
+    """跑一次 _cleanup_stale_workflows，stub 掉 pane 探测，返回被取消的 wf_id 列表。"""
     now = time.time()
     row = {
         "instance_id": "wf_test_r98",
@@ -62,9 +101,9 @@ def _run(step_sd, pane_state, assignee="reviewer"):
         "assignee": assignee,
         "step_results": json.dumps({"s1": step_sd}),
     }
-    inst = SimpleNamespace(_workflows={})
-    inst._lifecycle = SimpleNamespace(complete_step=lambda *a, **k: None)
+    inst = SimpleNamespace(_workflows={}, _notify_role=lambda *a, **k: None)
     lm = _FakeLM(row)
+    inst._lifecycle = _LmStub(lm)
     orig = liveness.tmux_pane_active
     orig_prod = wf_lifecycle._role_producing_recently
     liveness.tmux_pane_active = lambda role, **k: pane_state
@@ -76,7 +115,7 @@ def _run(step_sd, pane_state, assignee="reviewer"):
     finally:
         liveness.tmux_pane_active = orig
         wf_lifecycle._role_producing_recently = orig_prod
-    return [s for s in lm.executed if "cancelled" in s]
+    return _cancelled_wfs(inst, lm, row["instance_id"])
 
 
 _TWO_TIMEOUTS = {"timeout_count": 2, "ts": time.time() - 60, "queued": 0}
@@ -124,13 +163,13 @@ def test_pane_gate_is_load_bearing():
         "pane 状态不影响结论：门控未接入判定，静默/活跃无区别"
 
 
-def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect"):
-    """父步挂着子链时跑一次回收，返回 cancel SQL 列表。"""
+def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect", age_h=2):
+    """父步挂着子链时跑一次回收，返回被置 cancelled 的 wf_id 列表。"""
     now = time.time()
     row = {
         "instance_id": "wf_test_parent",
         "template_id": _TPL,
-        "created_at": now - 7200,
+        "created_at": now - age_h * 3600,
         "status": "running",
         "current_step_id": "s1",
         "assignee": assignee,
@@ -143,9 +182,9 @@ def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_archite
                 return [{"status": sub_status}] if sub_status else []
             return [self._row]
 
-    inst = SimpleNamespace(_workflows={})
-    inst._lifecycle = SimpleNamespace(complete_step=lambda *a, **k: None)
+    inst = SimpleNamespace(_workflows={}, _notify_role=lambda *a, **k: None)
     lm = _LM(row)
+    inst._lifecycle = _LmStub(lm)
     orig = liveness.tmux_pane_active
     orig_prod = wf_lifecycle._role_producing_recently
     liveness.tmux_pane_active = lambda role, **k: pane_state
@@ -155,7 +194,7 @@ def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_archite
     finally:
         liveness.tmux_pane_active = orig
         wf_lifecycle._role_producing_recently = orig_prod
-    return [s for s in lm.executed if "cancelled" in s]
+    return _cancelled_wfs(inst, lm, row["instance_id"])
 
 def test_live_subflow_blocks_parent_reclaim():
     """子链还在跑 → 父步没有新产出是正常态，不得按停滞判死（bus #425593）。"""
@@ -169,6 +208,12 @@ def test_dead_subflow_still_allows_reclaim():
     sd = {"subflow_id": "wf_sub_dead", "queued": 20,
           "queued_since": time.time() - 7200, "ts": time.time() - 10}
     assert _run_with_subflow(sd, "cancelled", False), "子链已死却连父链也不回收"
+
+def test_live_subflow_blocks_global_24h_reclaim():
+    """24h 兜底 + 级联会杀掉仍在产出的子链 → 子链活着时条件3 也必须放行。"""
+    sd = {"subflow_id": "wf_sub_live2", "ts": time.time() - 10}
+    assert _run_with_subflow(sd, "running", False, age_h=26) == [], \
+        "父链过 24h 阈值时活子链被级联杀掉，在途产出丢失"
 
 def test_select_includes_assignee():
     """主查询漏选 assignee → 角色解析恒空 → 探测恒 None → 条件4 静默失效。"""
@@ -191,6 +236,7 @@ if __name__ == "__main__":
             test_pane_gate_is_load_bearing,
             test_live_subflow_blocks_parent_reclaim,
             test_dead_subflow_still_allows_reclaim,
+            test_live_subflow_blocks_global_24h_reclaim,
             test_select_includes_assignee)
     _fails = 0
     for _fn in _fns:

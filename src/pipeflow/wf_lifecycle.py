@@ -68,6 +68,23 @@ def _resolve_value_gate_paths(vg_file: str, vg_ws: str) -> list:
 
 
 
+def _live_subflow(lm, step_sd: dict) -> bool:
+    """当前步骤挂的子链是否还活着。
+
+    父步的活由子链承担：子链运行期间父步没有新产出是正常态，不是卡死。
+    缺此判据时，子链结束的瞬间冻结的 queued_since 让父步「停滞 = 从建
+    子链至今」，整条父链被回收（实测 8 例，138min 子链工时无接收方）。
+    """
+    # ponytail: 每候选一次主键查询（当轮 running 实例 <100），与旧实现同频（旧版在
+    # 条件 4 内做同一条）；量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
+    _sf = step_sd.get("subflow_id") or ""
+    if not _sf:
+        return False
+    _rows = lm.query(
+        "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
+    return bool(_rows) and _rows[0]["status"] in ("pending", "running", "step_done_ready")
+
+
 def _role_producing_recently(role: str, window: float = 300.0) -> bool:
     """角色的会话转录最近 window 秒内是否在写入 —— 还在干活的强信号。
 
@@ -212,6 +229,11 @@ class WorkflowLifecycleMixin:
                         and _cur_step.get("status") in ("cancelled", "failed")):
                     reason = (f"当前步骤 {_cur_id} 已终态"
                               f"({_cur_step.get('status')})但行级仍 running")
+                # 子链活着 → 父步没有新产出是正常态，条件 1-4 一律不判死。
+                # 条件 0 例外：步骤自身已终态，子链本就该随之终止。缺这道门时
+                # 24h 兜底会连同活着的子链一起被级联杀掉（在途产出直接丢失）。
+                elif _live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {}):
+                    pass
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
                 elif max_tc >= _auto_cancel_at:
@@ -245,19 +267,6 @@ class WorkflowLifecycleMixin:
                     if isinstance(_cur_sr, dict):
                         _cur_tc = _cur_sr.get("timeout_count", 0)
                         _cur_q = _cur_sr.get("queued", 0) or 0
-                        # 子链守卫（bus #425593 修法②）：父步的活由子链承担，父步
-                        # 自己没有新产出是正常态。子链活着时不得按停滞判死——否则
-                        # 子链结束的瞬间，冻结的 queued_since 让父步「停滞 = 从建
-                        # 子链至今」，整条父链被回收（实测 8 例，138min 子链工时
-                        # 无接收方）。
-                        _sf = _cur_sr.get("subflow_id") or ""
-                        if _sf:
-                            _sf_rows = lm.query(
-                                "SELECT status FROM workflow_instances WHERE instance_id=?",
-                                (_sf,))
-                            _sf_st = _sf_rows[0]["status"] if _sf_rows else ""
-                            if _sf_st in ("pending", "running", "step_done_ready"):
-                                continue
                         # 停滞时长起点优先用 queued_since（首次排队时刻，不随 ts 重置），
                         # 退回 ts（每次重推刷新），再退回实例创建时间。
                         # 为什么必须用 queued_since：排队分支每轮都重置 ts，用 ts 算停滞
@@ -335,11 +344,9 @@ class WorkflowLifecycleMixin:
                     except Exception as _re:
                         LOGGER.debug("stale rescue failed for %s: %s", wf_id, _re)
                     try:
-                        lm.execute(
-                            "UPDATE workflow_instances SET status='cancelled', completed_at=? "
-                            "WHERE instance_id=?",
-                            (now, wf_id)
-                        )
+                        # 走 close_wf 而非裸 UPDATE：回收路径漏掉了 task 状态同步与
+                        # 子链级联，任务永远停在 running、子链继续占角色（实测 76 条）。
+                        self._lifecycle.close_wf(wf_id, status="cancelled")
                         lm.execute(
                             "INSERT INTO workflow_logs (workflow_instance_id, task_id, action, actor, detail, ts) "
                             "VALUES (?, ?, 'cancelled', 'workflow_engine', ?, ?)",
@@ -351,7 +358,9 @@ class WorkflowLifecycleMixin:
                         # blocker）。改为循环外汇总一条，各台原因按模板归并。
                         _recycled.append((tpl, wf_id, reason))
                     except Exception as e:
-                        LOGGER.debug("stale cleanup write failed: %s", e)
+                        # warning 而非 debug：close_wf 级联失败会整体回滚，父链留下、
+                        # 子链继续占角色；静默重试时无人知道孤儿还在。
+                        LOGGER.warning("stale cleanup write failed for %s: %s", wf_id, e)
             if _recycled:
                 _by_tpl: dict[str, list[str]] = {}
                 for _t, _w, _r in _recycled:
@@ -503,11 +512,7 @@ class WorkflowLifecycleMixin:
                         # 缺失本身由 exit_schema 的 required 约束兜底。
                         LOGGER.warning("wf %s [%s] 价值审计 FAIL → 按 failed 收尾（不推进为 completed）",
                                        wf_id[:8], wf_name)
-                        # 子链必须先级联取消：close_wf 不做级联，失败后留下的
-                        # running 子链会继续派活，产出无人认领（与 fail_step 的
-                        # 规范失败路径对齐）。同事务内调用 *_unsafe，避免
-                        # fail_step 自己 BEGIN IMMEDIATE 撞外层事务。
-                        self._lifecycle._cascade_cancel_unsafe(wf_id, "价值审计 FAIL")
+                        # close_wf 已内置子链级联（除 completed 外的终态），无需预调。
                         self._lifecycle.close_wf(wf_id, status='failed')
                         conn.commit()
                         _vg_fail_wf = wf_id

@@ -230,8 +230,11 @@ class StepHandlerMixin:
             _ccs_cli = get_ccs_cli()
             _ccs_cli = str(_ccs_cli) if not isinstance(_ccs_cli, str) else _ccs_cli
             import subprocess as _sp
+            # send-safe 的调用方参数是 --by-role（ccs.py:205-210），argv 里传 --from
+            # 会被 argparse 直接 rc=2 拒绝，异常再被下方 except 吞成 warning ——
+            # 这条催办通道自建立起从未成功过一次。
             _r = _sp.run(["python3", _ccs_cli, "send-safe", assigner, msg,
-                          "--from", "workflow_engine"],
+                          "--by-role", "workflow_engine"],
                          capture_output=True, timeout=15)
             _lvl = "warning" if _r.returncode != 0 else "info"
             LOGGER.log(getattr(LOGGER, _lvl.upper(), logging.INFO),
