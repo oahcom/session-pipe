@@ -310,6 +310,40 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
     mock_wf.return_value.create_task_v2.assert_called_once()
 
 
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_bug_report_label_mints_task(mock_hb, mock_metrics):
+    """[bug_report] 标签 + bug_report 分类 = 真实缺陷报告，必须建任务。
+
+    回归 #421072/#421074：旧判据"[xxx] 开头一律拦"使 36 条 qa 缺陷报告
+    在 tasks 表零记录，缺陷无人接手。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{
+        "id": 421072, "category": "bug_report", "src": "qa",
+        "text": "[bug_report] [P1] architect_full_design s1/s2 缺 require_wf",
+        "priority": 1,
+    }]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("routing.routes.sys") as mock_sys, \
+         patch("subprocess.run") as mock_run, \
+         patch("routing.routes.WorkflowClient") as mock_wf:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = "running"
+        status_result.returncode = 0
+        send_result = MagicMock()
+        send_result.stdout = ""
+        send_result.stderr = ""
+        send_result.returncode = 0
+        mock_run.side_effect = [status_result, send_result]
+        mock_sys.executable = "/usr/bin/python3"
+        mock_wf.return_value.check_task.return_value = None
+        route_to_ccs("engineer", dry_run=False)
+    mock_wf.return_value.create_task_v2.assert_called_once()
+
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
 def test_route_to_ccs_send_failure(mock_metrics, mock_hb):
