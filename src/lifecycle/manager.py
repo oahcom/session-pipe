@@ -15,7 +15,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, List, Optional
 
+import sys as _sys
+
 from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to relative when moved to subpackage
+
+# 驳回词表唯一真相源（src/review_gate.py）。本包 import 时 sys.path 未必含 src/，
+# 视入口而定（daemon 以 src/ 为 cwd 时不缺，pytest 从仓库根跑时缺）。
+if str(Path(__file__).resolve().parents[1]) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from review_gate import is_rejected  # noqa: E402
 
 
 
@@ -1045,17 +1053,17 @@ class LifecycleManager:
             (_cur_sr.get("exit_messages") or [])
             if isinstance(m, dict)
         ).lower()
-        # 词表与 wf_lifecycle.py:312 保持一致："未通过"/"驳回"/"not_approved"
-        # 此前只在后者存在，本路径漏检（wf_3565289ca783/s3 用"判定: 未通过"表达驳回）。
+        # 词表走 review_gate 唯一真相源：此前三处各写一份靠注释约定同步，
+        # "未通过"/"驳回"/"not_approved" 曾在 wf_lifecycle 有、本路径没有 →
+        # 同一条文案在两条推进路径上判定相反（wf_3565289ca783/s3 用
+        # "判定: 未通过"表达驳回，本路径漏检）。
         # 已确认的步骤不再判驳回：confirm_step 先写 status=completed 再调本函数，
         # 而 exit_messages 是第一轮的驳回文本、确认时不会清除 → 同一份文本被二次
         # 判成驳回，把刚落的 completed 当场改写回 rejected。步骤一旦被驳回过就
         # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
         # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
         _confirmed = bool(_cur_sr.get("confirmed_at"))
-        if not _confirmed and any(kw in _msgs for kw in
-               ("changes_requested", "rejected", "需修复", "回退",
-                "未通过", "not_approved", "驳回")):
+        if not _confirmed and is_rejected(_msgs):
             _sr.setdefault(current, {})["status"] = "rejected"
             self._conn.execute(
                 "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",

@@ -4,8 +4,14 @@
 
 ## Context
 
-驳回语义由 `step_results[step].exit_messages` 的文本关键词判定
-（`rejected` / `changes_requested` / `未通过` / `驳回` / `not_approved` / `需修复` / `回退`）。
+驳回语义由 `step_results[step].exit_messages` 的文本关键词判定。词表自 R105 起
+收敛为单一声明 `src/review_gate.py:REJECT_KEYWORDS`
+（`changes_requested` / `rejected` / `not_approved` / `驳回` / `未通过`），
+不再由 4 个消费者各写一份。
+
+`需修复` 与 `回退` 已于 R105 移除：前者是 `无需修复` 的子串（maintainer 健康
+巡检固定写「无异常需修复」，全库 18 例命中全为误报），后者在生产里作动词
+常态出现（「回退重投第4次」「代码回退 time.time()」，2 例皆误报）。
 `confirm_step` 批准时只写 `status=completed` + `confirmed_at`，**不清除** `exit_messages`——
 那是该步第一轮的真实驳回文本，被保留为产出证据（`task_evidence.py`、`wf_lifecycle` 的
 stale-rescue 都读它）。
@@ -22,7 +28,7 @@ stale-rescue 都读它）。
 | 1 | `lifecycle/manager._advance_unsafe` | 角色 `wf complete` 推进门禁 | ✅ `_confirmed` |
 | 2 | `pipeflow/wf_lifecycle._advance_production_wf` | 引擎 tick 推进门禁 | ✅ `_confirmed` |
 | 3 | `pipeflow/engine._REQUEUE_DROP` | 重投清理键（防旧确认残留放行新驳回） | ✅ |
-| 4 | `pipeflow/task_generator._subflow_verdict_rejected` | 子链末步驳回检测 | ❌ 无守卫 |
+| 4 | `pipeflow/task_generator._subflow_verdict_rejected` | 子链末步驳回检测 | ✅ `confirmed_at`（R105 补齐） |
 
 ## Decision
 
@@ -45,16 +51,18 @@ stale-rescue 都读它）。
   会被抑制。经 `_REQUEUE_DROP` 清理 `confirmed_at` 后，新一轮驳回可正常触发——
   抑制窗口 = 一次审批周期，可接受。
 
-## Residual（未闭合，交 engineer）
+## Residual（已由 R105 闭合）
 
-消费者 #4 `_subflow_verdict_rejected` 未加守卫。复现：
+四个消费者现已全部带 `confirmed_at` 守卫。消费者 #4 的复现命令当前返回 `False`：
 ```
 python3 -c "import sys;sys.path.insert(0,'src');from pipeflow.task_generator import _subflow_verdict_rejected as f; \
 import time;print(f({'s1':{'status':'completed','confirmed_at':time.time(),'exit_messages':[{'text':'REJECTED: 18 FINDING'}]}}))"
-# → True（误报）
+# → False（已确认步骤不判驳回）
 ```
-严重度低于 P0：该点在 `task_generator.py:162` 只写一条 `blocker` bus 通知（噪音），
-不翻转步骤状态、不阻断推进。但与 P0 同根因，应一并收敛。
+
+R105 同时改变了该点的严重度定位：它不再"只写一条 blocker"，而是把父步压回
+`rejected` 并阻止 advance。缺少 `confirmed_at` 守卫会变成真阻断，故本条与
+词表精确化、fail-open 移除同批上线。
 
 ## 参考
 

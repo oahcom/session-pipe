@@ -14,6 +14,7 @@ import re  # 修复: _scan_tasks 用 re.match 但漏 import, 导致每 tick Name
 from pathlib import Path
 from types import SimpleNamespace
 
+import review_gate as _review_gate  # 驳回词表唯一真相源（src/review_gate.py）
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 
 LOGGER = logging.getLogger("workflow.engine")
@@ -65,19 +66,21 @@ def _is_test_harness_template(template_id: str | None) -> bool:
 # → 本文件回流处把父步标 completed → 驳回信号在父链彻底丢失。
 # 实测 3 例（wf_sub_9e3d0b017f29 / wf_sub_9b5329785ab9 / wf_sub_fda79b387821）：
 # 子链 s1 文案为 REJECTED / CHANGES_REQUESTED，父链 wf_5412acef35 照常推进到 s5/s6。
-# 词表与 wf_lifecycle.py:312、lifecycle/manager.py 的门禁保持三方一致。
-_REJECT_KEYWORDS = ("changes_requested", "rejected", "需修复", "回退",
-                   "未通过", "not_approved", "驳回")
-
-
+# 词表走 review_gate 唯一真相源（原先三处各一份，靠注释约定"三方一致"同步）。
 def _subflow_verdict_rejected(sr: dict) -> bool:
-    """子链 step_results 的 exit_messages 是否含驳回文案（即其 completed 掩盖了驳回）。"""
+    """子链 step_results 的 exit_messages 是否含驳回文案（即其 completed 掩盖了驳回）。
+
+    已审批确认（confirmed_at）的步骤不判驳回，与 wf_lifecycle:403 /
+    manager:1055 两条推进路径同语义：exit_messages 是第一轮的驳回文本，人工
+    审批确认不会清除它 → 同一份文本会被二次判成驳回（ADR-APPROVAL-AUTHORITY）。
+    父步一旦被压回 rejected，这里误判的就是**真的阻断**，不再是纯噪音。
+    """
     _txt = " ".join(
         str(m.get("text", ""))
-        for _sd in sr.values() if isinstance(_sd, dict)
+        for _sd in sr.values() if isinstance(_sd, dict) and not _sd.get("confirmed_at")
         for m in (_sd.get("exit_messages") or []) if isinstance(m, dict)
-    ).lower()
-    return any(k in _txt for k in _REJECT_KEYWORDS)
+    )
+    return _review_gate.is_rejected(_txt)
 
 
 
@@ -216,15 +219,9 @@ class TaskGeneratorMixin:
                                                            _sub_row["instance_id"][:12], _step_id, _cerrs[:3])
                                         except Exception as _cwe:
                                             LOGGER.debug("contract-unmet blocker 写入失败: %s", _cwe)
-                                _sdata["status"] = "completed"
-                                _sdata["completed_at"] = time.time()
-                                conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                                    (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
-                                conn.commit()
-                                # 子链完成但其末步文案是驳回 → 父步「完成」是假象。
-                                # 不改完成语义（wf_lifecycle.py:302 有意不拦末步，硬拦会
-                                # 制造静默卡死），只记账 + 写 bus 让缺失可被外部观测，
-                                # 与同文件 _forced 子链超时的做法一致。
+                                # 必须先判驳回再定状态：子链末步驳回说明该步产出**未通过
+                                # 审查**，父步「完成」是假象，据它推进会让下游拿不存在
+                                # 的东西继续做。
                                 #
                                 # 必须查**子链**的 step_results：原实现传 _sr（父链的），
                                 # 于是判据恒在看父步自己的历史文案 —— 子链驳回永远检不出，
@@ -241,24 +238,80 @@ class TaskGeneratorMixin:
                                     if _sub_row_sr else None
                                 _sub_verdict_sr = ({_sub_row_sr["current_step_id"]: _sub_last}
                                                    if isinstance(_sub_last, dict) else {})
-                                if _subflow_verdict_rejected(_sub_verdict_sr):
+                                # 父步自身已审批确认时，子链末步文案不再有否决权：
+                                # 审批是人工对这一步的最终处置，覆盖子链的原始结论
+                                # （ADR-APPROVAL-AUTHORITY 的同一原则，消费者 #4
+                                # 之前只管子链侧 confirmed_at，漏了父步侧）。
+                                _verdict_rejected = (
+                                    _subflow_verdict_rejected(_sub_verdict_sr)
+                                    and not _sdata.get("confirmed_at"))
+                                if _verdict_rejected:
+                                    # 交父链自己的 rejected 消费分支（engine.py 的
+                                    # `step_status == "rejected"` 段）：有分类→建返工链、
+                                    # 无分类→重投原步，封顶 3 次后升级 coordinator。
+                                    # 该分支有完整出口，故此处「阻断」不再是静默卡死——
+                                    # 旧实现只写 blocker 就照常 completed（理由是硬拦会
+                                    # 卡死），前提已随该分支落地而不成立。
+                                    # 实测 7 例子链驳回（reviewer_pr_review 末步）全部
+                                    # 据此把父链放行到终点：wf_654cd82159/s5、
+                                    # wf_5f5eebc881/s7 等。
+                                    #
+                                    # 只压状态、**不**把子链 exit_messages 搬进父步：
+                                    # 父步一旦有 exit_messages 且 status≠completed，
+                                    # tick-rescue 会立刻把它判成"产出已就绪"并直接
+                                    # complete_step，压回的 rejected 当场被抵消。
+                                    # 建返工链所需的分类段读父步自身的 exit_messages；
+                                    # 父步无文案时建链失败 → 走重投原步（有出口）。
+                                    #
+                                    # 幂等：已被压成 rejected 就不再重写。每 tick 重写
+                                    # 会把 rejected_at 刷成当前时刻，engine 的
+                                    # `_rejected_wait_anchor` 读的正是它 → 等返工链的
+                                    # 超时保护（_REJECTED_WAIT_MAX）被永久续期，且 blocker
+                                    # 每 tick 重发一条。本块每轮都会重新进入（子链仍
+                                    # completed、父步仍持有 subflow_id），必须去重。
+                                    if _sdata.get("status") != "rejected":
+                                        _sdata["status"] = "rejected"
+                                        _sdata["rejected_at"] = time.time()
+                                        _sdata["rejected_by"] = "subflow_verdict"
+                                        _sdata["rejection_reason"] = (
+                                            f"子链 {_sf} 末步驳回: "
+                                            + " ".join(str(m.get("text", ""))
+                                                       for m in (_sub_last.get("exit_messages") or [])
+                                                       if isinstance(m, dict))[:300])
+                                else:
+                                    _sdata["status"] = "completed"
+                                    _sdata["completed_at"] = time.time()
+                                conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                    (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                                conn.commit()
+                                # blocker 与状态写入同样幂等：本块每 tick 重入
+                                # （子链仍 completed、父步仍持 subflow_id），不去重
+                                # 会在返工等待期每 10s 写一条同文 blocker。
+                                if _verdict_rejected and _sdata.get("rejected_by") == "subflow_verdict" \
+                                        and not _sdata.get("subflow_reject_reported_at"):
+                                    _sdata["subflow_reject_reported_at"] = time.time()
+                                    conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                        (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                                    conn.commit()
                                     try:
                                         self._bb.write(
                                             "blocker",
                                             f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
-                                            f"子链 {_sf[:12]} 末步驳回，父步完成不可信",
+                                            f"子链 {_sf[:12]} 末步驳回 → 父步压回 rejected，不再推进",
                                             src="workflow_engine",
                                             evidence=f"子链 {_sf} status={_sub_status['status']} "
-                                                     f"但 exit_messages 含驳回文案，父链仍按 completed 推进。"
-                                                     f"该步产出未通过审查，请核查是否需要返工。")
+                                                     f"但 exit_messages 含驳回文案，该步产出未通过审查。"
+                                                     f"父步交由 rejected 消费分支处置（建返工链或重投，"
+                                                     f"封顶后升级 coordinator）。")
                                         LOGGER.warning(
-                                            "子链 %s 末步驳回但报 completed → 父 %s/%s 完成不可信",
+                                            "子链 %s 末步驳回 → 父 %s/%s 压回 rejected",
                                             _sf[:12], _sub_row["instance_id"][:12], _step_id)
                                     except Exception as _bwe:
                                         LOGGER.debug("subflow-verdict blocker 写入失败: %s", _bwe)
                                 # 推进父工作流（advance 内部自带锁内 DB + 锁外 subprocess）
+                                # 驳回时不推进：上面已把父步压回 rejected，推进等于绕过门禁。
                                 _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
-                                if _tmpl:
+                                if _tmpl and not _verdict_rejected:
                                     _wf = self._workflows.get(_tmpl["template_id"])
                                     if _wf:
                                         deferred.append(

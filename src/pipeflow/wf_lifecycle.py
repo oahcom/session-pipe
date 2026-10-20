@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 from pipeflow.engine import Step, WorkflowDef
+import review_gate as _review_gate  # 驳回词表唯一真相源，与 manager.py 共用
 import paths as _paths_mod
 from paths import CCS_CLI as _CCS_CLI
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
@@ -395,35 +396,36 @@ class WorkflowLifecycleMixin:
                 if isinstance(m, dict)
             ).lower()
 
-            # "未通过"/"驳回" 补入：实测 s3 用"判定: 未通过"表达驳回，旧词表不含它
-            # → 漏检（wf_3565289ca783）。
             # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
             # 不会清除它 → 同一份文本被二次判成驳回。与 manager._advance_unsafe
             # 同一缺陷（实测 wf_256be862ea86/s3 确认后卡死 5h）。
             _confirmed = bool(_step_sr.get("confirmed_at"))
-            if not _confirmed and any(kw in _msgs for kw in
-                   ("changes_requested", "rejected", "需修复", "回退",
-                    "未通过", "not_approved", "驳回")):
+            if not _confirmed and _review_gate.is_rejected(_msgs):
                 LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
                                wf_id[:8], step_id)
-                _cls = self._has_issue_classification(_msgs)
-                if not _cls:
-                    # 非 review 模板本就不写分类段，硬拦会两不落 → 放行推进
+                # 无条件落库 rejected，不再按「有无问题分类」fail-open 放行。
+                # 旧实现把「解析不出【系统问题】/【业务问题】」当作放行依据，理由是
+                # 「硬拦会两不落 → 静默卡死」。该前提已不成立：engine 的 rejected
+                # 消费分支（engine.py:1146+）对无分类情形有完整出口——重投原步，
+                # 封顶 _MAX_REJECTED_RETRY(3) 后升级 coordinator。放行才是无出口的
+                # 那条，实测 19 例真实驳回被据此放行（WL-01/wf_cd4a9c21df 等），
+                # 产物一字未改却让下游拿不存在的东西继续做。
+                # 分类只决定返工链建成哪一类；建不出链不是通过审查的理由。
+                if not self._has_issue_classification(_msgs):
                     LOGGER.warning(
                         "rejected 但产出无【系统问题】/【业务问题】分类 %s/%s"
-                        " → 放行推进（fail-open）", wf_id[:8], step_id)
-                else:
-                    # 持久化 rejected 再返回：只 return 不落库时 step 仍是
-                    # step_done_ready → 下轮又走这里、engine 的 rejected 消费
-                    # 分支永远看不见 → 返工链建了但无回流入口（codex D10/D20）。
-                    _rej = dict(((results or {}).get(step_id) or {}))
-                    _rej.update({"status": "rejected", "rejected_at": time.time(),
-                                 "rejected_by": "workflow_engine"})
-                    results = {**(results or {}), step_id: _rej}
-                    lm.execute(
-                        "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                        (json.dumps(results, ensure_ascii=False), wf_id))
-                    return
+                        " → 交 rejected 消费分支（重投原步，不推进）", wf_id[:8], step_id)
+                # 持久化 rejected 再返回：只 return 不落库时 step 仍是
+                # step_done_ready → 下轮又走这里、engine 的 rejected 消费
+                # 分支永远看不见 → 返工链建了但无回流入口（codex D10/D20）。
+                _rej = dict(((results or {}).get(step_id) or {}))
+                _rej.update({"status": "rejected", "rejected_at": time.time(),
+                             "rejected_by": "workflow_engine"})
+                results = {**(results or {}), step_id: _rej}
+                lm.execute(
+                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                    (json.dumps(results, ensure_ascii=False), wf_id))
+                return
 
         completed_now = False
         _vg_fail_wf = ""   # 价值审计 FAIL 收尾标记：bus 写入放在锁外阶段
@@ -1033,8 +1035,8 @@ class WorkflowLifecycleMixin:
     def _has_issue_classification(msgs_text: str) -> bool:
         """产出里是否含【系统问题】/【业务问题】分类段——返工路由的判据。
 
-        复用 _parse_review_issues：它已封装该分类的解析规则，
-        另写一套关键词匹配会与它漂移。
+        走 _parse_review_issues 而非直接在文本里找标记：它已封装「带 →角色 流向
+        标注」「行内叙述形态」等生产实际写法，另写一套匹配会与它漂移。
         """
         _sys, _biz, _, _ = WorkflowLifecycleMixin._parse_review_issues(msgs_text)
         return bool(_sys or _biz)

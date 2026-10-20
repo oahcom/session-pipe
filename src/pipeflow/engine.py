@@ -124,7 +124,17 @@ _REWORK_TERMINAL = ("completed", "failed", "cancelled")
 # 测试直引本常量防两处漂移。
 _REQUEUE_DROP = ("status", "rejected_at", "rejected_by", "rejection_reason",
                  "poll_since", "bus_anchor", "notified_at", "exit_messages", "rework_ids",
-                 "rework_escalated_at", "confirmed_at", "confirmed_by")
+                 "rework_escalated_at", "confirmed_at", "confirmed_by",
+                 # subflow_id（R105）：R105 起，子链末步驳回会把父步压回 rejected。
+                 # 重投若不清 subflow_id，_scan_tasks 下一 tick 仍能看到那条已完成的
+                 # 子链（其末步文案仍是驳回原文）→ 再次压回 rejected → 派发分支
+                 # 永远轮不到 → retry 涨到封顶后误报"重投仍未通过"。
+                 # 清掉后 _subflow_takeover 见子链不在活跃白名单即交还父步自投。
+                 "subflow_id", "subflow_reject_reported_at",
+                 # 注：**不**清 subflow_retry / subflow_failed_*。它们是"同一父步
+                 # 重建子链的次数"预算，跨重投保留才不会让失败→驳回→重投无限
+                 # 领取新预算（codex round3 P2）。subflow_escalated 同理保留作审计。
+                 )
 
 
 def _rework_exit(sts: list) -> str:
