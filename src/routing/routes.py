@@ -111,6 +111,22 @@ def _is_role_report_title(title: str, category: str = "", src: str = "") -> bool
     return m.group(1) != category
 
 
+# 对「已存在工作流」的事件汇报：wf_4f3a... / s3-complete / xxx_complete。
+# 这类标题描述的是**已发生的事**，不是要让谁去做什么。不拦则每个消费者角色
+# 各自建一条完整链——7 天 909 个实例中 372 个此类，265 条直接作废
+# （WL-01 106 / consumer_processing 51 / maintainer_health_monitor 47）。
+# 不按 cat 豁免：`[bug_report] wf_x/s4 审批密钥不可达` 也是汇报，原消息仍
+# 正常路由给角色，只不 mint 新链。
+# `/s2-complete` 必须带斜杠：不带斜杠时 "请新增 s3-complete 状态的审计脚本"
+# 这类**真实需求**会被误杀（实测 1 条）。带斜杠的 154/364 条全是汇报，
+# 误判方向不对称——漏判只多建一条链，误杀则丢掉用户的活。
+_WF_ECHO_RE = re.compile(
+    r"wf_(?:sub_|rw_)?[0-9a-f]{5,}|/\s*s\d+\s*[-_]?\s*complete", re.I)
+
+
+def _is_wf_echo_title(title: str) -> bool:
+    return bool(_WF_ECHO_RE.search(title or ""))
+
 
 def _is_self_echo(msg: dict, role: str) -> bool:
     """该消息由 role 自己写 —— 不派回给 role。
@@ -205,6 +221,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 # bus 消息必须产出相同 title，否则 client.create_task_v2 的
                 # 按 title 去重会漏掉跨路径重复（60 vs 80 截断不等）
                 "title": (msg["text"] or "").split("\n")[0][:80],
+                # 正文作 description 落库：原实现只传 title，角色收到的任务描述恒为空
+                # （实测 WL-full_dev_pipeline 47/48、WL-01 194/194 为空）→ prompt 只有一行
+                # 标题，角色无法知道需求原意。截断 2000 防撑爆 prompt。
+                "body": (msg["text"] or "")[:2000],
                 "priority": msg["priority"],
                 "src": msg.get("src", ""),
                 "consumers": ordered,
@@ -253,15 +273,22 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                     # INFO 而非 DEBUG：拦截会改变投递行为，需在 journalctl 可见，
                                     # 否则若某个合法任务被误判，排查时无迹可寻。
                                     LOGGER.info("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
-                                elif _is_noop_report(_t, assignment.get("evidence", "")):
+                                elif _is_wf_echo_title(_t):
+                                    # 事件汇报而非新需求：原消息已正常路由给角色，
+                                    # 再 mint 新链只会派生同标题空任务（7 天 372 条）。
+                                    LOGGER.info("Skipping workflow create: wf echo title (%s) role=%s", _t[:40], role)
+                                elif _is_noop_report(_t, assignment.get("body", "")):
                                     # DESIGN §7 S3：no-op 健康报告是状态而非任务请求，
                                     # mint 出"为无需动作写方案"的空转实例。INFO 可见。
+                                    # 判据用 body：assignment 从未带 evidence 键，
+                                    # 原来取 evidence 恒为 "" → 只能靠标题命中，永远晚半拍。
                                     LOGGER.info("Skipping workflow create: no-op report (%s) role=%s", _t[:40], role)
                                 else:
                                     try:
                                         _wc = WorkflowClient(role)
                                         _wc.create_task_v2(_t[:80], assignee=role,
-                                                           initiator_role="system", bus_category=cat)
+                                                           initiator_role="system", bus_category=cat,
+                                                           description=assignment.get("body", ""))
                                         _wc.close()
                                     except Exception as _e:
                                         LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
@@ -501,13 +528,17 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                         # 与 route_all 对齐：[角色名] 开头是产出汇报，不是派发任务。
                         # 缺此判定时同一份完成汇报被 fan-out 成 7~9 个角色各自的新 workflow。
                         LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _title[:40], role_name)
+                    elif _is_wf_echo_title(_title):
+                        # 与 route_all 对齐：事件汇报不 mint 新链。
+                        LOGGER.debug("Skipping workflow create: wf echo title (%s) role=%s", _title[:40], role_name)
                     elif _is_noop_report(_title, _raw):
                         # 与 route_all 对齐（DESIGN §7 S3）：no-op 健康报告不 mint。
                         LOGGER.debug("Skipping workflow create: no-op report (%s) role=%s", _title[:40], role_name)
                     else:
                         _wf = WorkflowClient(role_name)
                         _wf.create_task_v2(_title, assignee=role_name,
-                                           initiator_role="system", bus_category=_cat)
+                                           initiator_role="system", bus_category=_cat,
+                                           description=_raw[:2000])
                         _wf.close()
                 except Exception as _e:
                     LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)

@@ -53,6 +53,13 @@ def test_verdict_sites_use_anyof():
         ("food_chain_loop.json", "s7", "VALUE_AUDIT.md"): {"PASS", "FAIL"},
         ("architect_full_design.json", "s4", "GATE_REPORT.md"): {"通过", "失败"},
         ("architect_review.json", "s2", "REVIEW.md"): {"APPROVED", "REJECTED"},
+        # prompt 允许 CONDITIONAL_APPROVED，schema 不认 → 合法结论必失败。
+        ("food_chain_loop.json", "s6", "REVIEW.md"):
+            {"APPROVED", "CONDITIONAL_APPROVED", "REJECTED"},
+        # 若在 mustContain(AND) 里写死 APPROVED，prompt 允许的 CHANGES_REQUESTED /
+        # REJECTED 结论必然 schema 失败 → 审查闸门只能"通过"，等于没有闸门。
+        ("full_dev_pipeline.json", "s4", "REVIEW.md"):
+            {"APPROVED", "CONDITIONAL_APPROVED", "CHANGES_REQUESTED", "REJECTED"},
     }
     seen = {}
     for tpl, sid, fname, props in _schemas():

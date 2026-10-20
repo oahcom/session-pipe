@@ -213,20 +213,24 @@ class WorkflowClient:
         now = time.time()
         cols = self._get_task_columns()
         if template_id and "template_id" in cols:
-            self._conn.execute("""
+            cur = self._conn.execute("""
                 INSERT OR IGNORE INTO tasks (task_id, title, description, assigner, assignee,
                                    priority, status, created_at, updated_at, template_id)
                 VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?, ?)
             """, (task_id, title, description, self.role, assignee,
                   priority, now, now, template_id))
         else:
-            self._conn.execute("""
+            cur = self._conn.execute("""
                 INSERT OR IGNORE INTO tasks (task_id, title, description, assigner, assignee,
                                    priority, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?)
             """, (task_id, title, description, self.role, assignee,
                   priority, now, now))
         self._conn.commit()
+        # OR IGNORE 会把约束冲突吞成 0 行；不校验就 notify 会向总线广播一个
+        # 查不到的 task_id，调用方按成功继续建链，需求就此静默丢失。
+        if not cur.rowcount:
+            raise RuntimeError(f"任务未写入（task_id={task_id} 已存在或约束冲突）")
         self._log(task_id=task_id, action="created", detail=f"title={title}, template_id={template_id}")
         # 测试模式检测: 环境变量 SESSION_PIPELINE_TEST=1 时跳过 ccs send 和 bus notify
         # 不依赖 db_path 判断，因为自定义 DB 路径也可能是生产用途
@@ -436,12 +440,30 @@ class WorkflowClient:
         sync_task_status(self._conn, task_id)
         self._conn.commit()
 
-    def fail(self, wf_id: str, reason: str):
+    # 实例级终结：reason 记到 `_close_reason` 子键，**不再整体覆写** step_results。
+    # 旧实现写 json.dumps({"reason": reason})，把全部步骤状态连同 subflow_id 一起
+    # 抹掉。后果实测生产 49 个实例：task_generator._scan_tasks 的父链回流扫描要求
+    # step_results[step] 是 dict 且有 subflow_id，顶层 `reason` 是 str 被 continue
+    # 跳过 → 父链回流通道静默关闭；wf_579f636f62 的 7 条 completed 子链无一条回流。
+    # manager.cancel_step（:600-614）早已是合并语义并写明了同样的后果，此处补齐。
+    _CLOSE_REASON_KEY = "_close_reason"
+
+    def _close(self, wf_id: str, status: str, reason: str, action: str):
+        """以合并语义把实例收敛到终态，reason 写 `_close_reason` 子键。"""
+        row = self._conn.execute(
+            "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+            (wf_id,)).fetchone()
+        try:
+            sr = json.loads((row[0] if row else None) or "{}")
+        except (TypeError, ValueError):
+            sr = {}          # 已损坏的旧值：宁可只保留 reason，也不整个丢掉
+        if not isinstance(sr, dict):
+            sr = {}
+        sr[self._CLOSE_REASON_KEY] = {"status": status, "reason": reason}
         self._conn.execute(
-            "UPDATE workflow_instances SET status='failed', completed_at=?, "
-            "step_results=? WHERE instance_id=?",
-            (time.time(), json.dumps({"reason": reason}), wf_id)
-        )
+            "UPDATE workflow_instances SET status=?, completed_at=?, step_results=? "
+            "WHERE instance_id=?",
+            (status, time.time(), json.dumps(sr, ensure_ascii=False), wf_id))
         self._conn.commit()
         wf = self.get(wf_id)
         if wf and wf.get('task_id'):
@@ -449,22 +471,13 @@ class WorkflowClient:
                 self._sync_task_from_workflows(wf['task_id'])
             except Exception:
                 self._conn.rollback()
-        self._log(wf_id=wf_id, action="failed", detail=f"reason={reason}")
+        self._log(wf_id=wf_id, action=action, detail=f"reason={reason}")
+
+    def fail(self, wf_id: str, reason: str):
+        self._close(wf_id, "failed", reason, "failed")
 
     def cancel(self, wf_id: str, reason: str = ""):
-        self._conn.execute(
-            "UPDATE workflow_instances SET status='cancelled', completed_at=?, "
-            "step_results=? WHERE instance_id=?",
-            (time.time(), json.dumps({"reason": reason}), wf_id)
-        )
-        self._conn.commit()
-        wf = self.get(wf_id)
-        if wf and wf.get('task_id'):
-            try:
-                self._sync_task_from_workflows(wf['task_id'])
-            except Exception:
-                self._conn.rollback()
-        self._log(wf_id=wf_id, action="cancelled", detail=f"reason={reason}")
+        self._close(wf_id, "cancelled", reason, "cancelled")
 
     def delete(self, wf_id: str) -> bool:
         wf = self.get(wf_id)
