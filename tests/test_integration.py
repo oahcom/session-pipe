@@ -30,13 +30,11 @@ sys.path.insert(0, _src_dir)
 
 import tempfile
 
-# 隔离：本文件只验证协议行为，不需要生产总线。旧实现 6 处 Blackboard() 直写
-# ~/.hermes/sister_bus/blackboard.db，每跑一次 run.py 就留下 6 条 src=test 的假 fact。
-# 用官方环境变量覆盖默认库，让 router 内部 new 出来的 Blackboard() 也一起隔离。
-os.environ.setdefault(
-    "HERMES_BLACKBOARD_DB",
-    str(Path(tempfile.mkdtemp(prefix="integration_bus_")) / "blackboard.db"),
-)
+# 只能当脚本跑（tests/run.py 用 subprocess 调本文件）；pytest 不要收集它。
+# 原因：__main__ 会把 HERMES_BLACKBOARD_DB 指向临时库，模块顶层做同样的事会泄漏给
+# 之后 import 的 test_output_continuity（它在 import 期快照该变量 → 24h 连续性断言
+# 静默降级成 skip，假绿）。
+__test__ = False
 
 
 def test_bus_write_and_unconsumed():
