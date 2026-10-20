@@ -436,6 +436,13 @@ class SurvivalMonitor:
                 roles.append(d.get("role", f.stem))
             except (json.JSONDecodeError, OSError):
                 continue
+        # infinite 角色无论有无哨兵都必须巡检：哨兵由 ccs start 写入，从未启动过的
+        # 角色没有哨兵 → 旧枚举把它们排除在外，与"健康"无法区分（实测 2026-10-20
+        # 重启后 scout/optimizer/knowledge_curator/codex-dev/ccs-monitor 五个
+        # infinite 角色无哨兵、无人拉起，巡检整整 36 分钟没看见它们）。
+        for _r, _lc in _load_role_lifecycles().items():
+            if _lc == "infinite" and _r not in roles:
+                roles.append(_r)
         now = time.time()
         results = {}
         for role in roles:
@@ -506,6 +513,22 @@ class SurvivalMonitor:
         # 手段是提醒而非重启（重启会清掉它可能正在推理的上下文）。
         stalled = [r for r, h in results.items() if h["overall"] in ("stale", "dead")]
         idled = [r for r, h in results.items() if h["overall"] == "idle"]
+        # infinite 角色「从未启动」（无 tmux、无哨兵）时 l1=UNKNOWN，既不在 stalled
+        # 也不在 orphan 清理范围，旧逻辑永不拉起。判据必须是 "未在跑" 的确凿证据
+        # 而非 "未在跑 + 探不到"：探测失败时 tmux_alive=None，把它当成 "没在跑"
+        # 会虚报重启（同类虚报见 2026-10-16 的 _was_alive 修复）。
+        # _ensure_role_alive 自带 tmux 双验证 + 300s 冷却，仍活着的是 no-op。
+        recoverable = stalled + [
+            r for r, h in results.items()
+            if r not in stalled and h.get("lifecycle") == "infinite"
+            and h.get("l1", {}).get("tmux_alive") is False
+        ]
+        # 真正未在跑的角色优先占用恢复名额：stalled 多为 pane 静默（tmux 尚在），
+        # 对 _ensure_role_alive 是 no-op，却会占满每轮 2 个名额，使缺角色的恢复
+        # 无限延后（实测 2026-10-20：scout/reviewer 每轮占据名额，4 个未启动的
+        # infinite 角色连续数轮未被处理）。
+        recoverable.sort(key=lambda r: results.get(r, {}).get("l1", {})
+                         .get("tmux_alive") is not False)
         # 节流 600s：与 stalled 的恢复冷却同量级。无节流时每 120s（tick 周期）
         # 重复告警同一批 idle 角色，长期运行持续产生日志噪音。
         if idled:
@@ -513,11 +536,11 @@ class SurvivalMonitor:
             if _now_idle - getattr(self, "_last_idle_warn_ts", 0) > 600:
                 LOGGER.warning("存活告警 idle（无产出）: %s", idled)
                 self._last_idle_warn_ts = _now_idle
-        if stalled:
+        if recoverable:
             # 节流 600s：与 idled 分支及下方恢复冷却同量级。此前只有 idled 有节流，
             # stalled 每 120s（tick 周期）重复告警同一批角色，实测 60min 内 9 条。
             _now_stale = time.time()
-            if _now_stale - getattr(self, "_last_stale_warn_ts", 0) > 600:
+            if stalled and _now_stale - getattr(self, "_last_stale_warn_ts", 0) > 600:
                 LOGGER.warning("存活告警 stale/dead: %s", stalled)
                 self._last_stale_warn_ts = _now_stale
             # D4 修复: 检测到 stale/dead 时尝试恢复（复用 engine._ensure_role_alive 拉起），
@@ -532,7 +555,7 @@ class SurvivalMonitor:
                         from pipeflow.engine import WorkflowEngine
                         _eng = WorkflowEngine()
                         self._engine = _eng
-                    for _r in stalled[:2]:
+                    for _r in recoverable[:2]:
                         # stale 的角色 L1 本就 ALIVE（只是 pane 静默），
                         # _ensure_role_alive 对其为 no-op 且返回 True。
                         # 不加区分地把两种 True 都记为"已重新拉起"＝日志虚报动作

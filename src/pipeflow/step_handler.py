@@ -80,6 +80,31 @@ def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
     return bool(re.search(pat, body))
 
 
+_WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
+
+
+def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
+                                          step_id: str) -> bool:
+    """完成消息是否"点名别的工作流实例，却声称完成了本模板本步骤"。
+
+    这正是同模板并发链串味的指纹：兄弟实例 wf_sub_ad604 的 s2 完成消息把
+    wf_sub_7afc1 的 s2 一起闭合了（实测 #421072）。
+
+    比 require_wf 宽松，因为它不要求消息带本实例 id —— 生产 105/164 条裸匹配
+    完成消息（no-op 巡检类）本来就不带 id，硬校验会把它们全卡成超时。
+    也刻意不拦"提到别实例 id 但没声称本步完成"的消息：coordinator 派发、
+    closer 建任务天然会引用别的工作流 id，那是真实产出（历史 24 条）。
+    """
+    if not wf_id or not template or not step_id:
+        return False
+    ids = set(_WF_ID_RE.findall(text or ""))
+    if not ids or wf_id in ids:
+        return False
+    claim = re.search(r'(?<![\w-])' + re.escape(template) + r'/' + re.escape(step_id) + r'(?![\w-])',
+                      text or "")
+    return bool(claim)
+
+
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
     """角色 tmux pane 显示越界操作 → 注入停止指令（安全护栏，不 cancel 工作流）。"""
     ops = "、".join(commands[:3])
@@ -362,7 +387,8 @@ class StepHandlerMixin:
                 # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
                 if cat:
                     _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                        wf_id=run.id if ec.get("require_wf") else "",
+                        wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
+                        template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
                     if _busy_match_ts:
@@ -539,7 +565,8 @@ class StepHandlerMixin:
                 # 超时但审查指令已发、角色可能已完成 → 检查 exit 匹配
                 _wide = re.sub(r"-complete$", "-", text_filter)
                 _match_ts2, _match_msgs2 = self._check_exit(cat, src_filter, _wide, created_after=last_ts,
-                    wf_id=run.id if ec.get("require_wf") else "",
+                    wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
+                    template=run.workflow_name, step_id=step.id,
                     wait_roles=getattr(step, "wait_roles", None),
                     eff_role=_eff)
                 if _match_ts2:
@@ -697,7 +724,8 @@ class StepHandlerMixin:
             # 若传 wait_roles，integrity 回复本身也会被协作门死锁（2026-08-11 codex 审查确认）
             _integ_ts, _integ_msgs = self._check_exit(
                 cat, src_filter, _integ_filter, created_after=last_ts,
-                wf_id=run.id if ec.get("require_wf") else "",
+                wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
+                template=run.workflow_name, step_id=step.id,
                 eff_role=_eff,
             )
             if _integ_ts:
@@ -748,11 +776,13 @@ class StepHandlerMixin:
                 # 宽匹配：第二节点消息（codex-approved）到达时也能匹配
                 _wide_filter = re.sub(r"-complete$", "-", text_filter)
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, _wide_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles,
+                            wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
+                            template=run.workflow_name, step_id=step.id, wait_roles=_wait_roles,
                             eff_role=_eff)
             else:
                 _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                            wf_id=run.id if ec.get("require_wf") else "", wait_roles=_wait_roles,
+                            wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
+                            template=run.workflow_name, step_id=step.id, wait_roles=_wait_roles,
                             eff_role=_eff)
             if _match_ts:
                 # 过滤已被其他工作流消费的消息
@@ -828,7 +858,8 @@ class StepHandlerMixin:
         if not cat:
             return
         _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
-                        wf_id=run.id if ec.get("require_wf") else "",
+                        wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
+                        template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
         if _match_ts:
@@ -1254,7 +1285,8 @@ class StepHandlerMixin:
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
                     wf_id: str = "", wait_roles: list = None,
-                    eff_role: str = "") -> tuple:
+                    eff_role: str = "", own_wf_id: str = "",
+                    template: str = "", step_id: str = "") -> tuple:
         """查 exit 是否有匹配消息。返回 (timestamp, matched_msgs)。
 
         wf_id 非空时过滤"消息必须含当前工作流实例 id"——防止新工作流
@@ -1318,6 +1350,13 @@ class StepHandlerMixin:
             # 归属边界统一由 _mentions 判定（标题+正文、完整 id）。
             # 严格归属：只认标题，与旧语义一致（正文顺带提及不放行）。
             if wf_id and not _mentions(f, wf_id, fields="t"):
+                continue
+            # 软归属（非 require_wf 步骤）：拦下"点名别的实例却声称完成了本步"的消息。
+            # 裸匹配步骤过去没有归属校验，同模板并发链会互相闭合（#421072：
+            # wf_sub_ad604 的 s2 完成消息闭合了 wf_sub_7afc1 的 s2，自有产出晚 7min）。
+            # 不改成 require_wf=true 的原因：105/164 条历史裸匹配完成消息本就不带
+            # 实例 id（no-op 巡检），硬校验会让它们全部超时。
+            if not wf_id and _claims_own_step_and_foreign_instance(f.t, own_wf_id, template, step_id):
                 continue
 
             # evidence 必须一并带上：驳回分类段【系统问题→maintainer】写在 evidence 里，

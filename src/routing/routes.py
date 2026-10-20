@@ -340,10 +340,16 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         r = _sp.run([sys.executable, str(_CCS_CLI), "send", "--from", "pipeline", role, msg],
                      capture_output=True, text=True, timeout=15, env=_launcher_env)
         err = ""
+        reason = ""
         if r.returncode != 0:
-            try: err = _json.loads(r.stdout).get("error", r.stderr[:100])
-            except Exception: err = r.stderr[:100] or "exit=" + str(r.returncode)
-        return {"success": r.returncode == 0, "sent_chars": len(msg), "error": err}
+            try:
+                _out = _json.loads(r.stdout)
+                err = _out.get("error", r.stderr[:100])
+                reason = _out.get("reason", "")  # busy 需上传给调用方区分排队/故障
+            except Exception:
+                err = r.stderr[:100] or "exit=" + str(r.returncode)
+        return {"success": r.returncode == 0, "sent_chars": len(msg),
+                "error": err, "reason": reason}
 
     def _is_running(role):
         import subprocess as _sp, json as _json
@@ -478,7 +484,10 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     LOGGER.warning("route_to_ccs workflow create failed for %s: %s", role_name, _e)
         else:
             details.append({"id": msg["id"], "category": msg["category"],
-                            "action": "failed", "error": result.get("error", "unknown")})
+                            # busy 不是投递失败：消息未发送、也未标记消费，
+                            # 下轮重推同一 id。分开记录才能在监控里区分排队与故障。
+                            "action": "deferred" if result.get("reason") == "busy" else "failed",
+                            "error": result.get("error", "unknown")})
 
     result = {"role": role_name, "routed": sum(1 for d in details if d["action"] == "routed"),
               "total": len(messages), "dry_run": dry_run, "details": details}

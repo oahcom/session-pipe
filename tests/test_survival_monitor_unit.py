@@ -42,6 +42,10 @@ def isolate_state(tmp_path, monkeypatch):
     health_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(sm, "SENTINEL_DIR", sentinel_dir)
     monkeypatch.setattr(sm, "HEALTH_DIR", health_dir)
+    # lifecycle 也必须隔离：tick() 现在额外枚举 infinite 角色以保证「从未启动」的
+    # 角色也进巡检；不隔离会读到生产 personas → 测试驱动 _ensure_role_alive
+    # 去拉起/杀真实 tmux 会话（实测 2026-10-20，一次 pytest 尝试重启 10 个角色）。
+    monkeypatch.setattr(sm, "_load_role_lifecycles", lambda: {})
     # Clear cache
     sm._ROLE_TARGETS_CACHE = {}
     sm._ROLE_TARGETS_TS = 0.0
@@ -336,6 +340,18 @@ class TestTick:
         # Second tick reuses cache (L2/L3 not re-run if within cache TTL)
         r2 = monitor.tick()
         assert r2["qa"]["overall"] == r1["qa"]["overall"]
+
+    def test_tick_includes_infinite_role_without_sentinel(self, monitor, monkeypatch):
+        """infinite 角色即使无哨兵也进巡检——否则「从未启动」与「健康」无法区分。"""
+        monkeypatch.setattr(sm, "_load_role_lifecycles",
+                            lambda: {"scout": "infinite", "qa": "ondemand"})
+        monkeypatch.setattr(sm, "subprocess", MagicMock(
+            run=lambda *a, **kw: MagicMock(returncode=1, stdout="")))
+        monkeypatch.setattr(monitor, "_ensure_role_alive", lambda r: True, raising=False)
+
+        result = monitor.tick()
+        assert "scout" in result, "infinite 角色必须进巡检"
+        assert "qa" not in result, "ondemand 且无哨兵不应被巡检"
 
 
 class TestWriteBus:

@@ -1,5 +1,6 @@
 """pytest conftest — 测试隔离配置。"""
 import os
+import signal
 import sys
 import tempfile
 
@@ -38,6 +39,18 @@ def pytest_runtest_setup(item):
         sys.modules["bus_protocol"] = _real_bus_protocol
     if _real_config_loader is not None and sys.modules.get("config_loader") is not _real_config_loader:
         sys.modules["config_loader"] = _real_config_loader
+
+
+def pytest_runtest_teardown(item, nextitem):
+    """用例结束必拆 SIGALRM 定时器。
+
+    多个用例用 signal.alarm(20) 做自超时，却只在 __main__ 分支装 handler；
+    pytest 下 handler 是默认动作（杀进程）。不拆则定时器跨用例残留，等到
+    后面某个稍慢的用例（如含真实 sleep 的 _ensure_role_alive）时引爆，
+    整个 pytest 进程以 EXIT=142 死掉且不打印任何失败——实测 34% 处。
+    """
+    if hasattr(signal, "alarm"):
+        signal.alarm(0)
 
 
 # collectstart 不恢复：它在收集 reliability_unit 后的其他模块时会恢复真实版本，

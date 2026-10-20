@@ -537,3 +537,39 @@ def test_route_to_ccs_prefix_is_idempotent(mock_metrics, mock_hb):
     body = sent.get("body", "")
     assert body.count("[test_report]") == 1, f"分类前缀重复: {body!r}"
     assert body.count("证据:") == 1, f"证据前缀重复: {body!r}"
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_thinking_role_is_deferred_not_failed(mock_metrics, mock_hb):
+    """角色思考中（ccs send 返回 busy）→ deferred，且**不标记消费**。
+
+    busy 与投递失败必须分开：失败累计连败/告警，busy 只是排队。关键不变量是
+    不调 mark_consumed —— bus 本身就是队列，未消费的消息下轮自然重推同一 id，
+    既不会丢也不会重复投递。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 77, "category": "task_spec", "text": "do the thing", "priority": 2}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("routing.routes.sys") as mock_sys, \
+         patch("subprocess.run") as mock_run, \
+         patch("routing.routes.WorkflowClient") as mock_wf, \
+         patch("bus_protocol.Blackboard") as mock_bb:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = '{"alive": true}'
+        status_result.returncode = 0
+        send_result = MagicMock()
+        send_result.returncode = 2
+        send_result.stdout = '{"success": false, "reason": "busy"}'
+        send_result.stderr = ""
+        mock_run.side_effect = [status_result, send_result]
+        mock_sys.executable = "/usr/bin/python3"
+        mock_wf.return_value.check_task.return_value = None  # 无活跃工作流
+        result = route_to_ccs("engineer", dry_run=False)
+    d = result["details"][0]
+    assert d["action"] == "deferred", d
+    # 未消费 → 下轮重推同一 id，不丢
+    mock_bb.return_value.mark_consumed.assert_not_called()
+    # 不建任务
+    mock_wf.return_value.create_task_v2.assert_not_called()

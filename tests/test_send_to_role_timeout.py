@@ -19,6 +19,7 @@ TimeoutExpired 不是 ValueError/KeyError/TypeError 的子类，原先不被捕�
 """
 import sys
 import subprocess
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -82,6 +83,43 @@ def test_other_exceptions_still_handled():
     assert result is False, f"兜底耗尽应返回 False（投递链路异常），实际 {result!r}"
 
 
+def test_rc1_with_busy_reason_returns_busy():
+    """ccs.py 对忙态以 rc=1 退出（`{"success": false, "reason": "busy"}`）→ 必须返回 busy。
+
+    非零退码一律判 False 会让角色长跑期间的重推累计 delivery_fail_count，
+    最终灌成 delivery_blocked —— 正好抵消忙时拒投的意义。
+    """
+    eng = _mk_engine()
+    _busy_out = json.dumps({"success": False, "reason": "busy",
+                            "error": "CCS reviewer[1] 思考中，未投递"})
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=1, stdout=_busy_out, stderr=b"")):
+        result = _call_send_to_role(eng)
+    assert result == "busy", f"忙态 rc=1 应返回 busy（排队重试），实际 {result!r}"
+
+
+def test_rc1_busy_reason_as_bytes_returns_busy():
+    """生产路径 capture_output 无 text=True → stdout 是 bytes，同样要识出 busy。"""
+    eng = _mk_engine()
+    _busy_out = json.dumps({"success": False, "reason": "busy"}).encode()
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=1, stdout=_busy_out, stderr=b"")):
+        result = _call_send_to_role(eng)
+    assert result == "busy", f"bytes stdout 的忙态应返回 busy，实际 {result!r}"
+
+
+def test_rc1_without_busy_reason_returns_false():
+    """防修过头：非 busy 的 rc=1 是真故障，仍必须返回 False。
+
+    若把整个非零码分支都收口为 busy，投递失败会被静默吞掉、永不计数。
+    """
+    eng = _mk_engine()
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=1, stdout="", stderr=b"boom")):
+        result = _call_send_to_role(eng)
+    assert result is False, f"真失败 rc=1 应返回 False，实际 {result!r}"
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -89,7 +127,10 @@ if __name__ == "__main__":
     for fn in (test_timeout_returns_busy_not_raises,
                test_timeout_does_not_propagate,
                test_timeout_writes_blocker_for_visibility,
-               test_other_exceptions_still_handled):
+               test_other_exceptions_still_handled,
+               test_rc1_with_busy_reason_returns_busy,
+               test_rc1_busy_reason_as_bytes_returns_busy,
+               test_rc1_without_busy_reason_returns_false):
         try:
             fn()
             print(f"  PASS  {fn.__name__}")

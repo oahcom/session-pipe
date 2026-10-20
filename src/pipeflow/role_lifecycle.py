@@ -909,6 +909,16 @@ class RoleLifecycleMixin:
                     LOGGER.debug("bus write fail after fallback CCS send")
                 return False  # 投递链路异常：明确失败
         if getattr(_result, "returncode", None) is None or _result.returncode != 0:
+            # 忙 ≠ 失败：ccs.py 对 `{"success": false, "reason": "busy"}` 也以 rc=1
+            # 退出（ccs.py:342 只判 success）。这里若按非零码一律判 False，角色每次
+            # 长跑期间的重推都会累计 delivery_fail_count，最终灌成 delivery_blocked
+            # ——正好抵消 _deliver_once 忙时拒投的意义。
+            _out = getattr(_result, "stdout", "") or ""
+            if isinstance(_out, bytes):
+                _out = _out.decode("utf-8", "ignore")
+            if '"reason": "busy"' in _out or '"reason":"busy"' in _out:
+                LOGGER.info("send-to-role %s 角色思考中，未投递（排队等下轮）", role)
+                return "busy"
             LOGGER.warning("send-to-role %s ccs send 退出码=%s (wf=%s step=%s)",
                            role, getattr(_result, "returncode", None),
                            wf_id[:12] if wf_id else "?", step_id)

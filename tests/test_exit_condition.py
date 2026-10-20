@@ -513,5 +513,175 @@ class TestTickNoMatchUpdatesPollSince(unittest.TestCase):
         self.assertIn("poll_since", sr)
 
 
+class TestSoftAttribution(unittest.TestCase):
+    """裸匹配步骤的软归属：拦"点名别实例却声称完成本步"，放行其他一切。
+
+    生产 #421072：architect_full_design 同批拉起两条链，wf_sub_ad604 的 s2
+    完成消息把 wf_sub_7afc1 的 s2 一起闭合，自有产出晚 7 分钟。
+
+    不用 require_wf=true 的硬校验：164 条历史裸匹配完成消息里 105 条不带
+    实例 id（no-op 巡检），硬校验会把它们全卡成超时。
+    """
+
+    def test_foreign_instance_claiming_own_step_not_matched(self):
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("system_design",
+                      f"SYSTEM_DESIGN: 磁盘清理方案 {marker} — 实例 wf_sibling999 / arch/s2 完成",
+                      src="product_architect")
+        ts, _ = eng._check_exit("system_design", "product_architect", marker,
+                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+        self.assertFalse(ts, "兄弟实例声称完成本步，不得闭合本实例")
+
+    def test_own_instance_claiming_own_step_matched(self):
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("system_design", f"设计完成 {marker} 实例 wf_mine111 / arch/s2 完成",
+                      src="product_architect")
+        ts, _ = eng._check_exit("system_design", "product_architect", marker,
+                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+        self.assertTrue(ts)
+
+    def test_no_instance_id_still_matched(self):
+        """no-op 巡检类消息不带 id —— 保持放行，否则步骤熬到超时。"""
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("root_cause_analysis", f"[修复] 服务全绿零僵尸 {marker}", src="maintainer")
+        ts, _ = eng._check_exit("root_cause_analysis", "maintainer", marker,
+                                own_wf_id="wf_mine111", template="maint", step_id="s2")
+        self.assertTrue(ts, "无实例 id 的完成消息必须放行")
+
+    def test_foreign_id_without_step_claim_still_matched(self):
+        """派发/建任务类消息天然提到别的工作流 id，不是串味。"""
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("task_spec", f"[closer] 创建任务 {marker} 审计 wf_other222/s2 产出",
+                      src="closer")
+        ts, _ = eng._check_exit("task_spec", "closer", marker,
+                                own_wf_id="wf_mine111", template="closer_close_loop", step_id="s1")
+        self.assertTrue(ts, "只引用别实例、未声称本步完成 → 放行")
+
+    def test_reverse_attribution_not_applied_when_require_wf(self):
+        """require_wf 已是硬校验，软归属不重复生效。"""
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("code_fix", f"{marker} 实例 wf_other222 / t/s1 完成", src="engineer")
+        ts, _ = eng._check_exit("code_fix", "engineer", marker, wf_id="wf_mine111",
+                                own_wf_id="wf_mine111", template="t", step_id="s1")
+        self.assertFalse(ts)
+
+
+class TestConcurrentInstancesNoCrossClosure(unittest.TestCase):
+    """并发夹具：同模板两实例同时推进，各自只认自己的完成消息。
+
+    修的是 23 个裸步骤（无 text_contains / require_wf）：兄弟实例的
+    s2-complete 会把本实例同步闭合（#421072 实测差 7 分钟）。
+    两条链共用同一模板标记（text_contains 相同），唯一区分量是实例 id。
+    """
+
+    def _eng(self):
+        eng = _make_eng()
+        eng._eff_role = lambda run, step: step.target_role
+        eng._sync_step_results = MagicMock()
+        eng._send_to_role = MagicMock()
+        eng._lm = MagicMock()
+        return eng
+
+    def _pair(self, eng, cat="notice"):
+        # 每个用例独立后缀：同文本重写会走 UPSERT 抬高 ts，屏障按首次写入
+        # (MIN(ts)) 判定 → 复用 marker 会让第二个用例的消息被判为"屏障前"。
+        _tok = f"{_UNIQUE}{time.time_ns() % 1_000_000_000:09d}"
+        marker = f"CONC_{_tok}"
+        ec = {"bus_category": cat, "source_contains": "scout",
+              "text_contains": marker, "require_wf": True, "timeout_minutes": 30}
+        step = _step(exit_condition=ec)
+        a = _run(); a.workflow_name = "conc_wf"
+        b = _run(); b.workflow_name = "conc_wf"
+        # _run() 的 id 取自模块级 _UNIQUE，两个实例会拿到同一个 id → 夹具假绿
+        a.id, b.id = f"wf_{_tok}a", f"wf_{_tok}b"
+        # 锚点必须早于完成消息：notified_at 缺失时 tick 用 time.time() 兜底，
+        # 会跳过刚写入的消息（真实实例在上一 tick 已持久化 poll_since）。
+        _anchor = time.time() - 60
+        a.step_results = {"s1": {"notified_at": _anchor}}
+        b.step_results = {"s1": {"notified_at": _anchor}}
+        return marker, step, a, b
+
+    def test_sibling_completion_does_not_close_other_instance(self):
+        eng = self._eng()
+        marker, step, a, b = self._pair(eng)
+        eng._bb.write(step.exit_condition["bus_category"],
+                      f"{marker} [实例] {b.id} 完成 s1", src="scout")
+        eng._tick(a, step)
+        self.assertFalse(a.step_results["s1"].get("exit_messages"),
+                         "B 的完成消息不得闭合 A")
+        eng._tick(b, step)
+        ids = {m["text"] for m in b.step_results["s1"]["exit_messages"]}
+        self.assertEqual(len(ids), 1)
+        self.assertIn(b.id, b.step_results["s1"]["exit_messages"][0]["text"])
+
+    def test_both_instances_close_only_on_own_message(self):
+        eng = self._eng()
+        marker, step, a, b = self._pair(eng)
+        cat = step.exit_condition["bus_category"]
+        eng._bb.write(cat, f"{marker} [实例] {a.id} 完成 s1", src="scout")
+        eng._bb.write(cat, f"{marker} [实例] {b.id} 完成 s1", src="scout")
+        eng._tick(a, step)
+        eng._tick(b, step)
+        for run in (a, b):
+            msgs = run.step_results["s1"].get("exit_messages") or []
+            self.assertEqual(len(msgs), 1, f"{run.id} 只应吃自己的消息: {msgs}")
+            self.assertIn(run.id, msgs[0]["text"])
+            others = [m for m in msgs if (a.id if run is b else b.id) in m["text"]]
+            self.assertEqual(others, [], f"{run.id} 不得消费兄弟实例消息")
+
+    def test_idless_completion_not_matched_by_require_wf(self):
+        """require_wf 下不带实例 id 的完成消息不闭合（否则回退到裸匹配）。"""
+        eng = self._eng()
+        marker, step, a, _b = self._pair(eng)
+        eng._bb.write(step.exit_condition["bus_category"],
+                      f"{marker} s1 完成", src="scout")
+        eng._tick(a, step)
+        self.assertFalse(a.step_results["s1"].get("exit_messages"))
+
+
+
+_WORKFLOWS_DIR = Path.home() / ".hermes" / "workflows"
+
+
+@unittest.skipUnless(_WORKFLOWS_DIR.is_dir(), "生产模板目录缺失（CI/沙箱）")
+class TestTemplatesBindIdentity(unittest.TestCase):
+    """回归门：任何带 bus_category 的步骤都必须能区分实例。
+
+    23/141 步裸匹配（只有 bus_category+source_contains）会把兄弟实例的完成
+    消息当本步完成（#421072）。判据是模板数据本身，不是扫描脚本。
+    """
+
+    def test_no_naked_exit_condition(self):
+        import json
+        naked = []
+        for f in sorted(_WORKFLOWS_DIR.glob("*.json")):
+            data = json.loads(f.read_text())
+            for st in data.get("steps", []):
+                ec = st.get("exit_condition") or {}
+                if ec.get("bus_category") and not (ec.get("text_contains") or ec.get("require_wf")):
+                    naked.append(f"{f.name}/{(st.get('step_id') or st.get('id'))}")
+        self.assertEqual(naked, [], f"裸匹配步骤会把兄弟实例消息当本步完成: {naked}")
+
+    def test_bound_steps_also_instruct_instance_id(self):
+        """require_wf 步骤的提示词必须要求标题带实例 id，否则步骤必超时。"""
+        import json
+        bad = []
+        for f in sorted(_WORKFLOWS_DIR.glob("*.json")):
+            data = json.loads(f.read_text())
+            for st in data.get("steps", []):
+                ec = st.get("exit_condition") or {}
+                if not (ec.get("require_wf") and str(ec.get("text_contains", "")).count("-complete")):
+                    continue
+                _pt = st.get("prompt_template") or ""
+                # 两种既有措辞：「本实例 id」/「[实例] 行给出的实例 id」
+                if "本实例 id" not in _pt and "[实例] 行给出的实例 id" not in _pt:
+                    bad.append(f"{f.name}/{(st.get('step_id') or st.get('id'))}")
+        self.assertEqual(bad, [], f"提示词未要求实例 id: {bad}")
+
 if __name__ == "__main__":
     unittest.main()
