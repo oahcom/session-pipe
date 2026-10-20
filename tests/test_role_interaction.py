@@ -315,7 +315,7 @@ def test_scenario_design_issue_feedback():
 def main():
     print("=" * 60)
     print("  角色交互测试 (Role Interaction Tests)")
-    print("  Sister Bus: ~/.hermes/sister_bus/blackboard.db")
+    print(f"  Sister Bus (临时): {_TMP_DB}")
     print("=" * 60)
     print()
 
