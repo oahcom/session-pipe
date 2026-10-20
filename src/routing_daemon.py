@@ -44,6 +44,60 @@ SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
 P0_CHECK_INTERVAL = 1800  # P0 超时检测间隔（每 30 分钟）
 CRON_SCHEDULE_TRACKER = Path.home() / ".hermes" / "run" / "cron_schedule_triggered.json"  # 去重跟踪
 
+# 排队积压兜底：指向角色的消息如果长期没人消费，既没有超时也没有告警。
+# 判据用「定向消息（@role）+ 超龄 + 该角色确实没消费」三者交集：全局未消费
+# 计数 94% 是别人已处理的汇报，按条数告警恒亮。数据源是 bus 的逐消费者
+# unconsumed()，不是 route_all_to_ccs 的 details —— 后者只含本轮 poll 窗口
+# （最新 90 条 ≈ 1.5h）里的消息，超龄消息根本不进窗口，永远告警不到。
+# task_spec/workflow 是工作流引擎的分发账本（已完成/取消后即成残渣），不算角色队列。
+_QUEUE_ALERT_HOURS = 24
+_QUEUE_ALERT_MIN_GAP = 6 * 3600  # 每 6 小时最多写一条汇总，避免刷屏
+_QUEUE_ALERT_OWNED_CATS = frozenset({"task_spec", "workflow"})
+# 标题固定（不含计数、含去重前缀）：UPSERT 归并成同一 fact，不再计入自身积压。
+_QUEUE_ALERT_TITLE = "@ccs-monitor [queue] 角色定向消息积压超 24h 未消费"
+_QUEUE_ALERT_LAST = 0.0
+
+
+def _alert_aged_queue(*, now: float | None = None) -> int:
+    """把超过 24h 仍未消费的定向消息汇总成一条 notice（每 6h 最多一次）。
+
+    标题固定（不含计数）让 Blackboard 的 UPSERT 归并为同一 fact，重复运行
+    不增长；计数与最老 id 写进 evidence，随每次检测刷新。
+    """
+    global _QUEUE_ALERT_LAST
+    now = time.time() if now is None else now
+    if now - _QUEUE_ALERT_LAST < _QUEUE_ALERT_MIN_GAP:
+        return 0
+    from bus_protocol import Blackboard
+    from routing.router import get_router
+    import re as _re
+
+    bb = Blackboard()
+    aged: list[tuple[str, int, int, float]] = []
+    for role in get_router().routing:
+        pending = [f for f in bb.unconsumed(consumer=role)
+                   if f.cat not in _QUEUE_ALERT_OWNED_CATS
+                   and not (f.t or "").startswith(_QUEUE_ALERT_TITLE)
+                   and now - f.ts > _QUEUE_ALERT_HOURS * 3600
+                   and role in _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", f.t or "")]
+        if pending:
+            oldest = min(pending, key=lambda f: f.ts)
+            aged.append((role, len(pending), oldest.id, now - oldest.ts))
+    _QUEUE_ALERT_LAST = now
+    if not aged:
+        return 0
+    aged.sort(key=lambda x: -x[1])
+    detail = "; ".join(f"{r}×{n}(#{oid}, {age / 3600:.0f}h)"
+                       for r, n, oid, age in aged[:10])
+    bb.write(
+        "notice",
+        _QUEUE_ALERT_TITLE,
+        evidence=f"共 {len(aged)} 个角色 / {sum(a[1] for a in aged)} 条: {detail}",
+        src="routing_daemon",
+    )
+    return len(aged)
+
+
 
 def _any_live_targets() -> bool:
     """如果存在任意 pid>0 且 tmux_session 非空的 CCS 哨兵则返回 True。"""
@@ -239,6 +293,10 @@ def main():
                                         d.get("category", "?"), d.get("id", 0),
                                         ",".join(d.get("assigned", [])))
                     LOGGER.info("route_all_to_ccs: %d/%d routed", ccs_routed, ccs_total)
+                    try:
+                        _alert_aged_queue()
+                    except Exception as e:
+                        LOGGER.warning("queue alert 失败: %s", e)
                     error_backoff = 0
                 except Exception as e:
                     LOGGER.error("route_all_to_ccs 异常 (backoff=%ds): %s", error_backoff, e)
