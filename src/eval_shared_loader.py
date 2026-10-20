@@ -2,85 +2,36 @@
 """eval 共享加载器 — 统一角色+eval_criteria 加载与解析，消除双 schema 漂移。
 
 这是 eval_checker 与 eval_consistency 的单一真相源。
+
+解析（_extract_cmd）与校验（_check_cmd）都委托给 eval_checker —— 延迟导入，
+因为 eval_checker 反向依赖本模块的 _load_roles。此前这里各写了一份副本：
+白名单通过模块级 `from eval_checker import` 获取，导入顺序不同会落到 51 项的
+fallback 静态副本（真表 29 项），且静态校验把引号内的 '|' 与 for 首词误判为
+不兼容 —— 同一批 persona 在静态检查报 10 项、运行时只拒 3 项。
 """
 
 import json
-import re
-import sys
 from pathlib import Path
 
 # personas 目录（与 eval_checker 一致）
 PERSONAS_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
 
-# 白名单（源自 eval_checker._ALLOWED_CMDS，单一真相源）
-# 注意：此处必须与 eval_checker._ALLOWED_CMDS 保持同步，建议直接从 eval_checker 导入
-try:
-    from eval_checker import _ALLOWED_CMDS as ALLOWED_CMDS
-except ImportError:
-    # 兜底：若 eval_checker 未安装（如单元测试），提供静态副本
-    ALLOWED_CMDS = frozenset({
-        "python3", "python", "bash", "sh", "ls", "cat", "grep", "find",
-        "git", "pytest", "python3", "python", "make", "cargo", "go",
-        "npm", "pip", "ruff", "black", "mypy", "pyright", "py_compile",
-        "jq", "yq", "awk", "sed", "sort", "uniq", "wc", "head", "tail",
-        "diff", "patch", "curl", "wget", "openssl", "ssh", "scp", "rsync",
-        "systemctl", "journalctl", "tmux", "ps", "pkill", "kill", "pgrep",
-        "stat", "md5sum", "sha256sum", "file", "which", "type", "command",
-    })
-
 
 def _extract_cmd(criterion: str) -> str | None:
-    """从 eval_criterion 提取验证命令（单一真相源，供 eval_checker/eval_consistency 共用）。
-
-    逻辑：去除 "验证:" 前缀，剥离 bash -c 外层，清理尾部噪音。
-    """
-    if "验证:" not in criterion:
-        return None
-    _, _, part = criterion.partition("验证:")
-    part = part.strip()
-    # 截断到输出/预期标记之前
-    for marker in ("输出结果", "输出 ", "全部返回 "):
-        idx = part.rfind(marker)
-        if idx >= 0 and part[:idx].count("'") % 2 == 0:
-            part = part[:idx].strip()
-            break
-    # 去掉中文混入
-    part = re.sub(r'[一-鿿　-〿＀-￯]+[<\d]*', '', part).strip()
-    # 剥离 bash -c 外层（支持单引号/双引号包裹）
-    m = re.match(r"^(?:bash|sh)\s+-c\s+(['\"])(.+?)\1\s*$", part, re.DOTALL)
-    if m:
-        part = m.group(2).strip()
-    # 清理尾部
-    part = re.sub(r'\s+[<>!]=?\s*\d+(?:\.\d+)?\s*', ' ', part).strip()
-    part = re.sub(r';$', '', part).strip()
-    part = re.sub(r'^\s*\|\s*', '', part)
-    return part or None
+    """从 eval_criterion 提取验证命令；委托 eval_checker 的同名实现。"""
+    from eval_checker import _extract_cmd as _ec_extract
+    extracted = _ec_extract(criterion)
+    return extracted[0] if extracted else None
 
 
 def _check_cmd(cmd: str) -> list[str]:
-    """检查命令是否与白名单兼容。返回不兼容原因列表（空=兼容）。
+    """检查命令能否被运行时执行。返回不兼容原因列表（空=兼容）。
 
-    单一真相源，供 eval_checker/eval_consistency 共用。
+    与 eval_checker._run 共用同一个 _preflight，静态预检不再与运行时判定分叉。
     """
-    issues = []
-    first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
-    _is_python_c = first_word == "python3" and "-c" in cmd
-    _is_composite = first_word in ("bash", "for", "while", "if") or cmd.startswith(("for ", "while ", "if "))
-    if not _is_python_c and not _is_composite:
-        if ";" in cmd or "`" in cmd or "$(" in cmd:
-            issues.append(f"含禁止符号（分号/命令替换）: {cmd[:60]}")
-    segments = [s.strip() for s in cmd.split("|") if s.strip()]
-    if not _is_python_c and not _is_composite:
-        for seg in segments:
-            first = seg.split(maxsplit=1)[0] if seg else ""
-            if first not in ALLOWED_CMDS:
-                issues.append(f"管道段命令不在白名单: {first!r} ← {seg[:50]}")
-    if not segments:
-        return issues
-    first_word = segments[0].split(maxsplit=1)[0] if segments[0] else ""
-    if first_word not in ALLOWED_CMDS:
-        issues.append(f"首命令不在白名单: {first_word!r}")
-    return issues
+    from eval_checker import _preflight
+    _, rejected = _preflight(cmd)
+    return [rejected["stderr"]] if rejected else []
 
 
 def _load_roles(personas_dir: Path | None = None) -> list[dict]:
@@ -89,7 +40,7 @@ def _load_roles(personas_dir: Path | None = None) -> list[dict]:
     单一真相源：eval_checker 和 eval_consistency 均从此导入。
     """
     if personas_dir is None:
-        personas_dir = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
+        personas_dir = PERSONAS_DIR
 
     if not personas_dir.is_dir():
         return []
@@ -98,9 +49,8 @@ def _load_roles(personas_dir: Path | None = None) -> list[dict]:
     for f in sorted(personas_dir.glob("persona_*.json")):
         try:
             d = json.loads(f.read_text())
-        except Exception as e:
+        except Exception:
             continue
-        name = d.get("name", f.stem)
         criteria = d.get("eval_criteria", [])
         role_issues = []
         for c in criteria:

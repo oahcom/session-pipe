@@ -283,15 +283,22 @@ def _is_tautology(cmd: str) -> bool:
     return any(p.replace(" ", "") in c for p in _TAUTOLOGY_PATTERNS)
 
 
-def _run(cmd: str, timeout: int = 30) -> dict:
-    """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
+def _preflight(cmd: str) -> tuple[str, dict | None]:
+    """白名单/沙箱前置校验（不执行命令）。
+
+    返回 (实际要执行的命令, 拒绝结果)；拒绝结果为 None 表示通过。
+    单一实现，供 _run 与 eval_consistency 静态检查共用。此前两边各写一份：
+    静态版把引号内的 '|'、for 循环首词判成不兼容（实测 10 项 vs 运行时 3 项），
+    且白名单因循环导入在不同入口下取到不同的表。
+    """
+    def _reject(msg: str, rc: int = -3) -> tuple[str, dict]:
+        return cmd, {"ok": False, "stdout": "", "stderr": msg, "returncode": rc}
+
     # 恒真检查必须放在最前：下方有"引号规范化"会把 eval_criteria 里
     # `python3 -c "print("PASS")"` 这类笔误**修好**使其可执行——那是帮一个
     # 恒真命令通过，而不是拒绝它。先拒绝，再谈白名单与规范化。
     if _is_tautology(cmd):
-        return {"ok": False, "stdout": "",
-                "stderr": "恒真命令被拒（与系统状态无关，会伪造 PASS）",
-                "returncode": -3}
+        return _reject("恒真命令被拒（与系统状态无关，会伪造 PASS）")
     first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
     # bash -c '...' 解包: 递归校验内部命令（for 循环巡检是白名单内命令的组合）
     if first_word == "bash":
@@ -299,10 +306,10 @@ def _run(cmd: str, timeout: int = 30) -> dict:
         if _m:
             inner = _m.group(1)
             if not _inner_cmd_ok(inner):
-                return {"ok": False, "stdout": "", "stderr": "bash -c 内部命令不在白名单", "returncode": -3}
-            # 递归校验通过后, 重新从内部命令开始白名单检查
-            return _run(inner, timeout)
-        return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
+                return _reject("bash -c 内部命令不在白名单")
+            # 递归校验通过后, 从内部命令重新检查
+            return _preflight(inner)
+        return _reject(f"命令不在白名单: {first_word}")
     # 禁止管道符/分号/命令替换——防止 curl|bash 类绕过白名单
     # 管道（|）只读过滤（cat | cut）放行；分号/命令替换仍禁（可拼接写操作）
     # 例外1: for/while 循环骨架中的 ';'（'for s in a b; do' 是安全语法）
@@ -324,11 +331,10 @@ def _run(cmd: str, timeout: int = 30) -> dict:
         except ValueError:
             _py_code = cmd.split(None, 2)[-1].strip("'\"")
         if not _validate_python_inline(_py_code):
-            return {"ok": False, "stdout": "", "stderr": "python3 -c 內部代碼含阻斷 API",
-                    "returncode": -4}
+            return _reject("python3 -c 內部代碼含阻斷 API", rc=-4)
     for _pat in ("`", "$("):
         if _pat in cmd and not _is_var_assign:
-            return {"ok": False, "stdout": "", "stderr": f"管道/分号/命令替换被禁止: 含 {_pat}", "returncode": -3}
+            return _reject(f"管道/分号/命令替换被禁止: 含 {_pat}")
     if not _is_loop_skeleton and not _is_py_inline and not _is_var_assign and ";" in cmd:
         # 仅允许 python3 -c '...' 引号内的 ';'（python 代码分隔符）
         # 以及 for/while 循环骨架（'for s in a b; do'）。用管道段递归校验：
@@ -341,23 +347,32 @@ def _run(cmd: str, timeout: int = 30) -> dict:
                 for s in _all_segments if s.strip()
             )
             if not _ok:
-                return {"ok": False, "stdout": "", "stderr": "管道/分号/命令替换被禁止: 含 ; 且段含非白名单命令", "returncode": -3}
+                return _reject("管道/分号/命令替换被禁止: 含 ; 且段含非白名单命令")
         else:
-            return {"ok": False, "stdout": "", "stderr": "管道/分号/命令替换被禁止: 含 ;", "returncode": -3}
+            return _reject("管道/分号/命令替换被禁止: 含 ;")
     # 管道仅允许左右两侧都是白名单只读命令（引号感知分割: grep 模式内的 '|' 不算管道）
     for _seg in _split_pipe_segments(cmd):
         _seg_cmd = _seg.strip().split(maxsplit=1)[0] if _seg.strip() else ""
         if _seg_cmd not in _ALLOWED_CMDS and _seg_cmd not in _SHELL_BUILTINS_READONLY:
-            return {"ok": False, "stdout": "", "stderr": f"管道段命令不在白名单: {_seg_cmd}", "returncode": -3}
+            return _reject(f"管道段命令不在白名单: {_seg_cmd}")
     if first_word not in _ALLOWED_CMDS and first_word not in _SHELL_BUILTINS_READONLY and not _is_var_assign:
-        return {"ok": False, "stdout": "", "stderr": f"命令不在白名单: {first_word}", "returncode": -3}
+        return _reject(f"命令不在白名单: {first_word}")
     if not _is_var_assign and not _cmd_is_readonly(first_word, cmd):
-        return {"ok": False, "stdout": "", "stderr": f"写操作被拒绝: {first_word} 不允许非只读子命令", "returncode": -3}
+        return _reject(f"写操作被拒绝: {first_word} 不允许非只读子命令")
     # 变量赋值 + $() 命令替换: 校验替换体内部命令在白名单
     if _is_var_assign and "$(" in cmd:
         _inner_body = cmd.split("$(", 1)[1].rsplit(")", 1)[0] if cmd.count("$(") == cmd.count(")") else ""
         if _inner_body and not _inner_cmd_ok(_inner_body):
-            return {"ok": False, "stdout": "", "stderr": f"$() 内部命令不在白名单: {_inner_body[:60]}", "returncode": -3}
+            return _reject(f"$() 内部命令不在白名单: {_inner_body[:60]}")
+    return cmd, None
+
+
+def _run(cmd: str, timeout: int = 30) -> dict:
+    """执行 bash 命令（白名单检查，仅允许只读类命令）。"""
+    cmd, _rejected = _preflight(cmd)
+    if _rejected is not None:
+        return _rejected
+    first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
     try:
         # 引号规范化: python3 -c "..." 内层同引号 → 转义为 \"
         # persona eval_criteria 常见笔误: python3 -c "import sys; print("PASS")"
