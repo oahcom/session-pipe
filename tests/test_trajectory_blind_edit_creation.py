@@ -478,20 +478,57 @@ def test_bash_same_absolute_path_still_exempts() -> None:
             pass
 
 
+def test_second_write_of_own_file_not_flagged() -> None:
+    """重写自己写过的文件不算盲改：同一 transcript 里内容就在上下文。
+
+    实测全库 15 处（pm 4 / product_architect 3 / maintainer 2 …），原先只豁免
+    Edit，这些全被判盲改。跨 transcript 仍不豁免（compact 续跑会开新 transcript）。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-rewrite-role"
+    path = "/tmp/probe_rewrite.py"
+    lines = _write_seq(0, "cw3", path,
+                       f"File created successfully at: {path} (file state is current)")
+    lines += [
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "cw4", "name": "Write",
+             "input": {"file_path": path, "content": "x=2"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "cw4", "is_error": False,
+             "content": "The file /tmp/probe_rewrite.py has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("rewrite", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"重写自己写过的文件被误判盲改: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
-    for _t in (test_created_file_not_flagged,
-               test_list_shaped_result_content,
-               test_path_mismatch_and_error_echo_not_exempted,
-               test_non_creation_write_still_flagged,
-               test_unparsed_retry_duplicate_not_blind_edit,
-               test_failed_write_is_not_blind_edit,
-               test_one_success_result_keeps_blind_edit,
-               test_edit_of_own_written_file_not_flagged,
-               test_edit_before_own_write_still_flagged,
-               test_mcp_write_then_edit_own_file_not_flagged,
-               test_same_file_different_path_form_not_flagged,
-               test_bash_basename_must_be_path_component,
-               test_bash_absolute_path_must_point_at_same_file,
-               test_bash_same_absolute_path_still_exempts):
+    _tests = (
+        test_created_file_not_flagged,
+        test_list_shaped_result_content,
+        test_path_mismatch_and_error_echo_not_exempted,
+        test_non_creation_write_still_flagged,
+        test_unparsed_retry_duplicate_not_blind_edit,
+        test_failed_write_is_not_blind_edit,
+        test_one_success_result_keeps_blind_edit,
+        test_edit_of_own_written_file_not_flagged,
+        test_edit_before_own_write_still_flagged,
+        test_mcp_write_then_edit_own_file_not_flagged,
+        test_same_file_different_path_form_not_flagged,
+        test_bash_basename_must_be_path_component,
+        test_bash_absolute_path_must_point_at_same_file,
+        test_bash_same_absolute_path_still_exempts,
+        test_second_write_of_own_file_not_flagged,
+    )
+    for _t in _tests:
         _t()
-    print(f"PASS: {len(_t.__globals__['__name__'] and tuple()) or 12} tests")
+    print(f"PASS: {len(_tests)} tests")
