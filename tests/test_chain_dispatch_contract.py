@@ -13,7 +13,6 @@
 subflow_id）就是这么来的。
 """
 import json
-import signal
 import tempfile
 import time
 from pathlib import Path
@@ -22,9 +21,6 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from pipeflow.engine import WorkflowEngine
-
-_TIMEOUT = 20
-
 
 def _wf(dirpath, name, steps):
     (dirpath / f"{name}.json").write_text(json.dumps(
@@ -80,11 +76,11 @@ def _drive(eng, rid, step_id, tries=20):
             return
 
 
+@patch("pipeflow.engine._DEV_ROLE_POOL", ())  # 本用例锁“下一棒是谁”，不测 dev 池分流
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_every_hop_dispatches_to_the_next_role(mock_run):
     """pm → 架构 → 开发：每一跳都必须给下一棒角色真的发一次投递。"""
-    signal.alarm(_TIMEOUT)
     d = Path(tempfile.mkdtemp())
     roles = ["pm", "product_architect", "engineer"]
     _wf(d, "chain", [_step(f"s{i+1}", r, type="handoff")
@@ -94,7 +90,9 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
     sent = []
 
     def _record(role, prompt, wf_id="", step_id="", **kw):
-        sent.append((role, step_id))
+        # 催办/完整性提醒也走 _send_to_role，同一步会多次 send；只把真派单计入契约。
+        if "完整性提醒" not in prompt:
+            sent.append((role, step_id, prompt[:60]))
         return True
 
     eng._send_to_role = _record
@@ -104,7 +102,10 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
         sid = f"s{i+1}"
         assert _until(eng, lambda: eng.status(rid)["current_step"] == sid), \
             f"{sid} 没被接手: {eng.status(rid)}"
-        eng._bb.write("notice", f"TAG_{sid}_DONE", src=role)
+        # 带实例 id：bus 按标题 UNIQUE 去重并保留首次 ts（blackboard_legacy.py:248），
+        # 同文本重写复用旧 fid → 出生屏障（step_handler.py:1604）把本用例刚写的
+        # 消息挡在 created_after 之前，步骤无法闭环。唯一标题才有新出生时间。
+        eng._bb.write("notice", f"TAG_{sid}_DONE {rid}", src=role)
         nxt = f"s{i+2}"
         assert _until(eng, lambda: eng.status(rid)["current_step"] == nxt
                       or eng.status(rid)["status"] == "completed"), \
@@ -113,15 +114,14 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
     assert eng.status(rid)["status"] == "completed", eng.status(rid)
     # s1 由 start 投递一次；s2/s3 由推进投递一次。少一次 = 那一跳没人干活。
     for i, role in enumerate(roles[1:], start=2):
-        assert (role, f"s{i}") in sent, \
-            f"s{i} 没有派给 {role}，实投={sent}"
+        hits = [x for x in sent if (x[0], x[1]) == (role, f"s{i}")]
+        assert len(hits) == 1, f"s{i} 应恰好派给 {role} 一次，实投={hits}"
 
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_subflow_takeover_keeps_notified_and_subflow_id(mock_run):
     """建子链后父步必须同时保有 notified（已派）与 subflow_id（子链指针）。"""
-    signal.alarm(_TIMEOUT)
     d = Path(tempfile.mkdtemp())
     _wf(d, "child", [_step("s1", "product_architect")])
     # s1 用 handoff：它的完成走引擎推进分支（wf_lifecycle），那条分支本 tick 里

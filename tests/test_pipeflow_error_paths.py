@@ -179,6 +179,36 @@ def test_send_to_role_creates_task_spec():
     assert "wf_abc" in title
 
 
+def test_send_to_role_defers_when_cli_busy():
+    """CLI 仍在执行 -> 排队，不启动 ccs send（避免单次投递卡住整个 tick）。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)  # DB 视角：没有别的活跃步
+
+    with patch("liveness.pane_cli_busy", return_value=True), \
+            patch.object(engine_mod._sp, "run") as mock_run:
+        assert eng._send_to_role("scout", "test prompt",
+                                 wf_id="wf_123", step_id="s1") == "busy"
+
+    mock_run.assert_not_called()
+    assert not eng._bb.write.called
+
+
+def test_send_to_role_proceeds_when_cli_probe_fails():
+    """探针异常/None 不阻断投递：沿用“探测不可用则放行”。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    with patch("liveness.pane_cli_busy", side_effect=OSError("tmux gone")), \
+            patch.object(engine_mod._sp, "run",
+                         return_value=_mock_run_out(returncode=0)):
+        assert eng._send_to_role("scout", "test prompt",
+                                 wf_id="wf_probe_fail", step_id="s1") is True
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 3. _load_workflows SQLite 分支
 # ═══════════════════════════════════════════════════════════════════════

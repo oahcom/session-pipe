@@ -19,44 +19,42 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 895 | Data-driven workflow execution engine (core, imports mixins below) |
-| **pipeflow/step_handler.py** | 977 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 443 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
-| **pipeflow/task_generator.py** | 406 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 903 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
-| **lifecycle/manager.py** | 1200 | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **template_registry.py** | 837 | 模板注册中心 |
-| **eval_checker.py** | 602 | 安全白名单命令执行检查 |
-| **workflow/client.py** | 496 | High-level API for CCS roles to interact with workflow DB |
+| **pipeflow/engine.py** | 1851 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/step_handler.py** | 1681 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1199 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/task_generator.py** | 874 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 1979 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **lifecycle/manager.py** | 1196 | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **template_registry.py** | 937 | 模板注册中心 |
+| **eval_checker.py** | 1428 | 安全白名单命令执行检查 |
+| **workflow/client.py** | 515 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 465 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
-| **reliability.py** | 444 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 472 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
-| **routing/router.py** | 374 | Route table: derive produce/consume from roles_export.json, priority routing |
-| **routing/survival_monitor.py** | 492 | 存活监测 |
-| **routing/rdb.py** | 298 | Route table SQLite persistence + audit log |
-| **routing/auto.py** | 290 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
-| **routing_daemon.py** | 354 | 路由守护进程 |
-| **task_evidence.py** | 317 | 任务证据链 |
-| **contract_updater.py** | 240 | 合约同步 |
-| **conversation_monitor.py** | 228 | 对话监控 |
-| **config_loader.py** | 184 | YAML config loading with env override and hot-reload |
-| **workflow/gateway.py** | 193 | 工作流网关门禁 |
-| **dispatch_tasks.py** | 145 | 任务分发 |
-| **drift_detector.py** | 143 | 架构漂移检测 |
-| **cron_scheduler.py** | 139 | cron 调度器 |
-| **eval_consistency.py** | 137 | 评估一致性 |
-| **routing/consistency.py** | 120 | 路由一致性 |
-| **pipeflow/daemon.py** | 108 | Main loop: `while True: engine.run_once(); sleep(10)` |
-| **workflow_metrics.py** | 103 | 工作流指标 |
-| **role_validator.py** | 92 | 角色校验 |
-| **workflow/db.py** | 92 | 工作流数据访问 |
-| **output_validator.py** | 90 | 输出格式验证 |
-| **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
-| **paths.py** | 84 | 路径常量 |
-| **workflow/sync.py** | 55 | 工作流同步 |
+| **reliability.py** | 446 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
+| **routing/routes.py** | 612 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
+| **routing/survival_monitor.py** | 640 | 存活监测 |
+| **routing/rdb.py** | 293 | Route table SQLite persistence + audit log |
+| **routing/auto.py** | 260 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
+| **routing_daemon.py** | 591 | 路由守护进程 |
+| **task_evidence.py** | 448 | 任务证据链 |
+| **contract_updater.py** | 431 | 合约同步 |
+| **conversation_monitor.py** | 417 | 对话监控 |
+| **config_loader.py** | 167 | YAML config loading with env override and hot-reload |
+| **workflow/gateway.py** | 188 | 工作流网关门禁 |
+| **drift_detector.py** | 198 | 架构漂移检测 |
+| **cron_scheduler.py** | 128 | cron 调度器 |
+| **eval_consistency.py** | 70 | 评估一致性 |
+| **routing/consistency.py** | 105 | 路由一致性 |
+| **pipeflow/daemon.py** | 345 | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **workflow_metrics.py** | 109 | 工作流指标 |
+| **workflow/db.py** | 96 | 工作流数据访问 |
+| **output_validator.py** | 93 | 输出格式验证 |
+| **routing/polling.py** | 88 | Message polling with cursor (dedup across restarts) |
+| **paths.py** | 105 | 路径常量 |
+| **workflow/sync.py** | 65 | 工作流同步 |
 
-| **pipeflow/db.py** | 328 | Three-layer SQLite: Template → Instance → Task |
-| **p0_exemption.py** | 486 | P0 豁免通道 |
+| **pipeflow/db.py** | 327 | Three-layer SQLite: Template → Instance → Task |
+| **p0_exemption.py** | 496 | P0 豁免通道 |
 
 **Total: 38 modules（不含 `__init__.py`），合计 ~10700 行 Python**
 
@@ -133,20 +131,15 @@ Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` i
 
 `route_to_ccs()` calls `ccs.py send` via subprocess. There is no documented API contract or version check between pipeline → launcher. If launcher changes CLI flags, pipeline silently fails.
 
+### Delivery prechecks
+
+`role_lifecycle._send_to_role` checks CLI busy (`liveness.pane_cli_busy`: bottom-bar `esc to interrupt` / `retrying`) before `ccs send`; busy returns `"busy"` for the next tick instead of starting a 30s child process that blocks the whole tick.
+
 ## Tests
 
-| Test file | Count | Pass |
-|-----------|-------|------|
-| test_workflow_db.py | 36 | 36/36 |
-| test_workflow_engine.py | 31 | 31/31 |
-| test_cross_component.py | 17 | 17/17 |
-| test_router.py | 13 | 13/13 |
-| test_integration.py | 12 | 12/12 |
-| test_role_interaction.py | 10 | 10/10 |
-| test_engine_e2e.py | 6 | 6/6 |
-| test_workflow_daemon.py | 4 | 4/4 |
-| test_router_extend_bh.py | 7 | 7/7 |
-| **Total** | **136** | **136/136** |
+- Full suite: `python3 -m pytest tests/ -q` → 1218 passed (2026-10-22).
+- Per-file counts are not maintained; run the suite for current numbers.
+- `python3 scripts/doccheck.py` enforces the line counts in this file and CLAUDE.md.
 
 ## Red lines
 

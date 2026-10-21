@@ -17,7 +17,8 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 TREE = re.compile(r'([\w/]+\.py)(\s*[─-]+.*?（)(\d+)( 行）)')
-TABLE = re.compile(r'(\|\s*\*\*`)([\w/]+\.py)(`\s*\|\s*)(\d+)(\s*\|)')
+# 表格两种写法都认：| **path** | 895 | 与 | **`path`** | 895 |
+TABLE = re.compile(r'(\|\s*\*\*`?)([\w/]+\.py)(`?\*\*\s*\|\s*)(\d+)(\s*\|)')
 
 
 def _resolve(name: str) -> Path | None:

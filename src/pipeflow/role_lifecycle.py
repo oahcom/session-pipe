@@ -216,7 +216,8 @@ class RoleLifecycleMixin:
     _ALERT_TS: dict[tuple, float] = {}
     _ALERT_COOLDOWN_S = 1800
     # 投递失败后的重试间隔（秒）。必须 < _ALERT_COOLDOWN_S：下面写的是
-    # now - COOLDOWN + RETRY，RETRY >= COOLDOWN 就写成未来时间戳 → 每 tick 重投。
+    # now - COOLDOWN + RETRY，RETRY > COOLDOWN 就写成未来时间戳 → 每 tick 重投；
+    # RETRY == COOLDOWN 时退化成静默满窗，同样不可取。
     _ALERT_RETRY_S = 600
     # 同一 (role, wf, step) 的**相同 prompt** 在窗口内不重发。
     # 实测 24h cross_role_send 24,284 条里 20,499 条（84%）是同 target 同文案重复，
@@ -861,8 +862,7 @@ class RoleLifecycleMixin:
             # "没叫醒"记成"已叫醒"，角色收不到而 30min 内不再重试。
             _delivered = getattr(_r, "returncode", 0) == 0
         except Exception as _e:
-            LOGGER.warning("notify send 异常（%ds 后重试）%s / %s: %s", self._ALERT_RETRY_S,
-                           role, title, _e)
+            LOGGER.warning("notify send 异常 %s / %s: %s", role, title, _e)
         # 冷却只在**真的叫醒之后**满额保留；投递失败退避 600s，不还回整窗。
         # 还回整窗的旧写法让每个 tick（10s）重投一次，而 API 报错/未登录的角色
         # 不会因为被多敲几次就恢复：实测 maintainer 30h 收 272 条同一告警、196 条
@@ -910,6 +910,22 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} prompt 含未替换变量: {unmatched}",
                 evidence=prompt[:500], src="workflow_engine")
             return False  # 投递未发生
+        # DB 没有别的活跃步，不等于 CLI 空闲：角色可能处于长工具调用/生成中
+        # （底栏 esc to interrupt）。此时 ccs send 会等 pane，实测单次 30s，
+        # 整个 tick 的其他工作流全停（R129 §8/§9.1）。
+        # 只看 CLI 忙态，不看 300s 活动窗：刚干完活的 pane 仍有输出，
+        # 用活动窗会把空闲角色判忙（bus #395128 的同一根因）。
+        if wf_id:
+            from liveness import pane_cli_busy
+            try:
+                _cli_busy = pane_cli_busy(role)
+            except Exception as _pe:  # 探针异常不阻断投递（下一 tick 再试）
+                LOGGER.warning("CLI 忙预检失败 %s: %s", role, _pe)
+                _cli_busy = None
+            if _cli_busy is True:
+                LOGGER.info("send-to-role %s 跳过: CLI 仍在执行 (wf=%s step=%s)",
+                            role, wf_id[:12], step_id)
+                return "busy"
         # 关键修复：确保角色存活并就绪，不只是 tmux 存活
         # 1. 先确保 tmux session 存活（如不存在则拉起）
         # 2. 等待角色真正就绪（有 claude 进程且非 busy）
