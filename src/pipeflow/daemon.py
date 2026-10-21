@@ -69,6 +69,17 @@ _RELOAD_MIN_INTERVAL_SEC = 300
 def _reload_allowed(now_ts, last_reload_ts, interval=_RELOAD_MIN_INTERVAL_SEC):
     """距上次重执行 ≥ interval 才允许 execv（跨进程用墙钟，monotonic 不可比）。"""
     return (now_ts - last_reload_ts) >= interval
+
+
+def _reload_decision(now_mtime, seen_mtime, pending_mtime, now_ts, last_reload_ts,
+                     interval=_RELOAD_MIN_INTERVAL_SEC):
+    """返回 (pending_mtime, 是否立即重执行)。
+
+    pending 永远收下新 mtime —— 限速期看到的那次更新不能当"已应用"丢掉，
+    否则此后无人再改代码时 daemon 永久跑旧代码（codex P1）。
+    """
+    pending = max(pending_mtime, now_mtime)
+    return pending, pending > seen_mtime and (now_ts - last_reload_ts) >= interval
 _TICK_STACK_DUMP_SEC = _parse_tick_sec("TICK_STACK_DUMP_SEC", 180)
 _TICK_SLOW_SEC = _parse_tick_sec("TICK_SLOW_SEC", 60)
 
@@ -326,6 +337,7 @@ def daemon_loop(interval: int):
         _last_reload = float(os.environ.get("_WF_LAST_RELOAD", "0") or 0)
     except ValueError:
         _last_reload = 0.0
+    _pending_mtime = 0.0  # 已看到但还没应用（受 _RELOAD_MIN_INTERVAL_SEC 限速）
 
 
     try:
@@ -361,24 +373,26 @@ def daemon_loop(interval: int):
                 # 每轮都探。旧写法按"轮次"计数（6 轮一探），而忙机上 run_once 一轮要
                 # 几分钟 → 实测 18:18:43 改 daemon.py、18:26 仍不重启，源码修复不生效。
                 try:
-                    _now_mtime = _src_mtime()
-                    if _now_mtime > _seen_mtime:
-                        time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
-                        if _src_mtime() == _now_mtime:
-                            # 就地重执行，不退出：退出依赖外部拉起（systemd Restart /
-                            # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
-                            # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
-                            # 锁随新进程重新获取，任何监管方式下都能生效。
-                            _now_ts = time.time()
-                            if not _reload_allowed(_now_ts, _last_reload):
-                                # 收下新 mtime，否则每轮都重走这条路径再 sleep 2s
-                                _seen_mtime = _now_mtime
-                                LOGGER.info(
-                                    "源码已更新，但距上次重执行 %.0fs < %ds，本轮不重启",
-                                    _now_ts - _last_reload, _RELOAD_MIN_INTERVAL_SEC)
-                            else:
+                    # 只把"看到的新 mtime"记进 _pending_mtime，冷却期过后**下一轮再判**。
+                    # 不能在这里直接推进 _seen_mtime：限速期丢掉的那次更新会永久丢失，
+                    # 若此后没人再改代码，daemon 会一直跑旧代码（codex P1）。
+                    _now_ts = time.time()
+                    _pending_mtime, _do_reload = _reload_decision(
+                        _src_mtime(), _seen_mtime, _pending_mtime, _now_ts, _last_reload)
+                    if _pending_mtime > _seen_mtime:
+                        if not _do_reload:
+                            LOGGER.info(
+                                "源码已更新，距上次重执行 %.0fs < %ds → 排队等待",
+                                _now_ts - _last_reload, _RELOAD_MIN_INTERVAL_SEC)
+                        else:
+                            time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
+                            if _src_mtime() == _pending_mtime:
+                                # 就地重执行，不退出：退出依赖外部拉起（systemd Restart /
+                                # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
+                                # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
+                                # 锁随新进程重新获取，任何监管方式下都能生效。
                                 LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
-                                            _now_mtime)
+                                            _pending_mtime)
                                 os.environ["_WF_LAST_RELOAD"] = str(_now_ts)
                                 logging.shutdown()
                                 os.execv(sys.executable, [sys.executable] + sys.argv)
