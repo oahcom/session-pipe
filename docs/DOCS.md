@@ -31,7 +31,6 @@
 1. 修改代码后，检查是否涉及文档变更
 2. 如涉及，更新对应文档 + 时间戳
 3. 核心规则变更只改 AGENTS.md
-4. 运行 `python3 docs/doc_check.py` 验证一致性
 
 ## 文档清单
 
@@ -46,6 +45,5 @@ session-pipeline/
     ├── TECHNICAL_DEEP_DIVE.md       # 技术深度
     ├── SYSTEM_LANDSCAPE.md          # 全景图
     ├── TEST_WORKFLOW.md             # 测试
-    ├── WORKFLOW_TEMPLATE_SPEC.md    # 模板规范
-    └── doc_check.py                 # 一致性检查脚本
+    └── WORKFLOW_TEMPLATE_SPEC.md    # 模板规范
 ```

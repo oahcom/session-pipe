@@ -792,6 +792,19 @@ class LeverageAccumulationChecker:
         return True
 
 
+def _result_text(blk: dict) -> str:
+    """把 tool_result 的 content 规整成纯文本（str / list[str] / list[dict] 皆可）。"""
+    ct = blk.get("content", "")
+    if isinstance(ct, list):
+        parts: list[str] = []
+        for b in ct:
+            if isinstance(b, dict):
+                parts.append(b.get("text", ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        return "\n".join(parts)
+    return ct if isinstance(ct, str) else ""
+
 class TrajectoryQualityChecker:
     """轨迹质量检查器：从角色对话 transcri.jsonl 评估工具调用质量。
 
@@ -862,6 +875,7 @@ class TrajectoryQualityChecker:
                                         "input": {},
                                         "id": blk.get("tool_use_id"),
                                         "error": blk.get("is_error", False),
+                                        "text": _result_text(blk),
                                         "order": order, "src": jf.name,
                                     })
                 except OSError as e:
@@ -948,6 +962,15 @@ class TrajectoryQualityChecker:
                     break  # 已配对 → 边界到此为止
                 tail_use_ids.add(c["id"])
 
+        # 新建文件不算盲改：把“写调用→新建文件路径”映射出来，免除该调用的盲改判定。
+        created_by_call: dict[str, str] = {}
+        for c in calls:
+            if c["kind"] == "result" and c["id"]:
+                m = re.search(r"File created successfully at:\s*(\S+)",
+                              c.get("text") or "")
+                if m:
+                    created_by_call[c["id"]] = m.group(1)
+
         def _close_thrash():
             nonlocal repeat_run, repeat_window_start, last_cmd
             if repeat_run >= _THRASH_REPEAT_MIN and repeat_window_start is not None:
@@ -985,6 +1008,11 @@ class TrajectoryQualityChecker:
                 # 绝对路径命中仅 2/16，故按 basename 匹配）。
                 bash_read = bool(fp) and any(
                     os.path.basename(fp) in b for b in bash_blob)
+                # 新建文件不是「盲改」：文件此前不存在，根本无法先 Read。
+                # Claude Code 的写结果为 "File created successfully at: <path>"，
+                # 此结果对应此前发出的该写调用（result id == tool_use_id）。
+                if cid and cid in created_by_call:
+                    continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
                         "issue": "blind_edit", "tool": name,
@@ -1209,3 +1237,4 @@ def main():
     return 0 if s["failed"] == 0 else 1
 if __name__ == "__main__":
     sys.exit(main())
+

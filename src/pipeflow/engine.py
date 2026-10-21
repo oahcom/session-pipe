@@ -778,9 +778,16 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             "coordinator",
             f"[workflow] {wf_id[:12]}/{step_id} {reason}，已停重投，待协调处置",
             wf_id=wf_id, step_id=step_id, force=True)
-        if _ok is not True:      # busy=排队、False=守卫拦下，两者都非送达
-            LOGGER.warning("升级投递未成功(%s) %s/%s → 下轮重试", _ok, wf_id[:12], step_id)
-            return
+        if _ok is not True:
+            # pane 未送达（busy=排队 / False=守卫拦下），但 bus 是持久通道：落库即算
+            # 已升级，随后按正常路径落锚停重试。不落库就 return 会让每 tick 重起一次
+            # ccs send 永不收敛（实测 wf_175751a92033/s2：48min 111 次告警，锚未置位）。
+            LOGGER.warning("升级 pane 未送达(%s) %s/%s → 改落 bus", _ok, wf_id[:12], step_id)
+            self._bb.write("blocker",
+                           f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
+                           evidence=f"pane 投递未成功({_ok})；驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
+                           src="workflow_engine")
+            _ok = True
         _now = time.time()
         sr["rework_escalated_at"] = _now
         try:
@@ -1515,8 +1522,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 上下文溢出检测 → 自动发 /compact
         try:
             self._check_context_overflow()
-        except Exception:
-            LOGGER.debug("context overflow check failed")
+        except Exception as _e:
+            # 必须可见：此处异常会让**所有**角色的溢出检测整轮失效（角色卡死后
+            # 无人 /compact，只能等僵尸回收）。旧写法是 debug 级，实测吞掉过一次
+            # NameError，故障期间零日志。
+            LOGGER.warning("context overflow check failed: %s", _e, exc_info=True)
 
         # 模型额度拒绝（403/429）→ 按退避发「继续」重试
         try:
