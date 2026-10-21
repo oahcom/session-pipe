@@ -46,7 +46,13 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
         # （54ms/轮，每 60s 一次且 row_factory 逐行建对象）；下推后只取 100 行、1.2ms。
         # SQL 的 LIMIT 只是省构造 Fact 的优化，不是契约：任何后端（含测试替身）
         # 都可能返回更多，函数自己的 limit 语义必须在这里兑现。
-        return bb.unconsumed(consumer=consumer, limit=effective_limit)[:effective_limit]
+        if effective_limit <= 0:
+            return []  # max_messages_per_poll=0 是"不轮询"，不是"不限"（旧行为是空列表）
+        try:
+            return bb.unconsumed(consumer=consumer, limit=effective_limit)[:effective_limit]
+        except TypeError:
+            # 老版 bus 没有 limit 形参（跨仓部署顺序不保证），退回本地切片
+            return bb.unconsumed(consumer=consumer)[:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
