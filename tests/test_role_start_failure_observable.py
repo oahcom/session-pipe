@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-_SRC = str(Path.home() / "session-pipeline" / "src")
+_SRC = (Path(__file__).resolve().parent.parent / "src")
 _SRC_FILE = Path(_SRC) / "pipeflow" / "role_lifecycle.py"
 
 

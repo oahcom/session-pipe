@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path.home() / "session-pipeline" / "src"))
+sys.path.insert(0, (Path(__file__).resolve().parent.parent / "src"))
 
 import pipeflow.engine as em  # noqa: E402
 from pipeflow.role_lifecycle import RoleLifecycleMixin  # noqa: E402

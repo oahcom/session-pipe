@@ -18,7 +18,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-sys.path.insert(0, str(Path.home() / "session-pipeline" / "src"))
+sys.path.insert(0, (Path(__file__).resolve().parent.parent / "src"))
 
 import pipeflow.engine as eng_mod
 eng_mod._TIMEOUT_GRACE = 0.05

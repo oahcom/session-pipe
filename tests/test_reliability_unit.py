@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-_SRC = str(Path.home() / "session-pipeline" / "src")
+_SRC = (Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 

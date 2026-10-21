@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ── 路径工具 ────────────────────────────────────────────────────
 
-PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
+PIPELINE_SRC = (Path(__file__).resolve().parent.parent / "src")
 LAUNCHER_SRC = str(Path.home() / "session-launcher" / "src")
 HERMES_SCRIPTS = str(Path.home() / ".hermes" / "scripts")
 

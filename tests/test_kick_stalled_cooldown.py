@@ -1,6 +1,7 @@
 """kick-stalled 冷却实证：4 用例 + 投递真伪。"""
 import sys, json, time
-sys.path.insert(0, '/home/administrator/session-pipeline/src')
+from pathlib import Path
+sys.path.insert(0, (Path(__file__).resolve().parent.parent / "src"))
 from unittest.mock import MagicMock, patch
 from pipeflow.engine import WorkflowEngine, Step, WorkflowDef
 
