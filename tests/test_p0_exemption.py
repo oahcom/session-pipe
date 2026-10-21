@@ -24,9 +24,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-# 同上：按本文件位置定位源码树，别写死主工作树（会污染所有运行时 import）
-_PIPELINE_SRC = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+_PIPELINE_SRC = str(os.path.expanduser("~/session-pipeline/src"))
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 

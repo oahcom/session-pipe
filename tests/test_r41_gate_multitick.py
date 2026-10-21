@@ -8,13 +8,8 @@
   否则既不返工也不推进 = 静默卡死
 """
 import sys, os, time, signal
-# 必须按本文件位置定位源码树：写死 ~/session-pipeline 会把 sys.path[0] 钉在
-# 主工作树上，此后所有**运行时** import（如测试函数体内的 from pipeflow.engine
-# import …）都读到主树、而不是被测的 worktree —— worktree 里跑出的红绿结论不可信
-# （2026-10-22 实测：worktree 已含 _biz_rework_ids，运行时却 ImportError 到主树）。
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ROOT, "src"))
-sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.expanduser("~/session-pipeline/src"))
+sys.path.insert(0, os.path.expanduser("~/session-pipeline"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from unittest.mock import patch, MagicMock
