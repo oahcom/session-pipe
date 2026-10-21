@@ -52,7 +52,7 @@ def test_recover_kills_utempter_then_reprobes():
     killed = []
     with patch.object(d, "_tmux_stuck_utempter", return_value=[42]), \
             patch.object(d.os, "kill", side_effect=lambda p, s: killed.append(p)), \
-            patch.object(d, "_tmux_wedged", return_value=False):
+            patch.object(d, "_tmux_ok", return_value=True):
         assert d._tmux_recover() is True
     assert killed == [42]
 
@@ -66,7 +66,8 @@ def test_alarm_self_heals_without_bus_write():
         calls.append(list(cmd))
         return _cp(cmd)
 
-    with patch.object(d, "_tmux_wedged", side_effect=[True, False]), \
+    with patch.object(d, "_tmux_wedged", return_value=True), \
+            patch.object(d, "_tmux_ok", return_value=True), \
             patch.object(d, "_tmux_stuck_utempter", return_value=[7]), \
             patch.object(d.os, "kill"), \
             patch.object(d.subprocess, "run", side_effect=_fake_run):
@@ -83,7 +84,8 @@ def test_alarm_escalates_when_recover_fails():
         calls.append(list(cmd))
         return _cp(cmd)
 
-    with patch.object(d, "_tmux_wedged", side_effect=[True, True]), \
+    with patch.object(d, "_tmux_wedged", return_value=True), \
+            patch.object(d, "_tmux_ok", return_value=False), \
             patch.object(d, "_tmux_stuck_utempter", return_value=[7]), \
             patch.object(d.os, "kill"), \
             patch.object(d.subprocess, "run", side_effect=_fake_run):
@@ -100,7 +102,8 @@ def test_alarm_writes_one_blocker_per_window():
         calls.append(list(cmd))
         return _cp(cmd)
 
-    with patch.object(d, "_tmux_wedged", side_effect=[True, True]), \
+    with patch.object(d, "_tmux_wedged", return_value=True), \
+            patch.object(d, "_tmux_ok", return_value=False), \
             patch.object(d, "_tmux_stuck_utempter", return_value=[]), \
             patch.object(d.subprocess, "run", side_effect=_fake_run):
         d._tmux_wedge_alarm()
@@ -127,3 +130,28 @@ if __name__ == "__main__":
         if _n.startswith("test_") and callable(_f):
             _f()
             print(f"PASS {_n}")
+
+
+def test_ok_requires_positive_answer():
+    """自愈判定必须看 rc==0：tmux 二进制缺失或服务端已死（rc!=0）时
+    not _tmux_wedged() 会误判成「已恢复」，从而吞掉升级（review P1）。"""
+    with patch.object(d.subprocess, "run", return_value=_cp(["tmux"], rc=1)):
+        assert d._tmux_ok() is False
+    with patch.object(d.subprocess, "run", return_value=_cp(["tmux"], rc=0)):
+        assert d._tmux_ok() is True
+    with patch.object(d.subprocess, "run", side_effect=FileNotFoundError):
+        assert d._tmux_ok() is False
+
+
+def test_only_helpers_older_than_30s_are_killed():
+    """pgrep 必须带 --older：正常助手活不过几十毫秒，不能误杀健康的
+    （review P2）。"""
+    seen = {}
+
+    def _fake(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        return _cp(cmd, out=b"9\n")
+
+    with patch.object(d.subprocess, "run", side_effect=_fake):
+        assert d._tmux_stuck_utempter() == [9]
+    assert "--older" in seen["cmd"] and "30" in seen["cmd"], seen["cmd"]
