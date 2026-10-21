@@ -1001,20 +1001,28 @@ class TrajectoryQualityChecker:
                 tail_use_ids.add(c["id"])
 
         # 新建文件不算盲改：把“写调用→新建文件路径”映射出来，免除该调用的盲改判定。
-        # 键是 (transcript 路径, tool_use id)：同 id 的重复记录实测只来自解析失败的重试
-        # 残影（可解析 + __unparsedToolInput 各一条，实测 2760 对 0 例外），二者是同一次
-        # 调用，必须共享同一条新建豁免——按序号配对会让残影抢走新建结果，把真新建写
-        # 报成盲改（R129：pg 4 条 / reviewer 5 条 / ccs-monitor 1 条全是这一类）。
+        # 结果只配给「此前最近一条**可解析**的写调用」：解析失败的重试残影
+        # （input 只有 __unparsedToolInput，实测 2760 对）没有 file_path，本身也判不了
+        # 盲改；让它参与配对就会把新建结果抢到自己名下，真正那条写反被报成盲改
+        # （R129：pg 4 / reviewer 5 / ccs-monitor 1 / security-auditor 1 全是这一类）。
+        # 键带序号：同一 id 若真被第二次写复用，第二条不继承第一条的豁免。
         # 路径捕获到行尾（不是 \S+）：路径可含空格，截断会同时造成误报与漏报。
-        created_by_call: dict[tuple[str, str], str] = {}
+        created_by_call: dict[tuple[str, str, int], str] = {}
+        _pending: dict[tuple[str, str], int] = {}   # (src, id) → 最近一条可解析写调用的序号
         for c in calls:
-            if c["kind"] == "result" and c["id"] and not c["error"]:
+            if (c["kind"] == "use" and c["name"] == "Write" and c["id"]
+                    and "__unparsedToolInput" not in (c["input"] or {})):
+                _pending[(c["src"], c["id"])] = c["order"]
+            elif c["kind"] == "result" and c["id"] and not c["error"]:
+                _k = (c["src"], c["id"])
+                if _k not in _pending:
+                    continue
                 _line0 = (c.get("text") or "").split(chr(10))[0]
                 m = re.match(
                     r"File created successfully at: (.+?)(?: \(file state|$)",
                     _line0)
                 if m:
-                    created_by_call[(c["src"], c["id"])] = m.group(1).strip()
+                    created_by_call[(_k[0], _k[1], _pending[_k])] = m.group(1).strip()
 
         # 写没落地就不构成盲改：pg 的「No such tool available: Write」曾被报成
         # blind_edit（文件根本没写）。同 id 可能有成功+失败两条结果（重试残影），
@@ -1074,7 +1082,7 @@ class TrajectoryQualityChecker:
                 # 不让任意含该文案的结果豁免（错误回显 input 时也含此短语）。
                 if cid and (c["src"], cid) in failed_ids:
                     continue
-                if cid and created_by_call.get((c["src"], cid)) == fp:
+                if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
                     continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
