@@ -19,18 +19,18 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 1940 | Data-driven workflow execution engine (core, imports mixins below) |
-| **pipeflow/step_handler.py** | 1696 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 1197 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/engine.py** | 1963 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/step_handler.py** | 1700 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1201 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
 | **pipeflow/task_generator.py** | 897 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
 | **pipeflow/wf_lifecycle.py** | 2089 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
 | **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
 | **template_registry.py** | 937 | 模板注册中心 |
-| **eval_checker.py** | 1460 | 安全白名单命令执行检查 |
-| **workflow/client.py** | 495 | High-level API for CCS roles to interact with workflow DB |
+| **eval_checker.py** | 1468 | 安全白名单命令执行检查 |
+| **workflow/client.py** | 487 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 383 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
 | **reliability.py** | 432 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 642 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/routes.py** | 643 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
 | **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
 | **routing/survival_monitor.py** | 640 | 存活监测 |
 | **routing/rdb.py** | 293 | Route table SQLite persistence + audit log |
@@ -41,9 +41,9 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **conversation_monitor.py** | 417 | 对话监控 |
 | **config_loader.py** | 167 | YAML config loading with env override and hot-reload |
 | **workflow/gateway.py** | 188 | 工作流网关门禁 |
-| **drift_detector.py** | 198 | 架构漂移检测 |
+| **drift_detector.py** | 203 | 架构漂移检测 |
 | **cron_scheduler.py** | 128 | cron 调度器 |
-| **eval_consistency.py** | 70 | 评估一致性 |
+| **eval_consistency.py** | 74 | 评估一致性 |
 | **routing/consistency.py** | 105 | 路由一致性 |
 | **pipeflow/daemon.py** | 478 | Main loop: `while True: engine.run_once(); sleep(10)` |
 | **workflow/db.py** | 96 | 工作流数据访问 |
