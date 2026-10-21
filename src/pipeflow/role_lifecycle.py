@@ -950,6 +950,22 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
             return False  # 投递未发生：明确语义，避免返回 None 被 engine 计数为失败
+        # prompt 已校验完再查 CLI：非法 prompt 必须走 False/blocker，不能被"忙"掩盖。
+        # 只看 CLI 忙态，不看 300s 活动窗——刚干完活的空闲角色会被活动窗判忙
+        # （bus #395128 的同一根因）。ccs send 等忙 pane 单次 30s，整个 tick 会停。
+        if wf_id and not force:
+            from liveness import pane_cli_busy
+            # force=True 不预检：timeout 重推/dual-node/integrity 提醒都是旁路，
+            # 其中 integrity 在发送前就落了 bypass flag，预检返回 busy 会把提醒永久吞掉。
+            try:
+                _cli_busy = pane_cli_busy(role)
+            except Exception as _pe:  # 探针异常不阻断投递（下一 tick 再试）
+                LOGGER.warning("CLI 忙预检失败 %s: %s", role, _pe)
+                _cli_busy = None
+            if _cli_busy is True:
+                LOGGER.info("send-to-role %s 跳过: CLI 仍在执行 (wf=%s step=%s)",
+                            role, wf_id[:12], step_id)
+                return "busy"
         # 相同 prompt 已在窗口内投递过 → 不重发，按排队返回（不盖 notified、不计失败）。
         # 放在占位符校验之后：非法 prompt 仍走 False（快速暴露），不会被"排队"掩盖。
         _fp = hash((role, wf_id, step_id, prompt))

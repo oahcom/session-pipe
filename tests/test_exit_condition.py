@@ -42,6 +42,10 @@ def _mocked_eng():
     eng = _make_eng()
     eng._bb = MagicMock()
     eng._lm = MagicMock()  # _lifecycle 是 property, 需要 mock _lm 直接
+    # 告警冷却是**类属性**（进程级）：上一条用例写进 (role,title) 后，
+    # 同标题的下一条用例会被 30min 冷却吞掉 → 间歇红。逐例清空。
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._ALERT_TS.clear()
     return eng
 
 
@@ -464,8 +468,9 @@ class TestTickExitSchemaBlocked(unittest.TestCase):
         # 与 TestTickVerifyBlocked 同一口径：同一 _tick 里角色启动失败也会写 blocker，
         # 次数取决于启动重试/冷却状态 → 全量跑间歇红、单跑绿。只锁契约：
         # schema 失败必须留下带 "schema" 的 blocker。
-        titles = [c[0][1] for c in eng._bb.write.call_args_list]
-        self.assertTrue(any("schema" in t for t in titles), titles)
+        texts = [c[0][1] + "\n" + str((c[1].get("evidence") if len(c) > 1 else None) or "")
+                 for c in eng._bb.write.call_args_list]
+        self.assertTrue(any("schema" in t for t in texts), texts)
 
 
 class TestTickVerifyBlocked(unittest.TestCase):
@@ -493,8 +498,9 @@ class TestTickVerifyBlocked(unittest.TestCase):
         # 不能断言"只写一次"：同一 _tick 里角色启动失败也会写 blocker（实测 7 次），
         # 次数取决于启动重试与冷却缓存状态 → 全量跑间歇红、单跑绿。这里只锁定契约：
         # verify 失败必须留下带 "verify" 的 blocker。
-        titles = [c[0][1] for c in eng._bb.write.call_args_list]
-        self.assertTrue(any("verify" in t for t in titles), titles)
+        texts = [c[0][1] + "\n" + str((c[1].get("evidence") if len(c) > 1 else None) or "")
+                 for c in eng._bb.write.call_args_list]
+        self.assertTrue(any("verify" in t for t in texts), texts)
 
 
 class TestTickCompletedRunSkipped(unittest.TestCase):
