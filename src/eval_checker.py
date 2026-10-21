@@ -10,7 +10,7 @@ eval_checker.py — eval_criteria 运行时执行器。
     run_eval_check()  # 每 300s 调一次
 """
 
-import ast, json, logging, os, random, re, shlex, subprocess, sys, time
+import ast, json, logging, math, os, random, re, shlex, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
@@ -666,7 +666,8 @@ class RequirementConfirmationChecker:
                     "ttl_pruner", default={}).get("max_age_days", 90))
             except Exception:
                 ttl_days = 90
-        self.ttl_days = float("inf") if (ttl_days or 0) <= 0 else ttl_days
+        self.ttl_days = (ttl_days if (ttl_days and math.isfinite(ttl_days)
+                                      and ttl_days > 0) else float("inf"))
 
     def check(self) -> dict:
         """需求有没有人 consume 过 —— 全局口径，不按角色。

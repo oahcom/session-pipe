@@ -134,4 +134,3 @@ def test_negative_ttl_also_means_no_window(monkeypatch):
     bb = _FakeBB([])
     _checker_with_real_ctor(monkeypatch, bb, -5).check()
     assert bb.calls[0]["ttl_days"] == float("inf")
-
