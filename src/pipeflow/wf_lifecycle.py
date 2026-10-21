@@ -1150,12 +1150,15 @@ class WorkflowLifecycleMixin:
         _steps = list(getattr(_wf, "steps", None) or [])
         _i = next((_k for _k, _s in enumerate(_steps)
                    if getattr(_s, "id", None) == getattr(review_step, "id", None)), 0)
-        # 只认紧邻上一步：继续上溯会跳过表外的直接产出者（full_dev_pipeline
-        # s6 驳 writer 文档会命中 s2 的 engineer），把文档缺陷派给工程。
-        if _i == 0:
-            return ""
-        _prev = str(getattr(_steps[_i - 1], "target_role", "") or "")
-        return _prev if _prev in _REWORK_TPL_FOR_ROLE else ""
+        # 上溯到最近的可返工角色：门禁常隔着 qa/closer 这类不可返工角色
+        #（生产 3/3 条真实驳回是 s4 reviewer 驳 s3 qa 产物，返工对象是 s2 engineer）。
+        # 残差：若直接产出者是表外角色（writer/pm），会跳过它命中更早的角色——
+        # 没有该角色的返工模板，跳与不跳都落到 engineer，不额外变坏。
+        for _s in reversed(_steps[:_i]):
+            _r = str(getattr(_s, "target_role", "") or "")
+            if _r in _REWORK_TPL_FOR_ROLE:
+                return _r
+        return ""
 
     def _create_rework_subflow(self, wf_id: str, lm, wf_name: str, review_step_id: str,
                                review_step, next_step, results: dict) -> bool:
