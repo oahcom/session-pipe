@@ -15,41 +15,7 @@ echo "  all staged .py files OK"
 # 只查"暂存区删掉的 def/class 名在删除后仍被 src/tests 引用"——改名、连调用点一起删、
 # 连测试一起删都不会误报。真需保留残留引用设 ALLOW_DANGLING_REF=1。
 if [ "$ALLOW_DANGLING_REF" != "1" ]; then
-  python3 - <<'PY' || exit 1
-import ast, re, subprocess, sys
-def git(*a, **kw):
-    return subprocess.run(["git", *a], capture_output=True, text=True, **kw).stdout
-removed = {m.group(1) for m in re.finditer(r"^-\s*(?:def|class)\s+([A-Za-z_]\w*)",
-                                         git("diff", "--cached", "-U0", "--", "*.py"), re.M)}
-if not removed:
-    sys.exit(0)
-refs = {}
-for f in git("ls-files", "-z", "src", "tests").split("\0"):
-    if not f.endswith(".py"):
-        continue
-    try:
-        tree = ast.parse(git("show", ":" + f))
-    except SyntaxError:
-        continue
-    # 只看真代码引用：注释/文档里提到旧名字（本仓大量存在）不算调用
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Name):
-            nm = n.id
-        elif isinstance(n, ast.Attribute):
-            nm = n.attr
-        elif isinstance(n, ast.alias):
-            nm = (n.asname or n.name).split(".")[-1]
-        else:
-            continue
-        if nm in removed:
-            refs.setdefault(nm, set()).add(f)
-if refs:
-    print("REF-GUARD 阻止提交: 删掉的符号还有代码引用", file=sys.stderr)
-    for nm, fs in sorted(refs.items()):
-        print(f"  {nm} ← {', '.join(sorted(fs))}", file=sys.stderr)
-    print("  要么连调用点一起删/改，要么别删。确需保留设 ALLOW_DANGLING_REF=1。", file=sys.stderr)
-    sys.exit(1)
-PY
+  python3 "$(git rev-parse --show-toplevel)/scripts/check_dangling_refs.py" || exit 1
 fi
 
 # ── revert-guard: 拒绝“历史回滚”型裸提交 ──────────────────────────────
