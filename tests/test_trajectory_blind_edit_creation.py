@@ -96,10 +96,10 @@ def test_list_shaped_result_content() -> None:
 
 
 def test_path_mismatch_and_error_echo_not_exempted() -> None:
-    """豁免不能扩大成放过一切写：路径不符 / is_error 的结果都要照判盲改。"""
+    """豁免不能扩大成放过一切写：路径不符 / 结果无创建标记 都要照判盲改。"""
     cases = [
         ("-mismatch", "other.py", f"File created successfully at: {os.path.join(os.sep, 'tmp', 'other.py')}"),
-        ("-echo", "/tmp/probe_echo.py", "/tmp/probe_echo.py"),  # 错误回显 input，含该路径
+        ("-pathonly", "/tmp/probe_echo.py", "/tmp/probe_echo.py"),  # 结果只回显路径，无创建标记
     ]
     for tag, target, result in cases:
         sess = _TRANSCRIPTS_DIR / f"-probe-selfcreate{tag}-role"
@@ -109,14 +109,19 @@ def test_path_mismatch_and_error_echo_not_exempted() -> None:
                  "input": {"file_path": target, "content": "x=1"}},
             ]),
             _turn(1, "user", [
-                {"type": "tool_result", "tool_use_id": "cx", "is_error": True,
+                # 写已成功落地（is_error=False）才谈得上盲改；失败的写不改动文件，
+                # 另有用例覆盖（test_failed_write_is_not_blind_edit）。
+                {"type": "tool_result", "tool_use_id": "cx", "is_error": False,
                  "content": result},
             ]),
         ]
         jf = _make(sess, lines)
         try:
             res = TrajectoryQualityChecker().check(f"selfcreate{tag}", "t")
-            blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+            # 只断言本用例的目标：角色名是子串匹配，别的用例留下的目录也会被扫到，
+            # 按总数断言会随执行顺序抖动。
+            blind = [f for f in res["findings"]
+                     if f["issue"] == "blind_edit" and f.get("file") == target]
             assert len(blind) == 1, f"{tag} 不该豁免: {res['findings']}"
         finally:
             jf.unlink(missing_ok=True)
@@ -143,10 +148,75 @@ def test_non_creation_write_still_flagged() -> None:
             pass
 
 
+def test_unparsed_retry_duplicate_not_blind_edit() -> None:
+    """解析失败的重试残影不是盲改。
+
+    同一调用在 transcript 里会留两条同 id 记录（一条可解析、一条
+    __unparsedToolInput），若按"最近一条 Write"配号，新建结果就配到残影上，
+    可解析那条被误判盲改。实测全库 2760 对，占 blind_edit 误报的绝大多数。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-retrydup-role"
+    path = "/tmp/probe_retry_dup.py"
+    ok_result = f"File created successfully at: {path} (file state is current in your context)"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "cd", "name": "Write",
+             "input": {"file_path": path, "content": "x=1"}},
+        ]),
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "cd", "name": "Write",
+             "input": {"__unparsedToolInput": {"raw": "{\"file_path\": ..."}}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "cd", "is_error": False,
+             "content": ok_result},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "cd", "is_error": True,
+             "content": "<tool_use_error>InputValidationError: Write was called with "
+                        "input that could not be parsed as JSON.</tool_use_error>"},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("retrydup", "t")
+        assert res["findings"] == [], f"重试残影被当成盲改: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_failed_write_is_not_blind_edit() -> None:
+    """写没发生就不算盲改：pg 的「No such tool available: Write」曾被报成 blind_edit。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-nowrite-role"
+    lines = _write_seq(0, "cw", "/tmp/probe_nowrite.py", "ok")
+    lines[1] = _turn(1, "user", [
+        {"type": "tool_result", "tool_use_id": "cw", "is_error": True,
+         "content": "<tool_use_error>Error: No such tool available: Write. "
+                    "Write is disabled for this session, in subagents as well as here."
+                    "</tool_use_error>"},
+    ])
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("nowrite", "t")
+        assert res["findings"] == [], f"未发生的写被报成盲改: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     for _t in (test_created_file_not_flagged,
                test_list_shaped_result_content,
                test_path_mismatch_and_error_echo_not_exempted,
-               test_non_creation_write_still_flagged):
+               test_non_creation_write_still_flagged,
+               test_unparsed_retry_duplicate_not_blind_edit,
+               test_failed_write_is_not_blind_edit):
         _t()
-    print("PASS: 4 tests")
+    print("PASS: 6 tests")
