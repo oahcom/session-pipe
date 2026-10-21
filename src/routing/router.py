@@ -166,7 +166,7 @@ class Router:
         """返回某类消息的消费者列表。
 
         优先从路由表获取；路由表为空时使用默认映射（dashboard 告警→
-        maintainer，verification→investigator）确保告警不被遗弃。
+        maintainer）确保告警不被遗弃。
         """
         consumers = [
             role for role, r in self._routing.items()

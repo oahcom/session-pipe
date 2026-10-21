@@ -120,7 +120,7 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
 
 
 # ── 路由分发（从 routes 导入）──
-from routing.routes import route_all, route_to_ccs, route_all_to_ccs, dispatch_investigator
+from routing.routes import route_all, route_to_ccs, route_all_to_ccs
 
 
 # ── CLI 辅助函数 ──────────────────────────────────────────
@@ -187,19 +187,6 @@ def _cli_route_all_to_ccs(dry_run, has_json):
         print(f"\n总路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
 
 
-def _cli_dispatch_investigator(argv, dry_run, has_json):
-    """--dispatch-investigator CLI。"""
-    cat = argv[1] if len(argv) > 1 else "code_fix"
-    result = dispatch_investigator(category=cat, dry_run=dry_run)
-    if has_json:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        for d in result["details"]:
-            icon = {"routed": "→", "dry_run": "□"}.get(d.get("action"), "?")
-            print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned_investigator', '?')}")
-        print(f"\n分派: {result['dispatched']}/{result['total']} 条")
-
-
 if __name__ == "__main__":
     has_json = "--json" in sys.argv
     argv = [a for a in sys.argv[1:] if a != "--json"]
@@ -215,7 +202,6 @@ if __name__ == "__main__":
     _consume_flag = "--consume" in flags
     _routetoccs_flag = "--route-to-ccs" in flags
     _routetoccsall_flag = "--route-all-to-ccs" in flags
-    _dispatch_flag = "--dispatch-investigator" in flags
     _dry_run = "--dry-run" in flags
 
     # ── dispatch ──
@@ -250,8 +236,6 @@ if __name__ == "__main__":
         _cli_route_to_ccs(argv, _dry_run, has_json)
     elif _routetoccsall_flag:
         _cli_route_all_to_ccs(_dry_run, has_json)
-    elif _dispatch_flag:
-        _cli_dispatch_investigator(argv, _dry_run, has_json)
     else:
         msgs = poll_unconsumed()
         if has_json:

@@ -99,8 +99,6 @@ def test_parse_produce_categories():
     eng = roles.get("engineer", {})
     eng_p = eng.get("routing", {}).get("produce", [])
     assert "code_fix" in eng_p, f"engineer produce={eng_p}"
-    inv = roles.get("investigator_general", {})
-    assert "root_cause_analysis" in inv.get("routing", {}).get("produce", [])
 
 
 def test_parse_consume_categories():

@@ -37,8 +37,8 @@ DAEMON_SRCS = {
 MIN_TOTAL_24H = 100      # 24h 内至少 100 条真实推理产出
 MIN_PER_6H = 8           # 每 6h 桶不少于 8 条 (防突然断流)
 REAL_ROLES = {"maintainer", "coordinator", "lr", "engineer", "qa", "pm",
-              "reviewer", "scout", "devops", "writer", "investigator_python",
-              "investigator_senior", "knowledge_curator", "security_auditor"}
+              "reviewer", "scout", "devops", "writer",
+              "knowledge_curator", "security_auditor"}
 
 
 def _conn():

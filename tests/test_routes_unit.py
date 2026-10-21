@@ -1,4 +1,4 @@
-"""Unit tests for routing/routes.py — _match_investigator, dispatch_investigator, route_all, route_to_ccs, route_all_to_ccs.
+"""Unit tests for routing/routes.py — route_all, route_to_ccs, route_all_to_ccs.
 
 Mocks all external deps (bus, subprocess, reliability globals).
 """
@@ -9,110 +9,6 @@ from unittest.mock import patch, MagicMock
 _src = Path(__file__).resolve().parent.parent / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
-
-
-# ── _match_investigator: 纯函数，直接测 ──
-
-
-def test_match_investigator_empty_returns_general():
-    from routing.routes import _match_investigator
-    assert _match_investigator("") == "investigator_general"
-    assert _match_investigator(None) == "investigator_general"
-
-
-def test_match_investigator_python_keywords():
-    from routing.routes import _match_investigator
-    assert _match_investigator("Traceback (most recent call last):") == "investigator_python"
-    assert _match_investigator("ImportError: No module named 'foo'") == "investigator_python"
-    assert _match_investigator("pip install requests") == "investigator_python"
-    assert _match_investigator("pytest test_foo.py") == "investigator_python"
-
-
-def test_match_investigator_senior_keywords():
-    from routing.routes import _match_investigator
-    assert _match_investigator("segfault at address 0xdeadbeef") == "investigator_senior"
-    assert _match_investigator("deadlock detected in thread pool") == "investigator_senior"
-    assert _match_investigator("OOM killed process 1234") == "investigator_senior"
-    assert _match_investigator("race condition in shared dict") == "investigator_senior"
-
-
-def test_match_investigator_python_beats_senior():
-    """Python 关键字优先于 senior 关键字。"""
-    from routing.routes import _match_investigator
-    result = _match_investigator("Traceback crash segfault")
-    assert result == "investigator_python"
-
-
-def test_match_investigator_fallback_general():
-    from routing.routes import _match_investigator
-    assert _match_investigator("normal message, no special keywords") == "investigator_general"
-
-
-def test_match_investigator_case_insensitive():
-    from routing.routes import _match_investigator
-    assert _match_investigator("SEGFAULT in kernel") == "investigator_senior"
-
-
-# ── dispatch_investigator ──
-
-
-def _make_fact(fact_id, cat, title, evidence=""):
-    """构造 Blackboard Fact 哑对象。"""
-    f = MagicMock()
-    f.id = fact_id
-    f.cat = cat
-    f.t = title
-    f.e = evidence
-    return f
-
-
-@patch("routing.routes._rt_mod")
-@patch("bus_protocol.Blackboard")
-def test_dispatch_investigator_filters_needs_investigation(mock_bb_cls, mock_rt):
-    """只处理含 needs_investigation/needs_triage 的消息。"""
-    from routing.routes import dispatch_investigator
-    bb = MagicMock()
-    mock_bb_cls.return_value = bb
-    bb.unconsumed.return_value = [
-        _make_fact(1, "code_fix", "bug report", "needs_investigation — traceback detected"),
-        _make_fact(2, "architecture", "design doc", "no filter keyword here"),
-        _make_fact(3, "code_fix", "error log", "needs_triage — crash dump"),
-    ]
-    result = dispatch_investigator(category="code_fix", dry_run=True)
-    assert result["total"] == 2
-    roles = [d["assigned_investigator"] for d in result["details"]]
-    assert "investigator_python" in roles
-
-
-@patch("routing.routes._rt_mod")
-@patch("bus_protocol.Blackboard")
-def test_dispatch_investigator_dry_run_no_write(mock_bb_cls, mock_rt):
-    """dry_run=True → 不写入 bus。"""
-    from routing.routes import dispatch_investigator
-    bb = MagicMock()
-    mock_bb_cls.return_value = bb
-    bb.unconsumed.return_value = [
-        _make_fact(1, "code_fix", "err", "needs_investigation — ImportError"),
-    ]
-    result = dispatch_investigator(category="code_fix", dry_run=True)
-    assert result["dispatched"] == 0
-    bb.write.assert_not_called()
-
-
-@patch("routing.routes._rt_mod")
-@patch("bus_protocol.Blackboard")
-def test_dispatch_investigator_real_write(mock_bb_cls, mock_rt):
-    """dry_run=False → 写入 notice 分类。"""
-    from routing.routes import dispatch_investigator
-    bb = MagicMock()
-    mock_bb_cls.return_value = bb
-    bb.unconsumed.return_value = [
-        _make_fact(1, "code_fix", "err", "needs_investigation — segfault"),
-    ]
-    result = dispatch_investigator(category="code_fix", dry_run=False)
-    assert result["dispatched"] == 1
-    bb.write.assert_called_once()
-    assert bb.write.call_args[0][0] == "notice"
 
 
 # ── route_all: mock routing.auto.poll_unconsumed + 局部依赖 ──
@@ -543,36 +439,6 @@ def test_is_self_echo_suppresses_only_own_messages():
     assert _is_self_echo({"src": ""}, "consumer") is False
 
 
-def test_needs_investigation_catches_maintainer_handoff():
-    """维护者发现缺陷但越界不改 → 移交 investigator 接手。"""
-    from routing.routes import _needs_investigation
-    assert _needs_investigation(_make_fact(
-        1, "code_fix", "[maintainer] 9Router 端口漂移",
-        "缺陷: launcher 兜底默认值指向死端口。建议（越界不自己改，交 engineer）恢复兜底")) is True
-
-
-def test_needs_investigation_skips_deploy_report():
-    """已完成回报（[deploy] 产出已部署）不是待办，不派 investigator。"""
-    from routing.routes import _needs_investigation
-    assert _needs_investigation(_make_fact(
-        1, "code_fix", "[deploy] wf_x 产出已部署: eval_consistency.py",
-        "路径: ~/.hermes/bin/eval_consistency.py")) is False
-
-
-def test_needs_investigation_skips_noop_health_report():
-    """健康巡检含"无需修复"，即使同时含 handoff 词也不派（否定式优先）。"""
-    from routing.routes import _needs_investigation
-    assert _needs_investigation(_make_fact(
-        1, "code_fix", "[maintainer] 健康检查: 服务全绿零僵尸(非修复,no-op报告)",
-        "本报告为健康巡检no-op(无异常无需修复),不应触发下游建修复任务")) is False
-
-
-def test_needs_investigation_no_marker_no_signal_is_false():
-    """无显式标记也无移交信号 → 默认不派，防淹没 investigator。"""
-    from routing.routes import _needs_investigation
-    assert _needs_investigation(_make_fact(
-        1, "code_fix", "CODE_FIX: wf_x/s2 代码开发 — 部署件安全抽查固化",
-        "新增 src/deploy_artifact_audit.py")) is False
 
 # ── 注入文本前缀幂等（R106）：角色不该收到「[cat] [cat]」「证据: 证据:」 ──
 

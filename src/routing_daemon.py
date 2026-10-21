@@ -37,7 +37,6 @@ INTERVAL = 60       # route-all 间隔
 CCS_INTERVAL = 300  # route-all-to-ccs 间隔
 EVAL_INTERVAL = 600 # eval_criteria 检查间隔（每 10 分钟）
 DRIFT_INTERVAL = 3600  # 角色输出漂移检测间隔（每 1 小时）
-INVESTIGATOR_INTERVAL = 900  # 缺陷移交分派间隔（每 15 分钟），生长 dispatch_investigator
 CONSISTENCY_INTERVAL = 3600  # 路由一致性校验间隔（每 1 小时），生长 consistency.py
 CONTRACT_INTERVAL = 3600  # 合约自改进闭环间隔（每 1 小时），生长 contract_updater.py
 SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
@@ -233,7 +232,6 @@ def main():
     last_drift = 0
     last_consistency = 0
     last_contract = 0
-    last_investigator = 0
     last_p0_check = 0
     last_g3_scan = 0
 
@@ -537,24 +535,6 @@ def main():
                 except Exception as _cu_e:
                     LOGGER.warning("contract_updater 接入异常（不阻塞）: %s", _cu_e)
                 last_contract = now
-
-            # 缺陷移交分派：把 code_fix 分类里带 needs_investigation/needs_triage 标记的
-            # 条目派给 investigator。dispatch_investigator 此前只挂在 CLI（auto.py:206），
-            # daemon 从不调用 → 该逻辑从未在生产推行。
-            # WHY code_fix：maintainer 等重点角色用 code_fix 承载两种语义 —— 已完成回报
-            # （"[deploy] wf_x 产出已部署"）与待办缺陷移交（"建议交 engineer 改 X"）。
-            # routes.py:37 因前者的污染把整个 code_fix 排除出建任务集合，后者随之被丢弃，
-            # 缺陷发现无人接手。此处只拾取**显式带标记**的条目，不碰已完成回报。
-            if now - last_investigator >= INVESTIGATOR_INTERVAL:
-                try:
-                    from routing.routes import dispatch_investigator
-                    _res = dispatch_investigator(category="code_fix")
-                    if _res.get("dispatched"):
-                        LOGGER.info("investigator 分派: %s 条（总 %s）",
-                                    _res["dispatched"], _res.get("total"))
-                except Exception as _iv_e:
-                    LOGGER.warning("investigator 分派异常（不阻塞）: %s", _iv_e)
-                last_investigator = now
 
             # 存活检测 tick（L1 进程存活 + 哨兵状态）
             if now - last_survival >= SURVIVAL_INTERVAL:
