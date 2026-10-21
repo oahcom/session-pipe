@@ -229,3 +229,27 @@ if __name__ == "__main__":
             print(f"  E   {name}: {type(e).__name__}: {e}")
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
+
+def test_rejected_child_not_rebuilt():
+    """父步已因驳回重投（rejected_retry），且该步有跑完的旧子链 → 不得再造子链。
+
+    实测 wf_0c5e3d807ede/s1：[auto] 任务只有模板简介没有需求，pm 子链三步全零产出
+    并自判 REJECTED；父链每次重投都清 subflow_id → 重建一条同样的子链，
+    19:28:45 旧子链完成、19:29:08 新子链已建（23 秒一轮），纯烧 pm 队列。
+    """
+    sr = {"s1": {"rejected_retry": 1}}
+
+    class _Conn(_FakeConn):
+        def execute(self, sql, params=()):
+            if "parent_wf_id=?" in sql and "status='completed'" in sql:
+                return _FakeCur({"instance_id": "wf_sub_oldchild"})
+            return super().execute(sql, params)
+
+    m = wfl.WorkflowLifecycleMixin()
+    m._workflows = {}
+    m._is_role_busy = lambda *a, **k: False
+    lm = MagicMock()
+    lm._conn_tx.return_value = _FakeTx(_Conn(sr, None))
+    r = m._subflow_takeover(lm, "wf_parent", "wfname", _step(), -1, {"s1": sr["s1"]}, "s1")
+    assert r is False, f"驳回后仍重建子链（返回 {r!r}）—— 会把同样的空需求再跑一遍"
+

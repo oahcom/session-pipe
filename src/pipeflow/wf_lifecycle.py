@@ -858,6 +858,20 @@ class WorkflowLifecycleMixin:
                             (json.dumps(results, ensure_ascii=False), wf_id))
                         conn2.commit()
                     return True
+                # 同一父步已有"跑完却没通过"的旧子链 → 不再重建：重建只是把同样的
+                # 空需求再跑一遍。实测 wf_0c5e3d807ede/s1（[auto] 产品交付全流程，
+                # 任务描述只有模板简介、没有用户需求）的子链三步全零产出并自判
+                # REJECTED，父链每次重投都清 subflow_id → 本函数再造一条，19:28:45
+                # 旧子链完成、19:29:08 新子链已建，23 秒一轮，纯烧 pm 队列。
+                # 交还父步自投，让 _MAX_REJECTED_RETRY 正常收敛。
+                if isinstance(_db_sdata, dict) and _db_sdata.get("rejected_retry"):
+                    _old_sub = conn2.execute(
+                        "SELECT instance_id FROM workflow_instances WHERE parent_wf_id=? "
+                        "AND subflow_source_step_id=? AND status='completed' "
+                        "AND instance_id NOT LIKE 'wf_rw_%' LIMIT 1",
+                        (wf_id, tgt_step.id)).fetchone()
+                    if _old_sub:
+                        return False
                 # 不再按"角色忙"跳过建子链：父步的完成判据就是整条子链，跳过建链
                 # 等于让父步空等角色空闲（实测 wf_b808ff2f3611 17:54 建链、18:08
                 # 才建出子链，14 分钟全耗在 17 次 "subflow skip: pm 忙于其他工作流"）。
