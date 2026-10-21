@@ -324,16 +324,23 @@ from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
 # 下一轮接着跑（每实例的处理本身幂等）。
 _TICK_BUDGET_SEC = 60
 
-# 实例循环按「本步最久没动」排序（ts 缺失 = 从未派出去 = 0，排最前）。
-# WHY：超预算只 break 本轮剩余实例，而查询无 ORDER BY → SQLite 按插入序走，
-# 尾部实例每轮都排不到（实测 2026-10-22 05:40：22 条在飞实例 150s 内零变化，
-# wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 不动，父链最终被回收）。
-# 排序让「最饿的先吃」：不新增状态、不改调度语义，只改遍历顺序。
-_INSTANCE_ORDER = (
-    "ORDER BY COALESCE(CAST(json_extract(step_results, "
-    "'$.\"' || current_step_id || '\".ts') AS REAL), 0) ASC"
-)
+# 主循环轮转断点：本轮在预算处 break，下一轮从断点**之后**接着走。
+# WHY：tick 预算 60s 超限即 break 本轮剩余实例，而查询无 ORDER BY → SQLite 按
+# 插入序遍历，尾部实例每轮都排不到（实测 2026-10-22：22 条在飞实例 150s 内零变化，
+# wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 从未投出，父链被回收）。
+# 用断点轮转而不是 ORDER BY：不引入 JSON 依赖（坏 step_results 会让整条查询报错），
+# 也不会让任何一组（如 ts 缺失的）长期霸占预算。进程内状态，重启即从头。
+_LOOP_RESUME_ID = ""
 
+
+def _rotate_after(rows, last_id):
+    """把 rows 转成「从 last_id 之后继续」；last_id 不在其中则原序返回。"""
+    if not last_id:
+        return rows
+    for i, r in enumerate(rows):
+        if r["instance_id"] == last_id:
+            return rows[i + 1:] + rows[:i + 1]
+    return rows
 
 class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMixin, StepHandlerMixin):
     """工作流引擎主类。各 mixin 提供具体职责，此类保留编排与 CLI。"""
@@ -884,6 +891,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
 
     def run_once(self):
+        global _LOOP_RESUME_ID
         _t_tick = time.time()
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
@@ -957,14 +965,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 永远查不到（三方审查 2026-10-21 实测 A/B）。
                 "SELECT instance_id, template_id, current_step_id, step_results, created_at, "
                 "status, task_id, effective_roles "
-                "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready') "
-                + _INSTANCE_ORDER
+                "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
+            rows = _rotate_after(list(rows), _LOOP_RESUME_ID)
             for row in rows:
                 if time.time() - _t_tick > _TICK_BUDGET_SEC:
                     LOGGER.warning("tick 超 %ds 预算，中止本轮剩余实例（下轮续跑）",
                                    _TICK_BUDGET_SEC)
                     break
+                _LOOP_RESUME_ID = row["instance_id"]
                 inst = dict(row)
                 if inst.get("status") == "pending":
                     lm.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
