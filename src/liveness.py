@@ -484,7 +484,7 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
         if (time.time() - float(raw)) < window:
             return True
         # 仅在耗时阶段付这次额外 capture-pane（正常路径不增加 tmux 调用）
-        return _pane_busy_markers(role, timeout)
+        return pane_cli_busy(role, timeout)
     except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
         return None
     except OSError:
@@ -504,11 +504,6 @@ _PANE_TAIL_LINES = 6   # 底栏状态行上方的 tip/输入框最多 3~5 行
 
 
 def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
-    """判断 CLI 是否仍在执行；投递前预检用，调用方可无条件调用。"""
-    return _pane_busy_markers(role, timeout)
-
-
-def _pane_busy_markers(role: str, timeout: float = 3.0) -> bool | None:
     """判断 CLI 是否仍在执行（底栏 esc/retrying 标记）。调用方可无条件调用。
 
     只看底部若干行：角色正文里讨论 "esc to interrupt"、贴日志里的 "Retrying …

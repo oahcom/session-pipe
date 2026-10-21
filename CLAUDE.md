@@ -168,7 +168,7 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 - **改了本逻辑需重启 `session-pipeline.service`** —— daemon 无热重载
 
 ## SQLite 运维
-生产 DB 位于 `~/.hermes/data/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
+生产 DB 位于 `~/.hermes/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
 
 - **监测阈值**：`freelist_count / page_count > 0.5` 或单一 DB > 50MB 视为膨胀。
 - **恢复**：`VACUUM;`（会新建事务写整个 DB，期间 daemon 应停。VACUUM 前 `cp` 备份）。
@@ -176,7 +176,7 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 ```bash
 python3 - <<'EOF'
 import sqlite3, os
-c=sqlite3.connect(os.path.expanduser("~/.hermes/data/state/workflows.db"))
+c=sqlite3.connect(os.path.expanduser("~/.hermes/state/workflows.db"))
 pc=c.execute("PRAGMA page_count").fetchone()[0]; fl=c.execute("PRAGMA freelist_count").fetchone()[0]
 print("freelist ratio=%.1f%%"%(fl/pc*100))
 EOF

@@ -32,9 +32,11 @@
 | `get_step(wf_id, step_id)` | str, str | `Optional[dict]` |
 | `upsert_template(template_id, name, description, steps)` | str, str, str, list | `None` |
 | `get_assigned_workflows(role)` | str | `list[dict]` |
-| `close(wf_id)` | str | `None` |
+| `close()` | — | `None` |
 
 ## Router (`routing/router.py`)
+
+`get_consumers_prioritized(category)` 是 `Router` 实例方法（`router.py:186`），不是模块级函数；调用形如 `get_router().get_consumers_prioritized(cat)`。
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
@@ -42,7 +44,6 @@
 | `role_produce_categories(role)` | str | `list[str]` |
 | `role_consume_categories(role)` | str | `list[str]` |
 | `get_consumers(category)` | str | `list[str]` |
-| `get_consumers_prioritized(category)` | str | `list[str]` |
 | `get_producers(category)` | str | `list[str]` |
 | `routing_summary()` | — | `dict` |
 | `format_pipeline()` | — | `str` |

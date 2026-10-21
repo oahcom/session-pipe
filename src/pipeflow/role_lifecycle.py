@@ -155,15 +155,19 @@ def _transcript_progress_after_error(role: str) -> bool:
     只认 tool_use：那才是"重发的那次请求真的跑起来了"。纯文本轮不证明任何进展，
     继续往前找，直到撞上错误轮（返回 False）或带 tool_use 的轮（返回 True）。
     """
+    _saw_error = False
     for line in _read_transcript_tail(role):
         _c = line.replace(" ", "")
         if '"type":"assistant"' not in _c:
             continue
         if '"isApiErrorMessage":true' in _c:
-            return False
+            _saw_error = True
+            continue
         if '"tool_use"' in _c:
             return True
-    return False
+    # 尾部根本没有错误轮 = 本来就没病，可以清退避；有错误但之后无 tool_use
+    # （注入「继续」后 CLI 只落一条纯文本半成品）= 不清，等下一条真进展。
+    return not _saw_error
 
 
 # 生成中但 transcript 多久没落事件即判卡死（秒）。
@@ -353,14 +357,17 @@ class RoleLifecycleMixin:
             # 退避曲线失效（24h 实测 614 次注入、相邻间隔 median 248s = 120s 重置
             # 再等 120s 的形状，<120s 占 17.6%；attempt 从未爬到 5 档封顶）。
             # pane 门（前半）不变：真恢复的角色照样立刻清状态、不被拖到 1800s 起步。
-            if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS) \
-                    and _transcript_progress_after_error(role):
-                # pane 未命中不代表已恢复：15/15 会话 alternate_on=1，capture-pane
-                # 只有视口，错误文案几分钟就滚出视口（实测 24h 1,342 条错误轮里
-                # pane 只认出 9 次 = 0.67%），转录才是落盘事实。
-                # 角色已恢复：清掉退避状态，否则下一次真 403 会从最大退避档
-                # （1800s）起步，恢复要等半小时。
-                self._last_rate_recover.pop(role, None)
+            _pane_err = any(p in _recent for p in self._RATE_LIMIT_PATTERNS)
+            # 错误信号 = pane 文案 或 转录最后一条就是错误轮。两者都没有时
+            # 必须直接跳过：ccebbcf 把判据换成"错误后有进展"后，健康角色
+            # （pane 干净、转录为空）progress=False 会落到下面的发送分支，
+            # 每个 tick 给健康角色发一句「继续」（6 个 rate_recovery 用例红）。
+            if not _pane_err and not _transcript_last_turn_is_api_error(
+                    role, max_age=float("inf")):
+                # 无错误信号：只在"确认已恢复"时清退避（错误轮后只落了纯文本
+                # 半成品不算恢复，清了会让 429 退避从第 1 档重来）。
+                if _transcript_progress_after_error(role):
+                    self._last_rate_recover.pop(role, None)
                 continue
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt

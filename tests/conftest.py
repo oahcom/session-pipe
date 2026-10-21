@@ -152,7 +152,7 @@ def _isolate_role_transcripts(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_probes_and_cooldowns(monkeypatch):
+def _isolate_probes_and_cooldowns(request, monkeypatch):
     """投递预检与告警冷却默认不跨用例共享。
 
     pane_cli_busy 走真实 tmux：服务端卡死时单条 capture-pane 实测 29.6s，
@@ -162,6 +162,8 @@ def _isolate_probes_and_cooldowns(monkeypatch):
     """
     import liveness
     from pipeflow.role_lifecycle import RoleLifecycleMixin
-    monkeypatch.setattr(liveness, "pane_cli_busy", lambda role, timeout=3.0: None)
+    # test_liveness 自己 mock subprocess.run 验底栏判据，打桩会把它测空
+    if "test_liveness" not in (request.module.__name__ if request.module else ""):
+        monkeypatch.setattr(liveness, "pane_cli_busy", lambda role, timeout=3.0: None)
     RoleLifecycleMixin._LAST_SEND.clear()
     RoleLifecycleMixin._ALERT_TS.clear()
