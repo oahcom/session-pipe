@@ -1,16 +1,14 @@
-"""RequirementConfirmationChecker 的回归：判据来自 consume 记录，不按角色。
+"""RequirementConfirmationChecker 的回归：判据来自 consume 记录，全局一次。
 
 背景（2026-10-22）：旧实现用 bus.search("role:x cat:y") 找需求——FTS5 不支持
 这种限定符，恒返回 0 条，于是这个检查自诞生起一直"通过"；它还传了不存在的
 unconsumed(limit=1)，每轮 eval 静默抛 TypeError 被吞。下面的断言锁住新口径。
 """
 import sys
-import types
-
-import pytest
 
 sys.path.insert(0, "src")
 
+import eval_checker as ec  # noqa: E402
 from eval_checker import RequirementConfirmationChecker  # noqa: E402
 
 
@@ -32,9 +30,9 @@ class _FakeBB:
         return list(self._facts) if cat == "task_spec" else []
 
 
-def _checker(bb):
+def _checker(bb, ttl_days=90):
     c = object.__new__(RequirementConfirmationChecker)
-    c._bb = bb
+    c._bb, c.ttl_days = bb, ttl_days
     return c
 
 
@@ -46,22 +44,67 @@ def test_counts_all_unconsumed_without_truncation():
     assert r["passed"] is False
 
 
-def test_query_error_fails_closed():
-    """查询异常不能变成"通过"——旧实现正是这样假绿的。"""
-    bb = _FakeBB(boom_on="task_spec")
-    r = _checker(bb).check()
+def test_query_error_fails_closed_and_is_not_a_requirement():
+    """查询异常不能变成"通过"，也不能冒充成"27 条需求没人消费"。"""
+    r = _checker(_FakeBB(boom_on="task_spec")).check()
     assert r["passed"] is False
-    assert any("check error" in f["issue"] for f in r["findings"])
+    assert r["checked_requirements"] == 0, "查询失败不是需求条目，不能计入需求数"
+    assert r["errors"] and "task_spec" in r["errors"][0]
 
 
 def test_clean_bus_passes():
     r = _checker(_FakeBB([])).check()
-    assert r["passed"] is True and r["checked_requirements"] == 0
+    assert r["passed"] is True and r["checked_requirements"] == 0 and r["errors"] == []
 
 
-def test_window_aligned_with_bus_retention():
+def test_window_covers_every_requirement_category():
     bb = _FakeBB([])
-    _checker(bb).check()
-    assert bb.calls and all(c["ttl_days"] == 90 for c in bb.calls), (
-        "窗口必须与 prune 保留期对齐，30 天会把更老的未确认需求静默漏掉"
-    )
+    _checker(bb, ttl_days=90).check()
+    assert {c["cat"] for c in bb.calls} == RequirementConfirmationChecker.REQUIREMENT_CATS, "5 个分类都要扫，一个都不能省"
+    assert all(c["ttl_days"] == 90 for c in bb.calls), "窗口必须透传给 bus"
+
+
+def _stub_pipeline(monkeypatch, counter):
+    """把 run_eval_check 里除需求检查外的重活（真跑命令、读转录）全部短路。"""
+    monkeypatch.setattr(ec, "_load_roles", lambda: [
+        {"name": "engineer", "eval_criteria": []},
+        {"name": "qa", "eval_criteria": []},
+    ])
+    monkeypatch.setattr(ec, "_write_bus", lambda *a, **k: None)
+
+    class _Stub:
+        def __init__(self, *a, **k):
+            pass
+
+        def check(self, *a, **k):
+            return {"passed": True, "findings": [], "checked": 0}
+
+    for name in ("OutputSemanticChecker", "TrajectoryQualityChecker"):
+        monkeypatch.setattr(ec, name, _Stub)
+
+    class _FakeReqc:
+        def __init__(self, *a, **k):
+            counter["ctor"] += 1
+
+        def check(self):
+            counter["check"] += 1
+            return {"passed": True, "findings": [], "errors": [], "checked_requirements": 0}
+
+    monkeypatch.setattr(ec, "RequirementConfirmationChecker", _FakeReqc)
+
+
+def test_runs_once_per_round_not_per_role(monkeypatch):
+    """采样到 2 个角色时，需求检查仍只跑一次（消费是全局事实）。"""
+    counter = {"ctor": 0, "check": 0}
+    _stub_pipeline(monkeypatch, counter)
+    monkeypatch.setattr(ec.random, "choices", lambda roles, weights, k: roles[:2])
+    ec.run_eval_check()
+    assert counter == {"ctor": 1, "check": 1}
+
+
+def test_skipped_when_role_filter_scopes_the_run(monkeypatch):
+    """role_filter 是"只看某角色"，全局扫描与之冲突 → 不跑。"""
+    counter = {"ctor": 0, "check": 0}
+    _stub_pipeline(monkeypatch, counter)
+    ec.run_eval_check(role_filter="engineer")
+    assert counter == {"ctor": 0, "check": 0}

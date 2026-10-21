@@ -653,11 +653,19 @@ class RequirementConfirmationChecker:
 
     REQUIREMENT_CATS = {"task_spec", "user_story", "prd", "approval", "product_design"}
 
-    def __init__(self):
+    def __init__(self, ttl_days: int | None = None):
         from hermes_bus.blackboard_legacy import Blackboard
         self._bb = Blackboard()
-
-    TTL_DAYS = 90  # 与 bus prune 保留期对齐：更老的窗口会静默漏掉未确认需求
+        # 窗口必须与 TTL pruner 同源：保留期调大而检查窗口不动，就会静默漏判老需求。
+        # ttl_pruner.max_age_days=0 表示关掉年龄清理 → 此处等价于"不设窗口"。
+        if ttl_days is None:
+            try:
+                from config_loader import get_config
+                ttl_days = int(get_config().nested_get(
+                    "ttl_pruner", default={}).get("max_age_days", 90))
+            except Exception:
+                ttl_days = 90
+        self.ttl_days = ttl_days or 36500
 
     def check(self) -> dict:
         """需求有没有人 consume 过 —— 全局口径，不按角色。
@@ -671,11 +679,11 @@ class RequirementConfirmationChecker:
         天花板：不追下游 code_fix/deployment_report 等确认事实（按 fid 反查 bus
         没有接口），升级路径 = 给 log 建 fid 索引后反查。
         """
-        findings = []
+        findings, errors = [], []
         for cat in self.REQUIREMENT_CATS:
             try:
                 for fact in self._bb.unconsumed(consumer=None, cat=cat,
-                                                ttl_days=self.TTL_DAYS):
+                                                ttl_days=self.ttl_days):
                     findings.append({
                         "fact_id": fact.id, "cat": cat,
                         "issue": ("expired_unconfirmed_requirement"
@@ -683,10 +691,11 @@ class RequirementConfirmationChecker:
                                   else "unconfirmed_requirement"),
                     })
             except Exception as e:
+                # 查询失败是"没查到"，不是"没有未确认需求"：单独记，不冒充需求条目。
                 LOGGER.warning("requirement check error cat=%s: %s", cat, e)
-                findings.append({"cat": cat, "issue": f"check error: {e}"})
-        return {"passed": not findings, "findings": findings,
-                "checked_requirements": len(findings)}
+                errors.append(f"{cat}: {e}")
+        return {"passed": not findings and not errors, "findings": findings,
+                "errors": errors, "checked_requirements": len(findings)}
 
 
 def _ts_recent(ts: str, cutoff: float) -> bool:
@@ -1054,8 +1063,8 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
                     continue
-                if (fp and own_written.get(
-                        (c["src"], _key(fp)), c["order"]) < c["order"]):
+                if (name == "Edit" and fp
+                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
@@ -1285,22 +1294,26 @@ def run_eval_check(role_filter: str | None = None) -> dict:
     # RequirementConfirmationChecker：需求有没有人消费。判的是 bus 的 consume 记录，
     # 与被抽到的角色无关 → 放在角色循环之外跑一次（在循环里会重复计数、重复发告警）。
     # role_filter 是「只看某角色」的口径，全局扫描与之冲突，此时不跑。
-    if role_filter is None:
+    if not role_filter:
         try:
             reqc_result = RequirementConfirmationChecker().check()
             if not reqc_result["passed"]:
                 summary["failed"] += 1
                 summary["checked"] += 1
                 _n = len(reqc_result["findings"])
+                _err = reqc_result.get("errors") or []
+                # 查询失败与"确实没人消费"是两回事，文案必须分开，否则报出去的是假数。
+                _headline = (f"RequirementConfirm ERROR: {len(_err)} 类查询失败 {_err[:2]}"
+                             if _err else f"RequirementConfirm FAIL: {_n} 条需求无人消费")
                 _write_bus(
                     "verification",
-                    f"[eval_checker] RequirementConfirm FAIL: {_n} 条需求无人消费 — {reqc_result['findings'][:3]}",
-                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
+                    f"[eval_checker] {_headline} — {reqc_result['findings'][:3]}",
+                    evidence=f"checked={reqc_result['checked_requirements']} errors={_err[:2]} findings={reqc_result['findings'][:3]}",
                 )
                 _write_bus(
                     "notice",
-                    f"@ccs-monitor [eval_checker] 未确认需求 {_n} 条",
-                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
+                    f"@ccs-monitor [eval_checker] {_headline}",
+                    evidence=f"checked={reqc_result['checked_requirements']} errors={_err[:2]} findings={reqc_result['findings'][:3]}",
                 )
                 summary["notices"] += 1
         except Exception as e:
