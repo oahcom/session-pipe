@@ -54,6 +54,18 @@ class TestLifecycleStateMachine(unittest.TestCase):
         wf = self.lm.get_wf("wf_test_3")
         self.assertEqual(wf["status"], "cancelled")
 
+    def test_close_wf_records_reason_in_log(self):
+        """回收原因必须落库，否则事后 6 条同秒 cancelled 无法归因（#429188）。"""
+        self.lm.upsert_template("test_tmpl_r", "TR", "desc",
+            [{"step_id": "s1", "target_role": "tester",
+              "prompt_template": "do", "exit_condition": {"bus_category": "notice"}}])
+        self.lm.start_wf("wf_test_r", "s1", "test_tmpl_r")
+        self.lm.close_wf("wf_test_r", status="cancelled", reason="queue 45min >= 30min")
+        row = self.lm._conn.execute(
+            "SELECT detail FROM workflow_logs WHERE workflow_instance_id=? "
+            "AND action='wf_closed'", ("wf_test_r",)).fetchone()
+        self.assertEqual(row["detail"], "workflow cancelled (queue 45min >= 30min)")
+
     def test_get_assigned_workflows(self):
         self.lm.upsert_template("test_tmpl4", "T4", "desc",
             [{"step_id": "s1", "target_role": "tester",

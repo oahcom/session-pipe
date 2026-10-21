@@ -1,93 +1,35 @@
 #!/usr/bin/env python3
-"""eval_consistency — eval_criteria 与 eval_checker 白名单一致性校验。
+"""eval_consistency — eval_criteria 可执行性预检。
 
-对比 personas/*.json eval_criteria 中的验证命令与 eval_checker._ALLOWED_CMDS，
-输出不兼容项（将导致 exit=-3 的命令）。
-用法: python3 cli/eval_consistency.py [--json] [--personas DIR]
+对每种 persona 的每条 eval_criteria 走与运行时相同的白名单/沙箱校验，
+输出会被 eval_checker 拒绝的条目（运行时记 skipped，角色永远拿不到该判据的反馈）。
+用法: python3 src/eval_consistency.py [--json] [--personas DIR]
 """
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
-# 运行时从 eval_checker 导入真实白名单（消除手动同步漂移：
-# 曾硬编码导致漏 ccs/du、误含 bash/pytest，2026-08-11 修复）
-from eval_checker import _ALLOWED_CMDS
+from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd
 
 _DEFAULT_PERSONAS = (Path.home() / "hermes-session-roles"
                      / "personas" / "session-roles")
 
 
-def _extract_cmd(criterion: str) -> str | None:
-    """从 eval_criterion 提取验证命令（简化版，复刻 eval_checker._extract_cmd 核心逻辑）。"""
-    if "验证:" not in criterion:
-        return None
-    _, _, part = criterion.partition("验证:")
-    part = part.strip()
-    # 截断到输出/预期标记之前
-    for marker in ("输出结果", "输出 ", "全部返回 "):
-        idx = part.rfind(marker)
-        if idx >= 0 and part[:idx].count("'") % 2 == 0:
-            part = part[:idx].strip()
-            break
-    # 去掉中文混入
-    part = re.sub(r'[一-鿿　-〿＀-￯]+[<\d]*', '', part).strip()
-    # 剥离 bash -c 外层（支持单引号/双引号包裹）
-    m = re.match(r"^(?:bash|sh)\s+-c\s+(['\"])(.+?)\1\s*$", part, re.DOTALL)
-    if m:
-        part = m.group(2).strip()
-    # 清理尾部
-    part = re.sub(r'\s+[<>!]=?\s*\d+(?:\.\d+)?\s*', ' ', part).strip()
-    part = re.sub(r';$', '', part).strip()
-    part = re.sub(r'^\s*\|\s*', '', part)
-    return part or None
-
-
-def _check_cmd(cmd: str) -> list[str]:
-    """检查命令是否与白名单兼容。返回不兼容原因列表（空=兼容）。"""
-    issues = []
-    first_word = cmd.lstrip().split(maxsplit=1)[0] if cmd else ""
-    # python3 -c '...' 与复合命令（for/while/if/bash -c）的分号/管道是语法，
-    # 非 shell 拼接，豁免（与 eval_checker 一致）
-    _is_python_c = first_word == "python3" and "-c" in cmd
-    _is_composite = first_word in ("bash", "for", "while", "if") or cmd.startswith(("for ", "while ", "if "))
-    if not _is_python_c and not _is_composite:
-        if ";" in cmd or "`" in cmd or "$(" in cmd:
-            issues.append(f"含禁止符号（分号/命令替换）: {cmd[:60]}")
-    segments = [s.strip() for s in cmd.split("|") if s.strip()]
-    if not _is_python_c and not _is_composite:
-        for seg in segments:
-            first = seg.split(maxsplit=1)[0] if seg else ""
-            if first not in _ALLOWED_CMDS:
-                issues.append(f"管道段命令不在白名单: {first!r} ← {seg[:50]}")
-    if not segments:
-        return issues
-    first_word = segments[0].split(maxsplit=1)[0] if segments[0] else ""
-    if first_word not in _ALLOWED_CMDS and not _is_composite:
-        issues.append(f"首命令不在白名单: {first_word!r}")
-    return issues
-
-
 def _load_role_criteria(personas_dir: Path) -> list[dict]:
     """加载所有 persona 的 eval_criteria，返回 [{name, criteria, issues}]。"""
     results = []
-    for f in sorted(personas_dir.glob("persona_*.json")):
-        try:
-            d = json.loads(f.read_text())
-        except Exception:
-            continue
-        name = d.get("name", f.stem)
-        criteria = d.get("eval_criteria", [])
+    roles = _load_roles(personas_dir)
+    for r in roles:
         role_issues = []
-        for c in criteria:
+        for c in r["eval_criteria"]:
             cmd = _extract_cmd(c)
             if cmd is None:
                 continue
             issues = _check_cmd(cmd)
             if issues:
                 role_issues.append({"criterion": c[:120], "issues": issues})
-        results.append({"name": name, "criteria_count": len(criteria),
+        results.append({"name": r["name"], "criteria_count": len(r["eval_criteria"]),
                         "incompatible": role_issues})
     return results
 

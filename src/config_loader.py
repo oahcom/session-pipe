@@ -104,7 +104,6 @@ def _default_config() -> dict:
     return {
         "bus": {
             "db_path": "~/.hermes/sister_bus/blackboard.db",
-            "poll_interval": 60,
             "max_messages_per_poll": 100,
         },
         "retry": {
@@ -137,24 +136,15 @@ def _default_config() -> dict:
             "evolution_report": 5,
             "reflexion_lesson": 6,
             "deception": 7,
-            "default": 8,
-        },
-        "routing": {
-            "default_consumer": "pipeline",
-            "idempotent_consume": True,
-            "optimistic_claim": True,
         },
         "logging": {
             "level": "INFO",
             "json_output": True,
-            "include_trace_id": True,
         },
         "graceful_shutdown": {
             "timeout": 30.0,
         },
         "health": {
-            "check_bus_connected": True,
-            "check_consumer_stale": True,
             "backlog_warning_threshold": 100,
             "backlog_critical_threshold": 500,
         },

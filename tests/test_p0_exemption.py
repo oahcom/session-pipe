@@ -12,7 +12,7 @@ p0_exemption.py 单元测试 — P0 豁免通道 + 审计轨迹。
   downgrade_p0: 权限检查、状态流转
   extend_deadline: 单次上限、累计上限、budget缩减
   p0_audit_scan: 1h升级、50min预警、4h自动降级
-  _check_escalation_chain: 6h→supervisor、12h→@everyone
+  _check_escalation_chain: 6h→supervisor、12h→@everyone、重复调用幂等去重
 
 运行: cd ~/session-pipeline && python3 -m pytest tests/test_p0_exemption.py -v
 """
@@ -476,6 +476,21 @@ class TestEscalationChain(unittest.TestCase):
                    p0_marked_by="engineer", status="completed")
         results = pex._check_escalation_chain()
         self.assertEqual(len(results), 0)
+
+    def test_no_duplicate_notification_on_repeat_call(self):
+        # 升级链接入 daemon 30 分钟循环必须幂等，否则同一 P0 任务每
+        # 30 分钟重复刷 @everyone/supervisor。第二次调用不应再通知。
+        pex = _make_pex("coordinator")
+        marked_at = time.time() - 7 * 3600
+        tid = _seed_task(pex, p0_state="draft", p0_marked_at=marked_at,
+                        p0_marked_by="engineer")
+        first = pex._check_escalation_chain()
+        second = pex._check_escalation_chain()
+        self.assertIn("escalated_6h",
+                      [r["action"] for r in first if r["task_id"] == tid])
+        self.assertEqual(
+            len([r for r in second if r["task_id"] == tid]), 0,
+            "第二次调用不应重复触发通知")
 
 
 class TestAuditLog(unittest.TestCase):

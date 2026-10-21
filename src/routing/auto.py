@@ -7,7 +7,6 @@ Auto Route — 自动感知 bus 新消息并通知下游角色。
 import json
 import sys
 
-# sys.path 由 paths.py 集中管理。list_sentinels 延迟注入 launcher 路径为例外。
 
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
@@ -15,31 +14,7 @@ from reliability import (
 )
 
 
-def _get_retry_policy():
-    import reliability as _rel
-    return _rel.DEFAULT_RETRY or _rel.RetryPolicy()
-
-
-def _get_shutdown():
-    """Lazy access to GRACEFUL_SHUTDOWN (needs _ensure_initialized first)."""
-    import reliability as _rel
-    return _rel.GRACEFUL_SHUTDOWN
 from routing import router as _rt_mod
-from paths import SESSION_LAUNCHER_SRC as _LAUNCHER_SRC
-# 延迟导入 launcher.sentinel（避免模块级循环依赖）
-_list_sentinels = None
-def list_sentinels():
-    """读取 CCS 哨兵列表。延迟导入 sentinel（可能不存在于当前 sys.path）。"""
-    global _list_sentinels
-    if _list_sentinels is None:
-        import importlib
-        # 确保 session-launcher/src 在 sys.path 中
-        _launcher_src = str(_LAUNCHER_SRC)
-        if _launcher_src not in sys.path:
-            sys.path.insert(0, _launcher_src)
-        _sentinel_mod = importlib.import_module("sentinel")
-        _list_sentinels = getattr(_sentinel_mod, "list_sentinels", lambda: [])
-    return _list_sentinels()
 
 
 def poll_unconsumed(category: str | None = None, consumer: str | None = None, instance_id: str = "", limit: int = 100) -> list[dict]:
@@ -145,7 +120,7 @@ def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") 
 
 
 # ── 路由分发（从 routes 导入）──
-from routing.routes import route_all, route_to_ccs, route_all_to_ccs, dispatch_investigator
+from routing.routes import route_all, route_to_ccs, route_all_to_ccs
 
 
 # ── CLI 辅助函数 ──────────────────────────────────────────
@@ -212,19 +187,6 @@ def _cli_route_all_to_ccs(dry_run, has_json):
         print(f"\n总路由: {result['routed']}/{result['total']} 条 (dry_run={dry_run})")
 
 
-def _cli_dispatch_investigator(argv, dry_run, has_json):
-    """--dispatch-investigator CLI。"""
-    cat = argv[1] if len(argv) > 1 else "code_fix"
-    result = dispatch_investigator(category=cat, dry_run=dry_run)
-    if has_json:
-        print(json.dumps(result, ensure_ascii=False))
-    else:
-        for d in result["details"]:
-            icon = {"routed": "→", "dry_run": "□"}.get(d.get("action"), "?")
-            print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned_investigator', '?')}")
-        print(f"\n分派: {result['dispatched']}/{result['total']} 条")
-
-
 if __name__ == "__main__":
     has_json = "--json" in sys.argv
     argv = [a for a in sys.argv[1:] if a != "--json"]
@@ -240,7 +202,6 @@ if __name__ == "__main__":
     _consume_flag = "--consume" in flags
     _routetoccs_flag = "--route-to-ccs" in flags
     _routetoccsall_flag = "--route-all-to-ccs" in flags
-    _dispatch_flag = "--dispatch-investigator" in flags
     _dry_run = "--dry-run" in flags
 
     # ── dispatch ──
@@ -275,8 +236,6 @@ if __name__ == "__main__":
         _cli_route_to_ccs(argv, _dry_run, has_json)
     elif _routetoccsall_flag:
         _cli_route_all_to_ccs(_dry_run, has_json)
-    elif _dispatch_flag:
-        _cli_dispatch_investigator(argv, _dry_run, has_json)
     else:
         msgs = poll_unconsumed()
         if has_json:

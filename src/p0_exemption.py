@@ -152,7 +152,7 @@ class P0Exemption:
         violations = []
         rows = self._conn.execute("""
             SELECT * FROM tasks
-            WHERE status != 'completed'
+            WHERE status NOT IN ('completed', 'failed', 'cancelled')
             ORDER BY created_at DESC
         """).fetchall()
 
@@ -401,7 +401,7 @@ class P0Exemption:
         p0_tasks = self._conn.execute(
             "SELECT task_id, title, created_at, p0_marked_at, p0_state FROM tasks "
             "WHERE p0_state IS NOT NULL AND p0_state NOT IN ('downgraded', 'confirmed') "
-            "AND status != 'completed'"
+            "AND status NOT IN ('completed', 'failed', 'cancelled')"
         ).fetchall()
 
         for row in p0_tasks:
@@ -410,21 +410,30 @@ class P0Exemption:
             created = t.get("p0_marked_at") or t.get("created_at", 0)
             elapsed = (now - created) / 3600
 
+            # ponytail: 去重护栏——升级链将接入 daemon 30 分钟循环，
+            # 必须幂等，否则同一 P0 任务每 30 分钟重复刷 @everyone/supervisor。
+            # 用 workflow_logs 记录已通知，复刻 p0_audit_scan 50min 预警的去重模式。
             if elapsed > 12:
                 # 12h+ → @everyone
+                if self._conn.execute(
+                        "SELECT 1 FROM workflow_logs WHERE task_id=? AND action='escalation_12h'",
+                        (t['task_id'],)).fetchone():
+                    continue
                 self._notify_bus("blocker",
                     f"@everyone P0 任务逾期 12h+: {t['task_id']} ({t.get('title','')})",
                     evidence=f"elapsed={elapsed:.1f}h, state={t['p0_state']}")
-                self._log_audit(t['task_id'], "system",
-                                "escalation_12h: @everyone notified")
+                self._log_audit(t['task_id'], "system", "escalation_12h: @everyone notified", action="escalation_12h")
                 results.append({"task_id": t['task_id'], "action": "escalated_12h"})
             elif elapsed > 6:
                 # 6h+ → supervisor
+                if self._conn.execute(
+                        "SELECT 1 FROM workflow_logs WHERE task_id=? AND action='escalation_6h'",
+                        (t['task_id'],)).fetchone():
+                    continue
                 self._notify_bus("blocker",
                     f"P0 任务逾期 6h+: {t['task_id']} — 需 {SUPERVISOR_ROLE} 介入",
                     evidence=f"elapsed={elapsed:.1f}h, state={t['p0_state']}")
-                self._log_audit(t['task_id'], "system",
-                                "escalation_6h: supervisor notified")
+                self._log_audit(t['task_id'], "system", "escalation_6h: supervisor notified", action="escalation_6h")
                 results.append({"task_id": t['task_id'], "action": "escalated_6h"})
 
         return results

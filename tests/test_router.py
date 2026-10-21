@@ -99,8 +99,6 @@ def test_parse_produce_categories():
     eng = roles.get("engineer", {})
     eng_p = eng.get("routing", {}).get("produce", [])
     assert "code_fix" in eng_p, f"engineer produce={eng_p}"
-    inv = roles.get("investigator_general", {})
-    assert "root_cause_analysis" in inv.get("routing", {}).get("produce", [])
 
 
 def test_parse_consume_categories():
@@ -301,10 +299,54 @@ if __name__ == "__main__":
         test_category_desc_complete,
         test_status_format,
         test_poll_unconsumed_sorted_by_priority,
-        test_pipeline_format,
         test_routing_summary,
     ]
 
+
+
+def test_wf_echo_title_guard():
+    """对已有工作流的汇报标题不建新链，真实需求照常建链。"""
+    from routing.routes import _is_wf_echo_title
+
+    echo = [
+        "[test_report] wf_43dc8aede0/s3-complete: hello 12/12 PASS",
+        "[step_output] wf_43dc8aede/s2 reviewer 产出审计",
+        "[bug_report] wf_sub_93776/s2 回退19min后自愈",  # 短 id 曾漏网
+        "qa_test_execute/s2-complete wf_sub_34d97422b585",
+        "[deploy] wf_8b87ab486 产出已部署",
+    ]
+    real = [
+        "给 pm 做一个高质量落地页",
+        "[requirements] 用户要一个高质量网页",
+        "[bug_report] 磁盘告警阈值判断负数",
+        # 无斜杠的 sN-complete 可能是需求本身（实测误杀过），宁可漏判 echo
+        "请新增 s3-complete 状态的审计脚本",
+        "S3 Complete 流程说明文档",
+    ]
+    for t in echo:
+        assert _is_wf_echo_title(t), f"汇报标题应命中：{t}"
+    for t in real:
+        assert not _is_wf_echo_title(t), f"真实需求不应命中：{t}"
+    print("  ✓ wf echo guard")
+
+
+if __name__ == "__main__":
+    print("=== Session Pipeline Router 单元测试 ===\n")
+
+    tests = [
+        test_parse_produce_categories,
+        test_parse_consume_categories,
+        test_priority_ordering,
+        test_router_auto_build_from_json,
+        test_router_fallback,
+        test_get_producers_consumers,
+        test_unconsumed_by_role_parsing,
+        test_category_desc_complete,
+        test_status_format,
+        test_poll_unconsumed_sorted_by_priority,
+        test_routing_summary,
+        test_wf_echo_title_guard,
+    ]
     passed = 0
     failed = 0
     for test in tests:

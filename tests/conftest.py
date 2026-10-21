@@ -1,5 +1,6 @@
 """pytest conftest — 测试隔离配置。"""
 import os
+import signal
 import sys
 import tempfile
 
@@ -40,6 +41,18 @@ def pytest_runtest_setup(item):
         sys.modules["config_loader"] = _real_config_loader
 
 
+def pytest_runtest_teardown(item, nextitem):
+    """用例结束必拆 SIGALRM 定时器。
+
+    多个用例用 signal.alarm(20) 做自超时，却只在 __main__ 分支装 handler；
+    pytest 下 handler 是默认动作（杀进程）。不拆则定时器跨用例残留，等到
+    后面某个稍慢的用例（如含真实 sleep 的 _ensure_role_alive）时引爆，
+    整个 pytest 进程以 EXIT=142 死掉且不打印任何失败——实测 34% 处。
+    """
+    if hasattr(signal, "alarm"):
+        signal.alarm(0)
+
+
 # collectstart 不恢复：它在收集 reliability_unit 后的其他模块时会恢复真实版本，
 # 但此时 reliability_unit 的 _isolate_deps fixture 还没运行，
 # 导致 workflow_engine 执行时 bus_protocol 是真实版本（fixture 生效前已被恢复）。
@@ -53,11 +66,32 @@ os.environ.setdefault("SESSION_PIPELINE_SKIP_TTL_PRUNER", "1")
 #    默认路径全部落到临时目录，不触碰生产 ~/.hermes/state/workflows.db
 _TEST_STATE_DIR = tempfile.mkdtemp(prefix="pipeline-test-state-")
 os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "workflows.db")
+# 指标文件同样隔离：task_generator 每轮 heal 都 append，不隔离则 pytest 的
+# total=1 夹具行会插进 daemon 的 total=1042 序列，生产文件末行去重失效
+# （实测一轮全量测试后 60 行里 48 行是测试产物）。
+os.environ["SESSION_PIPELINE_METRICS_JSONL"] = os.path.join(_TEST_STATE_DIR, "workflow-metrics.jsonl")
 
 # 3. 确保 paths 模块被加载并覆盖 module-level 常量
 #    （env var 在 paths.py import 时读取；若 paths 已在 sys.modules 缓存则 monkeypatch 补偿）
 import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
+_paths_mod.METRICS_JSONL = Path(os.environ["SESSION_PIPELINE_METRICS_JSONL"])
+
+# 3b. CCS_WORKSPACES 隔离：_send_to_role 会写 <workspace>/<role>/TASKS.md。
+#     不隔离则每个跑到的用例都写进生产 ~/ccs-workspaces/，实测已污染
+#     scout/engineer 的真实 TASKS.md（2026-10-16 16:22，fixture 的 "test"
+#     任务覆盖真实任务）。同 WORKFLOWS_DB 走 env + 属性重绑双保险。
+_TEST_WS_DIR = os.path.join(_TEST_STATE_DIR, "ccs-workspaces")
+os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
+_paths_mod.CCS_WORKSPACES = Path(_TEST_WS_DIR)
+
+# 3c. ITERATION_WORKSPACES 隔离：_write_step_prompt 读 <根>/<project_name>/PRD.md
+#     生成 {workspace_summary}。不隔离则跑 pytest 会在生产 ~/.hermes/workspace/
+#     下建 test_ws_project 等目录并写 PRD.md（2026-10-16 实测残留
+#     ws_prj2/ws_prj3/test_ws_project）。
+_TEST_ITER_DIR = os.path.join(_TEST_STATE_DIR, "iteration-workspace")
+os.environ["SESSION_PIPELINE_ITERATION_WORKSPACES"] = _TEST_ITER_DIR
+_paths_mod.ITERATION_WORKSPACES = Path(_TEST_ITER_DIR)
 
 # 4. BUS_DB 隔离：重定向 Blackboard 到临时 DB，测试不再写生产 blackboard.db。
 #    Blackboard.__init__ 默认用 blackboard_legacy 模块导入时的 BLACKBOARD_DB 快照，

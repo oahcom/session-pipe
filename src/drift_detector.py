@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -25,7 +26,21 @@ log = logging.getLogger("drift-detector")
 # （漂移分析发现 maintainer 36 条 + archivist 20 条误报根因）
 # workflow 是引擎内部信道（审批/步骤推送经 ccs.py send 回写 src 归因于角色，cat=workflow），
 # 属角色消费而非产出，所有角色都收，故放行（bus[301357] engineer 误报根因）。
-_ALWAYS_ALLOWED = {"notice", "architecture", "monitor_audit", "monitor_wf_health", "workflow"}
+# 引擎回写分类：routing_daemon/task_generator 经 ccs.py send 把任务/步骤推送
+# 以 src=角色 归因写回（cat=task_spec/scheduler 等），属输入信道而非角色产出。
+# L82 注释已声明 task_spec 为输入信道，但原 _ALWAYS_ALLOWED 只放了 workflow，
+# 导致 pm/knowledge_curator 等收到任务分配时被误报"产出越界"（PM 确认误报）。
+# 这里补全引擎回写分类，与 workflow 同列。
+_ENGINE_WRITEBACK_CATS = {"workflow", "task_spec", "scheduler", "monitor_wf_health"}
+# reflexion_lesson: prompts/base.md 的「违规后果」条款要求**所有角色**
+# 「首次违规 → 退回原角色 + 写 reflexion_lesson」，README 亦将其列为
+# consumer/archivist 的 output_targets。属被系统性要求的合法产出，但不在
+# persona 的 output_targets 里 → 4 角色 + watchdog 误报「产出越界」，
+# 且形成自指循环：写教训 → 被判漂移 → 再写教训。engineer #370527 取证确认。
+# session_log: base.md 要求所有角色在 /compact 前写核心结论，persona 普遍不声明
+# → 7 天 14 条漂移告警、涉 9 个角色（optimizer 最多，4 条）。
+_ALWAYS_ALLOWED = ({"notice", "architecture", "monitor_audit", "reflexion_lesson", "session_log"}
+                   | _ENGINE_WRITEBACK_CATS)
 
 
 def _load_role_config(role: str) -> Optional[dict]:
@@ -70,8 +85,16 @@ def _parse_allowed_categories(targets: list) -> set:
     return cats | _ALWAYS_ALLOWED
 
 
+# 漂移判定的时间窗：只看最近 N 小时的角色产出。
+# 原实现只看「最近 50 条」无时间窗 —— 引擎停摆 35 天期间积压的历史消息占满窗口
+# （实测 scout 最近 50 条里 36 条属 08-23~08-25），一条 53 天前的 design_issue
+# 持续每小时被判为漂移，直到被新消息挤出窗口。漂移是"当前产出是否越界"，
+# 历史越界早已处理完毕，不应长期挂账。
+_DRIFT_WINDOW_HOURS = 24
+
+
 def detect_drift(role: str, limit: int = 50) -> List[dict]:
-    """检测指定角色的 output 漂移"""
+    """检测指定角色的 output 漂移（仅最近 _DRIFT_WINDOW_HOURS 小时的产出）"""
     config = _load_role_config(role)
     if config is None:
         log.warning("role %r not found in persona dir", role)
@@ -83,11 +106,18 @@ def detect_drift(role: str, limit: int = 50) -> List[dict]:
     allowed |= _parse_allowed_categories(config.get("input_signals", []))
     bb = Blackboard()
     facts = bb.read(src=role, limit=limit)
+    _cutoff = time.time() - _DRIFT_WINDOW_HOURS * 3600
     drift = []
     for f in facts:
         # 排除测试场景消息（test_role_interact_* 是测试工作流产物，合法但非生产）
         if f.t.startswith("[test_role_interact_"):
             continue
+        try:
+            if float(f.ts) < _cutoff:
+                continue
+        except (TypeError, ValueError):
+            # ts 非数值（测试 mock / 脏数据）→ 不据其判窗口，保留原判定行为
+            pass
         if f.cat not in allowed:
             drift.append({
                 "category": f.cat,
@@ -119,19 +149,18 @@ def detect_all_drift() -> Dict[str, list]:
 
 def report_drift(results: Dict[str, list]) -> int:
     """将漂移结果写入 bus，返回有漂移的角色数"""
-    if not results:
-        return 0
     bb = Blackboard()
-    for role, entries in results.items():
-        cats = ", ".join(e["category"] for e in entries)
+    drifted = [r for r, e in (results or {}).items() if e]
+    for role in drifted:
+        cats = ", ".join(e["category"] for e in results[role])
         bb.write(
             "architecture",
-            f"[role_drift] {role} has {len(entries)} drift entries: {cats}",
-            evidence=json.dumps(entries, ensure_ascii=False, default=str),
+            f"[role_drift] {role} has {len(results[role])} drift entries: {cats}",
+            evidence=json.dumps(results[role], ensure_ascii=False, default=str),
             tags="role_drift",
             src="drift_detector",
         )
-    return len(results)
+    return len(drifted)
 
 
 def main():

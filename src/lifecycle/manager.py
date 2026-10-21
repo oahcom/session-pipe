@@ -15,39 +15,38 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, List, Optional
 
+import sys as _sys
+
 from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to relative when moved to subpackage
 
+# 驳回词表唯一真相源（src/review_gate.py）。本包 import 时 sys.path 未必含 src/，
+# 视入口而定（daemon 以 src/ 为 cwd 时不缺，pytest 从仓库根跑时缺）。
+if str(Path(__file__).resolve().parents[1]) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from review_gate import is_rejected  # noqa: E402
 
 
-# ── 资源治理约束（agent-contracts 模式）──
-_RESOURCE_BUDGETS: dict[str, dict] = {}
-_DEFAULT_BUDGET = {"max_sessions": 3, "max_memory_mb": 2000, "max_calls_per_hour": 60, "cooldown_sec": 10}
 
-def set_role_budget(role: str, budget: dict) -> None:
-    merged = dict(_DEFAULT_BUDGET); merged.update(budget)
-    _RESOURCE_BUDGETS[role] = merged
+# ── gate 判据路径工具（与 step_handler.py:817 的 glob 惯用法一致）──
+_PATH_CHARS = ("/", "\\", "~", ".", "*")
 
-def get_role_budget(role: str) -> dict:
-    return _RESOURCE_BUDGETS.get(role, dict(_DEFAULT_BUDGET))
 
-def check_resource_constraints(role: str) -> dict:
-    import subprocess
-    budget = get_role_budget(role); violations = []; usage = {}
-    try:
-        r = subprocess.run(["tmux","ls"], capture_output=True, text=True, timeout=5)
-        usage["sessions"] = r.stdout.count(f"ccs-{role}")
-        if usage["sessions"] > budget["max_sessions"]:
-            violations.append(f"sessions {usage['sessions']}/{budget['max_sessions']}")
-    except Exception: usage["sessions"] = -1
-    try:
-        mem = subprocess.run(["free","-m"], capture_output=True, text=True, timeout=5)
-        for line in mem.stdout.split("\n"):
-            if line.startswith("Mem:"):
-                usage["memory_mb"] = int(line.split()[2])
-                if usage["memory_mb"] > budget["max_memory_mb"]:
-                    violations.append("mem %d > %dMB exceed" % (usage["memory_mb"], budget["max_memory_mb"]))
-    except Exception: usage["memory_mb"] = -1
-    return {"ok": len(violations)==0, "violations": violations, "usage": usage}
+def _is_checkable_path(p: str) -> bool:
+    """该 output_exists 条目是否像路径（而非 "变更代码文件" 这类描述）。
+
+    模板里混入描述性文字是既成事实（技术实现.json 的 "deploy_success"），
+    纯中文描述永远 exists()==False，照直判会让 gate 永久 blocked。
+    """
+    return bool(p) and any(c in p for c in _PATH_CHARS)
+
+
+def _output_present(p: str) -> bool:
+    """条目指向的文件是否存在；含 * 时按 glob 匹配（同 step_handler 的完成判据）。"""
+    fp = Path(p).expanduser()
+    if "*" in p:
+        return any(fp.parent.glob(fp.name))
+    return fp.exists()
+
 
 class LifecycleManager:
     """生命周期管理器：状态机 + 步骤执行 + 推进逻辑。
@@ -58,7 +57,6 @@ class LifecycleManager:
     - 实例生命周期: start_wf/complete_step/fail_step/rollback_step/close_wf
     - 审批流: get_approval_token/confirm_step/_issue_approval_token/_notify_result
     - 内部工具: _get_wf_unsafe/_parse_results/_set_step_result_unsafe/_log_unsafe
-    - 资源治理: 见类外 set_role_budget/check_resource_constraints
     """
 
     WF_STATUSES = {"pending", "running", "completed", "failed", "cancelled"}
@@ -95,11 +93,6 @@ class LifecycleManager:
             self._conn.execute(sql, params)
             self._conn.commit()
 
-    def execute_many(self, sql: str, seq: list[tuple]) -> None:
-        """批量执行代理。"""
-        with self._lock:
-            self._conn.executemany(sql, seq)
-            self._conn.commit()
 
     def execute_raw(self, sql: str, params: tuple = ()) -> None:
         """执行 SQL（不自动提交，用于事务内操作）。"""
@@ -184,9 +177,6 @@ class LifecycleManager:
             return None
         template_id = wf.get("template_id")
         template = self._get_template(template_id)
-        # 兼容：实例存 name (如 reviewer_pr_review)，模板存 workflow_id (WF-reviewer_pr_review)
-        if not template and template_id and not template_id.startswith("WF-"):
-            template = self._get_template(f"WF-{template_id}")
         if not template:
             return None
         for step in template.get("steps", []):
@@ -198,9 +188,18 @@ class LifecycleManager:
     def _get_template(self, template_id: Optional[str]) -> Optional[dict]:
         if not template_id:
             return None
+        # 实例存裸名（子链 takeover 写 tgt_step.subflow_template），表里注册的是
+        # WF- 前缀名。缺回退时 _get_assigner_for_step 拿不到模板 → 审批人解析为空，
+        # 但 _complete_review_unsafe 仍先落 token → engine 审批门控只看 token 存在
+        # 就 continue，白等 TTL+grace 90min（实测 architect_full_design/s4 卡 65min）。
         row = self._conn.execute(
             "SELECT * FROM workflow_templates WHERE template_id=?", (template_id,)
         ).fetchone()
+        if not row and not template_id.startswith("WF-"):
+            row = self._conn.execute(
+                "SELECT * FROM workflow_templates WHERE template_id=?",
+                (f"WF-{template_id}",)
+            ).fetchone()
         if not row:
             return None
         d = dict(row)
@@ -224,7 +223,8 @@ class LifecycleManager:
     # ── 核心操作（并发安全） ─────────────────────
 
     def start_wf(self, wf_id: str, current_step_id: str = "s1",
-                  template_id: str = "", context: dict = None) -> bool:
+                  template_id: str = "", context: dict = None,
+                  initiator: str = None, assignee: str = None) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -235,21 +235,47 @@ class LifecycleManager:
                     (current_step_id, ctx_json, wf_id)
                 )
                 if cur.rowcount == 0:
-                    # engine 直接启动的工作流（无前置 task），INSERT 完整行
-                    task_id_val = "wf_" + wf_id[-8:]
+                    # engine 直接启动的工作流（无前置 task）→ 创建真实 task 父行，避免孤儿实例
+                    import uuid as _uuid
+                    _ctx = context or {}
+                    _task_id = _ctx.get("task_id") or ("task_" + _uuid.uuid4().hex[:8])
+                    _now = time.time()
+                    # assignee 取真实执行者（首步 target_role）。写死 workflow_engine 会
+                    # 让实例/任务归属于引擎自身，而引擎不是可投递角色：下游按 assignee
+                    # 算审批人、算忙闲、算归属时全部错位（实测 s0 排 10 次无法投递）。
+                    # engine.start 调用方可显式传 assignee；未传时回退旧值。
+                    _assignee = assignee or "workflow_engine"
+                    self._conn.execute("""
+                        INSERT OR IGNORE INTO tasks
+                        (task_id, title, description, assigner, assignee, priority,
+                         status, created_at, updated_at, template_id)
+                        VALUES (?, ?, ?, 'workflow_engine', ?, 0,
+                                'in_progress', ?, ?, ?)
+                    """, (_task_id, template_id or wf_id, "", _assignee, _now, _now,
+                          template_id or None))
                     self._conn.execute("""
                         INSERT OR IGNORE INTO workflow_instances
                         (instance_id, task_id, assigner, assignee, status, current_step_id,
                          template_id, created_at, context)
-                        VALUES (?, ?, 'workflow_engine', 'workflow_engine', 'running',
+                        VALUES (?, ?, 'workflow_engine', ?, 'running',
                                 ?, ?, ?, ?)
-                    """, (wf_id, task_id_val, current_step_id,
+                    """, (wf_id, _task_id, _assignee, current_step_id,
                           template_id or None, time.time(), ctx_json))
                 self._conn.commit()
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
+                # 真人发起 → 写 assigner 列使审批人得以算出，否则 assign器=workflow_engine 被豁免审批。
+                # 写在 UPDATE 后（无论 rowcount）: engine.start 路径在 L237 UPDATE 命中，
+                # 必须在此同步改写 assigner 列，否则实例永久 assigner=workflow_engine。
+                _assigner = initiator or self.role
+                if _assigner in ("workflow_engine", "system", ""):
+                    _assigner = "workflow_engine"
+                if _assigner != "workflow_engine":
+                    self._conn.execute(
+                        "UPDATE workflow_instances SET assigner=? WHERE instance_id=?",
+                        (_assigner, wf_id))
                 self._log(wf_id, task_id, "wf_started",
-                          detail=f"workflow started by {self.role}, step={current_step_id}")
+                          detail=f"workflow started by {self.role}, initiator={initiator or self.role}, step={current_step_id}")
                 return True
             except Exception:
                 self._conn.rollback()
@@ -322,12 +348,45 @@ class LifecycleManager:
         """返回应确认此步骤的角色（分配者链）。
 
         handoff: 第1步→发起者, 第N步→第N-1步的target_role
-        review: target_role
+        review: 上一步的 target_role；同角色则回退发起者，仍无则放行
+        subflow: 同 handoff 的链式规则（子链产出必须经父链确认才落地）
         single/gate/notify: 无需确认, 返回空
+
+        review 绝不能返回 target_role 自身：执行者自审 = 无人可批，token 必然
+        烂在 step_results 里等 TTL(1h)+grace(30min)。实测 architect_full_design/s4
+        因此卡死 61 分钟，同时把 product_architect 判忙，锁死同角色 3 个其它工作流
+        （排队 7~21 次）。返回空表示「无审批人」→ 不发 token → 引擎直接推进。
+
+        返回值有两处消费：发放 approval_token，以及 confirm_step 校验调用者
+        是否有权确认/驳回（本文件 :404-410）。handoff 不发 token（见
+        _complete_handoff_unsafe），但此处的计算必须保留 —— 抽空会让
+        confirm_step 的授权校验失效，任何角色都能把 handoff 打成 rejected。
         """
         st = step.get("type", "")
+        target = step.get("target_role", "")
         if st == "review":
-            return step.get("target_role", "")
+            template = self._get_template(wf.get("template_id"))
+            if not template:
+                return ""
+            steps = template.get("steps", [])
+            for i, s in enumerate(steps):
+                if s.get("step_id") != step_id:
+                    continue
+                # 首步 review 没有「上一步产出」可审 → 语义上就是自审。
+                # 旧实现落到 wf.assigner，而引擎自动建的返工链把 assigner 写死
+                # "reviewer"（wf_lifecycle._create_rework_subflow）——reviewer
+                # 从不知道这条链存在，token 无人消费，白等 TTL+grace 90 分钟
+                # （实测 wf_rw_46e42f725e74/s1）。
+                if i == 0:
+                    return ""
+                prev = steps[i - 1].get("target_role", "")
+                if prev and prev != target and prev not in ("workflow_engine", "system"):
+                    return prev
+                assigner = wf.get("assigner", "")
+                if assigner and assigner != target and assigner not in ("workflow_engine", "system"):
+                    return assigner
+                return ""
+            return ""
         if st in ("handoff", "subflow"):
             template = self._get_template(wf.get("template_id"))
             if not template:
@@ -347,13 +406,55 @@ class LifecycleManager:
                     return prev
         return ""
 
-    def get_approval_token(self, wf_id: str, step_id: str) -> Optional[str]:
-        """获取步骤的当前审批密钥（测试辅助）。"""
+
+    def get_approval_token(self, wf_id: str, step_id: str,
+                           requester: str = "") -> Optional[str]:
+        """审批人拉取自己的审批密钥（带鉴权与状态门控）。
+
+        为什么需要拉取通道（bus #427318/#427380）：token 只有 `ccs send` 一条
+        推送路径，角色正在思考时 tmux 拒绝注入 → 降级写 bus 时 token 被脱敏成
+        *** → 审批人拿不到钥匙，闸门形同虚设（全库 426 个 token 消费率 0）。
+        推送失败时审批人必须能自己取回。
+
+        fail-closed：requester 为空、无审批人、非审批人一律 PermissionError。
+        引擎自身判断「token 免了没」用 get_approval_token_raw()。
+        """
         wf = self._get_wf_unsafe(wf_id)
         if not wf:
             return None
-        results = self._parse_results(wf)
-        return results.get(step_id, {}).get("approval_token")
+        step = self.get_step(wf_id, step_id)
+        # 只认显式请求人：空串不是「内部调用」，是没鉴权。
+        assigner = self._get_assigner_for_step(wf, step or {}, step_id)
+        if not assigner or requester != assigner:
+            raise PermissionError(
+                f"仅审批人可拉取密钥: {requester!r} != {assigner or '无审批人'}")
+        cur = self._parse_results(wf).get(step_id, {})
+        # 只对「等审批」的步骤放行：已消费/已过期/状态已推进的 token 一律不返回，
+        # 否则审批人拿着死钥匙反复 confirm，错误信息还会掩盖真原因。
+        if cur.get("status") != "step_done_ready":
+            return None
+        if cur.get("approval_consumed_at"):
+            return None
+        if cur.get("approval_token_ttl", 0) > 0 and time.time() > cur["approval_token_ttl"]:
+            return None
+        return cur.get("approval_token")
+
+    def get_approval_token_raw(self, wf_id: str, step_id: str) -> Optional[str]:
+        """无鉴权读取（引擎内部：判断该步是否还在等审批，不可作对外入口）。"""
+        wf = self._get_wf_unsafe(wf_id)
+        if not wf:
+            return None
+        return self._parse_results(wf).get(step_id, {}).get("approval_token")
+
+    def approval_ttl_remaining(self, wf_id: str, step_id: str) -> float:
+        """审批密钥剩余有效秒数；无 token 返回 0。"""
+        wf = self._get_wf_unsafe(wf_id)
+        if not wf:
+            return 0.0
+        cur = self._parse_results(wf).get(step_id, {})
+        if not cur.get("approval_token") or cur.get("approval_consumed_at"):
+            return 0.0
+        return max(0.0, float(cur.get("approval_token_ttl", 0)) - time.time())
 
     def confirm_step(self, wf_id: str, step_id: str, token: str = "",
                      approved: bool = True, reason: str = "", allow_expired: bool = False) -> bool:
@@ -381,6 +482,15 @@ class LifecycleManager:
                         raise PermissionError("token expired")
                     if token != stored_token:
                         raise PermissionError("invalid token")
+                    # 持钥即放行 = 任何拿到 DB 副本/日志的人都能越权确认。钥匙本来
+                    # 只发给审批人，这里必须再验一次身份（ccs-monitor #427818 实测：
+                    # 副本 DB 越权 confirm 可复现）。引擎自身的自动推进/超时兜底以
+                    # workflow_engine 身份调用，按系统角色豁免。
+                    _step = self.get_step(wf_id, step_id)
+                    _assigner = self._get_assigner_for_step(wf, _step or {}, step_id)
+                    if _assigner and self.role not in (_assigner, "workflow_engine", "system"):
+                        raise PermissionError(
+                            f"only assigner can confirm: {self.role} != {_assigner}")
                     current["approval_consumed_at"] = time.time()
                     current["approval_token"] = None
                 else:
@@ -468,7 +578,7 @@ class LifecycleManager:
             _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
                 ["python3", _ccs_cli, "send", executor, msg,
-                 "--from", "cli"],
+                 "--from", "workflow_engine"],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
                 logger.warning("notify result failed for %s: %s", executor,
@@ -488,14 +598,30 @@ class LifecycleManager:
                     raise ValueError(
                         f"步骤不匹配: 当前={wf['current_step_id']}, 传入={step_id}")
                 results = self._parse_results(wf)
+                # 合并而非覆写：旧实现 `results[step_id] = {...}` 整体替换，
+                # 抹掉 subflow_id / queued / exit_messages 等字段。后果实测：
+                # 父链步骤被 cancel 后 subflow_id 丢失 → 子链完成后的回流通道
+                # （task_generator._scan_tasks 按 step_results[step].subflow_id 找子链）
+                # 断裂 → 只能退回等 exit_condition 文本匹配，实测延迟 60 分钟才闭合
+                # （wf_0e8885c48cbb/s2：子链 11:31 被误取消，pm 11:42 已写出
+                # s2-complete，父链却 12:42 才完成）。
+                _prev_sr = results.get(step_id, {})
                 results[step_id] = {
+                    **(_prev_sr if isinstance(_prev_sr, dict) else {}),
                     "status": "cancelled", "cancelled_at": time.time(),
                     "cancelled_by": self.role,
                     "reason": "角色持续不响应（tmux 信号自动取消）",
                 }
+                # 同步关闭工作流：cancel_step 的语义是"中止等待"，步骤已终结则该实例
+                # 不会再推进。只写 step_results 会让行级 status 永远停在 running——
+                # 回收器（_cleanup_stale_workflows）按行级 status 取候选，而这些实例的
+                # 步骤级已是 cancelled，不会被任何条件命中 → 永久滞留。
+                # 实测 2026-10-17：WL-dev_with_collab 14 台 @s4 行级 running / 步骤级
+                # cancelled 达 5.5-6.1h，是 running 存量里最大的一块死重。
                 self._conn.execute(
-                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                    (json.dumps(results, ensure_ascii=False), wf_id)
+                    "UPDATE workflow_instances SET step_results=?, status='cancelled', "
+                    "completed_at=? WHERE instance_id=?",
+                    (json.dumps(results, ensure_ascii=False), time.time(), wf_id)
                 )
                 self._log_unsafe(wf_id, wf.get("task_id"), "step_cancelled",
                                  detail=f"{step_id}: 角色不响应自动取消")
@@ -588,10 +714,60 @@ class LifecycleManager:
                 self._conn.rollback()
                 raise
 
-    def close_wf(self, wf_id: str, status: str = "completed"):
+    # 终态白名单：拼错（canceled/cancel）会让行进入终态却不触发级联，子链成孤儿。
+    _CLOSE_STATUSES = ("completed", "cancelled", "failed", "delivery_blocked")
+
+    def close_wf(self, wf_id: str, status: str = "completed", reason: str = ""):
+        if status not in self._CLOSE_STATUSES:
+            raise ValueError(f"unknown close status: {status!r}")
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            # 可能已在调用方的事务中（_advance_production_wf 的 _conn_tx 块内先做过
+            # DML，sqlite3 默认 isolation_level='' 已隐式 BEGIN）。此时再 BEGIN
+            # IMMEDIATE 会抛 "cannot start a transaction within a transaction"——
+            # 实测生产 wf_3d7210c2bc57 与 wf_ae31fd1c4c11 收尾时各触发过一轮，
+            # 导致 conn.commit() 从未执行、完成状态不落库。
+            # in_transaction 为真时复用外层事务，提交权交还调用方。
+            _own_tx = not self._conn.in_transaction
+            if _own_tx:
+                self._conn.execute("BEGIN IMMEDIATE")
             try:
+                _cur = self._conn.execute(
+                    "SELECT status FROM workflow_instances WHERE instance_id=?",
+                    (wf_id,)).fetchone()
+                # 终态不可逆：不同终态之间禁止覆写（实测 cancelled 可被后续
+                # close(completed) 改回 completed，把已判死的链复活成"完成"）。
+                # 必须先于级联：否则 close(completed) 打在已 cancelled 的父链上会
+                # 先杀掉它的子链、再因短路不改父链状态，留下"子死父活"的倒挂。
+                _cur_st = _cur["status"] if _cur else None
+                if _cur_st in self._CLOSE_STATUSES and _cur_st != status:
+                    import logging as _log
+                    _log.getLogger("lifecycle.manager").warning(
+                        "close_wf %s: 终态 %s 不可改为 %s，忽略",
+                        wf_id[:12], _cur_st, status)
+                    if _own_tx:
+                        self._conn.commit()
+                    return False
+                # 父链判死 → 子链必须同时终止。子链持有角色占用与任务，父链消失后
+                # 没有任何一方消费它的产出，只能跑到自己的超时（实测 72h 76 条子链
+                # 挂在已死父链下，wf_sub_ee03a71c3 在父链 cancelled 后仍 running 21min）。
+                # delivery_blocked 同属判死：投递达上限后无人再消费子链产出。
+                # 只在 completed 之外级联：completed 的子链正常情况下已自行收敛。
+                # 放在幂等短路之前：父链已 cancelled 但子链仍是旧代码留下的孤儿时，
+                # 再次 close 应继续级联而不是直接返回。
+                if status != "completed":
+                    # 子链留痕继承父链原因：只写 "parent cancelled" 时排查仍要回查父链。
+                    self._cascade_cancel_unsafe(wf_id, reason or f"parent {status}")
+                # 幂等：多条收尾路径（step_handler 超时兜底 / _handle_wf_loop / 回收）
+                # 会先后关同一台，重复写入会把 completed_at 改成后一次时间并刷重复日志。
+                if _cur_st == status:
+                    # task 同步不能跳：旧代码把实例关掉却漏同步 task（回收走裸
+                    # UPDATE 的存量），再次 close 正是唯一的自愈入口。该调用由
+                    # 实例行反推状态，重入无副作用。
+                    _wf = self.get_wf(wf_id)
+                    self._sync_task_unsafe(_wf.get("task_id") if _wf else None)
+                    if _own_tx:
+                        self._conn.commit()   # 级联可能已写入，commit 兼作无写时的空提交
+                    return True
                 self._conn.execute(
                     "UPDATE workflow_instances SET status=?, completed_at=? "
                     "WHERE instance_id=?", (status, time.time(), wf_id)
@@ -599,11 +775,16 @@ class LifecycleManager:
                 wf = self.get_wf(wf_id)
                 task_id = wf.get("task_id") if wf else None
                 self._sync_task_unsafe(task_id)
-                self._log_unsafe(wf_id, task_id, "wf_closed", detail=f"workflow {status}")
-                self._conn.commit()
+                # 只写 "workflow cancelled" 时，事后无法区分是人工 cancel、步骤缺失、
+                # 排队回收还是僵尸回收（curator #429188：05:23:40 同秒 6 条全部不可归因）。
+                self._log_unsafe(wf_id, task_id, "wf_closed",
+                                 detail=f"workflow {status}" + (f" ({reason})" if reason else ""))
+                if _own_tx:
+                    self._conn.commit()
                 return True
             except Exception:
-                self._conn.rollback()
+                if _own_tx:
+                    self._conn.rollback()
                 raise
 
     # ── 子工作流级联操作 ───────────────────────────
@@ -630,14 +811,6 @@ class LifecycleManager:
                                  detail=f"cascade from parent {_current}: {reason}")
                 _stack.append(_cid)
 
-    def _count_pending_subflows(self, wf_id: str, step_id: str) -> int:
-        """统计指定步骤创建的子工作流中未完成的个数。"""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM workflow_instances "
-            "WHERE parent_wf_id=? AND subflow_source_step_id=? AND status NOT IN ('completed')",
-            (wf_id, step_id)
-        ).fetchone()
-        return row[0] if row else 0
 
     # ── 内部 unsafe 方法（在已开启的事务中调用） ──
 
@@ -689,10 +862,19 @@ class LifecycleManager:
         return "completed_and_advanced"
 
     def _complete_handoff_unsafe(self, wf_id, step_id, step, task_id, results):
+        """交接步骤置 step_done_ready，**不发**审批 token。
+
+        handoff 是交接不是闸门：发 token 会让 engine 拦住每一步等 confirm，
+        而实测真实 confirm 率仅 1.4%（1347 步中 425 步持未消费 token、真
+        confirm 8 次）→ 每步白等 TTL+grace 90min，早于步骤超时上限被
+        auto-cancel，WL-full_dev_pipeline 21 实例 0 走完。
+        无 token 时 engine 审批门控放行 → _advance_production_wf 接手推进，
+        子链创建/loop/部署三件事照常执行（若在此直接 advance，防重守卫会因
+        current_step_id 已变而 return，这三件全部跳过）。
+        """
         self._set_step_result_unsafe(wf_id, step_id, "step_done_ready", results)
         self._log_unsafe(wf_id, task_id, "step_done_ready",
-                         detail=f"handoff waiting confirm: {step_id}")
-        self._issue_approval_token(wf_id, step_id, step, task_id, results)
+                         detail=f"handoff ready to advance: {step_id}")
         return "step_done_ready"
 
     def _complete_review_unsafe(self, wf_id, step_id, step, task_id, results):
@@ -708,25 +890,38 @@ class LifecycleManager:
         import logging as _log
         logger = _log.getLogger("lifecycle.approval")
 
+        # 确定审批人。必须在写 token **之前**判：无审批人却先落 token，
+        # engine 的审批门控只看"token 存在"（engine.py 审批门控段）→ 照样拦住
+        # 推进，等 TTL+grace 90 分钟。实测 architect_full_design/s4 因此卡死。
+        wf = self._get_wf_unsafe(wf_id)
+        assigner = self._get_assigner_for_step(wf, step, step_id)
+        if not assigner:
+            return  # 无审批人（系统发起/自审/首步）→ 不落 token，engine 直接放行
+
         token = _secrets.token_urlsafe(32)
         ttl = 3600  # 1 小时
 
-        # 存储到 step_results
-        wf = self._get_wf_unsafe(wf_id)
         step_results = self._parse_results(wf)
         step_results.setdefault(step_id, {}).update({
             "approval_token": token,
             "approval_token_ttl": time.time() + ttl,
+            # 签发时刻单独落库：提醒退避按「签发至今」算，从 ttl 反推需要
+            # 硬编码有效期常量，改 ttl 就会算错（下发时间点也要可追溯）。
+            "approval_issued_at": time.time(),
             "approval_consumed_at": None,
         })
         self._conn.execute(
             "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
             (json.dumps(step_results, ensure_ascii=False), wf_id))
 
-        # 确定审批人
-        assigner = self._get_assigner_for_step(wf, step, step_id)
-        if not assigner:
-            return  # 无审批人，跳过
+        # ── 先提交，再 spawn 子进程 ──
+        # complete_step 在外层持有 BEGIN IMMEDIATE 写锁；ccs send 子进程会经
+        # routing.gatekeeper._log_cross_role_send 向同一 DB 写 cross_role_send 日志，
+        # 争同一把写锁 → child 等 busy_timeout(10s) 后抛 database is locked。
+        # 实测：持锁时 10/10 子进程失败（journal 里 ccs send failed 耗时恒 ~10s 即指纹），
+        # 不持锁时 rc=0。审批请求因此长期走 bus 降级（token 被脱敏，审批人拿不到密钥）。
+        # 本方法是事务内最后一步，此处 commit 不影响后续原子性。
+        self._conn.commit()
 
         # 构建审批提示词
         approval_prompt = step.get("approval_prompt", "")
@@ -765,7 +960,7 @@ class LifecycleManager:
             _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
             result = _sp.run(
                 ["python3", _ccs_cli, "send", assigner, msg,
-                 "--from", "cli"],
+                 "--from", "workflow_engine"],
                 capture_output=True, timeout=15)
             if result.returncode != 0:
                 logger.warning("ccs send failed for %s->%s: %s", self.role, assigner,
@@ -781,20 +976,26 @@ class LifecycleManager:
             logger.warning("approval token CCS send error: %s", e)
 
     def _bb_write_fallback(self, wf_id, step_id, token, approval_prompt, assigner):
-        """ccs send 失败时的 bus 降级写入（WL-P2-03 通知降级）。
+        """ccs send 失败时的 bus 降级通知（WL-P2-03）。
 
-        确保审批请求不因 send 失败而丢失：写入 bus cat=workflow，
-        assigner 角色通过 bus 轮询可收到。
-        token 脱敏：bus 为共享通道，明文泄漏 = 任意角色可伪造 confirm_step。
+        通知的职责只是「告诉审批人有待批」— 凭证由审批人自己用
+        `wf approval <wf_id> <step_id>` 拉取。把 token 塞进共享 bus 再脱敏，
+        等于两件事都没做成：既没人能读到（标题无 @role），也没人能拿到钥匙。
         """
-        # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token L648）
+        # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token）
         safe_prompt = approval_prompt.replace(token, "***")
-        from blackboard import Blackboard
+        from hermes_bus.blackboard import Blackboard
         bb = Blackboard()
         bb.write(
             "workflow",
-            f"[审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求（ccs send 失败，经 bus 投递）",
-            evidence=f"审批人: {assigner}\n密钥: ***(仅通过 ccs send 安全投递)\n有效期: 1小时\n提示: {safe_prompt}",
+            # 标题必须带 @<assigner>：bus_client._addressed_to() 只匹配标题里的
+            # '@role'，缺了这句降级就等于没投递（估计 #427280 从未被 engineer 读到）。
+            f"@{assigner} [审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求"
+            f"（ccs send 失败，经 bus 投递）",
+            evidence=(
+                f"审批人: {assigner}\n密钥: 不在此处（共享 bus 不得承载一次性凭证）\n"
+                f"取回命令: wf -r {assigner} approval {wf_id} {step_id}\n"
+                f"有效期: 1小时（剩余见命令输出）\n提示: {safe_prompt}"),
             src="workflow_engine",
         )
 
@@ -886,7 +1087,18 @@ class LifecycleManager:
             return (True, "no conditions")
         output_exists = check.get("output_exists", [])
         if output_exists:
-            missing = [p for p in output_exists if not Path(p).exists()]
+            checkable = [p for p in output_exists if _is_checkable_path(p)]
+            if not checkable:
+                # 全部是不可判定条目（如 "变更代码文件"、"deploy_success"）→ 无可校验。
+                # 放行而非永久 blocked：blocked 不在 STEP_STATUSES/_ACTIVE_STEP_STATUS
+                # 内，回收扫描覆盖不到，会让步骤与实例双双搁浅（仅 24h 全局阈值兜底）。
+                # 放行但留痕——模板需修正为真实路径。
+                import logging as _lg
+                _lg.getLogger("lifecycle.gate").warning(
+                    "gate 的 output_exists 无可用路径判据，跳过检查（请修正模板）: %s",
+                    output_exists)
+                return (True, "no checkable path in output_exists")
+            missing = [p for p in checkable if not _output_present(p)]
             if missing:
                 return (False, f"output not found: {', '.join(missing)}")
         return (True, "conditions satisfied")
@@ -899,10 +1111,20 @@ class LifecycleManager:
         current = wf.get("current_step_id", "")
         idx = -1
         for i, s in enumerate(steps):
-            if s.get("step_id") == current:
+            # 模板步骤可能用 id 键（模式 ^s\d+$）而非 step_id；与 L194 get_step 约定一致
+            if (s.get("step_id") or s.get("id")) == current:
                 idx = i
                 break
         if idx == -1 or idx + 1 >= len(steps):
+            # 末步：不自行 close。直接写 completed 会绕开引擎的收尾阶段
+            # （子链检查 + close_wf + 锁外部署 + 食物链 loop 自触发），
+            # 实测单步链 deploy=0、loop 永不启动。改为返回 False 让上层
+            # （step_handler → engine 主循环）按 step_done_ready 走
+            # _advance_production_wf 的 is_last 分支，拿到完整收尾。
+            # idx == -1（步骤不在模板）仍自行收尾：引擎对该情况 idx<0
+            # 直接 return，交出去会永久悬空。
+            if idx >= 0:
+                return False
             self._conn.execute(
                 "UPDATE workflow_instances SET status='completed', completed_at=? "
                 "WHERE instance_id=?", (time.time(), wf_id)
@@ -910,11 +1132,64 @@ class LifecycleManager:
             self._sync_task_unsafe(task_id)
             return False
         next_step = steps[idx + 1]
-        self._conn.execute(
-            "UPDATE workflow_instances SET current_step_id=? WHERE instance_id=?",
-            (next_step["step_id"], wf_id)
-        )
-        # advance 时把旧步骤 status 改为 completed，防止 DB 扫描时
+        # 返工门禁：评审步骤（review/gate）被驳回 → 搁置当前步，不推进。
+        # 为什么在这里：本函数是「角色调 complete_step」的推进路径，与
+        # pipeflow/wf_lifecycle._advance_production_wf（引擎 tick 路径）是
+        # 两套独立实现，原门禁只装在后者 → 走本路径的驳回被无视，流水线
+        # 带着未修复的产物继续下滑（实测 wf_98a18e738d：s3 判 CHANGES_REQUESTED
+        # 却推进到 s4；回归守卫 tests/test_workcycle_e2e.py::test_gate_rejection_blocks_advance）。
+        #
+        # 只 return 不够：本函数四个调用点（433/707/887/900）均
+        # 不检查返回值，调用方会照常记 step_completed 并 commit。
+        # 故必须把 step 状态落库为 rejected（调用方无法覆盖），
+        # 让下游看到真实结果而非"已完成并推进"。
+        # 关键词 "fix" 不列入：它在正常文案高频出现（bugfix/prefix/fixture），
+        # 会把「已修复并通过」误判为驳回。
+        _cur_step = steps[idx]
+        # 不限定 step.type（对齐 pipeflow/wf_lifecycle.py:298 的 R41 修复）：旧实现
+        # 只查 review/gate，实测 handoff/single 的驳回无人消费——wf_3565289ca783/s3
+        # (handoff) 与 wf_0830e5a05e/s1 (single) 判"未通过"/REJECTED 后仍推进至 completed。
+        # 驳回语义由 exit_messages 文本判定，与 type 无关。
+        _sr = self._parse_results(wf)
+        _cur_sr = _sr.get(current, {}) or {}
+        _msgs = " ".join(
+            m.get("text", "") for m in
+            (_cur_sr.get("exit_messages") or [])
+            if isinstance(m, dict)
+        ).lower()
+        # 词表走 review_gate 唯一真相源：此前三处各写一份靠注释约定同步，
+        # "未通过"/"驳回"/"not_approved" 曾在 wf_lifecycle 有、本路径没有 →
+        # 同一条文案在两条推进路径上判定相反（wf_3565289ca783/s3 用
+        # "判定: 未通过"表达驳回，本路径漏检）。
+        # 已确认的步骤不再判驳回：confirm_step 先写 status=completed 再调本函数，
+        # 而 exit_messages 是第一轮的驳回文本、确认时不会清除 → 同一份文本被二次
+        # 判成驳回，把刚落的 completed 当场改写回 rejected。步骤一旦被驳回过就
+        # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
+        # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
+        _confirmed = bool(_cur_sr.get("confirmed_at"))
+        if not _confirmed and is_rejected(_msgs):
+            _sr.setdefault(current, {})["status"] = "rejected"
+            self._conn.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(_sr, ensure_ascii=False), wf_id))
+            import logging as _lg
+            _lg.getLogger("lifecycle.review_gate").warning(
+                "review rejected: %s/%s → 返工门禁触发，保持当前步", wf_id[:8], current)
+            return False
+        # assignee 跟随当前步的执行者：它只在建实例时设一次（首步角色），
+        # 之后推进从不更新 → 实测 8/9 running 实例的 assignee 与当前步要求
+        # 的角色不一致（如 WL-dev_with_collab 走到 s4 要求 closer 却仍归
+        # engineer）。而 assignee 被背压计数与任务生成消费 → 配额长期失真。
+        _next_sid = next_step.get("step_id") or next_step.get("id")
+        _next_role = next_step.get("target_role")
+        if _next_role:
+            self._conn.execute(
+                "UPDATE workflow_instances SET current_step_id=?, assignee=? "
+                "WHERE instance_id=?", (_next_sid, _next_role, wf_id))
+        else:
+            self._conn.execute(
+                "UPDATE workflow_instances SET current_step_id=? WHERE instance_id=?",
+                (_next_sid, wf_id))
         # 旧步骤的 notified 状态误判角色 busy（2026-08-10 观测：
         # s1 推进到 s2 后，_is_role_busy 扫到 s1 的 notified → pm 误判 busy）
         try:
@@ -946,38 +1221,6 @@ class LifecycleManager:
         t = self._get_template(template_id)
         return t.get("steps", []) if t else []
 
-    def check_gate_timeouts(self) -> list[dict]:
-        timeouts = []
-        templates = self._conn.execute("SELECT * FROM workflow_templates").fetchall()
-        for tpl_row in templates:
-            tpl = dict(tpl_row)
-            if not tpl.get("steps_json"):
-                continue
-            try:
-                steps = json.loads(tpl["steps_json"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            for step in steps:
-                if step.get("type") != "gate":
-                    continue
-                timeout_hours = step.get("estimated_hours", 24)
-                rows = self._conn.execute(
-                    "SELECT * FROM workflow_instances "
-                    "WHERE template_id=? AND status='running' AND current_step_id=?",
-                    (tpl["template_id"], step["step_id"])
-                ).fetchall()
-                for row in rows:
-                    inst = dict(row)
-                    elapsed = (time.time() - inst["created_at"]) / 3600
-                    if elapsed > timeout_hours:
-                        timeouts.append({
-                            "wf_id": inst["instance_id"],
-                            "step_id": step["step_id"],
-                            "elapsed_hours": round(elapsed, 1),
-                            "timeout_hours": timeout_hours,
-                        })
-        return timeouts
-
     def get_assigned_workflows(self, role: str) -> List[dict]:
         """获取分配给指定角色的所有活跃工作流"""
         rows = self._conn.execute(
@@ -997,88 +1240,6 @@ class LifecycleManager:
                     result.append(inst)
                     break
         return result
-
-    def get_workflow_context(self, wf_id: str) -> dict:
-        """获取工作流完整上下文"""
-        wf = self._get_wf_unsafe(wf_id)
-        if not wf:
-            return {}
-        steps = self._get_all_steps_unsafe(wf.get("template_id"))
-        current_step = wf.get("current_step_id", "")
-        results = self._parse_results(wf)
-        context = {
-            "wf_id": wf_id,
-            "template_name": wf.get("template_id"),
-            "current_step": current_step,
-            "status": wf.get("status"),
-            "assigner": wf.get("assigner"),
-            "steps": [],
-        }
-        for step in steps:
-            step_result = results.get(step["step_id"], {})
-            context["steps"].append({
-                "step_id": step["step_id"],
-                "title": step["title"],
-                "type": step["type"],
-                "target_role": step.get("target_role"),
-                "status": step_result.get("status", "pending"),
-                "approval_prompt": step.get("approval_prompt", ""),
-            })
-        return context
-
-    def get_workflow_progress(self, wf_id: str) -> dict:
-        """获取工作流实时进度"""
-        wf = self._get_wf_unsafe(wf_id)
-        if not wf:
-            return {}
-        steps = self._get_all_steps_unsafe(wf.get("template_id"))
-        current_step = wf.get("current_step_id", "")
-        results = self._parse_results(wf)
-        progress = {
-            "wf_id": wf_id,
-            "status": wf.get("status"),
-            "current_step": current_step,
-            "steps": [],
-        }
-        for i, step in enumerate(steps):
-            step_result = results.get(step["step_id"], {})
-            progress["steps"].append({
-                "index": i + 1,
-                "step_id": step["step_id"],
-                "title": step["title"],
-                "target_role": step.get("target_role"),
-                "status": step_result.get("status", "pending"),
-                "is_current": step["step_id"] == current_step,
-                "handoff_status": step_result.get("handoff_status", "N/A"),
-            })
-        return progress
-
-    def acknowledge_handoff(self, wf_id: str, step_id: str, role: str) -> bool:
-        """被交接方确认收到任务"""
-        wf = self._get_wf_unsafe(wf_id)
-        if not wf:
-            return False
-        steps = self._get_all_steps_unsafe(wf.get("template_id"))
-        current = wf.get("current_step_id", "")
-        if current != step_id:
-            return False
-        idx = next((i for i, s in enumerate(steps) if s.get("step_id") == step_id), -1)
-        if idx == -1 or idx + 1 >= len(steps):
-            return False
-        next_step = steps[idx + 1]
-        if next_step.get("target_role") != role:
-            return False
-        results = self._parse_results(wf)
-        step_result = results.get(step_id, {})
-        step_result["handoff_status"] = "acknowledged"
-        step_result["acknowledged_at"] = time.time()
-        step_result["acknowledged_by"] = role
-        results[step_id] = step_result
-        self._conn.execute(
-            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-            (json.dumps(results, ensure_ascii=False), wf_id))
-        self._conn.commit()
-        return True
 
     def _ensure_schema(self):
         """初始化数据库 schema（如不存在）+ 迁移已有表。
@@ -1129,6 +1290,11 @@ class LifecycleManager:
             ("workflow_instances", "context", "TEXT DEFAULT '{}'"),
             ("workflow_instances", "parent_wf_id", "TEXT"),
             ("workflow_instances", "subflow_source_step_id", "TEXT"),
+            # 步骤-角色重定向持久化（如 engineer↔pg 开发角色池按忙闲择一）。
+            # 存在实例级而非改 step.target_role：模板是权威定义不动，且分流决定
+            # 需随实例存活、对下游全部消费点可见（exit_messages 过滤、busy 门控、
+            # exit_schema 校验目录、codex cwd 等 20+ 处）。JSON: {"s4": "pg"}
+            ("workflow_instances", "effective_roles", "TEXT DEFAULT '{}'"),
             ("tasks", "parent_task_id", "TEXT"),
             ("tasks", "template_id", "TEXT"),
         ]:
@@ -1139,62 +1305,3 @@ class LifecycleManager:
 
     def close(self):
         self._conn.close()
-
-    # ── Engine 集成 ─────────────────────────────
-
-    def get_run(self, wf_id: str) -> Optional[dict]:
-        """返回工作流运行的轻量快照，供 engine 查询状态。"""
-        wf = self.get_wf(wf_id)
-        if not wf:
-            return None
-        template = self._get_template(wf.get("template_id"))
-        steps = template.get("steps", []) if template else []
-        results = self._parse_results(wf)
-        current_step = wf.get("current_step_id", "")
-        return {
-            "id": wf_id,
-            "status": wf.get("status", ""),
-            "current_step": current_step,
-            "steps": steps,
-            "step_results": results,
-            "created": wf.get("created_at"),
-        }
-
-    # ── 升级与重分配 ────────────────────────────
-
-    def escalate_step(self, wf_id: str, step_id: str,
-                      reason: str = "") -> dict:
-        """升级步骤：标记 escalated + 写日志 + 返回 coordinator 角色名。"""
-        with self._lock:
-            results = self._parse_results(self._get_wf_unsafe(wf_id) or {})
-            step_result = results.setdefault(step_id, {})
-            step_result["escalated"] = True
-            step_result["escalated_at"] = time.time()
-            step_result["escalated_by"] = self.role
-            if reason:
-                step_result["escalation_reason"] = reason
-            self._conn.execute(
-                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                (json.dumps(results, ensure_ascii=False), wf_id))
-            self._conn.commit()
-            task_id = (self._get_wf_unsafe(wf_id) or {}).get("task_id")
-            self._log(wf_id, task_id, "step_escalated",
-                      detail=f"step {step_id}: {reason}")
-            return {"wf_id": wf_id, "step_id": step_id, "role": "coordinator"}
-
-    def reassign_step(self, wf_id: str, step_id: str, new_role: str) -> bool:
-        """重分配步骤到新角色：改 step_results 中的 target_role。"""
-        with self._lock:
-            results = self._parse_results(self._get_wf_unsafe(wf_id) or {})
-            step_result = results.setdefault(step_id, {})
-            step_result["reassigned_to"] = new_role
-            step_result["reassigned_at"] = time.time()
-            step_result["reassigned_by"] = self.role
-            self._conn.execute(
-                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                (json.dumps(results, ensure_ascii=False), wf_id))
-            self._conn.commit()
-            task_id = (self._get_wf_unsafe(wf_id) or {}).get("task_id")
-            self._log(wf_id, task_id, "step_reassigned",
-                      detail=f"{step_id} → {new_role}")
-            return True

@@ -71,7 +71,11 @@ class IntegrityState:
 # ── 持久化 ──
 
 def load_state(step_results: dict, step_id: str) -> IntegrityState:
-    sr = step_results.get(step_id, {})
+    # 归一化：step_results[step_id] 可能是真值非 dict（'done'/'summary' 等
+    # 简写形，生产 DB 实测 413 个）。裸 .get 会抛 AttributeError，而调用方
+    # 多数在 run_once 的 try 内 → 整个 tick 循环中止（静默失败）。
+    _v = step_results.get(step_id, {})
+    sr = _v if isinstance(_v, dict) else {}
     return IntegrityState(
         pending=sr.get("integrity_pending", False),
         dim_index=sr.get("integrity_dim_index", 0),
@@ -85,7 +89,12 @@ def load_state(step_results: dict, step_id: str) -> IntegrityState:
 
 
 def save_state(step_results: dict, step_id: str, state: IntegrityState) -> None:
-    sr = step_results.setdefault(step_id, {})
+    # 同 load_state：真值非 dict 时 setdefault 返回原值（不是新 dict），
+    # 后续赋值抛 TypeError；先归一化再写。
+    _v = step_results.get(step_id)
+    if not isinstance(_v, dict):
+        step_results[step_id] = {}
+    sr = step_results[step_id]
     sr["integrity_pending"] = state.pending
     sr["integrity_dim_index"] = state.dim_index
     sr["integrity_last_sent_at"] = state.last_sent_at
@@ -177,9 +186,59 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
     两个核心问题分开发送（用户约束：分开提示词），发完标记 bypass flag。
     任一环节失败静默不阻塞完成（bypass 是旁路通知）。"""
     step_results = run.step_results
-    if step_results.get(step.id, {}).get("integrity_reminder_sent_bypass", False):
-        return  # 已发过
-    goal_text = getattr(step, 'prompt_template', '') or ''
+    # 幂等 + 节流：先落库再发送。
+    # 旧实现只写内存 flag，且在发送后才置位；而 11 处调用点各自持有 run 副本、
+    # complete_step 又在提醒之后才写库 → 下一 tick 读库看不到 flag，同一秒可重复
+    # 注入（实测 s1 被提醒 62 次 / s2 30 次，仅 4 个唯一 step）。
+    import time as _t
+    _srec = step_results.setdefault(step.id, {})
+    _last = float(_srec.get("integrity_reminder_sent_bypass_at", 0.0))
+    if _srec.get("integrity_reminder_sent_bypass") or (_t.time() - _last) < 60:
+        return  # 已发过（或 60s 节流窗内）
+    _srec["integrity_reminder_sent_bypass"] = True
+    _srec["integrity_reminder_sent_bypass_at"] = _t.time()
+    if sync_step_results:
+        sync_step_results(run.id, run.step_results)
+    # 剥离 /goal 前缀：模板存的 prompt_template 自带该前缀，直接截断填进
+    # 「用户指令：」会让角色收到字面的 /goal（bus #374984 实证）。
+    # 剥完为空时退回 step.title —— 至少是有语义的步骤名，而非空占位。
+    #
+    # 变量填充：prompt_template 是**模板原文**（含 {description}/{title}/{assignee} 等
+    # 占位符）。直接把原文塞进提醒 → 角色收到"用户指令：## 诊断结果 {description}"，
+    # 拿未填充的占位符无法回答"是否解决了用户的问题"（实测 2026-10-17：product_architect
+    # /maintainer 的提醒里 {description}/{assignee} 原样出现，且该未替换文本被
+    # _UNMATCHED_VAR_RE 拦下 → 提醒投递失败 → 用户要求的"重复提醒"机制整体失效）。
+    # 用 run.context 做最小填充——与 _fill_prompt_vars 同源，但不依赖 engine 实例。
+    goal_text = _re.sub(r"^/goal(?:\s+|$)", "",
+                        getattr(step, 'prompt_template', '') or '',
+                        count=1, flags=_re.IGNORECASE).strip()
+    _ctx = getattr(run, 'context', None) or {}
+    # 变量表与 _fill_prompt_vars 对齐（db 模板实测出现 {title}/{description}/{assignee}，
+    # {task_definition}/{topic}/{acceptance_criteria} 为 JSON 模板源可能出现的同义变量）。
+    # 每个都以 title 兜底：tasks.description 91% 为空（616/675 实测），
+    # 只填 description 会让绝大多数提醒仍带未替换变量并被守卫拦下。
+    # 末级兜底用 prompt_template 原文摘要而非固定字串：两个 bypass 调用点用
+    # SimpleNamespace 构造 run/step，**不传 context/workflow_name/title**
+    # （engine.py:858、wf_lifecycle.py:208），前四级全部落空 —— 退回固定字串会让
+    # 提醒变成"需求：请针对 步骤 输出 步骤"，发得出但零信息量。模板里带着真实
+    # 任务语义（【做什么】【怎么做】），截断一段远比占位符有用。
+    _tpl_fb = " ".join((getattr(step, "prompt_template", "") or "").split())[:120]
+    _title_fb = (_ctx.get("title") or _ctx.get("description")
+                 or _ctx.get("task_title")
+                 or getattr(run, "workflow_name", "") or getattr(step, "title", "")
+                 or _tpl_fb or "未知任务")
+    for _var, _val in (
+        ("{description}", _ctx.get("description") or _title_fb),
+        ("{title}", _title_fb),
+        ("{assignee}", getattr(step, 'target_role', '') or ''),
+        ("{topic}", _ctx.get("topic") or _title_fb),
+        ("{task_definition}", _ctx.get("task_definition") or _title_fb),
+        ("{acceptance_criteria}", _ctx.get("description") or _title_fb),
+    ):
+        if _var in goal_text:
+            goal_text = goal_text.replace(_var, str(_val))
+    if not goal_text:
+        goal_text = getattr(step, 'title', '') or ''
     # 复用 CORE_QUESTIONS（与 DIMENSIONS 前两条同源，P1-1 统一）
     _questions = [
         f"步骤 {step.id} 即将完成（{path}），请回答：\n{CORE_QUESTIONS[0]}（简答）\n需求：{goal_text[:300]}",
@@ -196,9 +255,6 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
             LOGGER.debug("integrity: bypass %s send %d/%d failed for %s",
                          path, i, len(_questions), step.id)
             continue  # 单条失败不阻塞后续，继续发下一条
-    step_results.setdefault(step.id, {})["integrity_reminder_sent_bypass"] = True
-    if sync_step_results:
-        sync_step_results(run.id, run.step_results)
     LOGGER.info("integrity: bypass %s reminder sent for %s", path, step.id)
 
 
@@ -225,7 +281,10 @@ def make_full_prompt(run: object, step: object, step_results: dict) -> str:
     if hasattr(run, "context") and isinstance(run.context, dict):
         _title = run.context.get("title", "")
     if hasattr(step, "prompt_template"):
-        _goal = step.prompt_template or ""
+        # 剥离模板自带的 /goal 前缀：它是指令语法，不是需求原文。
+        # 原样输出会把字面的 /goal 混进「步骤目标：」喂给角色。
+        _goal = _re.sub(r"^/goal(?:\s+|$)", "", step.prompt_template or "",
+                        count=1, flags=_re.IGNORECASE).strip()
     parts = []
     if _title:
         parts.append(f"工作流目标：{_title}")

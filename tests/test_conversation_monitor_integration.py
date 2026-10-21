@@ -22,6 +22,21 @@ class FakeEngine(StepHandlerMixin):
         self._is_role_busy = MagicMock(return_value=False)
         self._consumed_exit_ids = set()
         self._bb = MagicMock()  # Blackboard mock（timeout 路径依赖）
+        self._workflows = MagicMock()  # step_handler 末位值门禁访问 self._workflows
+        # 显式声明无活跃子流：_tick 的 idle/violation cancel 分支都带
+        # `and not self._has_live_subflow(...)` 守卫（bus #407499 父步误杀子流修复）。
+        # 不覆写则 MagicMock 返回 truthy → 永远走 else，cancel_step 永不调用，
+        # 测试结论与生产逻辑相反（2 例假失败）。本测试组语义即"无子流"路径。
+        self._has_live_subflow = MagicMock(return_value=False)
+
+    def _fill_prompt_vars(self, prompt, step, wf_name, title, desc, results,
+                          prev_step_id="", wf_id=""):
+        """桩：真实实现在 WorkflowLifecycleMixin（本类只继承 StepHandlerMixin）。
+
+        超时重推路径会调它做 {title}/{description} 等变量替换；此处只需原样返回，
+        让本测试聚焦 tmux 信号分支。
+        """
+        return prompt
 
 
 class _FakeStep:
@@ -29,6 +44,8 @@ class _FakeStep:
 
     def __init__(self, exit_condition: dict):
         self.exit_condition = exit_condition
+        self.exit_schema = None
+        self.type = "single"
         self.max_retries = 1
         self.id = "s1"
         self.target_role = "scout"
@@ -67,8 +84,12 @@ def _run(status: str = "running") -> _FakeRun:
     return _FakeRun(status)
 
 
-def test_tmux_step_completed_triggers_exit():
-    """tmux pane 含 's1 完成' → step_completed 信号 → 直接 complete_step。"""
+def test_tmux_step_completed_blocks_when_bus_contract_without_schema():
+    """声明 bus 契约但无 exit_schema → pane 文本不得推进（防假完成）。
+
+    实测 wf_7045df494d/s1：pane 里「s1 闭环（已完成）」在投递 98 秒后触发
+    complete_step，exit_messages 为空——pane 是叙述不是产出证据。
+    """
     eng = FakeEngine()
     step = _step({"bus_category": "workflow", "timeout_minutes": 30})
     run = _run()
@@ -78,8 +99,23 @@ def test_tmux_step_completed_triggers_exit():
                                                completion_evidence="s1 完成")) as mock_sig:
         eng._tick(run, step)
         mock_sig.assert_called_once()
+        assert eng._lifecycle.complete_step.call_count == 0, \
+            "声明 bus 契约且无 exit_schema 时 tmux 信号不得推进"
+
+
+def test_tmux_step_completed_triggers_exit_without_contract():
+    """无 bus 契约的步骤 → tmux 信号仍可推进（否则只能等超时）。"""
+    eng = FakeEngine()
+    step = _step({"timeout_minutes": 30})
+    run = _run()
+
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=ConversationSignal(step_completed=True,
+                                               completion_evidence="s1 完成")) as mock_sig:
+        eng._tick(run, step)
+        mock_sig.assert_called_once()
         assert eng._lifecycle.complete_step.call_count == 1, \
-            "tmux 步骤完成信号应触发 complete_step"
+            "无契约步骤的 tmux 完成信号应触发 complete_step"
         assert eng._lifecycle.complete_step.call_args[0][:2] == ("wf_test", "s1")
 
 

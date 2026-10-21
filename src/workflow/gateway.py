@@ -93,8 +93,13 @@ class Gate:
         except sqlite3.OperationalError:
             # schema 无 allowed_initiators 列 → 跳过权限校验
             return True
-        if not row or not row["allowed_initiators"]:
-            # no allowed_initiators set → backward compatible, allow all
+        if not row:
+            # 模板不存在 → fail-closed。原实现把「模板不存在」与「未设置
+            # allowed_initiators」并为 `not row or not row[...]` 一起放行，
+            # 等于对未知模板授予发起权（门禁越权面）。
+            return False
+        if not row["allowed_initiators"]:
+            # 模板存在但未声明 allowed_initiators → backward compatible, allow all
             return True
         try:
             initiators = json.loads(row["allowed_initiators"])
@@ -112,8 +117,11 @@ class Gate:
         except sqlite3.OperationalError:
             # schema 无 allowed_executors 列 → 跳过权限校验
             return True
-        if not row or not row["allowed_executors"]:
-            # no allowed_executors set → backward compatible, allow all
+        if not row:
+            # 模板不存在 → fail-closed（同 check_can_initiate 的越权面）
+            return False
+        if not row["allowed_executors"]:
+            # 模板存在但未声明 allowed_executors → backward compatible, allow all
             return True
         try:
             executors = json.loads(row["allowed_executors"])

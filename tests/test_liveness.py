@@ -2,11 +2,13 @@
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from liveness import (
+    PANE_ACTIVE_WINDOW, _STALE_NOTIFIED_SEC,
     _db_fetch, _health_gate, _load_steps_json, _row_get,
     _s0_alive, _s1_thinking, _s2_producing, _s3_assigned, _s4_stepping,
     _tmux_has_session, role_liveness, tmux_pane_active,
@@ -169,21 +171,58 @@ class TestL4Stepping(unittest.TestCase):
         self.assertTrue(s["busy"])
         conn.close()
 
+    def test_stale_notified_not_busy(self):
+        """陈旧 notified（投递后长期零响应）不计占用 —— 防两条链互为"忙"饿死。
+
+        实测 wf_sub_4e63/wf_sub_b548 各卡一个 pg/s1 notified 110 分钟，
+        双方互判 busy，kick-stalled 每 10 分钟触发却直接 continue。
+        """
+        conn = self._conn()
+        stale = time.time() - _STALE_NOTIFIED_SEC - 60
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "notified", "notified_at": stale,
+                                          "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertFalse(s["busy"])
+        conn.close()
+
+    def test_fresh_notified_still_busy(self):
+        """新鲜 notified 仍算占用（角色可能正在思考，不该被抢）。"""
+        conn = self._conn()
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "notified",
+                                          "notified_at": time.time() - 5,
+                                          "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertTrue(s["busy"])
+        conn.close()
+
+    def test_stale_running_still_busy(self):
+        """running 不受陈旧豁免：它是角色主动写的执行中状态。"""
+        conn = self._conn()
+        stale = time.time() - _STALE_NOTIFIED_SEC - 60
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
+                      (json.dumps({"s1": {"status": "running", "notified_at": stale,
+                                          "timeout_count": 0}}),))
+        s = _s4_stepping("qa", conn)
+        self.assertTrue(s["busy"])
+        conn.close()
+
     def test_no_db_returns_unavailable(self):
         s = _s4_stepping("qa", None)
         self.assertFalse(s["busy"])
 
-    def test_truncated_scan_returns_not_busy(self):
-        """>40 个 running 实例 → 截断，不判忙（安全方向，review P2 补测）。"""
+    def test_high_instance_count_still_detects_busy(self):
+        """>40 个 running 实例不再截断放行：生产实测 82~173 个实例常驻，
+        旧截断会把所有角色判为不忙 → 引擎继续投递 → 积压自我放大。"""
         conn = self._conn()
-        for i in range(41):
+        for i in range(60):
             conn.execute("INSERT INTO workflow_instances VALUES(?, 'tpl', ?, 'engineer', NULL, 'running')",
                           (f"wf_{i}", json.dumps({"s1": {"status": "running", "timeout_count": 0}})))
-        s = _s4_stepping("qa", conn)
-        self.assertFalse(s["busy"])
-        self.assertTrue(s.get("truncated"))
+        s_busy = _s4_stepping("qa", conn)
+        self.assertTrue(s_busy["busy"], "高实例数下仍应按步骤 target_role 判忙")
+        self.assertNotIn("truncated", s_busy, "截断键已删除，不再返回")
         conn.close()
-
     def test_list_format_steps_json(self):
         """steps_json 为 list 格式（真实 DB 生产格式）→ 正确读取步骤定义。"""
         conn = sqlite3.connect(":memory:")
@@ -244,6 +283,17 @@ class TestL4Stepping(unittest.TestCase):
         self.assertTrue(s["busy"])
         conn.close()
 
+    def test_cache_miss_falls_back_to_db(self):
+        conn = self._conn()
+        conn.execute("INSERT INTO workflow_templates VALUES('tpl2',"
+                     "?)", (json.dumps([{"id": "s1", "target_role": "qa"}]),))
+        conn.execute("INSERT INTO workflow_instances VALUES('wf_2','tpl2',?,'engineer',NULL,'running')",
+                     (json.dumps({"s1": {"status": "running", "timeout_count": 0}}),))
+        # workflows 已提供但 tpl2 不在其中 → 必须回退 DB 加载 steps，否则漏判 busy
+        s = _s4_stepping("qa", conn, workflows={"other": object()})
+        self.assertTrue(s["busy"])
+        conn.close()
+
 
 class TestRoleLiveness(unittest.TestCase):
     def setUp(self):
@@ -265,6 +315,174 @@ class TestRoleLiveness(unittest.TestCase):
         res = role_liveness("qa", level=1, health_dir=self._hd)
         self.assertTrue(res["busy"])
         self.assertIn(1, res["signals"])
+
+
+class TestTmuxPaneActiveRegression(unittest.TestCase):
+    """回归守卫：tmux_pane_active 必须读活动时间戳，不得读焦点标志。
+
+    2026-10-17 P0：原实现读 #{pane_active}（焦点 0/1），单 pane 会话下恒为 1 →
+    恒 True → stale/dead 兜底永远成立 → 空闲角色被判忙 → 任务排队 → 饿死 → 回收，
+    全链停摆（bus #395128/#395235/#395251）。
+    """
+
+    def _run_stdout(self, stdout):
+        fake = MagicMock(returncode=0, stdout=stdout)
+        with patch("liveness.subprocess.run", return_value=fake) as m:
+            result = tmux_pane_active("qa", window=300)
+        return result, m
+
+    def test_reads_window_activity_not_pane_active(self):
+        """必须查 #{window_activity}；查 #{pane_active} 则此断言失败。"""
+        _, mock = self._run_stdout(str(int(time.time())) + "\n")
+        cmd = mock.call_args[0][0]
+        self.assertIn("#{window_activity}", cmd[-1],
+                      "必须用活动时间戳，焦点标志 pane_active 恒 1 会永远判忙")
+        self.assertNotIn("#{pane_active}", cmd[-1])
+
+    def test_recent_activity_is_true(self):
+        result, _ = self._run_stdout(str(int(time.time()) - 10) + "\n")
+        self.assertIs(result, True, "10s 前有输出应判活跃")
+
+    def test_silent_beyond_window_is_false(self):
+        result, _ = self._run_stdout(str(int(time.time()) - 5000) + "\n")
+        self.assertIs(result, False, "静默超窗应判不活跃")
+
+    def test_silent_but_cli_busy_is_true(self):
+        """长工具调用（codex review）静默 8~12min，但 CLI 仍在跑 → 不得判死亡。
+
+        2026-10-19 P0：只按 window_activity 判活，reviewer 跑 codex review 时
+        被判 False → 条件4 auto-cancel 杀掉 wf_sub_8de33/wf_sub_fb975。
+        """
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        busy = MagicMock(returncode=0, stdout="⏵⏵ bypass permissions on · esc to interrupt")
+        with patch("liveness.subprocess.run", side_effect=[ts, busy]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIs(result, True, "CLI 忙态被当成死亡：长工具调用期间会误杀工作流")
+
+    def test_silent_and_cli_idle_is_false(self):
+        """静默超窗且底栏无忙态标记 → 真空闲/已死，保留回收路径。"""
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        idle = MagicMock(returncode=0, stdout="❯ \n⏵⏵ bypass permissions on")
+        with patch("liveness.subprocess.run", side_effect=[ts, idle]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIs(result, False, "真空闲被误判为忙：回收路径失效，卡死实例永驻")
+
+    def test_busy_probe_failure_is_unknown(self):
+        """忙态二次探测失败 → None（保守不杀），不把探测故障翻译成死亡。"""
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        with patch("liveness.subprocess.run", side_effect=[ts, FileNotFoundError]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIsNone(result)
+
+    def test_empty_output_is_unknown_not_busy(self):
+        """恒空输出（旧代码失败的形态）必须返回 None，不能返回 True。"""
+        result, _ = self._run_stdout("\n")
+        self.assertIsNone(result, "无数据 ≠ 活跃，须交调用方按未知处理")
+
+    def test_zero_timestamp_is_unknown(self):
+        result, _ = self._run_stdout("0\n")
+        self.assertIsNone(result)
+
+    def test_unparsable_output_is_unknown(self):
+        result, _ = self._run_stdout("not-a-number\n")
+        self.assertIsNone(result)
+
+    def test_tmux_missing_is_unknown(self):
+        with patch("liveness.subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(tmux_pane_active("qa"))
+
+
+class TestStaleRoleNotBusyWhenSilent(unittest.TestCase):
+    """回归守卫：stale 判定本身不得被 pane 存活推翻（P0 的直接症状）。
+
+    stale 的语义就是「无输出且无产出」；若此时因 pane 存活改判 busy，
+    引擎会一直排队等待，而角色永远不会产出 → 饿死。
+    """
+
+    def setUp(self):
+        self._hd = Path(tempfile.mkdtemp())
+
+    def _write(self, data):
+        (self._hd / "qa.json").write_text(json.dumps(data))
+
+    @patch("liveness.tmux_pane_active", return_value=False)
+    def test_stale_and_silent_is_not_busy(self, _m):
+        self._write({"survival_overall": "stale", "survival_l3_producing": False})
+        gate, _ = _health_gate("qa", self._hd, pane_fallback=True)
+        self.assertIs(gate, False)
+
+    @patch("liveness.tmux_pane_active", return_value=True)
+    def test_stale_but_recent_output_is_busy(self, _m):
+        """兜底仍应存在：health 快照 stale 但 pane 刚有输出（推理中）→ 不打断。"""
+        self._write({"survival_overall": "stale"})
+        gate, _ = _health_gate("qa", self._hd, pane_fallback=True)
+        self.assertIs(gate, True)
+
+
+class TestL4EffectiveRoleOverride(unittest.TestCase):
+    """开发角色池分流后，忙检测必须按实际执行者判定（不是模板 target_role）。
+
+    生产事故（2026-10-20 02:07~03:2x）：wf_sub_4e63ad633d39 / wf_sub_b548d0e2495a
+    分流到 pg、effective_roles={"s1":"pg"}，模板 target_role 仍是 engineer。
+    只比对模板值 → engineer 被两个自己不执行的子链永久判忙 →
+    父链 WL-food_chain_loop/s4 与 WF-product_delivery/s4 停滞 75min+
+    （journal 每 tick: liveness: skip engineer busy with wf_sub_b548/s1）。
+    """
+
+    def _conn(self, effective_roles: str):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE workflow_instances(instance_id TEXT, template_id TEXT, "
+            "step_results TEXT, assigner TEXT, parent_wf_id TEXT, effective_roles TEXT, "
+            "status TEXT)")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        conn.execute("INSERT INTO workflow_templates('template_id','steps_json') VALUES('tpl',?)",
+                      (json.dumps({"steps": [{"id": "s1", "target_role": "engineer"}]}),))
+        conn.execute(
+            "INSERT INTO workflow_instances VALUES('wf_sub_x','tpl',?,'workflow_engine',"
+            "'wf_main',?,'running')",
+            (json.dumps({"s1": {"status": "notified", "timeout_count": 0}}), effective_roles))
+        return conn
+
+    def test_engineer_not_busy_when_step_reassigned_to_pg(self):
+        conn = self._conn(json.dumps({"s1": "pg"}))
+        s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
+        self.assertFalse(s["busy"], "步骤已改投 pg，engineer 不应被判忙")
+        conn.close()
+
+    def test_pg_busy_when_step_reassigned_to_pg(self):
+        conn = self._conn(json.dumps({"s1": "pg"}))
+        s = _s4_stepping("pg", conn, exclude_wf_id="wf_other")
+        self.assertTrue(s["busy"], "实际执行者 pg 应被判忙")
+        conn.close()
+
+    def test_engineer_busy_without_override(self):
+        conn = self._conn("{}")
+        s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
+        self.assertTrue(s["busy"], "无覆盖时仍按模板 target_role 判忙")
+        conn.close()
+
+    def test_bare_name_template_resolves_with_wf_prefix(self):
+        """实例写裸名 engineer_feature，注册表存 WF-engineer_feature → 需回退查到。
+
+        不回退时 _load_steps_json 返回 None → 该实例在忙检测中被静默跳过
+        （实测 wf_sub_4e63/wf_sub_b548 在 running 中却从未被 pg 判忙）。
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE workflow_instances(instance_id TEXT, template_id TEXT, "
+            "step_results TEXT, assigner TEXT, parent_wf_id TEXT, effective_roles TEXT, "
+            "status TEXT)")
+        conn.execute("CREATE TABLE workflow_templates(template_id TEXT, steps_json TEXT)")
+        conn.execute("INSERT INTO workflow_templates VALUES('WF-engineer_feature',?)",
+                      (json.dumps([{"step_id": "s1", "target_role": "engineer"}]),))
+        conn.execute(
+            "INSERT INTO workflow_instances VALUES('wf_sub_y','engineer_feature',?,"
+            "'workflow_engine','wf_main','{}','running')",
+            (json.dumps({"s1": {"status": "notified", "timeout_count": 0}}),))
+        s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
+        self.assertTrue(s["busy"], "裸名模板应回退到 WF- 前缀后判忙")
+        conn.close()
 
 
 if __name__ == "__main__":

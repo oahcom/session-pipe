@@ -43,7 +43,8 @@ session-roles（定义层）
 
 | 地址 | 所属 | 用途 |
 |------|------|------|
-| `:20128` | nine-router | 模型路由 |
+| `:20127` | nine-router | 模型路由（主实例） |
+| `:20128` | nine-router | 模型路由（旧实例，回落） |
 | `:8767` | hermes-gateway | 外部网关 |
 | `:8890` | hermes-control-panel | 控制面板 |
 | `:9901` | memory-server-dkk | 大姐记忆服务 |

@@ -51,6 +51,19 @@ def test_completion_s1_done():
     assert "s1" in sig.completion_evidence
 
 
+
+def test_completion_negated_phrases_not_flagged():
+    """否定/疑问/将来语气的 s<N>+完成 不得判完成（防 pane 假完成）。
+
+    实测 wf_7045df494d/s1：pane 中「s1 闭环（已完成）」触发 98 秒假完成；
+    而旧正则 `(s\\d+ .*完成)` 的裸子串匹配会把下列句子全部误判为完成。
+    """
+    for text in ("s2 还没完成", "s1 完成了吗？", "我在检查 s4 完成的证据",
+                 "s3 完成前不推进", "s2 待完成", "s1 未完成"):
+        sig = parse_conversation_signals(text, "engineer")
+        assert not sig.step_completed, f"否定/疑问句误判完成: {text!r}"
+
+
 def test_completion_step_done_ready():
     """信号1: step_done_ready 显式标记"""
     text = "step_done_ready 状态已标记，等待确认"
@@ -102,7 +115,7 @@ def test_idle_excludes_waiting_reply():
 
 def test_violation_engineer_kubectl():
     """信号3: engineer 执行 kubectl → deploy 越界"""
-    text = "$ kubectl apply -f deploy.yaml"
+    text = "  ⎿  $ kubectl apply -f deploy.yaml"
     sig = parse_conversation_signals(text, "engineer")
     assert sig.violation_found
     assert any("deploy" in cmd for cmd in sig.violation_commands)
@@ -110,7 +123,7 @@ def test_violation_engineer_kubectl():
 
 def test_violation_qa_writes_code():
     """信号3: qa 写代码越界"""
-    text = "$ cat > new_module.py << EOF"
+    text = "  ⎿  $ cat > new_module.py << EOF"
     sig = parse_conversation_signals(text, "qa")
     assert sig.violation_found
     assert any("write_code" in cmd for cmd in sig.violation_commands)
@@ -118,10 +131,101 @@ def test_violation_qa_writes_code():
 
 def test_violation_pg_runs_tests():
     """信号3: pg 跑 pytest 越界"""
-    text = "$ python3 -m pytest tests/"
+    text = "  ⎿  $ python3 -m pytest tests/"
     sig = parse_conversation_signals(text, "pg")
     assert sig.violation_found
     assert any("run_tests" in cmd for cmd in sig.violation_commands)
+
+
+# ── 误报回归（2026-10-16）──
+# 判据原先对**整段 pane 文本**跑正则，把人话当命令：角色写调研报告、引用验证
+# 命令、读含关键词的日志，都被判越界。实测 5 样本中 3 个纯文本讨论全误判。
+# 放大效应：误报 → 引擎反复注入停止指令/cancel_step → 步骤不推进 → 2.4h 后
+# 当僵尸回收（wf_6ff71a38016c 的 s1 累计 violation_count=26，而其 transcript
+# 里 2911 条 Bash 命令全是只读，真实越界 0 次）。
+
+def test_discussing_pytest_in_prose_not_violation():
+    """正文讨论 pytest 不判越界——scout 调研报告的正常内容。"""
+    text = "本次调研发现该项目的 pytest 覆盖率已达 87%，建议关注"
+    sig = parse_conversation_signals(text, "scout")
+    assert not sig.violation_found, f"正文讨论被误判: {sig.violation_commands}"
+
+def test_citing_command_in_prose_not_violation():
+    """正文引用验证命令不判越界——写报告时的正常内容。"""
+    text = "验证命令: systemctl is-active hermes-gateway"
+    sig = parse_conversation_signals(text, "scout")
+    assert not sig.violation_found, f"命令引用被误判: {sig.violation_commands}"
+
+def test_reading_log_mentioning_systemctl_not_violation():
+    """读含 systemctl 字样的日志不判越界。"""
+    text = "日志显示 systemctl status 反复报 failed，根因是 unit 文件路径错误"
+    sig = parse_conversation_signals(text, "scout")
+    assert not sig.violation_found, f"读日志被误判: {sig.violation_commands}"
+
+def test_executed_command_with_echo_marker_still_flagged():
+    """正向控制：带 ⎿ 回显的已执行命令**仍须**判越界。
+
+    防止判据被改过头成"永不报警"的静默器——只放行叙述文字而放过真实执行。
+    """
+    text = "  ⎿  ⏵ $ systemctl restart hermes-gateway"
+    sig = parse_conversation_signals(text, "scout")
+    assert sig.violation_found, "已执行命令应判越界，实际被放过"
+
+def test_readonly_systemctl_query_not_violation():
+    """只读 systemctl 查询（排障常用）不判 edit_config 越界。
+
+    实测 2026-10-17：engineer 执行 `systemctl status user@1000` 排障被误报
+    「越界: edit_config」，引擎连发停止指令卡住工作流 s1。
+    """
+    for cmd in ("systemctl status user@1000.service --no-pager",
+                "systemctl is-active user@1000.service",
+                "systemctl cat hermes-dbus-watchdog.service",
+                "systemctl show user@1000 -p TimeoutStopUSec",
+                "systemctl list-timers --all"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert not sig.violation_found, f"只读查询被误判: {cmd} -> {sig.violation_commands}"
+
+def test_readonly_and_lifecycle_systemctl_not_edit_config():
+    """只读查询与生命周期动作（start/stop）不判 edit_config。
+
+    实测 bus #397969/#398702：`systemctl start user@1000`（maintainer 恢复动作）
+    与 `systemctl status`（排障）均被误报，引擎连发停止指令卡住工作流。
+    """
+    for cmd in ("systemctl start user@1000.service",
+                "sudo systemctl stop user@1000.service",
+                "systemctl restart hermes-gateway"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert not any("edit_config" in c for c in sig.violation_commands), \
+            f"误判 edit_config: {cmd} -> {sig.violation_commands}"
+
+def test_config_writing_systemctl_still_flagged():
+    """正向控制：写配置类 systemctl 子命令仍须判 edit_config 越界（防矫枉过正）。"""
+    sig = parse_conversation_signals("  ⎿  $ systemctl disable hermes-gateway.service\n", "engineer")
+    assert sig.violation_found, "写配置子命令应判越界，实际被放过"
+    assert any("edit_config" in c for c in sig.violation_commands), sig.violation_commands
+
+def test_flag_prefixed_config_write_still_flagged():
+    """P1-1 回归: 动词前带 flag 的写配置仍须判越界。
+
+    `systemctl --user <verb>` 是本生态主导写法（~/.hermes/scripts/ 内 80 处）。
+    收窄正则若要求动词紧跟 systemctl，则 flag 前缀写配置全部漏判（reviewer
+    dev_implement/s2 CONDITIONAL_APPROVED P1-1）。
+    """
+    for cmd in ("systemctl --user disable x.service",
+                "systemctl --user enable x.timer",
+                "sudo systemctl --user mask x",
+                "systemctl --now disable x"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert sig.violation_found, f"flag 前缀写配置漏判: {cmd}"
+        assert any("edit_config" in c for c in sig.violation_commands), sig.violation_commands
+
+def test_flag_prefixed_readonly_still_not_flagged():
+    """反向控制: flag 前缀的只读查询仍不判越界（防 flag 通配过头）。"""
+    for cmd in ("systemctl --user status x.service",
+                "systemctl --user is-active x",
+                "systemctl --user show x -p TimeoutStopUSec"):
+        sig = parse_conversation_signals(f"  ⎿  $ {cmd}\n", "engineer")
+        assert not sig.violation_found, f"flag 前缀只读查询被误判: {cmd} -> {sig.violation_commands}"
 
 
 def test_no_violation_engineer_normal_work():
@@ -133,7 +237,7 @@ def test_no_violation_engineer_normal_work():
 
 def test_violation_coordinator_deploy():
     """信号3: coordinator deploy 越界"""
-    text = "$ git push origin main"
+    text = "  ⎿  $ git push origin main"
     sig = parse_conversation_signals(text, "coordinator")
     assert sig.violation_found
     assert any("deploy" in cmd for cmd in sig.violation_commands)
@@ -143,7 +247,7 @@ def test_combined_signals():
     """组合信号：完成 + 空闲 + 越界同时出现"""
     text = """✔ Goal achieved (15s · 1 turn · 351 tokens)
 ● Same generic template. No change. Idle.
-$ kubectl get pods"""
+  ⎿  $ kubectl get pods"""
     sig = parse_conversation_signals(text, "engineer")
     assert sig.step_completed
     assert sig.idle_complaint
@@ -180,7 +284,7 @@ def test_propose_idle_signal_writes_bus():
 
 def test_propose_violation_signal_writes_bus():
     """violation 命中 → 写 bus architecture 提案"""
-    pane = "kubectl apply -f prod.yaml\nsystemctl restart hermes-gateway"
+    pane = "  ⎿  $ kubectl apply -f prod.yaml\n  ⎿  $ systemctl restart hermes-gateway"
     with mock.patch("conversation_monitor.capture_role_pane", return_value=pane), \
          mock.patch("conversation_monitor.subprocess.run") as m_run:
         result = propose_governance_action("engineer")
@@ -210,8 +314,10 @@ def test_scan_and_propose_counts_proposals():
     with mock.patch("conversation_monitor.capture_role_pane",
                     side_effect=[idle_text, normal_text]), \
          mock.patch("conversation_monitor.subprocess.run") as m_run:
-        n = scan_and_propose(["engineer", "maintainer"])
-        assert n == 1, f"期望 1 个提案，得到 {n}"
+        out = scan_and_propose(["engineer", "maintainer"])
+        assert len(out) == 1, f"期望 1 个提案，得到 {len(out)}"
+        assert out[0]["role"] == "engineer"
+        assert out[0]["_action"] == "idle"
         assert m_run.call_count == 1
 
 
@@ -220,7 +326,30 @@ def test_scan_and_propose_skips_test_persona():
     with mock.patch("conversation_monitor.capture_role_pane",
                     return_value="No change, idle"), \
          mock.patch("conversation_monitor.subprocess.run") as m_run:
-        n = scan_and_propose(["dead_role", "e2e_test", "t"])
-        assert n == 0, "测试 persona 不应產出治理提案"
+        out = scan_and_propose(["dead_role", "e2e_test", "t"])
+        assert out == [], "测试 persona 不应產出治理提案"
         assert not m_run.called
 
+
+
+def test_write_other_workspace_exempts_self_per_role():
+    """workspace 禁区必须豁免**本角色自己**，而非硬编码单一角色。
+
+    原正则写死 `(?!engineer)`，而 write_other_workspace 实际只配给 pg
+    （session-launcher/src/routing/roles.py:54）→ pg 读写自己的
+    ccs-workspaces/pg/ 每次命中，被判越界，引擎注入撤销指令耗掉一轮。
+    断言：同一路径，本角色不命中、他人命中。
+    """
+    import re as _re
+    from conversation_monitor import _SHELL_SIGNATURES
+    tpl = _SHELL_SIGNATURES["write_other_workspace"][0]
+
+    def hits(role, path):
+        return bool(_re.search(tpl.replace("{_self}", _re.escape(role)), path))
+
+    WS = "/home/administrator/ccs-workspaces/"
+    assert not hits("pg", f"{WS}pg/x.py"), "pg 读写自己的 workspace 不应判越界"
+    assert hits("pg", f"{WS}qa/x.py"), "pg 写他人 workspace 应判越界"
+    assert not hits("engineer", f"{WS}engineer/x.py"), "engineer 读写自己应豁免"
+    assert not hits("maintainer", f"{WS}maintainer/x.py"), "任意角色都该豁免自己"
+    assert hits("maintainer", f"{WS}qa/x.py"), "写他人仍须拦截"

@@ -258,3 +258,106 @@ class TestTitlePlaceholder:
     def test_engineer_task_1_is_placeholder(self):
         from workflow.client import WorkflowClient
         assert WorkflowClient._title_is_placeholder("engineer task #1") is True
+
+
+class TestMetaHardErrors:
+    """R77 回归守卫：建议性错误不得阻断推荐，结构性错误必须阻断。
+
+    背景：recommend() 曾用 _validate_meta().passed 做门禁，导致 34 个模板中
+    29 个（含全部角色专属模板）被"缺三段式/长度不足"这类文体建议挡掉，
+    路由 daemon 无法为任何角色建任务 → 13 个 CCS 角色无限空转。
+    """
+
+    def _tpl(self, pt):
+        return {
+            "trigger_scene": ["测试场景"], "allowed_initiators": ["pm"],
+            "allowed_executors": ["engineer"], "max_duration_hours": 8,
+            "quality_standards": "单元测试覆盖率 >=80%，接口测试通过率 100%",
+            "steps": [{"id": "s1", "title": "步骤", "type": "handoff",
+                       "target_role": "engineer", "prompt_template": pt + "\n## 完成\n写 bus。",
+                       "exit_condition": {"bus_category": "code_fix"}}],
+        }
+
+    def test_missing_three_sections_is_advisory_not_hard(self):
+        from template_registry import _meta_hard_errors
+        assert _meta_hard_errors(self._tpl("/goal\n一段没有三段式的 prompt，长度足够" * 5)) == []
+
+    def test_short_prompt_is_advisory_not_hard(self):
+        from template_registry import _meta_hard_errors
+        assert _meta_hard_errors(self._tpl("/goal\n短")) == []
+
+    def test_missing_required_meta_field_is_hard(self):
+        from template_registry import _meta_hard_errors
+        t = self._tpl("/goal\n" + "内容" * 100)
+        del t["quality_standards"]
+        assert any("missing meta field: quality_standards" in e
+                   for e in _meta_hard_errors(t))
+
+    def test_generic_quality_standards_wording_is_advisory(self):
+        from template_registry import _meta_hard_errors
+        t = self._tpl("/goal\n" + "内容" * 100)
+        t["quality_standards"] = "通过"
+        assert _meta_hard_errors(t) == []
+
+    def test_empty_trigger_scene_is_hard(self):
+        from template_registry import _meta_hard_errors
+        t = self._tpl("/goal\n" + "内容" * 100)
+        t["trigger_scene"] = []
+        assert any("trigger_scene" in e for e in _meta_hard_errors(t))
+
+
+class TestRecommendSystemInitiator:
+    """R77 回归守卫：路由 daemon 以 initiator_role='system' 建任务时，
+    不得因 allowed_initiators 不含 'system' 而被排除。
+
+    自建隔离 DB + 临时模板，不依赖生产模板库。
+    """
+    _SCENE = "产品设计与架构评审任务"
+
+    def setup_method(self):
+        from template_registry import TemplateRegistry
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        self.reg = TemplateRegistry(db_path=self.db_path)
+        self.reg.register({
+            "workflow_id": "WL-RT77", "name": "r77_guard",
+            "description": "R77 回归守卫用的最小角色专属模板",
+            "trigger_scene": [self._SCENE],
+            "allowed_initiators": ["pm"], "allowed_executors": ["engineer"],
+            "max_duration_hours": 24,
+            "quality_standards": "单元测试覆盖率 >=80%，接口测试通过率 100%",
+            "steps": [{
+                "id": "s1", "title": "编码", "type": "handoff",
+                "target_role": "engineer", "prompt_template": LONG_PROMPT,
+                "failure_patterns": ["编译失败", "测试未通过"],
+                "exit_condition": {"bus_category": "code_fix"},
+            }],
+        })
+
+    def teardown_method(self):
+        self.reg.close()
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_system_initiator_equivalent_to_empty(self):
+        a = self.reg.recommend(self._SCENE, initiator_role="", assignee="engineer")
+        b = self.reg.recommend(self._SCENE, initiator_role="system", assignee="engineer")
+        assert len(a) == 1 and len(b) == len(a), \
+            f"system 应与空发起等效且推荐到 1 个，实际 {len(a)} vs {len(b)}"
+
+    def test_system_initiator_reaches_role_specific_template(self):
+        """核心回归：修复前 recommend 把 'system' 当业务角色比对
+        allowed_initiators（只含 'pm'），engineer 的专属模板被排除 → n=0 →
+        路由 daemon 无法为任何角色建任务。"""
+        got = self.reg.recommend(self._SCENE, initiator_role="system", assignee="engineer")
+        assert got and got[0]["template_id"] == "WL-RT77", \
+            f"system 发起应能推荐到角色专属模板，实际 {got}"
+
+    def test_real_role_initiator_still_filtered(self):
+        """安全：真实业务角色仍受 allowed_initiators 约束，权限模型不放宽。"""
+        assert self.reg.recommend(
+            self._SCENE, initiator_role="scout", assignee="engineer") == []
+
+    def test_wrong_executor_still_filtered(self):
+        """安全：assignee 不在 allowed_executors → 不推荐。"""
+        assert self.reg.recommend(
+            self._SCENE, initiator_role="system", assignee="qa") == []

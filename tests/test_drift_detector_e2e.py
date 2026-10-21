@@ -84,3 +84,17 @@ def test_detect_all_drift(tmp_path):
     assert len(result["verifier"]) == 1
     assert result["verifier"][0]["category"] == "random_cat"
     assert "rebutter" not in result
+
+def test_engine_task_spec_writeback_is_not_drift():
+    """回归：引擎经 ccs.py send 把任务分配以 src=角色 回写 cat=task_spec 是输入信道，
+    不应被判为角色产出越界（PM 确认 pm 收到任务分配被误报 task_spec 越界）。
+    """
+    config = {"name": "pm", "output_targets": ["cat=user_story", "cat=feedback"]}
+    with mock.patch("drift_detector._load_role_config", return_value=config):
+        with mock.patch("drift_detector.Blackboard") as mock_bb:
+            mock_bb.return_value.read.return_value = [
+                FakeFact("task_spec", "新功能开发任务 | 用户反馈收敛模块"),
+                FakeFact("user_story", "ok"),
+            ]
+            result = detect_drift("pm")
+    assert result == []

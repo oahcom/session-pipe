@@ -1,4 +1,4 @@
-"""Unit tests for routing/routes.py — _match_investigator, dispatch_investigator, route_all, route_to_ccs, route_all_to_ccs.
+"""Unit tests for routing/routes.py — route_all, route_to_ccs, route_all_to_ccs.
 
 Mocks all external deps (bus, subprocess, reliability globals).
 """
@@ -9,110 +9,6 @@ from unittest.mock import patch, MagicMock
 _src = Path(__file__).resolve().parent.parent / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
-
-
-# ── _match_investigator: 纯函数，直接测 ──
-
-
-def test_match_investigator_empty_returns_general():
-    from routing.routes import _match_investigator
-    assert _match_investigator("") == "investigator_general"
-    assert _match_investigator(None) == "investigator_general"
-
-
-def test_match_investigator_python_keywords():
-    from routing.routes import _match_investigator
-    assert _match_investigator("Traceback (most recent call last):") == "investigator_python"
-    assert _match_investigator("ImportError: No module named 'foo'") == "investigator_python"
-    assert _match_investigator("pip install requests") == "investigator_python"
-    assert _match_investigator("pytest test_foo.py") == "investigator_python"
-
-
-def test_match_investigator_senior_keywords():
-    from routing.routes import _match_investigator
-    assert _match_investigator("segfault at address 0xdeadbeef") == "investigator_senior"
-    assert _match_investigator("deadlock detected in thread pool") == "investigator_senior"
-    assert _match_investigator("OOM killed process 1234") == "investigator_senior"
-    assert _match_investigator("race condition in shared dict") == "investigator_senior"
-
-
-def test_match_investigator_python_beats_senior():
-    """Python 关键字优先于 senior 关键字。"""
-    from routing.routes import _match_investigator
-    result = _match_investigator("Traceback crash segfault")
-    assert result == "investigator_python"
-
-
-def test_match_investigator_fallback_general():
-    from routing.routes import _match_investigator
-    assert _match_investigator("normal message, no special keywords") == "investigator_general"
-
-
-def test_match_investigator_case_insensitive():
-    from routing.routes import _match_investigator
-    assert _match_investigator("SEGFAULT in kernel") == "investigator_senior"
-
-
-# ── dispatch_investigator ──
-
-
-def _make_fact(fact_id, cat, title, evidence=""):
-    """构造 Blackboard Fact 哑对象。"""
-    f = MagicMock()
-    f.id = fact_id
-    f.cat = cat
-    f.t = title
-    f.e = evidence
-    return f
-
-
-@patch("routing.routes._rt_mod")
-@patch("bus_protocol.Blackboard")
-def test_dispatch_investigator_filters_needs_investigation(mock_bb_cls, mock_rt):
-    """只处理含 needs_investigation/needs_triage 的消息。"""
-    from routing.routes import dispatch_investigator
-    bb = MagicMock()
-    mock_bb_cls.return_value = bb
-    bb.unconsumed.return_value = [
-        _make_fact(1, "code_fix", "bug report", "needs_investigation — traceback detected"),
-        _make_fact(2, "architecture", "design doc", "no filter keyword here"),
-        _make_fact(3, "code_fix", "error log", "needs_triage — crash dump"),
-    ]
-    result = dispatch_investigator(category="code_fix", dry_run=True)
-    assert result["total"] == 2
-    roles = [d["assigned_investigator"] for d in result["details"]]
-    assert "investigator_python" in roles
-
-
-@patch("routing.routes._rt_mod")
-@patch("bus_protocol.Blackboard")
-def test_dispatch_investigator_dry_run_no_write(mock_bb_cls, mock_rt):
-    """dry_run=True → 不写入 bus。"""
-    from routing.routes import dispatch_investigator
-    bb = MagicMock()
-    mock_bb_cls.return_value = bb
-    bb.unconsumed.return_value = [
-        _make_fact(1, "code_fix", "err", "needs_investigation — ImportError"),
-    ]
-    result = dispatch_investigator(category="code_fix", dry_run=True)
-    assert result["dispatched"] == 0
-    bb.write.assert_not_called()
-
-
-@patch("routing.routes._rt_mod")
-@patch("bus_protocol.Blackboard")
-def test_dispatch_investigator_real_write(mock_bb_cls, mock_rt):
-    """dry_run=False → 写入 notice 分类。"""
-    from routing.routes import dispatch_investigator
-    bb = MagicMock()
-    mock_bb_cls.return_value = bb
-    bb.unconsumed.return_value = [
-        _make_fact(1, "code_fix", "err", "needs_investigation — segfault"),
-    ]
-    result = dispatch_investigator(category="code_fix", dry_run=False)
-    assert result["dispatched"] == 1
-    bb.write.assert_called_once()
-    assert bb.write.call_args[0][0] == "notice"
 
 
 # ── route_all: mock routing.auto.poll_unconsumed + 局部依赖 ──
@@ -280,8 +176,11 @@ def test_route_to_ccs_not_running_skips(mock_metrics, mock_hb):
 def test_route_to_ccs_send_success(mock_hb, mock_metrics):
     """发送成功 → action=routed。"""
     from routing.routes import route_to_ccs
+    # 载体分类用 bug_report（待办请求）而非 code_fix：后者自 2026-10-17 起归入
+    # _SYSTEM_CATEGORIES（它承载的是"已修复"回报，不是请求），不再 mint 任务。
+    # 本用例验证的是"含内容词的标题应建 workflow"的路由逻辑，与载体分类无关。
     msgs = [{
-        "id": 32, "category": "code_fix", "text": "修复登录模块非json文本",
+        "id": 32, "category": "bug_report", "text": "修复登录模块非json文本",
         "priority": 1,
     }]
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
@@ -306,6 +205,40 @@ def test_route_to_ccs_send_success(mock_hb, mock_metrics):
     # 标题含内容词且 ≥8 字符时创建 workflow（与 route_all 阈值统一）
     mock_wf.return_value.create_task_v2.assert_called_once()
 
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_bug_report_label_mints_task(mock_hb, mock_metrics):
+    """[bug_report] 标签 + bug_report 分类 = 真实缺陷报告，必须建任务。
+
+    回归 #421072/#421074：旧判据"[xxx] 开头一律拦"使 36 条 qa 缺陷报告
+    在 tasks 表零记录，缺陷无人接手。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{
+        "id": 421072, "category": "bug_report", "src": "qa",
+        "text": "[bug_report] [P1] architect_full_design s1/s2 缺 require_wf",
+        "priority": 1,
+    }]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("routing.routes.sys") as mock_sys, \
+         patch("subprocess.run") as mock_run, \
+         patch("routing.routes.WorkflowClient") as mock_wf:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = "running"
+        status_result.returncode = 0
+        send_result = MagicMock()
+        send_result.stdout = ""
+        send_result.stderr = ""
+        send_result.returncode = 0
+        mock_run.side_effect = [status_result, send_result]
+        mock_sys.executable = "/usr/bin/python3"
+        mock_wf.return_value.check_task.return_value = None
+        route_to_ccs("engineer", dry_run=False)
+    mock_wf.return_value.create_task_v2.assert_called_once()
 
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
@@ -433,3 +366,212 @@ def test_route_all_to_ccs_single_role(mock_metrics, mock_hb):
     assert result["routed"] == 2
     assert result["total"] == 2
     mock_r2c.assert_called_once_with("engineer", False)
+
+
+# ── _is_role_report_title: 防 fan-out 纯函数 ──
+# 实测 2026-10-17：无此判定时 [self-reflect] 复盘消息被 fan-out 到 9 个角色
+# （16 源事件 → 54 条"创建任务"，3.4 倍放大）。
+
+def test_is_role_report_title_blocks_bracketed_tags():
+    """[标签] 开头一律是系统自述/产出汇报，不建 workflow。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[self-reflect] 任务《x》无产出") is True
+    assert _is_role_report_title("[deploy] wf_xxx 产出已部署") is True
+    assert _is_role_report_title("[engineer] s1-complete (wf_xxx)") is True
+    assert _is_role_report_title("[maintainer] 创建任务: xxx") is True
+    assert _is_role_report_title("[qa] 唤醒: wf_x/s4 测试报告已就绪") is True
+
+
+def test_is_role_report_title_allows_real_tasks():
+    """真实任务标题不误杀。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("needs_implementation @qa 工作流任务") is False
+    assert _is_role_report_title("修复登录超时 bug") is False
+    assert _is_role_report_title("") is False
+    assert _is_role_report_title(None) is False
+
+
+def test_is_role_report_title_allows_content_category_labels():
+    """标签复用总线分类名 = 内容型待办，必须建任务（#421072 被静默吞掉）。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[bug_report] [P1] s1/s2 缺 require_wf", "bug_report", "qa") is False
+    assert _is_role_report_title("[design_issue] 单点瓶颈风险", "design_issue", "engineer") is False
+
+
+def test_is_role_report_title_still_blocks_engine_audit():
+    """引擎自写审计压倒一切：放行会形成引擎写审计→建任务→再写审计的自喂环。
+
+    真实形态：`[workflow] lr_tech_decision 完成: 3 步`（cat=workflow, src=workflow_engine，
+    历史 35 条）—— 标签与分类同名，只靠 src 守卫拦下。
+    """
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[workflow] lr_tech_decision 完成: 3 步", "workflow", "workflow_engine") is True
+    assert _is_role_report_title("[step_output] wf_x/s3 reviewer 产出审计", "workflow", "workflow_engine") is True
+
+
+def test_has_content_words_exempts_content_signal_categories():
+    """问题描述类分类不靠动词判定：无动词也必须放行（#423275/#422911 被吞）。"""
+    from routing.routes import _has_content_words
+    assert _has_content_words("[bug_report] cleanup_apply state_dir 仍取自计划", "bug_report") is True
+    assert _has_content_words("[bug_report] workflow_engine pipeflow 引擎链串味", "bug_report") is True
+
+
+def test_has_content_words_still_rejects_placeholders():
+    """豁免不外溢：普通分类仍要求内容词，纯占位标题依旧拦。"""
+    from routing.routes import _has_content_words
+    assert _has_content_words("ok", "workflow") is False
+    assert _has_content_words("[bug_report] cleanup 已完成", "code_fix") is False
+
+
+def test_is_role_report_title_blocks_when_label_differs_from_category():
+    """标签与分类不一致 = 角色汇报（[optimizer] cat=optimization）。"""
+    from routing.routes import _is_role_report_title
+    assert _is_role_report_title("[optimizer] 本轮优化 3 项", "optimization", "optimizer") is True
+
+
+def test_is_self_echo_suppresses_only_own_messages():
+    """回声抑制：只拦自己写的，不误杀他人（RFC 3834）。"""
+    from routing.routes import _is_self_echo
+    assert _is_self_echo({"src": "consumer"}, "consumer") is True
+    assert _is_self_echo({"src": "engineer"}, "consumer") is False
+    assert _is_self_echo({"src": "workflow_engine"}, "consumer") is False
+    assert _is_self_echo({}, "consumer") is False
+    assert _is_self_echo({"src": ""}, "consumer") is False
+
+
+
+# ── 注入文本前缀幂等（R106）：角色不该收到「[cat] [cat]」「证据: 证据:」 ──
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_prefix_is_idempotent(mock_metrics, mock_hb):
+    """fact 自带 [cat] 前缀与「证据: 」时不得重复拼接。"""
+    from routing.routes import route_to_ccs
+    msgs = [{
+        "id": 40, "category": "test_report",
+        "text": "[test_report] qa 三文档口径收敛",
+        "priority": 2, "evidence": "证据: 实跑核对 4 项",
+    }]
+    sent = {}
+
+    def _fake_run(cmd, *a, **k):
+        # status-role 返回存活；ccs.py send 的最后一个参数是被投递的正文
+        if any("status-role" in str(c) for c in cmd):
+            return MagicMock(returncode=0, stdout='{"alive": true}')
+        if "send" in cmd:
+            sent["body"] = cmd[-1]
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("subprocess.run", side_effect=_fake_run), \
+         patch("routing.routes.WorkflowClient") as mock_wfc:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        # WorkflowClient 直连实时生产 DB：不固定 check_task，本用例结果就取决于
+        # 当刻是否有 engineer 在跑工作流（全量套件里实测被判 deferred）。
+        mock_wfc.return_value.check_task.return_value = None
+        route_to_ccs("engineer", dry_run=False)
+
+    body = sent.get("body", "")
+    assert body.count("[test_report]") == 1, f"分类前缀重复: {body!r}"
+    assert body.count("证据:") == 1, f"证据前缀重复: {body!r}"
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_thinking_role_is_deferred_not_failed(mock_metrics, mock_hb):
+    """角色思考中（ccs send 返回 busy）→ deferred，且**不标记消费**。
+
+    busy 与投递失败必须分开：失败累计连败/告警，busy 只是排队。关键不变量是
+    不调 mark_consumed —— bus 本身就是队列，未消费的消息下轮自然重推同一 id，
+    既不会丢也不会重复投递。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 77, "category": "task_spec", "text": "do the thing", "priority": 2}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("routing.routes.sys") as mock_sys, \
+         patch("subprocess.run") as mock_run, \
+         patch("routing.routes.WorkflowClient") as mock_wf, \
+         patch("bus_protocol.Blackboard") as mock_bb:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = '{"alive": true}'
+        status_result.returncode = 0
+        send_result = MagicMock()
+        send_result.returncode = 2
+        send_result.stdout = '{"success": false, "reason": "busy"}'
+        send_result.stderr = ""
+        mock_run.side_effect = [status_result, send_result]
+        mock_sys.executable = "/usr/bin/python3"
+        mock_wf.return_value.check_task.return_value = None  # 无活跃工作流
+        result = route_to_ccs("engineer", dry_run=False)
+    d = result["details"][0]
+    assert d["action"] == "deferred", d
+    # 未消费 → 下轮重推同一 id，不丢
+    mock_bb.return_value.mark_consumed.assert_not_called()
+    # 不建任务
+    mock_wf.return_value.create_task_v2.assert_not_called()
+
+
+# ── 定向消息绕过分类过滤 ──
+
+def _engineer_router():
+    """真实的 engineer 订阅表：不含 notice/blocker（生产 routes 表原值）。"""
+    mock = MagicMock()
+    mock.routing = {"engineer": {"consume": [
+        "architecture", "task_spec", "user_story", "code_review", "bug_report",
+        "test_report", "test_plan", "documentation", "security_audit",
+        "system_design", "code_fix", "scheduler"]}}
+    return mock
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_directed_mention_bypasses_consume_filter(mock_metrics, mock_hb):
+    """@engineer 的 notice 不在 engineer 的 consume 列表，但点名了就必须送到。
+
+    实测 24h 内 62 条 @engineer 中 26 条（42%）被分类过滤丢弃，
+    其中 notice×13、blocker×4 —— 都是点名发给 engineer 的。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 88, "category": "notice", "text": "@engineer 你的修复没生效",
+             "priority": 2}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod:
+        mock_rt_mod.get_router.return_value = _engineer_router()
+        result = route_to_ccs("engineer", dry_run=True)
+    assert result["total"] == 1, "定向消息被分类过滤丢弃"
+    assert result["details"][0]["action"] == "dry_run"
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_undirected_unsubscribed_category_still_filtered(mock_metrics, mock_hb):
+    """没有 @ 的消息仍受分类过滤约束——广播抑制不能被这次改动拆掉。"""
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 89, "category": "notice", "text": "系统广播：某服务重启了",
+             "priority": 2}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod:
+        mock_rt_mod.get_router.return_value = _engineer_router()
+        result = route_to_ccs("engineer", dry_run=True)
+    assert result["total"] == 0, "未点名的无关分类不应投递给 engineer"
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_directed_task_spec_not_routed(mock_metrics, mock_hb):
+    """task_spec 是派发记录：写入者自己已 ccs send，路由再投就是双投。
+
+    实测 product_architect 存量 528 条 @它 的 task_spec 中位年龄 100h，
+    绕过分类过滤会把这批早已投过的锚点整批重放。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [{"id": 90, "category": "task_spec",
+             "text": "needs_implementation @engineer 工作流任务: wf_abc123/s1",
+             "priority": 1}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod:
+        mock_rt_mod.get_router.return_value = _engineer_router()
+        result = route_to_ccs("engineer", dry_run=True)
+    assert result["total"] == 0, "task_spec 锚点不得经路由重投"

@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-_PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
+_PIPELINE_SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
@@ -45,6 +45,9 @@ def _build_eng() -> WorkflowEngine:
     eng.runs_dir = eng.workflows_dir / "runs"
     eng._workflows = {}
     eng._lm = MagicMock()
+    # _fill_prompt_vars 需要 str 类型的 task_title/task_desc；MagicMock 默认返回
+    # MagicMock 导致 .replace() 抛 TypeError。配置 query 返回真实行数据。
+    eng._lm.query.return_value = [{"title": "测试任务", "description": "测试描述"}]
     eng._bb = MagicMock()
     eng._send_to_role = MagicMock()  # 阻止 tmux 子进程调用
     eng._sync_step_results = MagicMock()
@@ -202,6 +205,122 @@ def test_tick_escalation_every_third():
     assert len(coord_calls) >= 1, f"应有 coordinator 通知: calls={eng._send_to_role.call_args_list}"
 
 
+# ── 8b. tmux 信号推进必须过契约门 (exit_schema) ───────────────────
+
+def _fake_sig_step_completed():
+    from conversation_monitor import ConversationSignal
+    s = ConversationSignal()
+    s.step_completed = True
+    return s
+
+
+def test_tmux_signal_blocked_by_missing_schema_file():
+    """角色 pane 自称完成但契约文件没落盘 → 不得 complete_step。
+
+    实测 food_chain_loop/s7: 16:54:18 被 tmux 信号推进，而 VALUE_AUDIT.md
+    16:55:32 才落盘——盖戳时契约文件不存在，步骤被"半截子"确认。
+    """
+    eng = _build_eng()
+    eng._is_role_busy = MagicMock(return_value=False)
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_step_completed()):
+        step = _make_step(
+            exit_schema={"required": ["NO_SUCH_FILE_TMUX_XXXX"]},
+        )
+        run = _make_run()
+        eng._tick(run, step)
+
+    eng._lm.complete_step.assert_not_called()
+
+
+def test_tmux_signal_proceeds_when_schema_satisfied():
+    """契约文件已落盘 → tmux 信号正常推进（门不误伤正常路径）。"""
+    import tempfile
+    eng = _build_eng()
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    ws = Path(tempfile.mkdtemp())
+    (ws / "AUDIT_OK.md").write_text("FAIL\n" + "证据" * 60, encoding="utf-8")
+    with patch("pipeflow.step_handler._CCS_WORKSPACES", ws.parent), \
+         patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_step_completed()):
+        # _validate_exit_schema 用 _CCS_WORKSPACES / target_role 拼路径
+        step = _make_step(target_role=ws.name,
+                          exit_schema={"required": ["AUDIT_OK.md"]})
+        run = _make_run()
+        eng._tick(run, step)
+
+    eng._lm.complete_step.assert_called_once()
+
+
+
+# ── 8c. 子链存活门：空闲取消不得误杀有活子链的父步 ─────────────────
+
+def _fake_sig_idle():
+    from conversation_monitor import ConversationSignal
+    s = ConversationSignal()
+    s.idle_complaint = True
+    s.idle_evidence = "等待输入"
+    return s
+
+
+def _idle_run(**extra):
+    sd = {"status": "notified", "ts": time.time(),
+          "subflow_id": "wf_sub_child1",
+          "tmux_signals": {"idle_count": 4}}  # 本轮 +1 → 5 命中取消阈值
+    sd.update(extra)
+    return _make_run(step_results={"s1": sd})
+
+
+def test_idle_cancel_deferred_when_subflow_live():
+    """子链仍在跑 → 不得按空闲取消父步。
+
+    实测 wf_3f6128f1b3db/s2: 11:31:58 被空闲取消，子链 wf_sub_c5274c45c967
+    的 s2/s3 分别 11:32:27/11:34:57 才完成——取消时子链仍活。
+    """
+    eng = _build_eng()
+    eng._lm.query_one.return_value = {"status": "running"}
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(_idle_run(), _make_step())
+    eng._lm.cancel_step.assert_not_called()
+
+
+def test_idle_cancel_uses_parent_link_when_subflow_id_gone():
+    """subflow_id 已被历史 cancel 抹掉 → 退回 parent_wf_id 链接仍识别活子链。"""
+    eng = _build_eng()
+    eng._lm.query_one.side_effect = [
+        {"instance_id": "wf_sub_child1"}, {"status": "running"}]
+    run = _make_run(step_results={"s1": {"status": "notified", "ts": time.time(),
+                                         "tmux_signals": {"idle_count": 4}}})
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(run, _make_step())
+    eng._lm.cancel_step.assert_not_called()
+
+
+def test_idle_cancel_when_subflow_dead():
+    """子链已 cancelled（死）→ 父步空闲取消维持原语义。"""
+    eng = _build_eng()
+    eng._lm.query_one.return_value = {"status": "cancelled"}
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(_idle_run(), _make_step())
+    eng._lm.cancel_step.assert_called_once()
+
+
+def test_idle_cancel_no_subflow_unchanged():
+    """无子链 → 空闲取消行为不变（守卫不误伤普通步骤）。"""
+    eng = _build_eng()
+    eng._lm.query_one.return_value = None  # 无 parent 链接子链
+    run = _make_run(step_results={"s1": {"status": "notified", "ts": time.time(),
+                                         "tmux_signals": {"idle_count": 4}}})
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()):
+        eng._tick(run, _make_step())
+    eng._lm.cancel_step.assert_called_once()
+
+
 # ── 9. 空 exit_condition ──────────────────────────────────────────
 
 def test_tick_empty_exit_condition():
@@ -335,6 +454,10 @@ if __name__ == "__main__":
         ("7.  timeout_count 递增",          test_tick_timeout_increments_count),
         ("8.  每 3 次超时 escalation",      test_tick_escalation_every_third),
         ("10. 空 exit_condition",           test_tick_empty_exit_condition),
+        ("8c. 子链活→空闲取消延后",          test_idle_cancel_deferred_when_subflow_live),
+        ("8d. subflow_id 抹掉→parent 链接",  test_idle_cancel_uses_parent_link_when_subflow_id_gone),
+        ("8e. 子链死→空闲取消不变",          test_idle_cancel_when_subflow_dead),
+        ("8f. 无子链→空闲取消不变",          test_idle_cancel_no_subflow_unchanged),
         ("11. PID 锁首次获取",              test_acquire_pid_lock_first),
         ("12. PID 锁过期清理",              test_acquire_pid_lock_stale),
         ("13. PID 锁损坏清理",              test_acquire_pid_lock_corrupted),
@@ -357,3 +480,149 @@ if __name__ == "__main__":
 
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
+
+
+# ── 8d. tmux 信号必须真投出去且不得带 /goal ────────────────────────
+# 现场（R110，2026-10-21）：两个 helper 都只传 (role, msg)，_send_to_role 的
+# 忙门控以 wf_id 为条件，wf_id 为空 → 守卫跳过 → 但调用方也没传 force，
+# 于是 /goal 前缀被加上；且一旦有人补上 wf_id 就会立刻被忙门控拦成 "busy"，
+# 返回值被 `LOGGER.debug` 吞掉。安全护栏在两个方向上都可能是空转。
+# 契约：显式 force（跳过 /goal 前缀与忙门控），且不得带 wf_id（否则重写
+# TASKS.md + 写 task_spec）；不得带 scheduler_noise（coordinator 目标会被拦截）。
+
+def _capture_send():
+    seen = []
+    def _send(role, msg, **kw):
+        seen.append((role, msg, kw))
+        return True
+    return _send, seen
+
+
+def test_idle_reminder_is_forced_and_carries_ids():
+    from pipeflow.step_handler import _remind_tmux_idle
+    send, seen = _capture_send()
+    run, step = _make_run(), _make_step()
+    _remind_tmux_idle(run, step, "等待输入", send)
+    role, msg, kw = seen[0]
+    assert role == "scout"
+    assert kw.get("force") is True, "未带 force → /goal 前缀锁死角色"
+    assert "wf_id" not in kw, "催办不该带 wf_id：会连带重写 TASKS.md 并写 task_spec"
+    assert "scheduler_noise" not in kw, \
+        "scheduler_noise 会让 coordinator 目标的催办被 role_lifecycle:891 直接拦截"
+
+
+def test_coordinator_targeted_stop_is_not_swallowed():
+    """coordinator 作为步骤目标时，越界停止指令必须真的能投出去。
+
+    生产库 WL-full_dev_pipeline 有 7 个实例 assignee=coordinator；
+    scheduler_noise=True 在 role_lifecycle:891 对它直接 return False。
+    """
+    from pipeflow.step_handler import _stop_tmux_violation
+    send, seen = _capture_send()
+    run, step = _make_run(), _make_step()
+    _stop_tmux_violation(run, step, ["rm -rf /tmp/x"], "coordinator", send)
+    _, _, kw = seen[0]
+    assert kw.get("force") is True
+    assert not kw.get("scheduler_noise"), "停止指令被标记为噪音 → coordinator 侧静默丢弃"
+
+
+
+def test_violation_stop_is_forced_and_carries_ids():
+    from pipeflow.step_handler import _stop_tmux_violation
+    send, seen = _capture_send()
+    run, step = _make_run(), _make_step()
+    _stop_tmux_violation(run, step, ["rm -rf /tmp/x"], "scout", send)
+    role, msg, kw = seen[0]
+    assert "越界操作" in msg and "rm -rf /tmp/x" in msg
+    assert kw.get("force") is True, "安全护栏被 /goal 前缀变成 Stop hook 硬条件"
+
+
+def test_forced_send_does_not_add_goal_prefix():
+    """force=True 必须同时跳过 /goal 前缀 —— 否则运维催办变 Stop hook 硬条件。"""
+    import re as _re
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    src = RoleLifecycleMixin._send_to_role.__doc__ or ""
+    assert "force" in src
+    # 直接验证语义：force=True 分支不加前缀（代码级断言，防止有人改成无条件加）
+    import inspect
+    code = inspect.getsource(RoleLifecycleMixin._send_to_role)
+    assert _re.search(r"if not force:\s*\n\s*prompt = \"/goal \" \+ prompt", code), \
+        "前缀注入的条件不再是 `not force` → 催办消息会被锁成 Stop hook"
+
+
+
+# ── 9. 排队回收不得误杀正在产出的角色（活锁回归） ────────────────
+
+def _queue_cancel_setup(producing: bool):
+    """一个已排队超预算的步骤，角色是否在产出由 producing 决定。"""
+    eng = _build_eng()
+    eng._is_role_busy = MagicMock(return_value=True)
+    step = _make_step(exit_condition={"bus_category": "code_fix", "timeout_minutes": 1})
+    run = _make_run(step_results={"s1": {
+        "status": "notified", "ts": time.time() - 7200,
+        "queued": 50, "queued_since": time.time() - 7200,
+    }})
+    return eng, run, step
+
+
+def test_queue_cancel_skips_role_that_is_producing():
+    """角色在产出时排队超预算 ≠ 卡死，不得 auto-cancel。
+
+    实测 2026-10-21：8h 内 product_architect 名下 14 条子链全部在排队满 60min
+    时被取消，而同期它真跑完的子链耗时 113~237min —— 单角色串行时排队预算
+    永远小于服务时间，取消不释放产能，是纯损失（活锁）。
+    """
+    eng, run, step = _queue_cancel_setup(producing=True)
+    with patch("pipeflow.step_handler.get_conversation_signal", return_value=None), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=True):
+        eng._tick(run, step)
+    eng._lm.close_wf.assert_not_called()
+
+
+def test_queue_cancel_still_fires_when_role_dead():
+    """反向守卫：角色确实不在产出时，排队超预算仍然要回收（否则真僵尸永占位）。"""
+    eng, run, step = _queue_cancel_setup(producing=False)
+    with patch("pipeflow.step_handler.get_conversation_signal", return_value=None), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
+        eng._tick(run, step)
+    eng._lm.close_wf.assert_called_once()
+    assert eng._lm.close_wf.call_args.kwargs.get("status") == "cancelled"
+
+
+# ── 10. 越界停止指令按批次冷却（不得每 tick 重发） ──────────────
+
+def test_violation_stop_sent_once_per_batch():
+    """同一批越界命令留在 pane 窗口里时，停止指令只发一次。
+
+    去重键不变时 _bump_violation_count 返回旧值（升不到 cancel 阈值），
+    旧实现走 else 分支每 tick 重发一次；force=True 后重发真能送达角色。
+    """
+    from conversation_monitor import ConversationSignal
+    eng = _build_eng()
+    sig = ConversationSignal()
+    sig.violation_found = True
+    sig.violation_commands = ["rm -rf /tmp/x"]
+    sig.violation_role = "scout"
+    run = _make_run()
+    step = _make_step()
+    with patch("pipeflow.step_handler.get_conversation_signal", return_value=sig):
+        eng._tick(run, step)
+        eng._tick(run, step)
+        eng._tick(run, step)
+    assert eng._send_to_role.call_count == 1, \
+        f"同一批越界重发了 {eng._send_to_role.call_count} 次"
+
+
+def test_violation_stop_resends_on_new_batch():
+    """命令集合变了 = 新一次越界，必须立即再提醒（不被冷却拦住）。"""
+    from conversation_monitor import ConversationSignal
+    eng = _build_eng()
+    run, step = _make_run(), _make_step()
+    for cmds in (["rm -rf /tmp/x"], ["git push --force"]):
+        sig = ConversationSignal()
+        sig.violation_found = True
+        sig.violation_commands = cmds
+        sig.violation_role = "scout"
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=sig):
+            eng._tick(run, step)
+    assert eng._send_to_role.call_count == 2, "新一批越界被冷却吞掉了"

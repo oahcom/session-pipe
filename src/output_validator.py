@@ -40,7 +40,11 @@ def _load_role_schema(role: str, category: str) -> dict[str, Any] | None:
 
 
 def validate_output(role: str, category: str, content: dict[str, Any]) -> dict[str, Any]:
-    """Validate *content* against the role's declared output_schema.
+    """路由前结构 lint：只校验产出 JSON 是否缺必填字段，绝不背书内容质量。
+
+    调用方（routing/routes.py）必须用它对**非法格式**做拒绝路由（reject），
+    绝不能把它当作“产出合格/成功”的门禁——通过校验只代表字段齐全，
+    不代表角色思考对、动作对、产出有价值。质量判断只能由人读对话得出。
 
     Parameters
     ----------

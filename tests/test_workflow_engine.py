@@ -226,6 +226,8 @@ def test_tick_completes_on_last_step():
     eng.run_once()
     eng._bb.write("code_fix", f"test-header: exit_condition匹配完成_{abs(hash(rid))&0xffff:04x}", src="test")
     eng.run_once()
+    # 末步收尾需额外一 tick：_advance_unsafe 不在末步 close，交 _advance_production_wf
+    eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
 
@@ -299,6 +301,8 @@ def test_advance_finishes():
     # 先 run_once 标记 notified，再写消息才能被 created_after 过滤到
     eng.run_once()
     eng._bb.write("code_fix", f"test-header: tick_总步骤完成_{abs(hash(rid))&0xffff:04x}", src="engineer")
+    eng.run_once()
+    # 末步收尾需额外一 tick（同上）
     eng.run_once()
     s = eng.status(rid)
     assert s["status"] == "completed", f"应 completed: {s['status']}"
@@ -460,7 +464,9 @@ def test_collect_workspace_summary():
 
 def test_workspace_summary_in_prompt():
     wf_dir = _make_wf_dir()
-    ws_dir = Path.home() / ".hermes" / "workspace" / "test_ws_project"
+    # 用 paths.ITERATION_WORKSPACES（conftest 已隔离到临时目录），不写死 ~/.hermes/workspace
+    import paths
+    ws_dir = paths.ITERATION_WORKSPACES / "test_ws_project"
     ws_dir.mkdir(parents=True, exist_ok=True)
     (ws_dir / "PRD.md").write_text("# 需求文档 WS_SUMMARY_UNIQUE_8899")
     steps = [{"id": "s1", "title": "调研", "target_role": "scout",
@@ -574,9 +580,18 @@ if __name__ == "__main__":
 def test_delivery_fail_count_idempotent_when_notified():
     """已盖戳 notified 的 step，即使 _send_to_role 返回 None/False，
     delivery_fail_count 也不应续涨、status 不被覆盖回空。
-    复现根因：wf_sub_06b9e/s1 count=35 且 status=notified。"""
+    复现根因：wf_sub_06b9e/s1 count=35 且 status=notified。
+
+    exit 条件用唯一文本（永不可能命中）并禁用角色探测：否则本用例会匹配
+    共享测试 bus 里前序用例写的 architecture 消息，或受实时 tmux 忙闲影响，
+    实测全量跑时约 1/3 概率把 s1 推进成 completed（假失败）。
+    """
     wf_dir = _make_wf_dir()
-    _write_wf(wf_dir, "test", SIMPLE_STEPS)
+    _write_wf(wf_dir, "test", [{
+        "id": "s1", "title": "调研", "target_role": "scout",
+        "prompt_template": "请调研 {topic}",
+        "exit_condition": {"bus_category": "architecture", "text_contains": "IDEMPOTENT_NO_MATCH_XYZ"},
+        "max_retries": 0, "condition": "", "rollback_to": ""}])
     eng = WorkflowEngine(workflows_dir=wf_dir)
     rid = eng.start("test", {"topic": "幂等护栏"})
     lm = eng._lifecycle
@@ -584,7 +599,8 @@ def test_delivery_fail_count_idempotent_when_notified():
     lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                (json.dumps({"s1": {"status": "notified", "delivery_fail_count": 5}}, ensure_ascii=False), rid))
     # 模拟 _send_to_role 返回 None（goal 过短路径历史行为）
-    with patch.object(eng, "_send_to_role", return_value=None):
+    with patch.object(eng, "_ensure_role_alive", return_value=True), \
+         patch.object(eng, "_send_to_role", return_value=None):
         eng.run_once()
     sr = json.loads(lm.get_wf(rid)["step_results"])
     assert sr["s1"]["delivery_fail_count"] == 5, f"已 notified 不应续涨计数: {sr['s1']}"

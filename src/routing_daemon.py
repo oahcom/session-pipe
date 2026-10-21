@@ -11,7 +11,7 @@ routing_daemon.py — 路由分发 daemon，定期轮询 bus 未消费消息并�
   本 daemon = 消息路由分发（bus → 角色）
   workflow daemon = 工作流步骤推进（engine.run_once）
 """
-import fcntl, importlib, importlib.util, json, os, sys, time
+import fcntl, importlib, importlib.util, json, os, subprocess, sys, time
 from pathlib import Path
 # Ensure pipeline src is first in sys.path
 _PIPELINE_SRC = str(Path(__file__).resolve().parent)
@@ -42,6 +42,60 @@ CONTRACT_INTERVAL = 3600  # 合约自改进闭环间隔（每 1 小时），生�
 SURVIVAL_INTERVAL = 120  # 存活检测间隔（每 2 分钟）
 P0_CHECK_INTERVAL = 1800  # P0 超时检测间隔（每 30 分钟）
 CRON_SCHEDULE_TRACKER = Path.home() / ".hermes" / "run" / "cron_schedule_triggered.json"  # 去重跟踪
+
+# 排队积压兜底：指向角色的消息如果长期没人消费，既没有超时也没有告警。
+# 判据用「定向消息（@role）+ 超龄 + 该角色确实没消费」三者交集：全局未消费
+# 计数 94% 是别人已处理的汇报，按条数告警恒亮。数据源是 bus 的逐消费者
+# unconsumed()，不是 route_all_to_ccs 的 details —— 后者只含本轮 poll 窗口
+# （最新 90 条 ≈ 1.5h）里的消息，超龄消息根本不进窗口，永远告警不到。
+# task_spec/workflow 是工作流引擎的分发账本（已完成/取消后即成残渣），不算角色队列。
+_QUEUE_ALERT_HOURS = 24
+_QUEUE_ALERT_MIN_GAP = 6 * 3600  # 每 6 小时最多写一条汇总，避免刷屏
+_QUEUE_ALERT_OWNED_CATS = frozenset({"task_spec", "workflow"})
+# 标题固定（不含计数、含去重前缀）：UPSERT 归并成同一 fact，不再计入自身积压。
+_QUEUE_ALERT_TITLE = "@ccs-monitor [queue] 角色定向消息积压超 24h 未消费"
+_QUEUE_ALERT_LAST = 0.0
+
+
+def _alert_aged_queue(*, now: float | None = None) -> int:
+    """把超过 24h 仍未消费的定向消息汇总成一条 notice（每 6h 最多一次）。
+
+    标题固定（不含计数）让 Blackboard 的 UPSERT 归并为同一 fact，重复运行
+    不增长；计数与最老 id 写进 evidence，随每次检测刷新。
+    """
+    global _QUEUE_ALERT_LAST
+    now = time.time() if now is None else now
+    if now - _QUEUE_ALERT_LAST < _QUEUE_ALERT_MIN_GAP:
+        return 0
+    from bus_protocol import Blackboard
+    from routing.router import get_router
+    import re as _re
+
+    bb = Blackboard()
+    aged: list[tuple[str, int, int, float]] = []
+    for role in get_router().routing:
+        pending = [f for f in bb.unconsumed(consumer=role)
+                   if f.cat not in _QUEUE_ALERT_OWNED_CATS
+                   and not (f.t or "").startswith(_QUEUE_ALERT_TITLE)
+                   and now - f.ts > _QUEUE_ALERT_HOURS * 3600
+                   and role in _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", f.t or "")]
+        if pending:
+            oldest = min(pending, key=lambda f: f.ts)
+            aged.append((role, len(pending), oldest.id, now - oldest.ts))
+    _QUEUE_ALERT_LAST = now
+    if not aged:
+        return 0
+    aged.sort(key=lambda x: -x[1])
+    detail = "; ".join(f"{r}×{n}(#{oid}, {age / 3600:.0f}h)"
+                       for r, n, oid, age in aged[:10])
+    bb.write(
+        "notice",
+        _QUEUE_ALERT_TITLE,
+        evidence=f"共 {len(aged)} 个角色 / {sum(a[1] for a in aged)} 条: {detail}",
+        src="routing_daemon",
+    )
+    return len(aged)
+
 
 
 def _any_live_targets() -> bool:
@@ -129,9 +183,13 @@ def _check_cron_schedules() -> int:
                 continue
             # 检查是否触发了
             try:
-                cron = croniter.croniter(cron_exp, now - 60)
+                # 种子用 now（非 now-60）：get_prev 返回严格早于种子的调度点。
+                # 旧写法 seed=now-60 使 prev <= now-60，而 now_minute > now-60 恒成立
+                # → `now_minute <= prev` 恒假 → 本函数永不触发（实测 * * * * * 触发 0 次，
+                # subprocess.run 调用 0 次）。判据改为“调度点落在当前这一分钟内”。
+                cron = croniter.croniter(cron_exp, now)
                 prev = cron.get_prev(float)
-                if now_minute <= prev < now:
+                if now_minute <= prev < now_minute + 60:
                     # 去重：同一角色同一分钟不重复触发
                     key = f"{role}:{cron_exp}"
                     last = triggered.get(key, 0)
@@ -142,9 +200,15 @@ def _check_cron_schedules() -> int:
                             LOGGER.info("cron_schedule 跳过死角色: %s (not running)", role)
                             continue
                         LOGGER.info("cron_schedule 触发: %s (%s)", role, cron_exp)
+                        # 必须显式 --from：ccs.py 的 --from 默认值是 "cli"，
+                        # 而 core.send 把 "cli"/"user" 当人类来源 → 触发意图提醒注入
+                        # 并**刷新该角色的用户请求痕迹 ts**。痕迹是意图守护 daemon 的
+                        # 触发源（ts 即"最近一次用户请求"），被定时任务刷新后，同一请求
+                        # 会被当成"新一轮请求"→ 预算重置 → 提醒无限重复。
                         subprocess.run(
                             [sys.executable, str(launcher), "send", role,
-                             f"定时任务触发 (cron: {cron_exp})"],
+                             f"定时任务触发 (cron: {cron_exp})",
+                             "--from", "routing_daemon"],
                             capture_output=True, timeout=10,
                         )
                         triggered_count += 1
@@ -166,7 +230,6 @@ def main():
     last_eval = 0
     last_survival = 0
     last_drift = 0
-    last_metrics = 0
     last_consistency = 0
     last_contract = 0
     last_p0_check = 0
@@ -228,6 +291,10 @@ def main():
                                         d.get("category", "?"), d.get("id", 0),
                                         ",".join(d.get("assigned", [])))
                     LOGGER.info("route_all_to_ccs: %d/%d routed", ccs_routed, ccs_total)
+                    try:
+                        _alert_aged_queue()
+                    except Exception as e:
+                        LOGGER.warning("queue alert 失败: %s", e)
                     error_backoff = 0
                 except Exception as e:
                     LOGGER.error("route_all_to_ccs 异常 (backoff=%ds): %s", error_backoff, e)
@@ -249,8 +316,16 @@ def main():
                     import io, contextlib
                     _ec_buf = io.StringIO()
                     with contextlib.redirect_stdout(_ec_buf):
-                        _ec_main(["--json"])
-                    LOGGER.debug("eval_consistency 预检: %s", _ec_buf.getvalue()[:200])
+                        _ec_rc = _ec_main(["--json"])
+                    # 结果必须可见：曾用 LOGGER.debug，而运行期有效级别是 INFO
+                    # → 输出永不落盘（实测 30 天 journal 里 0 条），且 _ec_main 的
+                    # 返回值被丢弃。该预检的全部意义就是"发现不兼容项"，用不可见
+                    # 级别打印等于没做——正是它自己要防的那种静默。
+                    if _ec_rc:
+                        LOGGER.warning("eval_consistency 预检发现不兼容项 (rc=%s): %s",
+                                       _ec_rc, _ec_buf.getvalue()[:400])
+                    else:
+                        LOGGER.info("eval_consistency 预检通过")
                 except Exception as _ec:
                     LOGGER.warning("eval_consistency 预检异常（不阻塞 eval 执行）: %s", _ec)
                 if _run_eval is None:
@@ -263,6 +338,7 @@ def main():
                 # ponytail: 检测 eval_checker.py 变更，热重载无需重启 daemon
                 eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
                 if _eval_checker_mtime != eval_checker_mtime:
+                    _old_mtime = 0.0  # Fix: initialize to avoid UnboundLocalError on exception path
                     try:
                         # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）
                         for _key in list(sys.modules):
@@ -289,6 +365,8 @@ def main():
                             LOGGER.info("eval_checker 强制重新 import 成功")
                         except Exception as _e2:
                             LOGGER.error("eval_checker 强制重新 import 也失败: %s", _e2)
+                        # Fix: ensure _old_mtime is defined even on fallback failure
+                        _old_mtime = 0.0
                 try:
                     r = _run_eval()
                     if r.get("failed", 0):
@@ -314,6 +392,8 @@ def main():
                                         v["task_id"], v["title"], v["elapsed_hours"])
                     # P0_draft 阶梯扫描：1h 升级、4h 降级、50min 预警
                     _p0.p0_audit_scan()
+                    # P0 逾期升级链：6h→supervisor、12h→@everyone（已去重，可定时调用）
+                    _p0._check_escalation_chain()
                 except Exception as e:
                     LOGGER.error("P0 超时/阶梯检测异常: %s", e)
                     METRICS.inc("daemon_errors_total")
@@ -328,9 +408,24 @@ def main():
                     def _run_g3_scan():
                         try:
                             from conversation_monitor import scan_and_propose
-                            n = scan_and_propose()
-                            if n:
-                                LOGGER.info("G3 治理提案扫描: %d 个提案", n)
+                            proposals = scan_and_propose()
+                            if proposals:
+                                LOGGER.info("G3 治理提案扫描: %d 个提案", len(proposals))
+                                # 自动执行层：仅对 idle/violation 调用 ccs.py stop (僵尸回收)，
+                                # content_void 仅提醒不杀 (安全边界: content_void 噪音风险 > 僵尸)
+                                for p in proposals:
+                                    action = p.get("_action")
+                                    role = p.get("role")
+                                    if action in ("idle", "violation") and role:
+                                        try:
+                                            subprocess.run(
+                                                [sys.executable, str(_paths_mod.CCS_CLI), "stop", role],
+                                                capture_output=True, timeout=30)
+                                            LOGGER.warning("G3 治理自动执行 stop: %s (%s)", role, action)
+                                        except Exception as _e:
+                                            LOGGER.error("G3 stop 失败 %s: %s", role, _e)
+                            elif proposals == []:
+                                LOGGER.debug("G3 治理提案扫描: 无提案")
                         except Exception as e:
                             LOGGER.error("G3 扫描异常: %s", e)
                             METRICS.inc("daemon_errors_total")
@@ -396,17 +491,47 @@ def main():
                     if _hist_dir.exists():
                         _files = sorted(_hist_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:3]
                         for _hf in _files:
+                            _bad = 0
                             for _line in _hf.read_text(errors="replace").splitlines()[-5:]:
                                 try: _feed.append(json.loads(_line))
-                                except: pass
+                                except (json.JSONDecodeError, ValueError):
+                                    _bad += 1
+                            if _bad:
+                                LOGGER.warning("contract_updater: %d malformed review_gate history lines skipped", _bad)
                     if _feed:
+                        # 生成建议 → 写 bus 待 session-roles 处置。**不在此自动 --apply。**
+                        # 原因：--apply 直接改写 hermes-session-roles/personas/*.json，
+                        # 而本项目 CLAUDE.md:51 明令「❌ 修改角色定义（那是 session-roles 的事）」。
+                        # 原实现每轮都跑 --apply 且恒失败（applied:0 failed:3，实测每小时复现），
+                        # 根因是 suggest_improvements 从不产出 verification_command 而
+                        # _apply_suggestion 要求它非空——即便补上，闭环也会变成"越界改角色定义"，
+                        # 是把一条红线违规做成自动化。故改为把建议交给有权的角色。
                         _feed_path = Path("/tmp/contract_feed.json")
                         _feed_path.write_text(json.dumps(_feed, ensure_ascii=False))
                         _cu = _sp.run(
                             [sys.executable, str(Path(__file__).resolve().parent / "contract_updater.py"),
                              "--from-file", str(_feed_path)],
                             capture_output=True, text=True, timeout=60)
-                        LOGGER.info("contract_updater 自改进: rc=%s %s", _cu.returncode, _cu.stdout[:200])
+                        _sug = _cu.stdout.strip()
+                        LOGGER.info("contract_updater 自改进建议: rc=%s %s",
+                                    _cu.returncode, _sug[:200])
+                        if _cu.returncode == 0 and _sug:
+                            try:
+                                _items = json.loads(_sug)
+                                _summary = "; ".join(
+                                    f"{s.get('role')}/{s.get('type')}"
+                                    for s in (_items if isinstance(_items, list) else []))[:300]
+                            except (json.JSONDecodeError, ValueError):
+                                _summary = _sug[:300]
+                            _sp.run(
+                                [sys.executable, str(Path.home() / ".hermes/scripts/bus_client.py"),
+                                 "write", "architecture",
+                                 f"[contract_updater] {len(_feed)} 条 review 记录 → 自改进建议待处置",
+                                 "--evidence",
+                                 f"建议: {_summary}\n"
+                                 f"（本项属 session-roles 职责，pipeline 不自动改角色定义）",
+                                 "--src", "routing_daemon"],
+                                capture_output=True, timeout=10)
                 except Exception as _cu_e:
                     LOGGER.warning("contract_updater 接入异常（不阻塞）: %s", _cu_e)
                 last_contract = now
@@ -429,29 +554,6 @@ def main():
                     LOGGER.error("survival_check 异常: %s", e)
                     METRICS.inc("daemon_errors_total")
                 last_survival = now
-
-            # R2-4 生长接入: workflow_metrics 快照写 bus（每小时一次）
-            # 8.6MB workflow-metrics.jsonl 长期无消费者（D6 发现），
-            # 由 task_generator heal 写入，这里消费输出供监控审计
-            if now - last_metrics >= 3600:
-                try:
-                    from workflow_metrics import snapshot as _wf_snapshot
-                    import io, contextlib
-                    _buf = io.StringIO()
-                    with contextlib.redirect_stdout(_buf):
-                        _wf_snapshot()
-                    _snap_text = _buf.getvalue()
-                    _rate_line = next((l for l in _snap_text.splitlines() if "完成率" in l), "完成率: N/A")
-                    import subprocess as _sp
-                    _sp.run(
-                        [sys.executable, str(Path.home() / ".hermes/scripts/bus_client.py"), "write", "monitor_wf_health",
-                         f"[wf-metrics] {_rate_line.strip()}",
-                         "--evidence", _snap_text[:800],
-                         "--src", "routing_daemon"],
-                        capture_output=True, timeout=10)
-                except Exception as _me:
-                    LOGGER.debug("workflow_metrics 快照写 bus 失败（可选组件）: %s", _me)
-                last_metrics = now
 
             time.sleep(INTERVAL + error_backoff)
     finally:

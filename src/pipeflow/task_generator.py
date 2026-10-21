@@ -8,13 +8,96 @@ import json
 import time
 import uuid
 import logging
+import hashlib
 import threading
+import re  # 修复: _scan_tasks 用 re.match 但漏 import, 导致每 tick NameError 使任务生成静默死亡
 from pathlib import Path
+from types import SimpleNamespace
 
+import review_gate as _review_gate  # 驳回词表唯一真相源（src/review_gate.py）
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 
 LOGGER = logging.getLogger("workflow.engine")
 
+
+def _event_key(title: str, assignee: str, template_id: str) -> str:
+    """事件去重键（DESIGN §2.1）：同一 标题|角色|模板 24h 内只 mint 一个任务实例。
+
+    与既有 5-min 精确标题去重（workflow/client.py create_task_v2）互补：
+    标题常内嵌 wf 实例号，精确匹配恒不命中，hash 键把语义同一的事件收敛。
+    """
+    return hashlib.sha256(f"{title}|{assignee}|{template_id}".encode()).hexdigest()[:16]
+
+
+# per-role running 上限（DESIGN §2.2 backpressure 水位线）。
+MAX_RUNNING_PER_ROLE = 3
+
+# 测试 harness 模板名前缀。**不用 `.*_test`**：它会命中 qa_test_* 等生产模板
+# （实测 qa_test_execute/qa_test_plan 被误判为 harness → 超时即静默 cancel，
+# 且被 full_dev_pipeline/architect_review/food_chain_loop 作为 subflow 引用）。
+# 新增测试模板请以 test_ 或 drill 开头，或加入本元组。
+_TEST_HARNESS_PREFIXES = ("test_", "exit_schema", "role_interact", "drill")
+
+# engine 注册 JSON 模板时用 "WL-" + name 生成 workflow_id（engine.py:316），于是同一个
+# harness 模板在 DB/内存里有两个 id：`test_x` 与 `WL-test_x`。只堵不带前缀的那个等于
+# 没堵：WL-test_exit_schema 逃过本判据 → 自动选择把它排在真实模板之前 → 路由 daemon
+# 把真任务的标题套上测试模板 → 产出回执又是新的 code_fix 消息 → 自激循环，无外部
+# 输入也能永转（2026-10-17 实测：177 个实例、159 条 bus fact、12 个角色被派）。
+_WORKFLOW_ID_PREFIXES = ("WL-", "WF-")
+
+
+def _strip_wf_prefix(template_id: str) -> str:
+    """剥离 engine 生成 id 时的 WL-/WF- 前缀（str.removeprefix 不接受元组）。"""
+    for p in _WORKFLOW_ID_PREFIXES:
+        if template_id.startswith(p):
+            return template_id[len(p):]
+    return template_id
+
+
+def _is_test_harness_template(template_id: str | None) -> bool:
+    """该模板是否为测试 harness（不参与真实生产派发/超时取消）。"""
+    if not template_id:
+        return False
+    return _strip_wf_prefix(template_id).startswith(_TEST_HARNESS_PREFIXES)
+
+
+# 子链驳回判据。子链末步驳回不拦（wf_lifecycle.py:302「末步仍不拦」是有意设计：
+# 无 next_step 可退回、也无返工承接方，硬拦即静默卡死），于是子链仍报 completed
+# → 本文件回流处把父步标 completed → 驳回信号在父链彻底丢失。
+# 实测 3 例（wf_sub_9e3d0b017f29 / wf_sub_9b5329785ab9 / wf_sub_fda79b387821）：
+# 子链 s1 文案为 REJECTED / CHANGES_REQUESTED，父链 wf_5412acef35 照常推进到 s5/s6。
+# 词表走 review_gate 唯一真相源（原先三处各一份，靠注释约定"三方一致"同步）。
+def _subflow_verdict_rejected(sr: dict) -> bool:
+    """子链 step_results 的 exit_messages 是否含驳回文案（即其 completed 掩盖了驳回）。
+
+    已审批确认（confirmed_at）的步骤不判驳回，与 wf_lifecycle:403 /
+    manager:1055 两条推进路径同语义：exit_messages 是第一轮的驳回文本，人工
+    审批确认不会清除它 → 同一份文本会被二次判成驳回（ADR-APPROVAL-AUTHORITY）。
+    父步一旦被压回 rejected，这里误判的就是**真的阻断**，不再是纯噪音。
+    """
+    _txt = " ".join(
+        str(m.get("text", ""))
+        for _sd in sr.values() if isinstance(_sd, dict) and not _sd.get("confirmed_at")
+        for m in (_sd.get("exit_messages") or []) if isinstance(m, dict)
+    )
+    return _review_gate.is_rejected(_txt)
+
+
+
+def _last_metrics(path: Path) -> dict:
+    """读 workflow-metrics.jsonl 末行；文件不存在/损坏 → {}（不阻断本轮）。"""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode("utf-8", "replace").splitlines()
+        return json.loads(tail[-1]) if tail else {}
+    except (OSError, ValueError, IndexError):
+        return {}
+
+def _same_metrics(last: dict, cur: dict) -> bool:
+    """除 ts 外全部字段相等即视为状态未变（ts 每行必然不同，不能参与比较）。"""
+    return {k: v for k, v in last.items() if k != "ts"} == cur
 
 class TaskGeneratorMixin:
     """WorkflowEngine 的任务生成 mixin。"""
@@ -22,6 +105,48 @@ class TaskGeneratorMixin:
     _TASK_GEN_COOLDOWN: dict[str, float] = {}  # role → last gen ts
     # check-then-act 竞态防护：cooldown 检查与写入之间加锁（GIL 下结构不损坏，仅语义竞态）
     _TASK_GEN_LOCK = threading.Lock()
+    # 积压告警冷却（DESIGN §2.6 S4）：同一角色积压告警 30min 内只发一次。
+    # 无冷却时每个 run_once tick 对同一积压角色重发同一条 → curator 实测 3 天 106 条
+    # 重复告警（8 角色各 4-19 条），把 architecture 类淹没成噪音。只告警一次不丢信息量。
+    _BACKLOG_ALERT_TS: dict[str, float] = {}
+    _BACKLOG_ALERT_COOLDOWN_S = 1800
+
+    def _parent_contract_errs(self, conn, wf_id: str, step_id: str) -> list:
+        """父步（handoff 容器）自身 exit_schema 尚未满足的项。
+
+        子链完成不代父步履行契约：子链模板与父模板是两个独立文件，父步要的
+        产物子链未必产出。校验失败返回空表（守卫自身不得成为新的卡死源）。
+        """
+        try:
+            _row = conn.execute(
+                "SELECT template_id, created_at, effective_roles, step_results "
+                "FROM workflow_instances WHERE instance_id=?", (wf_id,)).fetchone()
+            if not _row:
+                return []
+            _wf = (self._workflows.get(_row["template_id"])
+                   or self._workflows.get(f"WF-{_row['template_id']}"))
+            _st = next((s for s in (_wf.steps if _wf else []) if s.id == step_id), None)
+            if not _st or not _st.exit_schema:
+                return []
+            ok, errs = self._validate_exit_schema(_st, self._contract_run(_row, wf_id))
+            return [] if ok else errs
+        except Exception as _e:
+            LOGGER.debug("parent contract check failed %s/%s: %s", wf_id, step_id, _e)
+            return []
+
+    @staticmethod
+    def _contract_run(row, wf_id: str) -> SimpleNamespace:
+        """把 DB 行包装成 _validate_exit_schema 需要的 run 形态。
+
+        _inst_row 而非 effective_roles：_eff_role 先取 _inst_row，直接给字符串
+        effective_roles 会让 effective_role() 走 getattr(str, "effective_roles")
+        → None → 回退模板角色。等价角色分流（engineer→pg）后产出落在 pg 目录，
+        按 engineer 校验会把真实交付报成缺失（假 contract_unmet）。
+        """
+        return SimpleNamespace(
+            id=wf_id, created_at=row["created_at"],
+            _inst_row={"effective_roles": row["effective_roles"]},
+            step_results=json.loads(row["step_results"] or "{}"))
 
     def _scan_tasks(self):
         lm = self._lifecycle
@@ -53,9 +178,20 @@ class TaskGeneratorMixin:
                             (ts, time.time(), task_id))
                         conn.commit()
                 # 子工作流完成 → 推进父工作流
+                # 子链完成 → 推进父链。这是唯一的回流通道，它此前用
+                # `template_id IN (SELECT template_id FROM workflow_templates)` 做过滤，
+                # 而两侧键空间不一致：子链实例写的是**裸名**（tgt_step.subflow_template，
+                # 见 wf_lifecycle._subflow_takeover），而 workflow_templates 里注册的是
+                # **WF- 前缀名**（engine 启动 upsert 时 `tid = 'WF-' + tid`）。
+                # 裸名不在子查询结果里 → 6/7 条子链被静默排除 → 子链建得出、也跑得动，
+                # 但父链永远收不到完成信号（实测 food_chain_loop s2 是稳定死点，
+                # 历史 12 个实例 s2 从未突破，唯一能做到 s7 的是旧模板版本）。
+                # 修法：两侧都剥掉 WF- 前缀再比，兼容两种命名，不改写入端（存量实例
+                # 已经是裸名，改消费端可同时覆盖存量与新增）。
                 for _sub_row in conn.execute(
                     "SELECT wi.instance_id, wi.current_step_id, wi.step_results FROM workflow_instances wi "
-                    "WHERE wi.status='running' AND wi.template_id IN (SELECT template_id FROM workflow_templates)"
+                    "WHERE wi.status='running' AND REPLACE(wi.template_id,'WF-','') IN "
+                    "(SELECT REPLACE(template_id,'WF-','') FROM workflow_templates)"
                 ).fetchall():
                     _sr = json.loads(_sub_row["step_results"] or "{}")
                     for _step_id, _sdata in _sr.items():
@@ -69,21 +205,193 @@ class TaskGeneratorMixin:
                             if _step_id != _sub_row["current_step_id"]:
                                 continue
                             _sub_status = conn.execute("SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,)).fetchone()
+                            # 子链跑完 ≠ 父步交付契约达成：父步自己的 exit_schema 才是这一
+                            # 阶段的交付物清单，而子链模板未必产出其中每一项。实测
+                            # wf_26f108c663e4/s2（architect_review 要 REVIEW.md，子链
+                            # architect_full_design 从不产出该文件）子链全绿、REVIEW.md 从未
+                            # 落盘，父步照样 completed。全历史 161 个「有 schema 且已推进」的
+                            # 父步中 23 个契约未达成 —— 全部静默。
                             if _sub_status and _sub_status['status'] in ('completed', 'step_done_ready'):
-                                _sdata["status"] = "completed"
-                                _sdata["completed_at"] = time.time()
+                                # 幂等：本步已记过账就不再重复写 bus（每 tick 重扫同一子链）
+                                if not _sdata.get("contract_unmet"):
+                                    _cerrs = self._parent_contract_errs(conn, _sub_row["instance_id"], _step_id)
+                                    if _cerrs:
+                                        # 与 _subflow_verdict_rejected 同一处置：不改完成语义
+                                        # （硬拦会制造静默卡死），只记账 + 写 bus 让缺失可观测。
+                                        _sdata["contract_unmet"] = _cerrs
+                                        _sdata["contract_unmet_at"] = time.time()
+                                        try:
+                                            self._bb.write(
+                                                "blocker",
+                                                f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                                f"子链完成但父步交付契约未达成",
+                                                src="workflow_engine",
+                                                evidence=(f"子链 {_sf[:12]} status={_sub_status['status']}，"
+                                                          f"但父步 exit_schema 未满足: {'; '.join(_cerrs[:5])}。"
+                                                          f"父链仍按 completed 推进，该步产出实际缺失，"
+                                                          f"请核查父模板 schema 与子链模板产出是否对齐。"))
+                                            LOGGER.warning("父步契约未达成 %s/%s: %s",
+                                                           _sub_row["instance_id"][:12], _step_id, _cerrs[:3])
+                                        except Exception as _cwe:
+                                            LOGGER.debug("contract-unmet blocker 写入失败: %s", _cwe)
+                                # 必须先判驳回再定状态：子链末步驳回说明该步产出**未通过
+                                # 审查**，父步「完成」是假象，据它推进会让下游拿不存在
+                                # 的东西继续做。
+                                #
+                                # 必须查**子链**的 step_results：原实现传 _sr（父链的），
+                                # 于是判据恒在看父步自己的历史文案 —— 子链驳回永远检不出，
+                                # 而父步早前某步的驳回文案会一直误报。
+                                # 只看**末步**：历史步骤里被确认后放行的驳回文案
+                                # 会一直留在 step_results 里，全量扫描 → 每 tick
+                                # 误报（codex P2）。末步才是本次完成真正掩盖的结论。
+                                _sub_row_sr = conn.execute(
+                                    "SELECT current_step_id, step_results FROM workflow_instances "
+                                    "WHERE instance_id=?", (_sf,)).fetchone()
+                                _sub_all = (json.loads(_sub_row_sr["step_results"] or "{}")
+                                            if _sub_row_sr else {})
+                                _sub_last = _sub_all.get(_sub_row_sr["current_step_id"]) \
+                                    if _sub_row_sr else None
+                                _sub_verdict_sr = ({_sub_row_sr["current_step_id"]: _sub_last}
+                                                   if isinstance(_sub_last, dict) else {})
+                                # 父步自身已审批确认时，子链末步文案不再有否决权：
+                                # 审批是人工对这一步的最终处置，覆盖子链的原始结论
+                                # （ADR-APPROVAL-AUTHORITY 的同一原则，消费者 #4
+                                # 之前只管子链侧 confirmed_at，漏了父步侧）。
+                                _verdict_rejected = (
+                                    _subflow_verdict_rejected(_sub_verdict_sr)
+                                    and not _sdata.get("confirmed_at"))
+                                if _verdict_rejected:
+                                    # 交父链自己的 rejected 消费分支（engine.py 的
+                                    # `step_status == "rejected"` 段）：有分类→建返工链、
+                                    # 无分类→重投原步，封顶 3 次后升级 coordinator。
+                                    # 该分支有完整出口，故此处「阻断」不再是静默卡死——
+                                    # 旧实现只写 blocker 就照常 completed（理由是硬拦会
+                                    # 卡死），前提已随该分支落地而不成立。
+                                    # 实测 7 例子链驳回（reviewer_pr_review 末步）全部
+                                    # 据此把父链放行到终点：wf_654cd82159/s5、
+                                    # wf_5f5eebc881/s7 等。
+                                    #
+                                    # 只压状态、**不**把子链 exit_messages 搬进父步：
+                                    # 父步一旦有 exit_messages 且 status≠completed，
+                                    # tick-rescue 会立刻把它判成"产出已就绪"并直接
+                                    # complete_step，压回的 rejected 当场被抵消。
+                                    # 建返工链所需的分类段读父步自身的 exit_messages；
+                                    # 父步无文案时建链失败 → 走重投原步（有出口）。
+                                    #
+                                    # 幂等：已被压成 rejected 就不再重写。每 tick 重写
+                                    # 会把 rejected_at 刷成当前时刻，engine 的
+                                    # `_rejected_wait_anchor` 读的正是它 → 等返工链的
+                                    # 超时保护（_REJECTED_WAIT_MAX）被永久续期，且 blocker
+                                    # 每 tick 重发一条。本块每轮都会重新进入（子链仍
+                                    # completed、父步仍持有 subflow_id），必须去重。
+                                    if _sdata.get("status") != "rejected":
+                                        _sdata["status"] = "rejected"
+                                        _sdata["rejected_at"] = time.time()
+                                        _sdata["rejected_by"] = "subflow_verdict"
+                                        _sdata["rejection_reason"] = (
+                                            f"子链 {_sf} 末步驳回: "
+                                            + " ".join(str(m.get("text", ""))
+                                                       for m in (_sub_last.get("exit_messages") or [])
+                                                       if isinstance(m, dict))[:300])
+                                else:
+                                    _sdata["status"] = "completed"
+                                    _sdata["completed_at"] = time.time()
                                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                                     (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
                                 conn.commit()
+                                # blocker 与状态写入同样幂等：本块每 tick 重入
+                                # （子链仍 completed、父步仍持 subflow_id），不去重
+                                # 会在返工等待期每 10s 写一条同文 blocker。
+                                if _verdict_rejected and _sdata.get("rejected_by") == "subflow_verdict" \
+                                        and not _sdata.get("subflow_reject_reported_at"):
+                                    _sdata["subflow_reject_reported_at"] = time.time()
+                                    conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                        (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                                    conn.commit()
+                                    try:
+                                        self._bb.write(
+                                            "blocker",
+                                            f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                            f"子链 {_sf[:12]} 末步驳回 → 父步压回 rejected，不再推进",
+                                            src="workflow_engine",
+                                            evidence=f"子链 {_sf} status={_sub_status['status']} "
+                                                     f"但 exit_messages 含驳回文案，该步产出未通过审查。"
+                                                     f"父步交由 rejected 消费分支处置（建返工链或重投，"
+                                                     f"封顶后升级 coordinator）。")
+                                        LOGGER.warning(
+                                            "子链 %s 末步驳回 → 父 %s/%s 压回 rejected",
+                                            _sf[:12], _sub_row["instance_id"][:12], _step_id)
+                                    except Exception as _bwe:
+                                        LOGGER.debug("subflow-verdict blocker 写入失败: %s", _bwe)
                                 # 推进父工作流（advance 内部自带锁内 DB + 锁外 subprocess）
+                                # 驳回时不推进：上面已把父步压回 rejected，推进等于绕过门禁。
                                 _tmpl = conn.execute("SELECT template_id FROM workflow_instances WHERE instance_id=?", (_sub_row["instance_id"],)).fetchone()
-                                if _tmpl:
+                                if _tmpl and not _verdict_rejected:
                                     _wf = self._workflows.get(_tmpl["template_id"])
                                     if _wf:
                                         deferred.append(
                                             lambda wfid=_sub_row["instance_id"], tpl=_tmpl["template_id"], sid=_step_id, sr=_sr:
                                                 self._advance_production_wf(wfid, lm, tpl, sid, sr)
                                         )
+                            elif _sub_status and _sub_status['status'] in ('failed', 'cancelled'):
+                                # 子链终态（failed/cancelled）→ 父步无出口，只能等 exit
+                                # 超时被 auto-cancel（实测 wf_59263/s5：子链 cancelled 后
+                                # 父步 notified 悬空 40min）。重置父步状态让它重走投递。
+                                # 按 subflow_id 去重：同一子链只重置一次，否则每 tick 重写。
+                                # 前 2 次连 subflow_id 一起清 → _subflow_takeover 重建子链（首选，
+                                # 实测 writer_document 因此走通并让 wf_59263 推进到 s6）。
+                                # 之后保留 subflow_id：_subflow_takeover 见子链不在活跃白名单
+                                # 即返回 False 交还父步自投（wf_lifecycle.py 终态分支）。
+                                # **不可**置父步 delivery_blocked 收口：_recover_delivery_blocked
+                                # 只扫行级 status=delivery_blocked 的实例，而父链行级是
+                                # running，看不见步骤级标记 → 父步永久悬空（实测 wf_22b96/s3）。
+                                if _sdata.get("subflow_failed_id") != _sf:
+                                    _sdata["subflow_failed_id"] = _sf
+                                    _sdata["subflow_failed_at"] = time.time()
+                                    _sdata["subflow_failed_status"] = _sub_status["status"]
+                                    # 命中 _subflow_takeover 三步：前 2 次清 subflow_id 重建子链；
+                                    # 2 次用完父步自投一次（子链重建失败说明该角色/链路持续异常，
+                                    # 再建只是同型空转），之后保留 subflow_id 并交人工——
+                                    # 无限自投只会让同一失败模式每 tick 重演（实测 wf_22b96/s3
+                                    # reviewer 子链连建 5 条全部 delivery_blocked）。
+                                    _n = int(_sdata.get("subflow_retry", 0) or 0) + 1
+                                    _sdata["subflow_retry"] = _n
+                                    if _n <= 2:
+                                        _sdata.pop("subflow_id", None)
+                                    _sdata.pop("notified_at", None)
+                                    _sdata.pop("poll_since", None)
+                                    _sdata["status"] = ""
+                                    if _n > 3:
+                                        # 保留 status="" 但不重建：engine 的派发分支会看到
+                                        # subflow_id 仍指向终态子链 → _subflow_takeover 返回
+                                        # False → 父步自投；自投失败才落到 delivery_blocked 收口。
+                                        _sdata["subflow_escalated"] = True
+                                        self._bb.write(
+                                            "blocker",
+                                            f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                            f"子链 {_n} 次失败，停止自动重建",
+                                            src="workflow_engine",
+                                            evidence=(f"子链 {_sf} status={_sub_status['status']}；"
+                                                      f"同一父步已重建 {_n - 1} 次。需人工排查"
+                                                      f"该角色/模板链路，自动重建已停止。"))
+                                    conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                        (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
+                                    conn.commit()
+                                    _note = (f"已重置重投(第 {_n} 次)" if _n <= 2
+                                             else "保留 subflow_id，交还父步自投")
+                                    try:
+                                        self._bb.write(
+                                            "blocker",
+                                            f"[workflow] {_sub_row['instance_id'][:12]}/{_step_id} "
+                                            f"子链 {_sf[:12]} {_sub_status['status']}，{_note}",
+                                            src="workflow_engine",
+                                            evidence=f"子链 {_sf} status={_sub_status['status']}。父步 {_step_id} {_note}。")
+                                        LOGGER.warning(
+                                            "子链 %s %s → 父 %s/%s %s",
+                                            _sf[:12], _sub_status["status"],
+                                            _sub_row["instance_id"][:12], _step_id, _note)
+                                    except Exception as _bwe:
+                                        LOGGER.debug("subflow-failed blocker 写入失败: %s", _bwe)
 
                 conn.commit()
                 self._check_anomalies(conn, deferred)
@@ -110,6 +418,61 @@ class TaskGeneratorMixin:
                 LOGGER.info("task-evidence: evaluated %d completed tasks", _feed["evaluated"])
         except Exception as _e:
             LOGGER.debug("task_evidence feedback failed: %s", _e)
+
+    _HEAL_COOLDOWN_SEC = 600
+
+    def _heal_send(self, role: str, prompt: str, instance_id: str, step_id: str) -> None:
+        """锁外自愈重投：投递成功才盖戳 last_heal（锁外独立事务）。
+
+        投递失败（并发守卫/变量校验拦截）时返回 False，不盖戳 → 下轮重试，
+        避免把"未投递却标记已自愈"掩盖死锁（bus #728c6e4307c1 同类根因）。
+
+        冷却：同一 step 每 _HEAL_COOLDOWN_SEC 最多重投一次。原先 last_heal 只写
+        不读（全仓无读取点），_check_anomalies 每 tick（10s）都重走本路径 →
+        同一 prompt 气温每 11s 重复注入角色 pane（实测近 24h 916 条同前缀投递）。
+        与 role_lifecycle 的 _KICK_COOLDOWN_SEC 同范式。
+        """
+        try:
+            _row0 = self._lifecycle.query_one(
+                "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                (instance_id,))
+            _sr0 = json.loads((_row0["step_results"] if _row0 else None) or "{}")
+            _last_heal = (_sr0.get(step_id) or {}).get("last_heal", 0)
+            if _last_heal and time.time() - _last_heal < self._HEAL_COOLDOWN_SEC:
+                return
+        except Exception as _e:
+            LOGGER.debug("heal cooldown read failed: %s", _e)
+        self._ensure_role_alive(role)
+        # 用 `is not False` 而非 bool()："busy"（角色正忙）不应视为投递失败去重试 ——
+        # 角色已在工作，heal 无意义；只对真失败（False）返回不盖戳以待下轮。
+        _ok = self._send_to_role(role, prompt, wf_id=instance_id, step_id=step_id) is not False
+        if not _ok:
+            return
+        try:
+            with self._lifecycle._conn_tx() as _c:
+                _row = _c.execute(
+                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                    (instance_id,)).fetchone()
+                _sr = json.loads(_row["step_results"] or "{}") if _row else {}
+                _sr.setdefault(step_id, {})["last_heal"] = time.time()
+                _c.execute(
+                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                    (json.dumps(_sr, ensure_ascii=False), instance_id))
+        except Exception as _e:
+            LOGGER.debug("heal stamp failed: %s", _e)
+
+    def _backlog_alert_allowed(self, role: str) -> bool:
+        """积压告警冷却闸（DESIGN §2.6 S4）：同角色 30min 内只放行一次。
+
+        无冷却时每 run_once tick 对同一积压角色重发同条告警 → curator 实测
+        3 天 106 条。去重键取 assignee：消息文本含实时计数、每 tick 都变，
+        文本维度的 hash 恒不命中（这正是原告警无节流的原因）。
+        """
+        _now = time.time()
+        if _now - self._BACKLOG_ALERT_TS.get(role, 0) < self._BACKLOG_ALERT_COOLDOWN_S:
+            return False
+        self._BACKLOG_ALERT_TS[role] = _now
+        return True
 
     def _check_anomalies(self, conn=None, deferred=None):
         """Detect workflows stuck across multiple steps; auto-heal.
@@ -149,6 +512,11 @@ class TaskGeneratorMixin:
                     "WHERE status IN ('pending','running') GROUP BY assignee"
                 ).fetchall():
                     if _row["c"] > 10:
+                        # S4 冷却（DESIGN §2.6）：同角色积压告警 30min 只发一次。
+                        # 去重键用 assignee（不是消息文本）：文本含实时计数，每 tick 都变，
+                        # 文本 hash 恒不命中 → 冷却失效。只按角色节流即可。
+                        if not self._backlog_alert_allowed(_row["assignee"]):
+                            continue
                         self._bb.write("architecture",
                             f"[workflow_engine] 角色 {_row['assignee']} 积压 {_row['c']} 个运行中任务，超过阈值 10",
                             src="workflow_engine")
@@ -166,7 +534,9 @@ class TaskGeneratorMixin:
                 for _sid, _sr in results.items():
                     if not isinstance(_sr, dict):
                         continue
-                    if _sr.get("escalated"):
+                    # 写端是 subflow_escalated（:353），只读 escalated 时该抑制
+                    # 永不生效——子链连续失败后本步仍每轮被计入超时重推。
+                    if _sr.get("subflow_escalated") or _sr.get("escalated"):
                         _escalated = True
                     _tc = _sr.get("timeout_count", 0)
                     if _tc == 0:
@@ -177,12 +547,16 @@ class TaskGeneratorMixin:
                         timed_out_steps += 1
                 # ZOMBIE 模板（test/retry_test/prompt_test 等）超时不 escalate → 过滤 95% stress-test blocker 噪音
                 _is_zombie = inst.get("template_id") in _engine_mod.ZOMBIE_TEMPLATES
-                if timed_out_steps >= 2 and not _escalated and not _is_zombie:
+                # 测试 harness 模板（test_*/exit_schema 等验收仅 grep 关键词）在生产环境
+                # 反复运行 → 派发 phantom 角色 → ondemand 回收 → 无限重推 → bus 噪音循环。
+                # 与 ZOMBIE 同一处理：超时不重推，直接 cancel，让活着的角色注意力回到真实产出。
+                _is_test_harness = _is_test_harness_template(inst.get("template_id"))
+                if timed_out_steps >= 2 and not _escalated and not _is_zombie and not _is_test_harness:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
                             f"工作流多步骤超时: {i['instance_id'][:12]}",
                             f"{timed_out_steps} 个步骤已耗尽重试次数，当前步骤={i.get('current_step_id','?')} 角色={i.get('assignee','?')}"))
-                if timed_out_steps >= 3 and not _is_zombie:
+                if timed_out_steps >= 3 and not _is_zombie and not _is_test_harness:
                     _deferred.append(lambda i=inst:
                         self._notify_role("maintainer",
                             f"工作流多步骤超限自愈: {i['instance_id'][:12]}",
@@ -192,37 +566,66 @@ class TaskGeneratorMixin:
                     if _sid and _role and wf:
                         _sf = next((s for s in wf.steps if s.id == _sid), None)
                         if _sf:
-                            _prompt = _sf.prompt_template
+                            # 必须走 _fill_prompt_vars：直接投 prompt_template 会把
+                            # {title}/{description} 原样发出，被 _send_to_role 的
+                            # _UNMATCHED_VAR_RE 守卫拦下 → 自愈链路整体空转（_heal_send
+                            # 返回前就 return、不盖 last_heal，下轮重来）。与
+                            # step_handler:380、role_lifecycle:214、wf_lifecycle:417 一致。
+                            _hf_name = inst.get("template_id") or ""
+                            _hf_title = inst.get("title") or _hf_name
+                            _hf_idx = next((n for n, s in enumerate(wf.steps)
+                                            if s.id == _sid), -1)
+                            _hf_prev = wf.steps[_hf_idx - 1].id if _hf_idx > 0 else ""
+                            _prompt = self._fill_prompt_vars(
+                                _sf.prompt_template, _sf, _hf_name, _hf_title,
+                                inst.get("description") or "", results, _hf_prev,
+                                wf_id=inst["instance_id"])
+                            # 锁外执行：投递成功才盖戳 last_heal（投递失败不下轮重试，不误标已自愈）
                             _deferred.append(lambda role=_role, p=_prompt, i=inst, s=_sid:
-                                (self._ensure_role_alive(role),
-                                 self._send_to_role(role, p, wf_id=i["instance_id"], step_id=s)))
-                    if _sid and _sid in results:
-                        conn.execute("BEGIN IMMEDIATE")
-                        try:
-                            results[_sid]["last_heal"] = time.time()
-                            conn.execute(
-                                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                                (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
-                            conn.commit()
-                        except Exception:
-                            conn.rollback()
-                            raise
+                                self._heal_send(role, p, i["instance_id"], s))
+                # 测试 harness 实例超时达阈值 → 直接 cancel，不再无限重推喂噪音。
+                # 这是堵死 phantom 回环的关键：保留 running 会让下一轮继续 timeout→重推→升级，
+                # 把测试噪音广播给所有活着的角色。
+                if _is_test_harness and timed_out_steps >= 3:
+                    try:
+                        conn.execute(
+                            "UPDATE workflow_instances SET status='cancelled', completed_at=? "
+                            "WHERE instance_id=?",
+                            (time.time(), inst["instance_id"]))
+                        LOGGER.info("test-harness instance cancelled (no re-push): %s",
+                                    inst["instance_id"][:12])
+                    except Exception as _e:
+                        LOGGER.debug("cancel test-harness instance failed: %s", _e)
                 conn.commit()
             # ── 指标持久化（JSONL）──
             try:
                 _st_rows = conn.execute("SELECT status, COUNT(*) as c FROM workflow_instances GROUP BY status").fetchall()
                 _metrics = {
-                    "ts": time.time(),
                     "total": total,
                     "completed": (_completed["c"] if _completed else 0),
                     "rate": round((_completed["c"] or 0) / max(total, 1) * 100, 1),
                     "running": len(running) if running else _running["c"] if _running else 0,
                     "by_status": {r["status"]: r["c"] for r in _st_rows},
                 }
-                _mf = Path.home() / ".hermes" / "state" / "workflow-metrics.jsonl"
+                # 状态未变且 300s 内已写过 → 跳过（#432192）：heal_stalled 每 6s tick
+                # 无条件 append 曾让文件膨胀到 30MB（98.9% 重复行）。心跳下限 300s
+                # 保住时间轴连续性，状态变化立即落盘保住事件精度。
+                #
+                # 比对基准优先用**本进程内存**：同文件还有其它写者（并发跑测试的
+                # worktree、旧版进程），读末行会被它们的 total=1 夹具行打断，
+                # 实测 60 行里 48 行是测试产物 → 末行去重形同虚设。仅当本进程
+                # 尚无记录（daemon 重启）时才回读文件末行兜底。
+                _now = time.time()
+                # 路径走 paths.METRICS_JSONL 以便 conftest 隔离（同 WORKFLOWS_DB）。
+                from paths import METRICS_JSONL as _mf
                 _mf.parent.mkdir(parents=True, exist_ok=True)
-                with _mf.open("a") as f:
-                    f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
+                _last = getattr(self, "_metrics_last", None) or _last_metrics(_mf)
+                if not (_last and _same_metrics(_last, _metrics)
+                        and _now - _last.get("ts", 0) < 300):
+                    _metrics["ts"] = _now
+                    with _mf.open("a") as f:
+                        f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
+                    self._metrics_last = _metrics
             except (ValueError, KeyError, TypeError):
                 pass
         except Exception as _e:
@@ -260,6 +663,11 @@ class TaskGeneratorMixin:
             if not _wf.steps or not _wf.allowed_executors:
                 continue
             if _wf.is_subflow:
+                continue
+            # 测试 harness 模板（test_*/exit_schema 等验收仅 grep 关键词）禁止自动派发：
+            # 反复生成 → 喂饱 production 角色做无意义的测试任务 → 真实需求被淹没。
+            # 与 _check_anomalies 共用同一判据函数，避免测试噪音回环。
+            if _is_test_harness_template(_wf_name):
                 continue
             # 取第一个 executor 作为目标角色
             _role = _wf.allowed_executors[0]
@@ -309,21 +717,27 @@ class TaskGeneratorMixin:
                     continue
             except Exception:
                 pass
-
-            # 3) 组装有描述性的任务标题
+            # 3) 组装有描述性的任务标题（必须在去重检查**之前**：
+            # 去重要按 title 比对，先读后写会 UnboundLocalError，
+            # 且被下面的 except 吞掉 → 去重静默失效）
             _title = f"[auto] {_wf.title or _wf_name}: {_wf.description[:40]}" if _wf.description else f"[auto] 执行 {_wf_name} 工作流"
             if len(_title) < 12:
                 continue  # 跳过标题过短
-            _prompt = (
-                f"/goal\n\n"
-                f"## 任务\n执行工作流模板 {_wf_name}\n\n"
-                f"## 描述\n{_wf.description}\n\n"
-                f"## 步骤\n"
-            )
-            for _s in _wf.steps:
-                _prompt += f"  {_s.id}: {_s.title}\n"
-            if _wf.quality_standards:
-                _prompt += f"\n## 质量标准\n{_wf.quality_standards}\n"
+            # S1 事件去重（DESIGN §2.1）：同标题同角色 24h 内已 mint 过 task → 跳过。
+            # 上一段 per-template 守卫挡不住同模板下不同标题的事件洪水（每次超时
+            # 重推/路由消费都带新标题），title 维度的 24h 窗口补齐该缺口。
+            try:
+                _dup = self._lifecycle.query(
+                    "SELECT COUNT(*) as c FROM tasks "
+                    "WHERE title=? AND assignee=? AND created_at > ?",
+                    (_title[:80], _role, _now - 86400)
+                )[0]["c"]
+                if _dup > 0:
+                    continue
+            except Exception as _e:
+                # 不再静默：去重失效 = 事件洪水无闸门，必须在日志可见
+                LOGGER.warning("auto-task title 去重检查失败（降级为不去重）: %s", _e)
+            # 原 _prompt 构造块已删除：只赋值从不使用，且内含 /goal 死路径 (task_generator.py:434-443)
 
             # 4) 直接启动工作流——绕过路由 daemon 直接创建 task + workflow_instance
             # _can_assign_role 已检测 tmux 会话存活
@@ -372,35 +786,45 @@ class TaskGeneratorMixin:
 
         L1: tmux 会话存活（session 不存在 → 不可分配）
         L2: 正在思考（liveness L1 thinking 信号 → busy，跳过）
+        L3: running 实例 >= MAX_RUNNING_PER_ROLE → backpressure（DESIGN §2.2）
         idel/stale/unknown → 放行
         """
         _skip = {"coordinator", "pipeline", "claude", "workflow_engine", ""}
         if role in _skip:
             return False
+        # L3: per-role running 上限（防洪水第二层）：角色已有 >= MAX_RUNNING_PER_ROLE
+        # 个 running/pending 实例 → 拒绝新派发，等回收自然降到水位线以下。
+        # 常量化而非配置：改大=放开洪水闸门，改小=饿死慢角色；3 与 DESIGN 验收 ⑤ 一致。
+        try:
+            _run = self._lifecycle.query(
+                "SELECT COUNT(*) as c FROM workflow_instances "
+                "WHERE assignee=? AND status IN ('running','pending')",
+                (role,)
+            )[0]["c"]
+            if _run >= MAX_RUNNING_PER_ROLE:
+                LOGGER.debug("_can_assign_role backpressure: %s running=%d >= %d",
+                             role, _run, MAX_RUNNING_PER_ROLE)
+                return False
+        except Exception as _e:
+            LOGGER.debug("_can_assign_role running-count query failed: %s", _e)
         # L1: tmux 存活（与原实现一致：异常/session 不在 → 不可分配）
         from liveness import _tmux_has_session, role_liveness
         if _tmux_has_session(role, timeout=5) is not True:
             return False
         # L2: thinking 信号（health 文件 survival_l2_thinking）。health 文件缺失时
-        # （available=False）降级回 pane_activity 60s 检查，保留原语义兜底——
+        # （available=False）降级回 pane 活跃检查，保留原语义兜底——
         # 否则自动任务生成从"60s 活跃拦截"退化为"无条件放行"（review P1-2 修复）。
         res = role_liveness(role, level=1)
         if res["busy"]:
             return False
         if res.get("signals", {}).get(1, {}).get("available"):
             return True  # health 信号可用且不忙
-        # 降级：health 文件缺失 → pane_activity 60s 兜底（原 _can_assign_role L2 语义）
-        try:
-            _pr = _engine_mod._sp.run(["tmux", "list-panes", "-t", f"ccs-{role}",
-                           "-F", "#{pane_activity}"],
-                          capture_output=True, text=True, timeout=3)
-            if _pr.returncode == 0 and _pr.stdout.strip():
-                _val = _pr.stdout.strip().split("\n")[0]
-                if _val and _val != "0" and time.time() - float(_val) < 60:
-                    return False
-        except Exception as _e:
-            # D1 修复: pane_activity 解析失败返回 False（保守），
-            # 防 tmux 异常导致角色误判空闲 → 重复分配任务
-            LOGGER.debug("_can_assign_role pane_activity fallback failed: %s", _e)
-            return False
-        return True
+        # 降级：health 文件缺失 → pane 最近有无输出（原 _can_assign_role L2 语义）。
+        # 原实现直接跑 `tmux list-panes -F #{pane_activity}`，该格式在 tmux 3.4
+        # 恒为空串（实测），故条件恒不成立 → 返回 False → 角色永久不可分配任务。
+        # 改调 liveness.tmux_pane_active()：同一信号源，#{window_activity} 已实测有效。
+        from liveness import tmux_pane_active
+        _active = tmux_pane_active(role, timeout=3)
+        if _active is None:
+            return True  # 探测不可用 → 不阻断（与 liveness 的 available=False 放行一致）
+        return not _active  # 近期有输出 = 在干活 → 不可分配

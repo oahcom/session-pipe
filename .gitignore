@@ -6,6 +6,22 @@ __pycache__/
 *.swp
 *.swo
 *~
-workflow.db-shm
-workflow.db-wal
+# workflow*.db*：SQLite 数据库与其 WAL/SHM 运行时文件不入库。
+# 原规则写作 workflow.db-shm（少一个 s），与实际文件名 workflows.db-shm
+# 不匹配，导致 ca9d1b9 误提交二进制 WAL/SHM。
+workflow*.db
+workflow*.db-shm
+workflow*.db-wal
+*.db-shm
+*.db-wal
+# 仓库根目录的 SQLite 数据库一律不入库（生产 DB 在 ~/.hermes/data/state/）
+/*.db
+# 运行时产物：投递链状态与守护锁（根目录与 src/ 均会生成）
+delivery_chain_status.json
+delivery_chain_status.lock
+# 工作流引擎本地库（workflows.db-shm/-wal 已由上方 *.db-shm / *.db-wal 覆盖）
+pipeflow.db
 .coverage
+
+tmp_out_*.txt
+_codex_verify.txt

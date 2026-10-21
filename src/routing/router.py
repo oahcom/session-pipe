@@ -96,16 +96,6 @@ class Router:
             print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
         return self._build_from_export()
 
-    def load_from_db(self) -> dict:
-        """重新从 DB 加载路由表，更新 self._routing。"""
-        try:
-            db_routing = routing_db.load_routing()
-            if self._db_ok(db_routing):
-                self._routing = db_routing
-        except Exception as _e:
-            print(f"  [router] WARNING: DB 加载路由失败: {_e}", file=sys.stderr)
-        return self._routing
-
     def register_role(self, role: str, produce: list[str], consume: list[str], changed_by: str = "") -> bool:
         """注册/更新角色路由（同时写入 DB 和内存）。"""
         self._routing[role] = {"produce": produce, "consume": consume}
@@ -176,7 +166,7 @@ class Router:
         """返回某类消息的消费者列表。
 
         优先从路由表获取；路由表为空时使用默认映射（dashboard 告警→
-        maintainer，verification→investigator）确保告警不被遗弃。
+        maintainer）确保告警不被遗弃。
         """
         consumers = [
             role for role, r in self._routing.items()
@@ -194,18 +184,19 @@ class Router:
         return _FALLBACK.get(category, [])
 
     def get_consumers_prioritized(self, category: str) -> list[str]:
-        """返回按优先级排序的消费者列表。
+        """返回消费者列表（通吃角色置后，其余保持路由表顺序稳定）。
 
         规则：
         1. 消费该分类的消费者
-        2. 按优先级排序：security > code_fix > architecture > 其他
-        3. consume="*"（通吃一切）的角色排最后
+        2. consume="*"（通吃一切）的角色排最后
+
+        注：分类内各消费者共享同一 category，跨分类优先级
+        （security > code_fix > architecture > 其他）由调用方在聚合多分类结果时处理，
+        此处不再引入恒等无贡献的 cat_prio 排序项。
         """
         consumers = self.get_consumers(category)
-        # 通吃角色排后；同一 category 消费，cat_prio 恒等无排序贡献（已删）
-        consumers.sort(key=lambda r: (
-            self._routing.get(r, {}).get("consume", []).count("*"),
-        ))
+        # 通吃角色排后；同组保持路由表原序（稳定排序）
+        consumers.sort(key=lambda r: self._routing.get(r, {}).get("consume", []).count("*"))
         return consumers
 
     def role_produce_categories(self, role: str) -> list[str]:
@@ -310,12 +301,8 @@ def routing_summary() -> dict:
 
 
 def format_pipeline() -> str:
+    """格式化为人类可读的路由拓扑图（供 AGENTS.md / PUBLIC_API.md 文档指令调用）。"""
     return get_router().format_pipeline()
-
-
-def category_priority(cat: str) -> int:
-    """返回分类的优先级分数（数字越小越优先）。"""
-    return priority(cat)
 
 
 def main():

@@ -124,42 +124,210 @@ def _has_output_schema(role_name: str) -> bool:
     return False
 
 
+# 角色别名映射 (中文 title / 英文别称 → persona name)。
+# WHY: eval_passrate 的 role_filter 可能是中文 title(维护者) 或英文(engineer)，
+# review_gate 的 target 是文件名(user_intent_reminder.py) — 三者粒度不同，
+# 需统一映射到 persona name 才能让 add_output_schema 对角色真生效。
+_ROLE_ALIAS: dict[str, str] = {}
+# 缓存绑定的 PERSONAS_DIR —— 目录变了必须重建，否则首建结果永久生效。
+# 实测（2026-10-19）：src/test_routing_daemon.py 用 mock.patch 把 PERSONAS_DIR 指到
+# 单 persona 临时目录，填出残缺映射后所有用例复用 → 5 条 contract_updater 测试全量失败。
+_ALIAS_DIR: object = None
+
+
+# 已知別稱漂移補丁: eval_passrate 的 role_filter 用詞(维护者) 與 persona title(运维者)
+# 不一致 → 手工對齊, 避免映射失敗導致建議失效。
+_ROLE_DRIFT_PATCH = {
+    "维护者": "maintainer",
+    "运维": "maintainer",
+    "开发者": "engineer",
+}
+# ponytail: 已知詞彙漂移補丁。天花板=硬編碼違反 D3(config>hardcode); 升級路徑=將映射移入
+# config.yaml (角色別稱表), 並由 _detect_drift 在發現未映射中文 title 時自動報 bus notice
+# (已實作), 不在此手動維護。當 persona title 變動時, 舊稱會被 drift notice 捕獲而非靜默失效。
+
+
+def _build_role_alias_map() -> dict[str, str]:
+    """从 persona JSON 构建 中文title/英文name → name 的别名表 (按目录缓存)。"""
+    global _ALIAS_DIR
+    if _ROLE_ALIAS and _ALIAS_DIR == PERSONAS_DIR:
+        return _ROLE_ALIAS
+    _ROLE_ALIAS.clear()
+    _ALIAS_DIR = PERSONAS_DIR
+    for f in PERSONAS_DIR.glob("persona_*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        name = d.get("name")
+        if not name:
+            continue
+        _ROLE_ALIAS[name] = name                       # 英文直过
+        title = d.get("title")
+        if title:
+            _ROLE_ALIAS[title.strip()] = name           # 中文 title → name
+    _ROLE_ALIAS.update(_ROLE_DRIFT_PATCH)              # 已知漂移補丁
+    return _ROLE_ALIAS
+
+
+def _resolve_role_for_suggestion(entry: dict) -> str:
+    """将单条历史记录解析为 persona name (供 suggest_improvements 使用)。
+
+    优先级: role_filter(中文title/英文) → role → target 末段(文件名回退)。
+    映射失败回退到原始末段标识，绝不返回字面 'unknown' 导致建议失效。
+    """
+    alias = _build_role_alias_map()
+    rf = entry.get("role_filter") or entry.get("role")
+    if rf:
+        if rf in alias:
+            return alias[rf]
+        # 部分匹配: role_filter 含 title 子串 (e.g. '管理者 / Manager')
+        for k, v in alias.items():
+            if k and k in rf:
+                return v
+    # 文件名回退: review_gate 的 target 屬於文件, 非角色。檢測 drift 並告警。
+    target = str(entry.get("target", "") or "")
+    leaf = target.rstrip("/").split("/")[-1]
+    if leaf and leaf not in ("src", "engine.py", "manager.py", "daemon.py"):
+        # review_gate 真实角色在 dims[].parties, 优先提取再回退文件名(避免误告警+漏映射)
+        p = _parties_role(entry)
+        if p:
+            return p
+        _detect_drift(rf, leaf=leaf)  # 文件名回退 → 告警缺 file→persona mapping
+        return leaf
+    return ""  # 無法解析 → 空 (調用方跳過, 不產生 unknown 垃圾建議)
+
+
+def _detect_drift(role_filter: str | None, *, leaf: str = "") -> None:
+    """檢測數據源詞彙漂移，寫 bus notice (not fail)。
+
+    WHY: eval_passrate 的 role_filter(维护者) 與 persona title(运维者) 可能漂移；
+    review_gate 的 target 是文件名而非角色名 → 兩類皆是跨系統契約缺口。
+    此函數**告警不失敗**: 新漂移詞不應阻塞 contract_updater, 但必須可觀測。
+    """
+    alias = _build_role_alias_map()
+    if role_filter and role_filter not in alias and not any(k in role_filter for k in alias):
+        _write_bus("notice",
+                   f"[contract_updater] role_filter 漂移: {role_filter!r} 無對應 persona title",
+                   f"role_filter={role_filter}", "--src", "contract_updater")
+    if leaf:
+        # 文件名回退代表 file→persona mapping 缺失 → 告警 (ponytail: 文件屬義邊界未實現)
+        _write_bus("notice",
+                   f"[contract_updater] target={leaf!r} 是文件名, 無法映射到角色 persona —— 需建立 file→role 映射表",
+                   f"file_target={leaf}", "--src", "contract_updater")
+
+
+def _assert_role_coverage(feed: list[dict]) -> int:
+    """覆蓋斷言: 驗證每個非 None role_filter 能解析到 persona。
+
+    返回**未解析數** (0=全部覆蓋)。將 silent skip 轉為可觀測:
+    未解析項會寫 bus notice, 但不丟異常(避免阻塞自改進閉環)。
+    """
+    unmapped = 0
+    for e in feed:
+        rf = e.get("role_filter") or e.get("role")
+        if rf is None:
+            continue  # None 是合法 (無角色標記的統計行)
+        resolved = _resolve_role_for_suggestion(e)
+        # 仅"解析不出角色"算未解析。不可写作 `or resolved == rf`：role_filter 本身
+        # 就是 persona name 时（engineer/qa/lr… 占绝大多数）解析结果天然等于输入，
+        # 旧判据把"解析成功"判成"未解析" → 每小时刷假 notice，真漂移被淹没。
+        if not resolved:
+            unmapped += 1
+            _write_bus("notice",
+                       f"[contract_updater] role_filter 未解析: {rf!r}",
+                       f"role_filter={rf}", "--src", "contract_updater")
+    if unmapped:
+        _write_bus("code_fix",
+                   f"[contract_updater] 發現 {unmapped} 個 role_filter 未解析 —— 覆蓋率<100%",
+                   f"unmapped={unmapped}/100%", "--src", "contract_updater")
+    return unmapped
+
+
+def _parties_role(entry: dict) -> str:
+    """从 review_gate 的 dims[].parties 提取首个可映射 persona 的角色。
+
+    review_gate 真实 schema 无 role 字段, 角色真值在 dims 的 parties 里。
+    优先用 parties 而非文件名回退, 避免文件→persona 映射缺失导致误告警+漏判。
+    返回 "" 表示无可行角色(调用方继续文件名回退)。
+    """
+    try:
+        dims = entry.get("dims", "[]")
+        if isinstance(dims, str):
+            dims = json.loads(dims)
+        alias = _build_role_alias_map()
+        for d in dims:
+            for p in (d.get("parties") or []):
+                if not p or p == "unknown":
+                    continue
+                if p in alias:
+                    return alias[p]
+                for k, v in alias.items():  # 双向部分匹配 ('codex'↔'codex-dev')
+                    if k and (k in p or p in k):
+                        return v
+    except Exception:
+        pass
+    return ""
+
+
 def suggest_improvements(check_history: list[dict]) -> list[dict]:
-    """分析 eval_checker 历史记录，生成改进建议。
+    """分析 review_gate 历史记录（真实 schema: target/verdict/dims），生成改进建议。
 
     规则:
-    - 某角色连续 3 次以上被 skipped（无可执行 criterion）→ 建议加验证命令
-    - 某角色连续 fail > 3 → 建议调整阈值或检查服务
     - 某角色 output_schema 不存在 → 建议加 output_schema
+    - 某角色最近 dims 含 FAIL/WARN 维度 → 建议调整（阈值/服务/验证）
+    - verdict=BLOCK 且 retry_reasons 非空 → 建议复盘根因
     """
     suggestions: list[dict] = []
-    # 按角色分组
+    # 按角色分组 (统一解析为 persona name, 支持 review_gate/eval_passrate 多源)
     by_role: dict[str, list[dict]] = {}
     for entry in check_history:
-        role = entry.get("role", "unknown")
+        role = _resolve_role_for_suggestion(entry)
+        if not role:
+            continue  # 無法解析 (role_filter=None 且無 target) → 跳過, 不產 unknown 垃圾
         by_role.setdefault(role, []).append(entry)
 
     for role, entries in by_role.items():
-        # 规则 1: 连续 3+ 次 skipped
-        if all(e.get("skipped", 0) > 0 and e.get("checked", 1) == 0 for e in entries[-3:]):
+        # 规则 1: 最近 dims 含 FAIL 维度 → 建议调整验证/服务
+        recent = entries[-5:]
+        fail_dims = []
+        for e in recent:
+            dims = e.get("dims", "[]")
+            if isinstance(dims, str):
+                try:
+                    dims = json.loads(dims)
+                except Exception:
+                    dims = []
+            for d in dims:
+                if d.get("status") in ("FAIL", "WARN"):
+                    fail_dims.append(d.get("dim_id"))
+        if fail_dims:
             suggestions.append({
                 "role": role,
                 "criterion": "eval_criteria",
-                "suggestion": f"角色 {role} 连续 {len(entries[-3:])} 次被跳过（无可执行 criterion），建议添加含可执行验证命令的 eval_criterion",
-                "type": "add_verification_cmd",
-            })
-
-        # 规则 2: 连续 fail > 3
-        recent = [e for e in entries[-5:] if e.get("failed", 0) > 0]
-        if len(recent) >= 3 and all(e.get("failed", 0) > (e.get("checked", 1) or 1) * 0.5 for e in recent):
-            suggestions.append({
-                "role": role,
-                "criterion": "eval_criteria",
-                "suggestion": f"角色 {role} 最近 {len(recent)} 次检查失败率 > 50%，建议调整验证阈值或检查对应服务状态",
+                "suggestion": f"角色 {role} 最近审查维度 {fail_dims} 判 FAIL/WARN，建议调整验证阈值或检查对应服务状态",
                 "type": "adjust_threshold_or_service",
             })
 
-        # 规则 3: output_schema 不存在
+        # 规则 2: verdict=BLOCK 且 retry_reasons 非空 → 复盘根因
+        if any(e.get("verdict") == "BLOCK" and e.get("retry_reasons") for e in recent):
+            suggestions.append({
+                "role": role,
+                "criterion": "root_cause",
+                "suggestion": f"角色 {role} 审查 verdict=BLOCK 且有 retry_reasons，建议复盘根因后再放行",
+                "type": "review_root_cause",
+            })
+
+        # 规则 3: 近期 check 存在 skipped>0 → 建议补驗證指令 (grow-unused-logic: skipped 信号曾为 eval_checker.schema, suggest 遗漏未落地)
+        if any(e.get("skipped", 0) > 0 for e in recent):
+            suggestions.append({
+                "role": role,
+                "criterion": "eval_criteria",
+                "suggestion": f"角色 {role} 最近有 skipped>0 的审查，建议补充验证指令 (add_verification_cmd) 以降低跳过率",
+                "type": "add_verification_cmd",
+            })
+
+        # 规则 4: output_schema 不存在（始终检查，不依赖历史格式）
         if not _has_output_schema(role):
             suggestions.append({
                 "role": role,
@@ -168,7 +336,30 @@ def suggest_improvements(check_history: list[dict]) -> list[dict]:
                 "type": "add_output_schema",
             })
 
+    # 覆蓋斷言: 每個非 None role_filter 應可解析到 persona, 否則寫 bus notice
+    # (將 silent skip 轉為可觀測信號, 不阻塞建議生成)
+    try:
+        _assert_role_coverage(check_history)
+    except Exception as _ce:
+        LOGGER.warning("role coverage assert 異常(不阻塞): %s", _ce)
+
     return suggestions
+
+
+def _write_bus(category: str, text: str, evidence: str = "", *extra: str) -> bool:
+    """寫一条 bus 訊息 (notice/code_fix/architecture) — 用於 drift 检测与覆盖断言告警。
+
+    獨立 guard: bus I/O 故障不得阻塞自改進閉環或消息投递。
+    """
+    try:
+        subprocess.run(
+            [sys.executable, str(BUS_SCRIPT), "write", category, text,
+             "--evidence", evidence, "--src", "contract_updater", *extra],
+            capture_output=True, timeout=10)
+        return True
+    except Exception as e:
+        LOGGER.warning("bus write fail (notice): %s", e)
+        return False
 
 
 def write_suggestions(suggestions: list[dict]) -> int:

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from template_registry import (
-    TemplateRegistry, _validate_schema, _validate_meta,
+    TemplateRegistry, _is_test_harness, _validate_schema, _validate_meta,
 )
 
 from paths import HERMES_WORKFLOWS
@@ -87,14 +87,15 @@ def test_legacy_shape_registers():
 
 # ── 5. register 双写：JSON 文件出现 ──
 def test_register_writes_json_and_db():
-    """注册后 {name}.json 出现且内容含 workflow_id；DB 有行。"""
+    """注册后 {template_id}.json 出现且内容含 workflow_id；DB 有行。"""
     with tempfile.TemporaryDirectory() as tmp:
         wf_dir = Path(tmp) / "workflows"
         reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=wf_dir)
-        tid = reg.register(_valid_template(), workflows_dir=wf_dir)
+        template = _valid_template()
+        tid = reg.register(template, workflows_dir=wf_dir)
         reg.close()
-        # JSON 文件
-        jf = wf_dir / "test_wf.json"
+        # JSON 文件: 以 template_id 命名 (避免同名不同 ID 碰撞)
+        jf = wf_dir / f"{tid}.json"
         assert jf.exists(), "JSON 文件应被写出"
         data = json.loads(jf.read_text())
         assert data["workflow_id"] == "WF-test_wf"
@@ -111,7 +112,7 @@ def test_register_refuses_existing_file():
     with tempfile.TemporaryDirectory() as tmp:
         wf_dir = Path(tmp) / "workflows"
         wf_dir.mkdir()
-        (wf_dir / "test_wf.json").write_text(json.dumps({"old": True}))
+        (wf_dir / "WF-test_wf.json").write_text(json.dumps({"old": True}))
         reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"), workflows_dir=wf_dir)
         try:
             reg.register(_valid_template(), workflows_dir=wf_dir)
@@ -121,7 +122,7 @@ def test_register_refuses_existing_file():
         finally:
             reg.close()
         # 原文件未被覆盖
-        assert json.loads((wf_dir / "test_wf.json").read_text()) == {"old": True}
+        assert json.loads((wf_dir / "WF-test_wf.json").read_text()) == {"old": True}
 
 
 # ── 7. 路径穿越拒绝 ──
@@ -203,7 +204,7 @@ def test_upsert_rejects_bad_structure():
 
 # ── 10. 双节点端到端闭环（完整推进链） ──
 def test_dual_node_full_cycle():
-    """start → run_once → complete×2 → 引擎推进。验证完整生命周期。"""
+    """start → run_once → complete_step(s0) → run_once(s1 dual_node) → complete_step(s1) → run_once → 引擎推进。验证完整生命周期。"""
     import sys as _sys, logging as _logging, json as _json
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     _logging.disable(_logging.CRITICAL)
@@ -215,23 +216,120 @@ def test_dual_node_full_cycle():
         wf_dir = Path(tmp) / "wf"
         wf_dir.mkdir()
         _shutil.copy(_PROD_WF / "food_chain_loop.json", wf_dir / "food_chain_loop.json")
+        # s1 的 completion_check 指向生产 scout workspace 的 SCOUT_REPORT.md。
+        # 该文件必然早于本测试新建的工作流 → 新鲜度守卫正确拒绝它 → dual_node 不触发。
+        # 原测试是靠"陈旧文件也放行"的缺陷通过的（环境耦合）。改为指向测试沙箱内的
+        # 同名文件，显式构造本步产出。只改模板副本，不碰生产 JSON。
+        _doc = _json.loads((wf_dir / "food_chain_loop.json").read_text(encoding="utf-8"))
+        _report = Path(tmp) / "SCOUT_REPORT.md"
+        _report.write_text("## 发现\nx\n## 推荐\ny\n## 来源\nz\n" + "filler\n" * 100,
+                           encoding="utf-8")
+        for _s in _doc.get("steps", []):
+            _cc = (_s.get("exit_condition") or {}).get("completion_check")
+            if isinstance(_cc, dict) and _cc.get("file"):
+                _cc["file"] = str(_report)
+        (wf_dir / "food_chain_loop.json").write_text(
+            _json.dumps(_doc, ensure_ascii=False), encoding="utf-8")
         eng = WorkflowEngine(workflows_dir=wf_dir, db_path=str(Path(tmp) / "t.db"))
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = b"pid=123"
-        mock_result.stderr = b""
-        with patch("subprocess.run", return_value=mock_result), \
-             patch.object(eng, "_ensure_role_alive", return_value=True):
+        # str 而非 bytes：调用方普遍传 text=True，tmux 探测（liveness.tmux_pane_active）
+        # 会解析 stdout 里的时间戳，bytes 会抛 TypeError。
+        mock_result.stdout = "pid=123"
+        mock_result.stderr = ""
+        with patch("subprocess.run", return_value=mock_result),              patch.object(eng, "_ensure_role_alive", return_value=True):
             wf_id = eng.start("food_chain_loop", {"source": "test", "loop_iteration": 1})
-            eng.run_once()  # run_once 已内置 dual_node 推进: 标记 notified + node1_done + node2_sent
-            # 验证 run_once 已完成第一步（node1）并发送第二步指令
+            # 第一次 run_once: 处理 s0 (非 dual_node)，标记 notified
+            eng.run_once()
             _sr0 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
-            assert _sr0.get("s1", {}).get("node1_done") is True, "run_once 应完成 dual_node 第一步"
-            assert _sr0.get("s1", {}).get("node2_sent") is True, "run_once 应发送第二节点指令"
-            # 第二步消息到 → complete_step 完成并推进
+            assert _sr0.get("s0", {}).get("status") == "notified", "第一次 run_once 应完成 s0 并标记 notified"
+
+            # 完成 s0，推进到 s1 (dual_node)
+            r0 = eng._lifecycle.complete_step(wf_id, "s0")
+            assert r0 in ("step_done_ready", "completed_and_advanced"), f"s0 应完成并推进: {r0}"
+
+            # 第二次 run_once: 处理 s1 (dual_node)，标记 node1_done + 发送 codex review
+            eng.run_once()
+            _sr1 = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
+            assert _sr1.get("s1", {}).get("node1_done") is True, "第二次 run_once 应完成 dual_node 第一步 node1_done"
+            assert _sr1.get("s1", {}).get("node2_sent") is True, "第二次 run_once 应发送 codex review 指令"
+
+            # 完成 s1
             r2 = eng._lifecycle.complete_step(wf_id, "s1")
             assert r2 in ("step_done_ready", "completed_and_advanced"), f"第二步应完成: {r2}"
             eng.run_once()
             rows = eng._lifecycle.query(
                 "SELECT current_step_id FROM workflow_instances WHERE instance_id=?", (wf_id,))
             assert rows[0]["current_step_id"] in ("s2", "s1"), f"应推进: {rows[0]['current_step_id']}"
+
+
+def test_harness_detection_strips_wf_prefix():
+    """回归守卫：engine 用 "WL-"+name 生成 workflow_id，harness 判据必须剥前缀。
+
+    2026-10-17 事故：只堵无前缀形态 → WL-test_exit_schema 逃过过滤 →
+    recommend() 把它排在真实模板之前（bus_category 命中同样 +5 分）→
+    真任务被套上测试模板 → 产出回执又是新的 code_fix 消息 → 自激循环。
+    实测 177 实例 / 159 条 bus fact / 12 个角色被派。
+    """
+    for tid in ("test_exit_schema", "WL-test_exit_schema", "WF-drill_x",
+                "WL-role_interact", "exit_schema_v2", "WL-exit_schema_v2"):
+        assert _is_test_harness(tid), f"{tid} 应判为 harness"
+
+
+def test_harness_detection_spares_production_templates():
+    """前缀剥离不得误伤生产模板（尤其 qa_test_* 系列）。"""
+    for tid in ("WF-dev_implement", "WL-01", "WL-food_chain_loop",
+                "qa_test_execute", "WF-qa_test_plan", "WL-09",
+                "WF-closer_close_loop", "", None):
+        assert not _is_test_harness(tid), f"{tid} 不是 harness，不得排除"
+
+
+_COMPLIANT_PROMPT = """## 做什么
+修复指定问题。
+
+## 怎么做
+定位根因后最小改动修复，跑测试验证。
+
+## 验收标准
+测试通过，无回归。
+
+## 完成
+写 bus cat=code_fix title 含 s1-complete 并附证据。"""
+
+
+def test_recommend_excludes_harness():
+    """recommend() 是唯一自动选择入口，harness 模板必须在此拦住。
+
+    自建库而非依赖生产 DB：conftest 把 SESSION_PIPELINE_WORKFLOWS_DB 指向临时库，
+    读外部库会 skip；而本用例要验的是 recommend() 的过滤分支本身。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        reg = TemplateRegistry(db_path=str(Path(tmp) / "t.db"),
+                               workflows_dir=Path(tmp))
+        try:
+            def _tpl(wid, name):
+                return {
+                    "workflow_id": wid, "name": name, "title": "t",
+                    "description": "a" * 30,
+                    "trigger_scene": ["修复"],
+                    "allowed_initiators": ["coordinator"],
+                    "allowed_executors": ["engineer"],
+                    "max_duration_hours": 24,
+                    "quality_standards": "a" * 30,
+                    "steps": [{
+                        "id": "s1", "title": "do", "target_role": "engineer",
+                        "prompt_template": _COMPLIANT_PROMPT,
+                        "exit_condition": {"bus_category": "code_fix"},
+                    }],
+                }
+            reg.register(_tpl("WL-test_exit_schema", "test_exit_schema"))
+            reg.register(_tpl("WL-dev_implement", "dev_implement"))
+            got = [x["template_id"] for x in reg.recommend(
+                "[修复] 9router 路由", initiator_role="system",
+                assignee="engineer", bus_category="code_fix")]
+            assert "WL-dev_implement" in got, f"真实模板应被推荐: {got}"
+            assert "WL-test_exit_schema" not in got, f"harness 混入推荐: {got}"
+        finally:
+            reg.close()
+
+

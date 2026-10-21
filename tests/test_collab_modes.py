@@ -102,130 +102,6 @@ class TestEnsureRoleAliveFalseBranch(unittest.TestCase):
 
 # ── 对等模式: track 真实触发 ──────────────────
 
-class TestPeerTrack(unittest.TestCase):
-    """对等模式: track 超时 → 写审计 + 提醒伙伴。"""
-
-    def _eng_with_track(self, latest_ts: float):
-        eng = _eng()
-        eng._is_role_busy = MagicMock(return_value=False)
-        eng._check_exit = MagicMock(return_value=(0.0, []))
-        fake_fact = type("F", (), {"ts": latest_ts, "src": "other_role"})()
-        eng._bb.read = MagicMock(return_value=[fake_fact])
-        eng._lifecycle.complete_step = MagicMock(return_value=None)
-        eng._sync_step_results = MagicMock()
-        return eng
-
-    def test_track_timeout_writes_audit_and_notifies(self):
-        eng = self._eng_with_track(latest_ts=time.time() - 600)
-        step = Step(
-            id="s1", title="生产", target_role="scout", prompt_template="t",
-            exit_condition={},
-            track={"bus_category": "evolution_report", "timeout_sec": 300,
-                   "notify_roles": ["pm"]})
-        run = WorkflowRun(
-            id="wf_x", workflow_name="food_chain", context={},
-            current_step="s1", status="running",
-            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
-            eng._tick(run, step)
-        audit_writes = [c.args for c in eng._bb.write.call_args_list
-                        if c.args[0] == "monitor_audit"]
-        self.assertTrue(audit_writes, "超时应写 monitor_audit")
-        self.assertIn("轮次", audit_writes[0][1])
-        sent = [c.args for c in eng._send_to_role.call_args_list]
-        self.assertTrue(any("pm" in str(c) for c in sent), "应提醒 pm 伙伴")
-
-    def test_track_throttle_no_spam(self):
-        """节流: 第二次 tick 在 timeout 窗口内不应再发消息。"""
-        eng = self._eng_with_track(latest_ts=time.time() - 600)
-        step = Step(
-            id="s1", title="生产", target_role="scout", prompt_template="t",
-            exit_condition={},
-            track={"bus_category": "evolution_report", "timeout_sec": 300,
-                   "notify_roles": ["pm"]})
-        # 第一次 tick
-        run = WorkflowRun(
-            id="wf_throttle", workflow_name="test", context={},
-            current_step="s1", status="running",
-            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
-            eng._tick(run, step)
-        first_call_count = eng._send_to_role.call_count
-        self.assertEqual(first_call_count, 1, "第一次应提醒")
-        # 第二次 tick（节流窗口内，track_notified_at 已设置）
-        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
-            eng._tick(run, step)
-        second_call_count = eng._send_to_role.call_count
-        self.assertEqual(second_call_count, 1, "第二次应被节流，不重复提醒")
-
-    def test_track_same_cat_as_exit_skipped(self):
-        """track_cat == exit cat 时跳过 track 消费。"""
-        eng = self._eng_with_track(latest_ts=time.time() - 600)
-        step = Step(
-            id="s1", title="生产", target_role="scout", prompt_template="t",
-            exit_condition={"bus_category": "evolution_report"},
-            track={"bus_category": "evolution_report", "timeout_sec": 1,
-                   "notify_roles": ["pm"]})
-        run = WorkflowRun(
-            id="wf_same", workflow_name="test", context={},
-            current_step="s1", status="running",
-            step_results={"s1": {"status": "notified", "ts": time.time() - 600}})
-        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
-            eng._tick(run, step)
-        audit_writes = [c.args for c in eng._bb.write.call_args_list
-                        if c.args[0] == "monitor_audit"]
-        self.assertFalse(audit_writes, "相同分类时 track 应跳过，不写审计")
-
-
-# ── 组合模式: guard + track 同时 ──────────────────
-
-class TestCombinedMode(unittest.TestCase):
-    """组合模式: guard + track 同一步骤同时生效。"""
-
-    def test_guard_and_track_both_active(self):
-        """通过 run_once 收集路径验证 guard + 通过 _tick 验证 track。"""
-        eng = _eng()
-        eng._ensure_role_alive = MagicMock(return_value=True)
-        eng._is_role_busy = MagicMock(return_value=False)
-        eng._check_exit = MagicMock(return_value=(0.0, []))
-        fake_fact = type("F", (), {"ts": time.time() - 600, "src": "other_role"})()
-        eng._bb.read = MagicMock(return_value=[fake_fact])
-        eng._sync_step_results = MagicMock()
-        eng._lifecycle.complete_step = MagicMock()
-
-        step = Step(
-            id="s2", title="审查", target_role="reviewer", prompt_template="t",
-            exit_condition={},
-            guard={"watch": ["engineer"], "auto_restart": True},
-            track={"bus_category": "code_review", "timeout_sec": 300,
-                   "notify_roles": ["engineer"]})
-
-        # guard: 真实引擎收集路径
-        wf_def = MagicMock()
-        wf_def.steps = [step]
-        eng._workflows = {"dev": wf_def}
-        eng._lm.query = MagicMock(side_effect=[
-            [{"assignee": "pm"}],
-            [{"instance_id": "wf_c", "template_id": "dev", "current_step_id": "s2"}],
-        ])
-        _alive = eng._collect_guard_roles()
-        for r in _alive:
-            eng._ensure_role_alive(r)
-
-        # track: 调真实 _tick
-        run = WorkflowRun(
-            id="wf_c", workflow_name="test", context={},
-            current_step="s2", status="running",
-            step_results={"s2": {"status": "notified", "ts": time.time() - 600}})
-        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
-            eng._tick(run, step)
-
-        called = {c.args[0] for c in eng._ensure_role_alive.call_args_list}
-        self.assertIn("engineer", called, "guard: engineer 被守护")
-        audit = [c.args for c in eng._bb.write.call_args_list
-                 if c.args[0] == "monitor_audit"]
-        self.assertTrue(audit, "track: 超时写审计")
-
 
 # ── 仲裁模式: 多 watch + loop value_gate ──────────────────
 
@@ -330,9 +206,11 @@ class TestLoopValueGate(unittest.TestCase):
         eng._lifecycle._conn_tx = MagicMock(return_value=ctx)
         eng._lifecycle._conn_tx.return_value.__enter__ = MagicMock(return_value=ctx)
         eng._lifecycle._conn_tx.return_value.__exit__ = MagicMock(return_value=False)
-
         import pipeflow.wf_lifecycle as wfl
-        with patch.object(wfl, "_CCS_WORKSPACES", Path(tmp)):
+        # 生产者重启走模块级 _engine_mod._sp（见 wf_lifecycle._handle_wf_loop），
+        # 只 mock 实例属性拦截不到 → 真的去跑 ccs start，30s 超时。
+        with patch.object(wfl, "_CCS_WORKSPACES", Path(tmp)), \
+                patch.object(wfl._engine_mod, "_sp", MagicMock()):
             eng._handle_wf_loop(wf_def, "wf_loop", eng._lifecycle)
 
         # PASS → 应执行 INSERT（新迭代创建）

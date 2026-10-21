@@ -28,6 +28,14 @@ if _src_dir in sys.path:
     sys.path.remove(_src_dir)
 sys.path.insert(0, _src_dir)
 
+import tempfile
+
+# 只能当脚本跑（tests/run.py 用 subprocess 调本文件）；pytest 不要收集它。
+# 原因：__main__ 会把 HERMES_BLACKBOARD_DB 指向临时库，模块顶层做同样的事会泄漏给
+# 之后 import 的 test_output_continuity（它在 import 期快照该变量 → 24h 连续性断言
+# 静默降级成 skip，假绿）。
+__test__ = False
+
 
 def test_bus_write_and_unconsumed():
     """bus 写入 → unconsumed 能读到。"""
@@ -238,6 +246,21 @@ def test_idempotent_consume_dedup():
 
 
 if __name__ == "__main__":
+    # 隔离：直跑（无 conftest）时把 bus 指向独立临时 DB，不污染生产 Sister Bus。
+    # 不能放在模块顶层：pytest 按文件名顺序 import 测试模块，顶层写入会泄漏给
+    # 其后导入的模块（test_output_continuity 在 import 时快照该变量 → 读到本文件的
+    # 临时空库，24h 产出断言恒为 0）。走 pytest 时由 conftest 负责 bus 隔离。
+    os.environ["HERMES_BLACKBOARD_DB"] = os.path.join(
+        tempfile.mkdtemp(prefix="bus-test-"), "blackboard.db"
+    )
+    # workflows DB 同样必须隔离：test_route_all_e2e / test_priority_routing 会调
+    # route_all() → create_task_v2()，把测试写的 performance facts 铸成**生产**
+    # 工作流实例（实测 2026-10-19：5 次直跑铸出 10 台 WL-full_dev_pipeline，全部
+    # 卡 s1 互相判忙，1 小时后 15 台被僵尸回收器批量回收）。
+    # 仅隔离 bus 不够 —— 铸造动作发生在 workflows 库上。
+    os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(
+        tempfile.mkdtemp(prefix="wf-test-"), "workflows.db"
+    )
     print("=== 集成测试: bus + routing + reliability ===\n")
 
     tests = [

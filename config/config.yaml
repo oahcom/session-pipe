@@ -6,8 +6,6 @@ bus:
   # bus 数据库路径（相对 HOME 或绝对路径）
   # 默认: ~/.hermes/sister_bus/blackboard.db
   db_path: "~/.hermes/sister_bus/blackboard.db"
-  # 未消费消息轮询间隔（秒）
-  poll_interval: 60
   # 单次 poll 最大返回消息数
   max_messages_per_poll: 100
 
@@ -42,31 +40,11 @@ ttl_pruner:
   interval: 3600            # 清理间隔（1 小时）
   auto_start: true          # 启动时自动运行
 
-# 优先级映射（数字越小越优先）
-priority:
-  security: 1
-  code_fix: 2
-  architecture: 3
-  performance: 4
-  evolution_report: 5
-  reflexion_lesson: 6
-  deception: 7
-  default: 8
-
-# 路由配置
-routing:
-  # route-all 时消费者名称
-  default_consumer: "pipeline"
-  # 是否启用幂等消费
-  idempotent_consume: true
-  # 是否启用乐观锁 claim
-  optimistic_claim: true
 
 # 日志
 logging:
   level: "INFO"             # DEBUG/INFO/WARNING/ERROR
   json_output: true         # 结构化 JSON 输出
-  include_trace_id: true    # 注入 trace_id
 
 # 优雅关闭
 graceful_shutdown:
@@ -75,8 +53,6 @@ graceful_shutdown:
 # 健康检查
 health:
   # 健康判定：bus 连通 + 无 stale consumer
-  check_bus_connected: true
-  check_consumer_stale: true
   # 积压阈值：超过 N 条视为 degraded
   backlog_warning_threshold: 2000
   backlog_critical_threshold: 8000

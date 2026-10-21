@@ -19,6 +19,13 @@ import os
 import signal
 import subprocess
 import sys
+
+# 不写新的 .pyc。WHY: 与源文件落在同一秒的 .pyc 会让 Python 的 (mtime, size)
+# 失效校验误判命中，加载**过期字节码** —— 实测 WorkflowLifecycleMixin 因此丢失
+# _handle_wf_loop 等 10 个方法（AST 显示类完整 12 方法，hasattr 却为 False），
+# 引擎静默跑在不同版本上。不写新字节码可消除这个同秒窗口。
+# 必须放在其它项目模块导入之前才生效。
+sys.dont_write_bytecode = True
 import threading
 import time
 from pathlib import Path
@@ -57,7 +64,6 @@ from paths import BUS_CLIENT, CCS_CLI, STARVE_STATE
 
 _BUS_SCRIPT = BUS_CLIENT
 _STARVE_STATE = STARVE_STATE
-_CCS_PY = CCS_CLI
 
 
 def _safe_write_state(state: dict) -> None:
@@ -69,24 +75,6 @@ def _safe_write_state(state: dict) -> None:
         tmp.replace(_STARVE_STATE)
     except OSError as e:
         LOGGER.warning("starve 状态写入失败: %s", e)
-
-
-def _ensure_role_alive(role: str) -> bool:
-    """通过 ccs.py start 拉起未运行的角色 session（幂等，已运行则跳过）。"""
-    try:
-        result = subprocess.run(
-            [sys.executable, str(_CCS_PY), "start", role,
-             "--no-attach", "--no-auto-send"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            LOGGER.info("_ensure_role_alive: %s 已就绪", role)
-            return True
-        LOGGER.warning("_ensure_role_alive %s 失败: %s", role, result.stderr[:200])
-        return False
-    except Exception as e:
-        LOGGER.warning("_ensure_role_alive %s 异常: %s", role, e)
-        return False
 
 
 def _active_count(eng: WorkflowEngine) -> int:
@@ -121,6 +109,10 @@ def _starve_signal(eng: WorkflowEngine) -> None:
         # 失败时间戳过旧（迁移前脏数据/首次触碰）→ 允许创建一次以重置计数
         if last_failure_ts > 0 and now - last_failure_ts < _STARVE_FAIL_BACKOFF:
             return  # 24h 内有失败记录 → 退避
+        # 退避期已过 → 重置计数重新尝试。缺此重置则失败计数永久 ≥ 阈值，
+        # 每次退避到期都只是再退避一次，饥饿恢复路径永不重试
+        # （实测 2026-10-17：consecutive_failures 卡在 5，last_active_ts 停在 8-08）。
+        consec_fails = 0
     else:
         if now - last_fire < _STARVE_COOLDOWN:
             return  # 成功冷却期内
@@ -140,7 +132,9 @@ def _starve_signal(eng: WorkflowEngine) -> None:
             return
 
     # 1) 确保首步角色（scout）session 已启动
-    _ensure_role_alive("scout")
+    eng._ensure_role_alive("scout")
+    # reviewer 作为审批方需常驻以接收 code_review/architecture 消息（bus #336293 缺口修复）
+    eng._ensure_role_alive("reviewer")
 
     # 2) 创建食物链工作流（确定性触发，不依赖 coordinator 转发）
     try:
@@ -178,6 +172,9 @@ def _starve_signal(eng: WorkflowEngine) -> None:
 
     state["last_fire"] = now
     state["last_wf"] = wf_id
+    # last_active_ts 曾被遗留为 69 天前的陈旧值（无任何写入点），会被读成
+    # "引擎长期停摆"。这里显式维护为本次触发时刻。
+    state["last_active_ts"] = now
     state.pop("consecutive_failures", None)  # 成功 → 清零失败计数
     state.pop("last_failure_ts", None)
     _safe_write_state(state)
@@ -214,7 +211,9 @@ def daemon_loop(interval: int):
     shutdown = False
 
     def _handler(s, f):
-        nonlocal shutdown; shutdown = True
+        nonlocal shutdown
+        LOGGER.info("收到信号 %s，开始优雅关闭...", s)
+        shutdown = True
 
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _handler)
@@ -224,6 +223,19 @@ def daemon_loop(interval: int):
 
     idled = 0
     starve_rounds = 0
+    # ── 源码热加载守卫 ──
+    # 本进程启动后永不重读源文件，分支上的修复对运行中的 daemon 完全不生效。
+    # 实测 2026-10-19：判活守卫 _role_producing_recently 已写在工作区，daemon
+    # 仍按旧代码误杀正在写报告的 reviewer。判据 = 源码 mtime 晚于本进程启动。
+    # 处理：优雅退出，由 systemd Restart=always 用新代码拉起。
+    # 连续两次探测到同一新 mtime 才退出 —— 编辑器保存瞬时态不触发重启。
+    _src_dir = Path(__file__).resolve().parent
+
+    def _src_mtime() -> float:
+        return max((_p.stat().st_mtime for _p in _src_dir.glob("*.py")), default=0.0)
+
+    _seen_mtime = _src_mtime()
+
     try:
         while not shutdown:
             try:
@@ -245,12 +257,36 @@ def daemon_loop(interval: int):
                         starve_rounds = 0
             except Exception as e:
                 LOGGER.warning("饥饿检测异常: %s", e)
+            # 每轮都探。旧写法按"轮次"计数（6 轮一探），而忙机上 run_once 一轮要
+            # 几分钟 → 实测 18:18:43 改 daemon.py、18:26 仍不重启，源码修复不生效。
+            try:
+                _now_mtime = _src_mtime()
+                if _now_mtime > _seen_mtime:
+                    time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
+                    if _src_mtime() == _now_mtime:
+                        # 就地重执行，不退出：退出依赖外部拉起（systemd Restart /
+                        # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
+                        # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
+                        # 锁随新进程重新获取，任何监管方式下都能生效。
+                        LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
+                                    _now_mtime)
+                        logging.shutdown()
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+            except OSError as _e:
+                LOGGER.debug("源码 mtime 探测失败: %s", _e)
             time.sleep(interval)
+    except KeyboardInterrupt:
+        LOGGER.info("收到 KeyboardInterrupt，正在关闭...")
+    except Exception as e:
+        LOGGER.error("Daemon 主循环异常: %s", e, exc_info=True)
     finally:
+        LOGGER.info("正在关闭 Workflow Daemon...")
         if _LOCK_FD is not None:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
             _LOCK_FD.close()
-            _LOCK_FILE.unlink(missing_ok=True)
+            # 不 unlink：删文件会让新实例锁到**新 inode**，与还在退出的旧实例
+            # 同时持锁（实测 18:17:25 系统实例 + 18:17:36 手工实例并存 10s 以上）。
+            # 留文件不碍事，flock 随进程消失即释放。
         LOGGER.info("Workflow Daemon 已停止")
 
 

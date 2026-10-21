@@ -233,7 +233,7 @@ class WorkflowRun:
 | type | 完成策略 | 需要审批 | 自动推进 |
 |------|---------|---------|---------|
 | `single` | 直接完成 | 否 | 是 |
-| `handoff` | 等待分配者确认 | 是 (token) | 否 |
+| `handoff` | 置 step_done_ready，引擎 tick 推进 | 否 | 是 |
 | `review` | 等待 target_role 确认 | 是 (token) | 否 |
 | `gate` | 检查条件通过/阻塞 | 否 | 条件通过时 |
 | `notify` | 直接完成 | 否 | 是 |

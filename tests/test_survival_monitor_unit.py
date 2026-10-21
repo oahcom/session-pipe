@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 _SRC = str(Path.home() / "session-pipeline" / "src")
@@ -22,7 +23,6 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import pytest
-import http.client
 
 # Use a fixture to isolate SENTINEL_DIR and _ROLE_TARGETS_CACHE
 from routing import survival_monitor as sm
@@ -30,10 +30,22 @@ from routing import survival_monitor as sm
 
 @pytest.fixture(autouse=True)
 def isolate_state(tmp_path, monkeypatch):
-    """隔离哨兵目录 + 清除角色 target 缓存。"""
+    """隔离哨兵 + 健康目录，清除角色 target 缓存。
+
+    health 目录必须一并隔离：tick() 会调 _write_health()，原先它硬编码
+    真实路径，测试会把 survival_* 字段写进生产 ccs-health/{role}.json
+    （实测 2026-10-16，qa.json 被改写）。
+    """
     sentinel_dir = tmp_path / "ccs-sentinels"
     sentinel_dir.mkdir(parents=True, exist_ok=True)
+    health_dir = tmp_path / "ccs-health"
+    health_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(sm, "SENTINEL_DIR", sentinel_dir)
+    monkeypatch.setattr(sm, "HEALTH_DIR", health_dir)
+    # lifecycle 也必须隔离：tick() 现在额外枚举 infinite 角色以保证「从未启动」的
+    # 角色也进巡检；不隔离会读到生产 personas → 测试驱动 _ensure_role_alive
+    # 去拉起/杀真实 tmux 会话（实测 2026-10-20，一次 pytest 尝试重启 10 个角色）。
+    monkeypatch.setattr(sm, "_load_role_lifecycles", lambda: {})
     # Clear cache
     sm._ROLE_TARGETS_CACHE = {}
     sm._ROLE_TARGETS_TS = 0.0
@@ -175,15 +187,12 @@ class TestL2Check:
                 m.stdout = ""
             return m
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        # Disable HTTP call
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
 
         result = monitor._l2_check("qa")
         assert result["thinking"] is True
 
     def test_l2_stale_pane(self, monitor, monkeypatch):
-        """pane 活动超过 5 分钟 + 无 token → thinking=False。"""
+        """pane 活动超过 5 分钟 → thinking=False。"""
         def fake_run(cmd, **kw):
             m = MagicMock()
             m.returncode = 0
@@ -195,38 +204,33 @@ class TestL2Check:
                 m.stdout = ""
             return m
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
 
         result = monitor._l2_check("qa")
         assert result["thinking"] is False
 
-    def test_l2_token_activity_shows_thinking(self, monitor, monkeypatch):
-        """0 token 但 pane 在活动 → thinking=True。"""
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            if "list-panes" in cmd:
-                m.stdout = f"{time.time() - 10}\n"
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        # Mock 9Router returns tokens > 0
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = b'{"total_tokens": 500}'
-        mock_conn = MagicMock()
-        mock_conn.getresponse.return_value = mock_resp
-        monkeypatch.setattr(http.client, "HTTPConnection", lambda *a, **kw: mock_conn)
+    def test_l2_reads_window_activity_not_pane_activity(self, monitor, monkeypatch):
+        """回归守卫: #{pane_activity} 在 tmux 3.4 恒为空 → 必须用 #{window_activity}。
 
-        result = monitor._l2_check("qa")
-        assert result["thinking"] is True
+        问错变量会让 last_activity 恒为 0 → thinking 恒 None → overall 恒 unknown，
+        三层存活检测整体失效而不报错（实测 2026-10-16）。
+        """
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            return MagicMock(returncode=0, stdout=f"{time.time() - 10}\n")
+
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
+        monitor._l2_check("qa")
+
+        assert any("#{window_activity}" in c for c in seen), "L2 必须查 window_activity"
+        assert not any("#{pane_activity}" in c for c in seen), "pane_activity 在 tmux 3.4 恒空"
 
     def test_l2_tmux_error_fallback(self, monitor, monkeypatch):
         """tmux 命令出错不崩溃。"""
         def raise_error(*a, **kw):
             raise FileNotFoundError("no tmux")
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
 
         result = monitor._l2_check("qa")
         assert "thinking" in result  # no crash
@@ -236,16 +240,17 @@ class TestL3Check:
     """L3: 产出存活"""
 
     def test_l3_recent_output(self, monitor, monkeypatch):
-        """最近有产出 → producing=True。"""
-        def fake_bus(*a, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = json.dumps([
-                {"cat": "code_fix", "src": "qa", "created_at": time.time() - 60},
-                {"cat": "test_report", "src": "qa", "created_at": time.time() - 120},
-            ])
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_bus)
+        """最近有产出 → producing=True。
+
+        L3 已从 bus CLI 子进程改为 Blackboard 进程内查询：read 子命令无 --src，
+        原调用必然 argparse 退出 2 → 恒 producing=False（角色被误判 idle 击杀）。
+        """
+        def fake_read(*, src=None, limit=5):
+            return [
+                SimpleNamespace(cat="code_fix", src="qa", ts=time.time() - 60),
+                SimpleNamespace(cat="test_report", src="qa", ts=time.time() - 120),
+            ]
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=fake_read))
 
         result = monitor._l3_check("qa")
         assert result["producing"] is True
@@ -254,21 +259,23 @@ class TestL3Check:
 
     def test_l3_no_output(self, monitor, monkeypatch):
         """无产出 → producing=False。"""
-        def fake_bus(*a, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = "[]"
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_bus)
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=lambda **kw: []))
 
         result = monitor._l3_check("qa")
         assert result["producing"] is False
 
     def test_l3_bus_error(self, monitor, monkeypatch):
-        """bus 命令异常 → producing=None。"""
-        def raise_error(*a, **kw):
+        """bus 查询异常 → producing=None（不可判，不得当成"没产出"）。"""
+        def raise_error(**kw):
             raise FileNotFoundError("bus not found")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=raise_error))
+
+        result = monitor._l3_check("qa")
+        assert result["producing"] is None
+
+    def test_l3_blackboard_unavailable(self, monitor, monkeypatch):
+        """Blackboard 不可用 → producing=None，不能误判为"没产出"。"""
+        monkeypatch.setattr(monitor, "_bb", None)
 
         result = monitor._l3_check("qa")
         assert result["producing"] is None
@@ -288,6 +295,13 @@ class TestOverall:
 
     def test_overall_stale(self, monitor):
         assert monitor._overall({"status": "ALIVE"}, {"thinking": False}, {}) == "stale"
+
+    def test_overall_thinking_false_but_recent_output_is_healthy(self, monitor):
+        # 回归锁定：pane 静默（thinking=False）不应掩盖最近的 bus 产出。
+        # 实测：qa 交付 112 passed 后仍被判 stale（pane 静默 >300s，但 L3 producing=True）。
+        assert monitor._overall(
+            {"status": "ALIVE"}, {"thinking": False}, {"producing": True}
+        ) == "healthy"
 
     def test_overall_idle(self, monitor):
         assert monitor._overall({"status": "ALIVE"}, {"thinking": True}, {"producing": False}) == "idle"
@@ -309,9 +323,6 @@ class TestTick:
 
         # Mock L1 → ALIVE
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: MagicMock(returncode=0, stdout=""))
-        # Disable HTTP
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
         # Mock bus
         monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
 
@@ -322,8 +333,6 @@ class TestTick:
     def test_tick_caches_l2_l3(self, monitor, monkeypatch):
         _make_sentinel("qa", sm.SENTINEL_DIR)
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: MagicMock(returncode=0, stdout=""))
-        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **kw: None)
-        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", lambda *a: MagicMock(status=404))
         monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
 
         # First tick populates cache
@@ -331,6 +340,18 @@ class TestTick:
         # Second tick reuses cache (L2/L3 not re-run if within cache TTL)
         r2 = monitor.tick()
         assert r2["qa"]["overall"] == r1["qa"]["overall"]
+
+    def test_tick_includes_infinite_role_without_sentinel(self, monitor, monkeypatch):
+        """infinite 角色即使无哨兵也进巡检——否则「从未启动」与「健康」无法区分。"""
+        monkeypatch.setattr(sm, "_load_role_lifecycles",
+                            lambda: {"scout": "infinite", "qa": "ondemand"})
+        monkeypatch.setattr(sm, "subprocess", MagicMock(
+            run=lambda *a, **kw: MagicMock(returncode=1, stdout="")))
+        monkeypatch.setattr(monitor, "_ensure_role_alive", lambda r: True, raising=False)
+
+        result = monitor.tick()
+        assert "scout" in result, "infinite 角色必须进巡检"
+        assert "qa" not in result, "ondemand 且无哨兵不应被巡检"
 
 
 class TestWriteBus:

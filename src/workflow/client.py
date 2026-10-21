@@ -112,13 +112,35 @@ class WorkflowClient:
                 f"标题 '{title[:40]}' 是占位符，不会产生实际收益。"
                 f"请提供有描述性的任务标题（≥8字符，描述具体做什么）"
             )
-        # 去重防御：同一角色同一标题 5 分钟内不重复创建
+        # 去重防御：同一角色同一标题 5 分钟内不重复创建。
+        # status 过滤与下方 _cross 保持一致：本检查先执行，若不过滤 failed/cancelled，
+        # 失败任务的重投会在这里就被拦下，下方"放行 failed/cancelled"永远不可达。
         dup = self._conn.execute(
-            "SELECT 1 FROM tasks WHERE assignee=? AND title=? AND created_at > ? LIMIT 1",
+            "SELECT 1 FROM tasks WHERE assignee=? AND title=? AND created_at > ? "
+            "AND status NOT IN ('failed','cancelled') LIMIT 1",
             (assignee, title, time.time() - 300)
         ).fetchone()
         if dup:
             raise ValueError(f"重复任务: assignee={assignee} title='{title[:40]}' 已在 5 分钟内创建过")
+        # 跨角色 fan-out 防御：同一条 bus 消息（同 title）已为**任一**角色建过，
+        # 就不再为其他角色建。原去重要求 assignee 相同才拦，于是同一条
+        # "s1-complete 复核通过" 消息在 0.5s 内给 6~9 个角色各建一个 workflow
+        # （实测 2026-10-17：单条消息 fan-out 到 closer/devops/pm/qa/engineer/coordinator）。
+        # 路由的语义是"通知相关角色"，不是"给每个角色派同一份任务"。
+        # 只放过 **failed/cancelled**：那是真重试，拦掉会让它彻底消失
+        # （调用方只 warning、bus 无痕迹）。completed **不放过**——
+        # 本系统 completed 常是"建成即盖戳"（实测 75 秒就 completed 的第二条
+        # 又被创建，正是排除 completed 造成的回归）。统计 300s 内同 title 重复对
+        # 1347 个，前条 completed 占 909、真重试仅 14；放行 completed 得不偿失。
+        _cross = self._conn.execute(
+            "SELECT assignee FROM tasks WHERE title=? AND created_at > ? "
+            "AND status NOT IN ('failed','cancelled') LIMIT 1",
+            (title, time.time() - 300)
+        ).fetchone()
+        if _cross:
+            raise ValueError(
+                f"跨角色重复任务: title='{title[:40]}' 已派给 {_cross[0]}，"
+                f"5 分钟内不再为 {assignee} 重复创建")
         # 自动选择模板: 未指定时按任务标题 + 发起角色 + bus 分类匹配
         if not template_id:
             from template_registry import TemplateRegistry
@@ -129,6 +151,18 @@ class WorkflowClient:
             if not _candidates:
                 raise ValueError(f"无法为任务 '{title}' 匹配到工作流模板，请显式指定 template_id")
             template_id = _candidates[0]["template_id"]
+        # assignee 对齐模板首步目标：路由自动创建时 assignee 是"路由消费者"，
+        # 而多角色链（如 WL-01: product_architect→pg→reviewer→qa→devops）的
+        # 首步目标可能完全不同。错配的实例永远做不了自己那一步，只会堆积。
+        # 实测（2026-10-17）：活跃实例 107 个错配 / 48 个正确，其中
+        # WL-01 被误派给 devops(42) 和 qa(39) —— 两者完成率均为 0%。
+        assignee = self._align_assignee_to_first_step(template_id, assignee)
+        # Gate 必须在对齐**之后**校验：原顺序是先校验旧 assignee、再对齐、再落库、
+        # 最后由 _create_workflow_instance 用新 assignee 二次校验 —— 新值不过闸时
+        # task 已 COMMIT，异常抛出后无人回收，成为永久孤儿。实测 39 条
+        # status='created' 孤儿（task_aff8dbb4 等）全部源于此：推荐器选中裸名
+        # full_dev_pipeline（executors 不含 product_architect），对齐又写回
+        # product_architect → 二次校验必失败。
         from workflow.gateway import Gate
         gate = Gate(str(self.db_path) if hasattr(self, 'db_path') and self.db_path else None)
         gate.validate_create_task(template_id, initiator_role, assignee)
@@ -143,6 +177,33 @@ class WorkflowClient:
         gate.route_task(task_id, initiator_role, assignee)
         return (task_id, wf_id)
 
+    def _align_assignee_to_first_step(self, template_id: str, assignee: str) -> str:
+        """把 assignee 校正为模板首步的 target_role。
+
+        路由自动创建任务时 assignee 取"路由消费者"，但多角色链的首步目标
+        可能完全不同（WL-01 首步是 product_architect，却被派给 devops/qa）。
+        错配实例永远执行不了自己那一步，只会堆在 s1 直到超时取消。
+        读不到模板或首步无 target_role 时原样返回（不阻断既有路径）。
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT steps_json FROM workflow_templates WHERE template_id=?",
+                (template_id,)).fetchone()
+            if not row or not row[0]:
+                return assignee
+            steps = __import__("json").loads(row[0])
+            if not steps:
+                return assignee
+            first = steps[0]
+            target = (first.get("target_role") or "").strip()
+            if target and target != assignee:
+                LOGGER.info("assignee 对齐模板首步: %s -> %s (template=%s)",
+                            assignee, target, template_id)
+                return target
+        except Exception as _e:
+            LOGGER.debug("align assignee 失败（原样返回）: %s", _e)
+        return assignee
+
     def _create_task_impl(self, title: str, description: str,
                           assignee: str, priority: int,
                           template_id: str = None) -> str:
@@ -152,20 +213,24 @@ class WorkflowClient:
         now = time.time()
         cols = self._get_task_columns()
         if template_id and "template_id" in cols:
-            self._conn.execute("""
+            cur = self._conn.execute("""
                 INSERT OR IGNORE INTO tasks (task_id, title, description, assigner, assignee,
                                    priority, status, created_at, updated_at, template_id)
                 VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?, ?)
             """, (task_id, title, description, self.role, assignee,
                   priority, now, now, template_id))
         else:
-            self._conn.execute("""
+            cur = self._conn.execute("""
                 INSERT OR IGNORE INTO tasks (task_id, title, description, assigner, assignee,
                                    priority, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?)
             """, (task_id, title, description, self.role, assignee,
                   priority, now, now))
         self._conn.commit()
+        # OR IGNORE 会把约束冲突吞成 0 行；不校验就 notify 会向总线广播一个
+        # 查不到的 task_id，调用方按成功继续建链，需求就此静默丢失。
+        if not cur.rowcount:
+            raise RuntimeError(f"任务未写入（task_id={task_id} 已存在或约束冲突）")
         self._log(task_id=task_id, action="created", detail=f"title={title}, template_id={template_id}")
         # 测试模式检测: 环境变量 SESSION_PIPELINE_TEST=1 时跳过 ccs send 和 bus notify
         # 不依赖 db_path 判断，因为自定义 DB 路径也可能是生产用途
@@ -338,17 +403,67 @@ class WorkflowClient:
                 self._conn.rollback()  # 同步失败不阻断主流程，日志必须落库
         self._log(wf_id=wf_id, action="completed", detail=f"summary={summary}")
 
+    def confirm(self, wf_id: str, step_id: str, token: str, approved: bool, reason: str = ""):
+        """角色侧审批入口：把 token 回传给 LifecycleManager 完成/驳回步骤。
+
+        self.role 即被指派审批人（由 _get_assigner_for_step 计算），
+        manager.py 的 only-assigner 校验依赖此值通过。
+        """
+        from lifecycle.manager import LifecycleManager
+        lm = LifecycleManager(role=self.role, db_path=self.db_path)
+        lm.confirm_step(wf_id, step_id, token=token, approved=approved, reason=reason)
+        self._log(wf_id=wf_id, action="step_confirmed" if approved else "step_rejected",
+                  detail=f"{step_id} by {self.role}: {reason}")
+
+    def pull_approval(self, wf_id: str, step_id: str) -> dict:
+        """审批人拉取自己的审批密钥（推送失败时的唯一可用路径）。
+
+        bus #427318：`ccs send` 因「角色思考中」失败时，降级写 bus 的 token 被
+        脱敏成 ***，审批人拿不到钥匙 → 只能等 TTL+30min 自动放行，闸门失效。
+        本接口让审批人用 `wf -r <role> approval <wf_id> <step_id>` 自行取回。
+        鉴权在 LifecycleManager.get_approval_token(requester=self.role) 内 fail-closed。
+        """
+        from lifecycle.manager import LifecycleManager
+        lm = LifecycleManager(role=self.role, db_path=self.db_path)
+        try:
+            token = lm.get_approval_token(wf_id, step_id, requester=self.role)
+            if not token:
+                return {"ok": False, "error": "该步骤当前无可用审批密钥"
+                        "（已消费 / 已过期 / 状态已推进）"}
+            return {"ok": True, "token": token,
+                    "ttl_remaining": lm.approval_ttl_remaining(wf_id, step_id)}
+        finally:
+            lm.close()
+
     def _sync_task_from_workflows(self, task_id: str):
         from workflow.sync import sync_task_status
         sync_task_status(self._conn, task_id)
         self._conn.commit()
 
-    def fail(self, wf_id: str, reason: str):
+    # 实例级终结：reason 记到 `_close_reason` 子键，**不再整体覆写** step_results。
+    # 旧实现写 json.dumps({"reason": reason})，把全部步骤状态连同 subflow_id 一起
+    # 抹掉。后果实测生产 49 个实例：task_generator._scan_tasks 的父链回流扫描要求
+    # step_results[step] 是 dict 且有 subflow_id，顶层 `reason` 是 str 被 continue
+    # 跳过 → 父链回流通道静默关闭；wf_579f636f62 的 7 条 completed 子链无一条回流。
+    # manager.cancel_step（:600-614）早已是合并语义并写明了同样的后果，此处补齐。
+    _CLOSE_REASON_KEY = "_close_reason"
+
+    def _close(self, wf_id: str, status: str, reason: str, action: str):
+        """以合并语义把实例收敛到终态，reason 写 `_close_reason` 子键。"""
+        row = self._conn.execute(
+            "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+            (wf_id,)).fetchone()
+        try:
+            sr = json.loads((row[0] if row else None) or "{}")
+        except (TypeError, ValueError):
+            sr = {}          # 已损坏的旧值：宁可只保留 reason，也不整个丢掉
+        if not isinstance(sr, dict):
+            sr = {}
+        sr[self._CLOSE_REASON_KEY] = {"status": status, "reason": reason}
         self._conn.execute(
-            "UPDATE workflow_instances SET status='failed', completed_at=?, "
-            "step_results=? WHERE instance_id=?",
-            (time.time(), json.dumps({"reason": reason}), wf_id)
-        )
+            "UPDATE workflow_instances SET status=?, completed_at=?, step_results=? "
+            "WHERE instance_id=?",
+            (status, time.time(), json.dumps(sr, ensure_ascii=False), wf_id))
         self._conn.commit()
         wf = self.get(wf_id)
         if wf and wf.get('task_id'):
@@ -356,22 +471,13 @@ class WorkflowClient:
                 self._sync_task_from_workflows(wf['task_id'])
             except Exception:
                 self._conn.rollback()
-        self._log(wf_id=wf_id, action="failed", detail=f"reason={reason}")
+        self._log(wf_id=wf_id, action=action, detail=f"reason={reason}")
+
+    def fail(self, wf_id: str, reason: str):
+        self._close(wf_id, "failed", reason, "failed")
 
     def cancel(self, wf_id: str, reason: str = ""):
-        self._conn.execute(
-            "UPDATE workflow_instances SET status='cancelled', completed_at=?, "
-            "step_results=? WHERE instance_id=?",
-            (time.time(), json.dumps({"reason": reason}), wf_id)
-        )
-        self._conn.commit()
-        wf = self.get(wf_id)
-        if wf and wf.get('task_id'):
-            try:
-                self._sync_task_from_workflows(wf['task_id'])
-            except Exception:
-                self._conn.rollback()
-        self._log(wf_id=wf_id, action="cancelled", detail=f"reason={reason}")
+        self._close(wf_id, "cancelled", reason, "cancelled")
 
     def delete(self, wf_id: str) -> bool:
         wf = self.get(wf_id)
@@ -477,15 +583,6 @@ class WorkflowClient:
             else:
                 lanes["blocked"].append(wf)
         return [{"lane": k, "count": len(v), "items": v} for k, v in lanes.items()]
-
-    def workflow_stats(self) -> dict:
-        stats = {}
-        for lane in ("pending", "running", "completed", "failed", "cancelled"):
-            row = self._conn.execute("SELECT COUNT(*) as c FROM workflow_instances WHERE status=?", (lane,)).fetchone()
-            stats[lane] = row["c"] if row else 0
-        stats["total"] = sum(stats.values())
-        stats["completion_rate"] = round(stats["completed"] / max(stats["total"], 1) * 100, 1)
-        return stats
 
     def close(self):
         self._conn.close()

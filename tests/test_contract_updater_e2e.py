@@ -18,10 +18,12 @@ class TestSuggestImprovements:
 
     def test_suggest_improvements_skipped(self):
         """有 skipped > 0 时生成建议。"""
+        # 角色名必须是**现存 persona**：未解析的角色会被跳过（不产 unknown 垃圾），
+        # 用死角色当 fixture 只能验证"跳过"，测不到 skipped>0 的建议规则。
         history = [
-            {"role": "tester", "skipped": 1, "checked": 0},
-            {"role": "tester", "skipped": 1, "checked": 0},
-            {"role": "tester", "skipped": 1, "checked": 0},
+            {"role": "engineer", "skipped": 1, "checked": 0},
+            {"role": "engineer", "skipped": 1, "checked": 0},
+            {"role": "engineer", "skipped": 1, "checked": 0},
         ]
         s = suggest_improvements(history)
         assert len(s) > 0

@@ -150,3 +150,99 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"❌ {t.__name__}: {e}")
     print("\n--- 全部测试完成 ---")
+
+
+# ── 新增（R88）：transcript 回退路径 ──
+# pane 走备用屏无 scrollback，溢出报错滚出视口即不可见（实测新角色 252 次
+# "Prompt is too long" 而本检测从未触发过一次 /compact）。
+
+def _write_transcript(tmp_path, role, age_sec, text="Prompt is too long"):
+    """写一条形如真实溢出事件的行，timestamp 为 age_sec 秒前。"""
+    import json as _json, time as _time
+    from datetime import datetime, timezone, timedelta
+    d = tmp_path / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+    d.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc) - timedelta(seconds=age_sec)
+    rec = {"type": "assistant", "isApiErrorMessage": True,
+           "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+           "message": {"role": "assistant", "model": "<synthetic>",
+                       "content": [{"type": "text", "text": text}]}}
+    (d / "sess.jsonl").write_text(_json.dumps(rec) + "\n", encoding="utf-8")
+    return d
+
+
+def test_transcript_overflow_recent_detected(tmp_path, monkeypatch):
+    """近期溢出 → 检测为 True。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, "qa", age_sec=60)
+    assert rl._transcript_shows_overflow("qa") is True
+
+
+def test_transcript_anthropic_400_detected(tmp_path, monkeypatch):
+    """Anthropic 400 原文（maximum context length）→ 必须检测为溢出。
+
+    2026-10-19 生产实测：reviewer 撞此措辞，旧清单只认另外三种 → 永不自愈。
+    """
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(
+        tmp_path, "reviewer", age_sec=30,
+        text='API Error: 400 [400]: {"error":{"message":"Your request resulted in '
+             'more tokens than this model\'s maximum context length allows.",'
+             '"type":"invalid_request_error","code":"context_length_exceeded"}}')
+    assert rl._transcript_shows_overflow("reviewer") is True
+
+def test_anthropic_400_pane_triggers_compact():
+    """pane 含 Anthropic 400 原文（maximum context length）→ 必须发 /compact。
+
+    2026-10-19 生产实测：reviewer pane 命中该措辞，旧 pane 检测漏掉；且同函数
+    的 _CONTEXT_WARN_K 被当全局名引用 → NameError 被 engine 的静默 except 吞掉，
+    整轮检测对所有角色失效。两条都必须修复。
+    """
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    send_keys = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-reviewer\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=(
+                "API Error: 400 ... more tokens than this model's maximum context "
+                "length allows ... context_length_exceeded"))
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._check_context_overflow()
+
+    assert any("/compact" in c for c in send_keys), f"应发 /compact, got {send_keys}"
+    assert eng._last_compact.get("reviewer") is not None
+
+
+
+def test_transcript_overflow_stale_ignored(tmp_path, monkeypatch):
+    """超时效的旧溢出 → False（防旧错误无限期重发 /compact）。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, "qa", age_sec=99999)
+    assert rl._transcript_shows_overflow("qa") is False
+
+
+def test_transcript_no_error_returns_false(tmp_path, monkeypatch):
+    """无溢出记录 → False。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, "qa", age_sec=10, text="正常输出")
+    # 文本不含溢出措辞，但 isApiErrorMessage=True 仍会被 pat 拦住 → False
+    assert rl._transcript_shows_overflow("qa") is False
+
+
+def test_transcript_missing_dir_returns_false(tmp_path, monkeypatch):
+    """角色无 transcript 目录 → False（不抛异常）。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    assert rl._transcript_shows_overflow("no_such_role") is False
