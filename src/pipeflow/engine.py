@@ -1013,6 +1013,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             lm, inst["instance_id"], wf_name, step, -1, results, step_id):
                         self._sync_step_results(inst["instance_id"], results)
                         continue   # 子链已接管
+                    # 首步不走 _fill_prompt_vars（本函数自行组装 prompt），
+                    # 强制子代理指令必须在此再注入一次，否则每条链的 s1 漏掉。
+                    prompt += self._subagent_directive(step)
+
 
                     # 分流决定**先持久化再投递**：下游（exit_messages 过滤 / busy
                     # 门控 / exit_schema 的 workspace / codex cwd）都读 effective_roles，

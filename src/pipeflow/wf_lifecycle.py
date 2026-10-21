@@ -1721,6 +1721,38 @@ class WorkflowLifecycleMixin:
             if isinstance(m, dict) else str(m)
             for m in msgs)[:limit]
 
+    # 引擎强制派子代理（2026-10-22）：实测 819 份角色转录仅 3 次 Agent 调用（且都是
+    # `echo` 探针），协议存在于 CLAUDE.md 但零执行——因为它是「可选建议」。
+    # 改为在**派单时**注入，而不是改角色 CLAUDE.md：后者需重启 pane 才生效
+    # （argv 烤进 tmux session），前者下一 tick 即生效，且一处覆盖首推/重推/kick。
+    #
+    # 只对产出型步骤注入：gate 是二值判定（APPROVED / CHANGES_REQUESTED），
+    # 拆给零上下文的子代理易得出「自信的错结论」；notify 无实质工作。
+    _SUBAGENT_FORCED_TYPES = frozenset({"handoff", "single", "review"})
+    _SUBAGENT_DIRECTIVE = """
+## 本步必须使用子代理（引擎强制）
+
+本步执行方式：**你只做派单、核对、落盘；取证/检索/大量读取交给子代理（工具 `Agent`）**。
+
+- **并行派**：同一回合把所有互不依赖的子任务一次派出，不要串行等。
+- **自带上下文**：子代理零上下文——看不到本会话、看不到你刚读的文件、不知道实例 id。
+  每条 prompt 必须自带背景、绝对路径、验收标准、输出格式。
+- **只要结论**：要求子代理只回「结论 + 证据行（`file:line` / 命令输出）」，不要过程日志。
+- **模型**：子代理继承会话的 `9router_hermes`，禁止另行指定 Opus/Sonnet。
+- **回来必须核对**：关键数字与结论，你在主线程重跑命令验证后才能写进产出与 bus；
+  未核对的在产出里明写「未验证」。子代理给的是「自信的答案」，不是事实。
+- **不嵌套**：子代理不得再派子代理。
+
+**唯一例外**：若本步 1-2 条命令即可得结论，或子任务之间必须共享刚拍下的板，
+可自行完成——但必须在产出里写明「本步未派子代理，原因：…」。
+"""
+
+    def _subagent_directive(self, step) -> str:
+        """按步骤类型决定是否注入强制子代理指令。"""
+        _t = getattr(step, "type", "single") or "single"
+        return self._SUBAGENT_DIRECTIVE if _t in self._SUBAGENT_FORCED_TYPES else ""
+
+
     def _fill_prompt_vars(self, prompt: str, step: Step, wf_name: str,
                           task_title: str, task_desc: str, results: dict,
                           prev_step_id: str = "", wf_id: str = "") -> str:
@@ -1781,6 +1813,7 @@ class WorkflowLifecycleMixin:
                         "{task_list}", "{assignments}", "{workspace_summary}", "{project}"):
                 if var in prompt:
                     prompt = prompt.replace(var, fallback)
+        prompt += self._subagent_directive(step)
         return prompt
 
     def _write_step_prompt(self, run, step: Step, extra_prompt: str = ""):
