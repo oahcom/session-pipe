@@ -177,6 +177,16 @@ def _is_system_rework(row) -> bool:
         return False
 
 
+def _biz_rework_ids(rows) -> list:
+    """返工链里的业务链 id —— 系统问题链不占"已建过返工链"位。
+
+    系统链修的是引擎/模板债，与本次驳回的产品问题无关；把它当"已返工"会让
+    `if _has_next and not _rework_ids` 恒假 → 再驳回只重投不返工，直到 retry 封顶
+    （2026-10-22 CASE-B 实测：唯一 rework_id 是已完成的 maintainer_health_monitor）。
+    """
+    return [r["instance_id"] for r in rows if not _is_system_rework(r)]
+
+
 def _blocking_rework_sts(rows) -> list:
     """返工链状态里真正砍住重审的那部分：系统问题链不阻断。
 
@@ -1326,7 +1336,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     _rework_ids = _rej_sr.get("rework_ids") or []
                     _idx = next((i for i, s in enumerate(wf.steps) if s.id == step_id), -1)
                     _has_next = 0 <= _idx < len(wf.steps) - 1
-                    if _has_next and not _rework_ids:
+                    # 系统问题链不算"已建业务返工链"：把它留在集内会让本判据恒假，
+                    # 再驳回只重投不返工，直到 retry 封顶（报告 P1 CASE-B 实测）。
+                    _biz_rw = _rework_ids
+                    if _has_next and _rework_ids:
+                        try:
+                            _ph0 = ",".join("?" * len(_rework_ids))
+                            _biz_rw = _biz_rework_ids(lm.query(
+                                f"SELECT instance_id, template_id FROM workflow_instances "
+                                f"WHERE instance_id IN ({_ph0})", tuple(_rework_ids)))
+                        except Exception as _q0:
+                            LOGGER.warning("系统链过滤查询失败 %s/%s: %s",
+                                           inst["instance_id"][:12], step_id, _q0)
+                            _biz_rw = _rework_ids
+                    if _has_next and not _biz_rw:
                         try:
                             if self._create_rework_subflow(
                                     inst["instance_id"], lm, wf_name, step_id,
@@ -1347,6 +1370,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             LOGGER.warning("rejected 建返工链失败 %s/%s: %s",
                                            inst["instance_id"][:12], step_id, _rw)
                     _sys_rw_ids = []
+                    # 供下方回退重投的 bus 正文引用：返工链存在过就如实报状态，
+                    # 不再一律写「无返工链」（角色据此反驳引擎，白烧一轮）。
+                    _rework_rows, _sts = [], []
                     if _rework_ids:
                         # 返工链回流：等全部终态才决定出口。
                         # 为什么自己查而不走 _scan_tasks 的 subflow_id 通道：那条通道
@@ -1427,11 +1453,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     lm.execute(
                         "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                         (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                    _chain_txt = (
+                        f"已知返工链 {len(_rework_rows)} 条 状态={','.join(_sts)}"
+                        if _rework_rows else
+                        "未见【系统问题】/【业务问题】分类，建不出返工链")
                     self._bb.write("blocker",
-                        f"[workflow] {inst['instance_id'][:12]}/{step_id} 被驳回但无返工链"
-                        f" → 回退重投（第 {_retry} 次）",
+                        f"[workflow] {inst['instance_id'][:12]}/{step_id} 被驳回后回退重投"
+                        f"（第 {_retry} 次）{_chain_txt}",
                         evidence=(f"驳回理由: {(_rej_sr.get('rejection_reason') or '')[:200]}\n"
-                                  f"未见【系统问题】/【业务问题】分类，建不出返工链。"),
+                                  f"返工链状态: {','.join(_sts) if _sts else '无'}"),
                         src="workflow_engine")
                     LOGGER.warning("rejected → 无返工链，回退重投 %s/%s (retry=%d)",
                                    inst["instance_id"][:12], step_id, _retry)

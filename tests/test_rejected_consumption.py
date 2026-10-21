@@ -292,3 +292,4 @@ class TestEscalateRejectedAnchor:
             assert sent == [], '库里的锚未阻止重发 → 每 tick 刷屏'
         finally:
             _cleanup(d)
+
