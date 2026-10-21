@@ -69,3 +69,22 @@ def test_tasks_md_untouched_when_delivery_fails(tmp_path, monkeypatch):
     txt = tasks.read_text(encoding="utf-8")
     assert "## 标题\n旧任务" in txt, "没投出去的任务怎能成为角色的任务书：" + txt
     assert "工作流 wf_old0000000001" in txt
+
+def test_negative_lessons_survive_rewrite(tmp_path, monkeypatch):
+    """评分回写的 negative 教训必须活过下一次投递。
+
+    task_evidence._append_role_feedback 把教训 append 到 TASKS.md，而投递整体重写
+    会抹掉它 —— 实测 17 个 TASKS.md 里 0 个存活，闭环收集的反馈从不进角色上下文。
+    """
+    monkeypatch.setattr(rl, "_CCS_WORKSPACES", tmp_path)
+    tasks = _workspace(tmp_path)
+    with tasks.open("a", encoding="utf-8") as f:
+        f.write("- [negative] 任务《旧活》(task_old01) → 评分回写：无产出\n")
+    h = _Harness()
+    with patch.object(rl._engine_mod._sp, "run",
+                      return_value=MagicMock(returncode=0, stdout='{"success": true}')):
+        assert h._send_to_role("qa", PROMPT, wf_id="wf_new0000000002", step_id="s1") is True
+    txt = tasks.read_text(encoding="utf-8")
+    assert "新任务" in txt and "wf_new0000000002" in txt
+    assert "(task_old01)" in txt, "教训被投递重写抹掉了"
+    assert txt.count("- [negative]") == 1
