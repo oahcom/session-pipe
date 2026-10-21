@@ -127,13 +127,6 @@ def test_wf_lifecycle_has_delivery_fallback():
         "wf_lifecycle 缺投递失败回退 → 角色未收到却被判已通知"
 
 
-def test_busy_is_truthy_string():
-    """文档化风险: 'busy' 是 truthy，调用点必须用 is not False / == 'busy' 判断。"""
-    assert bool("busy") is True
-    assert "busy" is not False
-    assert "busy" != False
-
-
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
