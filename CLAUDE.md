@@ -42,8 +42,8 @@ python3 tests/test_router.py -x -q
 # 列出路由表（router CLI）
 PYTHONPATH=src python3 -m routing.router list
 
-# 健康检查（工作流统计与 completion_rate）
-python3 src/wf.py -r maintainer stats
+# 健康检查（工作流统计；wf CLI 在 launcher 侧，pipeline 无 stats 子命令）
+python3 ~/session-launcher/src/wf.py -r maintainer stats
 ```
 
 ### 禁止操作
