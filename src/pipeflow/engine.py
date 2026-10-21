@@ -760,11 +760,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                            lm, reason: str) -> None:
         """驳回步骤停重投 → 升级 coordinator。reason 说明为何放弃继续等/重投。
 
-        幂等锚 rework_escalated_at：升级一经发起（pane True 或改落持久 bus
-        通道）即落库，防每 tick 重发一条。pane 未送达（busy=排队 / False=守卫拦
-        下）非送达，但 bus 是持久通道：落库即算已升级，随后正常路径落锚停重投。
-        不落库会让每 tick 重起一次 ccs send，永不收敛（实测 wf_175751a92033/s2：
-        48min 111 次告警，锚未置位）。
+        幂等锚 rework_escalated_at：投递成功(True) 或被守卫拦下(False) 后落库，防每
+        tick 重发。**busy 是排队/去重，不是失败**（三态口径见 role_lifecycle.py:820、
+        task_generator.py:456、本文件:1023），不落锚、下一 tick 重试——落锚会让本可
+        送达的升级永不再发。False 重投只会再被拦一次，故写一条持久 bus 记录后落锚；
+        不落锚的写法实测每 tick 重起 ccs send 永不收敛（wf_175751a92033/s2 48min
+        111 次告警）。
 
         锚用单键 json_set 写，**不**擕整份 results——results 是本 tick 起始快照。
         wait 分支紧跟在 _create_rework_subflow 之后（同一 tick 内可达），建链走
@@ -780,16 +781,17 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             "coordinator",
             f"[workflow] {wf_id[:12]}/{step_id} {reason}，已停重投，待协调处置",
             wf_id=wf_id, step_id=step_id, force=True)
+        if _ok == "busy":
+            # 排队 / 同 prompt 窗口去重（非失败）：不落锚，下一 tick 重试。
+            # 本调用 force=True 已跳过 role_lifecycle 的 busy 门，此处 busy 只表示
+            # 「角色正在干活」，重投成本低；落锚则下 tick 直接 return，升级永远发不出去。
+            LOGGER.warning("升级 pane 排队中(busy) %s/%s → 下 tick 重试",
+                           wf_id[:12], step_id)
+            return
+        _blocked = ""
         if _ok is not True:
-            # pane 未送达（busy=排队 / False=守卫拦下），但 bus 是持久通道：落库即算
-            # 已升级，随后按正常路径落锚停重试。不落库就 return 会让每 tick 重起一次
-            # ccs send 永不收敛（实测 wf_175751a92033/s2：48min 111 次告警，锚未置位）。
+            _blocked = f"pane 投递被拦({_ok})；"
             LOGGER.warning("升级 pane 未送达(%s) %s/%s → 改落 bus", _ok, wf_id[:12], step_id)
-            self._bb.write("blocker",
-                           f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
-                           evidence=f"pane 投递未成功({_ok})；驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
-                           src="workflow_engine")
-            _ok = True
         _now = time.time()
         sr["rework_escalated_at"] = _now
         try:
@@ -808,7 +810,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                        (json.dumps(results, ensure_ascii=False), wf_id))
         self._bb.write("blocker",
                        f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
-                       evidence=f"驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
+                       evidence=f"{_blocked}驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
                        src="workflow_engine")
         LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
 

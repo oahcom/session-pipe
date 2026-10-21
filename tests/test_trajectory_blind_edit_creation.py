@@ -8,6 +8,7 @@
 运行：cd session-pipeline && python3 tests/test_trajectory_blind_edit_creation.py
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -65,6 +66,66 @@ def test_created_file_not_flagged() -> None:
             pass
 
 
+def test_list_shaped_result_content() -> None:
+    """tool_result content 可能是 list[str] / list[dict]：两种形态都要认出"新建"。"""
+    for shape in ("list-str", "list-dict"):
+        sess = _TRANSCRIPTS_DIR / f"-probe-selfcreate-{shape}-role"
+        path = "/tmp/probe_shape.py"
+        msg = f"File created successfully at: {path}"
+        content = [msg] if shape == "list-str" else [{"type": "text", "text": msg}]
+        lines = [
+            _turn(0, "assistant", [
+                {"type": "tool_use", "id": "cs", "name": "Write",
+                 "input": {"file_path": path, "content": "x=1"}},
+            ]),
+            _turn(1, "user", [
+                {"type": "tool_result", "tool_use_id": "cs", "is_error": False,
+                 "content": content},
+            ]),
+        ]
+        jf = _make(sess, lines)
+        try:
+            res = TrajectoryQualityChecker().check(f"selfcreate-{shape}", "t")
+            assert res["findings"] == [], f"{shape} 形态误判: {res['findings']}"
+        finally:
+            jf.unlink(missing_ok=True)
+            try:
+                sess.rmdir()
+            except OSError:
+                pass
+
+
+def test_path_mismatch_and_error_echo_not_exempted() -> None:
+    """豁免不能扩大成放过一切写：路径不符 / is_error 的结果都要照判盲改。"""
+    cases = [
+        ("-mismatch", "other.py", f"File created successfully at: {os.path.join(os.sep, 'tmp', 'other.py')}"),
+        ("-echo", "/tmp/probe_echo.py", "/tmp/probe_echo.py"),  # 错误回显 input，含该路径
+    ]
+    for tag, target, result in cases:
+        sess = _TRANSCRIPTS_DIR / f"-probe-selfcreate{tag}-role"
+        lines = [
+            _turn(0, "assistant", [
+                {"type": "tool_use", "id": "cx", "name": "Write",
+                 "input": {"file_path": target, "content": "x=1"}},
+            ]),
+            _turn(1, "user", [
+                {"type": "tool_result", "tool_use_id": "cx", "is_error": True,
+                 "content": result},
+            ]),
+        ]
+        jf = _make(sess, lines)
+        try:
+            res = TrajectoryQualityChecker().check(f"selfcreate{tag}", "t")
+            blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+            assert len(blind) == 1, f"{tag} 不该豁免: {res['findings']}"
+        finally:
+            jf.unlink(missing_ok=True)
+            try:
+                sess.rmdir()
+            except OSError:
+                pass
+
+
 def test_non_creation_write_still_flagged() -> None:
     """对照：结果不含"新建"标记的写仍判盲改（豁免不能扩大成放过一切写）。"""
     sess = _TRANSCRIPTS_DIR / "-probe-selfupdate-role"
@@ -83,6 +144,9 @@ def test_non_creation_write_still_flagged() -> None:
 
 
 if __name__ == "__main__":
-    test_created_file_not_flagged()
-    test_non_creation_write_still_flagged()
-    print("PASS: 2 tests")
+    for _t in (test_created_file_not_flagged,
+               test_list_shaped_result_content,
+               test_path_mismatch_and_error_echo_not_exempted,
+               test_non_creation_write_still_flagged):
+        _t()
+    print("PASS: 4 tests")
