@@ -158,7 +158,15 @@ def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
         return True
 
     if first_word == "systemctl":
-        return parts[1] in _SYSTEMCTL_READONLY
+        # 必须跳过选项再取子命令：实测 maintainer 的判据写成
+        # `systemctl --user is-active <svc>`，旧实现取 parts[1]="--user"
+        # → 判成写操作 → 该条判据永远跑不了（生产日志 06:21 报 rc=1 就是这个）。
+        # 取值型选项（-n/--lines/-H…）在这里会被当成子命令 → fail-closed 拒绝，
+        # 方向是安全的（宁可拒一条只读，不可放一条写）。
+        i = 1
+        while i < len(parts) and parts[i].startswith("-"):
+            i += 1
+        return i < len(parts) and parts[i] in _SYSTEMCTL_READONLY
 
     if first_word == "curl":
         # -X POST/-d/--data 等写操作标志 → 拒绝

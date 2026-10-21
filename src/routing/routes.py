@@ -549,7 +549,8 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "routed", "sent_chars": result.get("sent_chars", 0)})
             # 投递成功即标记已消费，防下轮重投同一批。
-            # route_all 走 cursor 推进，route_to_ccs 无 cursor，不标记则永久重复：
+            # 两条路都靠 bus 的 consume 记录去重（cursor 已于 2026-10-22 退役），
+            # route_to_ccs 自己不记就会永久重复：
             # 实测 15 条 P0 blocker 因 rc=0 被无限重投（每 5 分钟一轮）。
             try:
                 _Blackboard().mark_consumed(msg["id"], consumer=role_name)
