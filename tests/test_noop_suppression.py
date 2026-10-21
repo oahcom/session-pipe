@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
-"""test_noop_suppression.py — no-op 健康报告抑制 + 引擎实例幂等（DESIGN §9）。
+"""test_noop_suppression.py — no-op 健康报告抑制（DESIGN §9）。
 
 覆盖：
 1. 措辞命中：no-op 报告（无职责内修复动作）→ _is_noop_report True（不 mint）
-2. 状态无 delta：同报告二次上报 → _noop_delta True（抑制）
-3. 真修复放行：含变更 delta 报告 → _is_noop_report False + _noop_delta False
-4. 冷却/放行边界：泛词（无异常）不在 mint 抑制子集 → 不误杀
+2. 真修复放行：真修复报告 → _is_noop_report False（不误杀）
+3. 冷却/放行边界：泛词（无异常）不在 mint 抑制子集 → 不误杀
 """
 import sys
-import json
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-
-def _fresh_scheduler(tmp):
-    """隔离 idle-state 文件，避免污染生产 ~/.hermes/run/cron_idle_state.json。"""
-    import cron_scheduler as cs
-    p = Path(tmp) / "idle.json"
-    with patch.object(cs, "_IDLE_STATE_PATH", p), \
-         patch.object(cs, "PERSONAS_DIR", Path(tmp) / "nonexistent"):
-        return cs.CronScheduler()
 
 
 def test_noop_report_phrase_hit():
@@ -40,25 +27,11 @@ def test_noop_report_phrase_hit():
     print("✅ no-op 措辞命中 ✓")
 
 
-def test_noop_delta_suppresses_repeat():
-    """DESIGN §9.2：同报告二次上报 → _noop_delta True（状态无变化，抑制）。"""
-    with tempfile.TemporaryDirectory() as tmp:
-        s = _fresh_scheduler(tmp)
-        _r = "服务全绿零僵尸, 无职责内修复动作"
-        assert s._noop_delta("maintainer", _r) is False, "首次上报 = 有变化，放行"
-        assert s._noop_delta("maintainer", _r) is True, "同指纹二次 = 无 delta，抑制"
-    print("✅ 状态无 delta 抑制 ✓")
-
-
 def test_real_fix_passes():
-    """DESIGN §9.3：真修复报告（含 delta）→ 非 no-op 且 delta 为真 → 放行。"""
+    """DESIGN §9.3：真修复报告 → 不命中 no-op → 放行。"""
     from cron_scheduler import _is_noop_report
-    with tempfile.TemporaryDirectory() as tmp:
-        s = _fresh_scheduler(tmp)
-        _fix = "修复 routing 死锁: 门控误锚跨工作流失败判定, 改动 step_handler"
-        assert _is_noop_report(_fix) is False, "真修复不命中 no-op"
-        assert s._noop_delta("maintainer", _fix) is False, "首次 = 放行"
-        assert s._noop_delta("maintainer", _fix + " 追加一行") is False, "指纹变 = 放行"
+    _fix = "修复 routing 死锁: 门控误锚跨工作流失败判定, 改动 step_handler"
+    assert _is_noop_report(_fix) is False, "真修复不命中 no-op"
     print("✅ 真修复放行 ✓")
 
 

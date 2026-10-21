@@ -34,7 +34,6 @@
 | `get_step(wf_id, step_id)` | str, str | `Optional[dict]` |
 | `upsert_template(template_id, name, description, steps)` | str, str, str, list | `None` |
 | `get_run(wf_id)` | str | `Optional[dict]` |
-| `get_assigned_workflows(role)` | str | `list[dict]` |
 | `get_workflow_context(wf_id)` | str | `dict` |
 | `get_workflow_progress(wf_id)` | str | `dict` |
 | `check_gate_timeouts()` | — | `list[dict]` |

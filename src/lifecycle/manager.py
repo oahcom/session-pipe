@@ -1045,26 +1045,6 @@ class LifecycleManager:
         t = self._get_template(template_id)
         return t.get("steps", []) if t else []
 
-    def get_assigned_workflows(self, role: str) -> List[dict]:
-        """获取分配给指定角色的所有活跃工作流"""
-        rows = self._conn.execute(
-            """SELECT wi.*, wt.name as template_name, wt.steps_json
-               FROM workflow_instances wi
-               JOIN workflow_templates wt ON wi.template_id = wt.template_id
-               WHERE wi.status = 'running'
-               ORDER BY wi.created_at DESC""",
-        ).fetchall()
-        result = []
-        for r in rows:
-            inst = dict(r)
-            steps = json.loads(inst.get("steps_json", "[]"))
-            current = inst.get("current_step_id", "")
-            for s in steps:
-                if s.get("target_role") == role and s.get("step_id") == current:
-                    result.append(inst)
-                    break
-        return result
-
     def _ensure_schema(self):
         """初始化数据库 schema（如不存在）+ 迁移已有表。
 

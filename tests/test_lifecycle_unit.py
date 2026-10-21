@@ -66,13 +66,5 @@ class TestLifecycleStateMachine(unittest.TestCase):
             "AND action='wf_closed'", ("wf_test_r",)).fetchone()
         self.assertEqual(row["detail"], "workflow cancelled (queue 45min >= 30min)")
 
-    def test_get_assigned_workflows(self):
-        self.lm.upsert_template("test_tmpl4", "T4", "desc",
-            [{"step_id": "s1", "target_role": "tester",
-              "prompt_template": "do", "exit_condition": {"bus_category": "notice"}}])
-        self.lm.start_wf("wf_test_4", "s1", "test_tmpl4")
-        assigned = self.lm.get_assigned_workflows("tester")
-        self.assertIsInstance(assigned, list)
-
 if __name__ == "__main__":
     unittest.main()

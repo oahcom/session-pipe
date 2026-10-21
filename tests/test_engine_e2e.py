@@ -22,7 +22,6 @@ sys.path.insert(0, (Path(__file__).resolve().parent.parent / "src"))
 
 import pipeflow.engine as eng_mod
 eng_mod._TIMEOUT_GRACE = 0.05
-eng_mod._REMINDER_INTERVAL = 60  # 测试周期长，不干扰
 
 from pipeflow.engine import WorkflowEngine
 

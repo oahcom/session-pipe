@@ -51,7 +51,6 @@ class CronScheduler:
         self._last_idle_value: dict[str, float] = {}
         # DESIGN §7 S2：per-role 上次报告指纹。与 _last_idle_value（冷却截止
         # 时间戳，语义不同）分开存，避免改冷却语义。
-        self._last_report: dict[str, str] = {}
         self._load_idle_state()
         self._load_roles()
 
@@ -81,7 +80,6 @@ class CronScheduler:
                 d = json.loads(_IDLE_STATE_PATH.read_text())
                 self._idle_counts = d.get("counts", {})
                 self._last_idle_value = d.get("cooldown_until", {})
-                self._last_report = d.get("last_report", {})
         except Exception as e:
             LOGGER.warning("idle state load failed: %s", e)
 
@@ -89,8 +87,7 @@ class CronScheduler:
         try:
             _IDLE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             _IDLE_STATE_PATH.write_text(json.dumps(
-                {"counts": self._idle_counts, "cooldown_until": self._last_idle_value,
-                 "last_report": self._last_report},
+                {"counts": self._idle_counts, "cooldown_until": self._last_idle_value},
                 ensure_ascii=False))
         except Exception as e:
             LOGGER.warning("idle state save failed: %s", e)
@@ -109,19 +106,6 @@ class CronScheduler:
             LOGGER.info("cron idle: %s 连续 %d 次空转 → 冷却 %d h",
                         role, self._idle_counts[role] + 2, _IDLE_COOLDOWN // 3600)
         self._save_idle_state()
-
-    def _noop_delta(self, role: str, report_summary: str) -> bool:
-        """状态差分判据（DESIGN §4）：与上次报告指纹相同 → True（无变化，抑制）。
-
-        emit-on-change：健康检查本身幂等（状态不变恒判绿），非幂等的是引擎
-        每轮新建实例。指纹相同即"状态无 delta" → 上游不 mint。指纹不同（真变化）
-        → False 放行。指纹取报告正文；调用方传 no-op 报告的可比对摘要。
-        """
-        _fp = (report_summary or "").strip()
-        _changed = self._last_report.get(role) != _fp
-        self._last_report[role] = _fp
-        self._save_idle_state()
-        return not _changed
 
     # ponytail: tick()/_fire() 已删除 — 原 cron 到期触发逻辑零生产调用方
     # (仅 test_cron_scheduler.py 覆盖)；step_handler 仅用 report_idle 做空转冷却，

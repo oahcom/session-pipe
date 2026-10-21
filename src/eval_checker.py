@@ -177,7 +177,6 @@ def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
     return True
 
 
-_CONTROL_WORDS = frozenset({"for", "while", "if", "then", "do", "done", "fi", "else", "elif", "in"})
 # 白名单检查通过后仍需排除的 bash 控制结构（非命令，但需在 for/while 体内递归检查）
 _SHELL_BUILTINS_READONLY = frozenset({"for", "while", "do", "done", "if", "then", "fi", "else", "elif", "in", "exit", "return", "break", "continue", "true", "false"})
 
@@ -431,6 +430,17 @@ def _is_tool_error(result: dict) -> bool:
     return False
 
 
+def _has_word(text: str, words) -> bool:
+    r"""text 里是否按**词边界**出现 words 中任意一个。
+
+    WHY 不用 `in`：`"active" in "inactive"` 为真 —— 维护者的「全部返回 active」
+    判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界同时排除 `-_`，
+    避免 `5xx-error` 这类被拆词误伤；中文/CJK 也算 \w，"不通过" 不会命中 "通过"。
+    """
+    return any(w and re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text)
+               for w in words)
+
+
 def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, str):
     """根据命令输出和预期结果判断 pass/fail。
 
@@ -457,11 +467,14 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
         return (True, f"无匹配=健康 (grep exit=1, expected={expected[:40]})")
 
     if "全部返回" in cmd_raw:
-        # 检查 stdout 包含关键字
-        keywords = expected.replace("、", " ").split()
-        if keywords:
-            passed = any(k in stdout for k in keywords)
-            detail = f"expected={expected} | stdout={stdout[:120]}"
+        # 「全部返回 X」= 每一行都要按词边界出现 X。旧写法 any(k in stdout) 让
+        # "active" 命中 "inactive"：实测 inactive/inactive 也判 PASS，维护者那条
+        # 核心服务判据因此恒真（2026-10-22 三轮审查复核）。
+        keywords = [k for k in expected.replace("、", " ").split() if k]
+        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+        if keywords and lines:
+            passed = all(_has_word(ln, keywords) for ln in lines)
+            detail = f"expected={expected} | 行={lines[:6]}"
             return (passed, detail)
 
     # 检查预期是否含数字
@@ -480,8 +493,9 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
             detail = f"{val}{op}{ref} | stdout={stdout[:120]}"
             return (passed, detail)
 
-    # 简单文本包含检查
-    passed = expected in stdout or expected in stderr
+    # 简单文本包含检查（按词边界）：子串匹配会把 "active" 吃进 "inactive"、
+    # "OK" 吃进 "NOT OK"，是判据恒真最常见的来源。
+    passed = _has_word(stdout, [expected]) or _has_word(stderr, [expected])
     detail = f"expected={expected[:60]} | stdout={stdout[:120]} | exit={rc}"
     return (passed, detail)
 
@@ -692,117 +706,6 @@ class RequirementConfirmationChecker:
             "findings": findings,
             "checked_requirements": checked
         }
-
-
-# ── Main entry ──
-
-class LeverageAccumulationChecker:
-    """杠杆积累检查器：检测 agent 是否在 24h 窗口内产出可复用资产。
-
-    三类可复用资产信号：
-      1. bus 上的 knowledge_distill / memory_store / skill_audit 事实
-      2. ~/.hermes/skills/ 下新增的技能文件
-      3. git 历史中新增的复用型文件（skill/util/helper/core/common/base 等）
-
-    原则：无可检查数据（24h 内零资产）= 通过（不误杀）。
-    本检查器为观测型：leverage_count 上报资产数，findings 列出明细。
-    """
-
-    ASSET_CATS = ("knowledge_distill", "memory_store", "skill_audit")
-    # 复用型文件关键词（git 新增文件命中即计为可复用资产）
-    _REUSABLE_KW = ("skill", "util", "helper", "core", "common", "base", "lib", "shared", "knowledge", "memory")
-    WINDOW = 86400  # 24h
-
-    def __init__(self):
-        from hermes_bus.blackboard_legacy import Blackboard
-        self._bb = Blackboard()
-        self._skills_dir = Path.home() / ".hermes" / "skills"
-        # 扫描 git 仓库（仅统计新增复用型文件，限定已知仓库避免全盘遍历）
-        self._git_repos = [
-            Path.home() / "session-pipeline",
-            Path.home() / "hermes-session-roles",
-            Path.home() / ".hermes",
-        ]
-
-    def check(self, role: str, task_id: str) -> dict:
-        """检查 24h 窗口内的可复用资产积累。
-
-        返回 {passed: bool, findings: list[dict], leverage_count: int}
-        无可检查数据 → passed=True, leverage_count=0（no data = pass）。
-        """
-        cutoff = time.time() - self.WINDOW
-        assets: list[dict] = []
-
-        # 1. bus 上的可复用资产事实（24h 窗口）
-        for cat in self.ASSET_CATS:
-            try:
-                for f in self._bb.read(cat=cat, limit=500):
-                    if f.ts >= cutoff:
-                        assets.append({"source": "bus", "cat": cat, "id": f.id, "title": f.t[:80]})
-            except Exception as e:
-                LOGGER.debug("leverage bus read %s fail: %s", cat, e)
-
-        # 2. ~/.hermes/skills/ 新增文件（24h 窗口）
-        if self._skills_dir.is_dir():
-            for p in self._skills_dir.rglob("*"):
-                if p.is_file() and p.stat().st_mtime >= cutoff:
-                    assets.append({"source": "skills", "file": str(p)})
-
-        # 3. git 历史中新增的复用型文件（24h 窗口）
-        git_assets = self._git_reusable_count(cutoff)
-
-        leverage_count = len(assets) + git_assets
-        # 观测型检查器：无资产=通过；有资产=上报（不判失败）
-        return {
-            "passed": True,
-            "findings": assets,
-            "leverage_count": leverage_count,
-        }
-
-    def _git_reusable_count(self, cutoff: float) -> int:
-        """统计 24h 内 git 新增的复用型文件数。
-
-        遍历已知仓库，解析 `git log --since --name-status` 的 A 行，
-        命中复用关键词即计入。单仓库失败不影响其他仓库。
-        """
-        n = 0
-        since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cutoff))
-        for repo in self._git_repos:
-            if not (repo / ".git").is_dir():
-                continue
-            try:
-                r = subprocess.run(
-                    ["git", "-C", str(repo), "log", f"--since={since}",
-                     "--name-status", "--pretty=format:"],
-                    capture_output=True, text=True, timeout=20,
-                )
-            except Exception as e:
-                LOGGER.debug("leverage git log %s fail: %s", repo, e)
-                continue
-            for line in r.stdout.splitlines():
-                if not line.startswith("A"):
-                    continue
-                path = line[1:].strip()
-                low = path.lower()
-                if any(kw in low for kw in self._REUSABLE_KW):
-                    n += 1
-        return n
-
-    def self_test(self) -> bool:
-        """自检：注入一条 knowledge_distill 事实，断言 check 能计数。
-
-        返回是否通过。注入使用带时间戳的唯一标题以避免 bus 去重。
-        """
-        marker = f"[self_test] leverage probe {time.time()}"
-        try:
-            self._bb.write("knowledge_distill", marker, evidence="leverage self-test", src="eval_checker")
-        except Exception as e:
-            LOGGER.warning("leverage self_test write fail: %s", e)
-            return False
-        res = self.check("__self_test__", "selftest")
-        assert res["leverage_count"] >= 1, f"self_test: leverage_count={res['leverage_count']} expected>=1"
-        assert res["passed"] is True, "self_test: passed must be True"
-        return True
 
 
 def _ts_recent(ts: str, cutoff: float) -> bool:
@@ -1033,10 +936,6 @@ class TrajectoryQualityChecker:
                         return True
             return False
 
-        # 语义边界（判据能回答什么）：盲改问的是"角色有没有看过这个文件"，不是
-        # "看的是不是最新版本"。读过之后别人又改了文件、角色拿着旧内容去 Edit，
-        # 不建模——跨角色交错改动要扫全部 transcript 的时间线，且那是"内容陈旧"
-        # 问题，不是"没看就改"。同理只建模 Write/Edit 两种改文件工具。
         read_files: set[str] = set()
         bash_blob: list[str] = []
         seen_use_ids: set[str] = set()
@@ -1101,12 +1000,11 @@ class TrajectoryQualityChecker:
                       if c["kind"] == "result" and c["id"] and c["error"]} - _ok_ids
 
         # 自己写过的文件不算盲改：内容本来就在自己上下文里（Claude Code 也明说
-        # "no need to Read it back"）。只豁免**写之后**的改写；键带 transcript，
-        # 跨 transcript 不豁免——那份内容可能已被别人改过（compact 续跑会开新
-        # transcript，所以"compact 后盲覆盖"仍被挡住），不需要再区分工具。
-        # 2026-10-22 实测：同一 transcript 里第二次 Write 自己写过的文件有 15 处
-        # （pm 4 / product_architect 3 / maintainer 2 …），原先只豁免 Edit，这些
-        # 全被判盲改，每个都让角色花一轮自证。
+        # "no need to Read it back"）。只豁免**写之后**的编辑；跨 transcript 不豁免
+        # ——那份内容可能已被别人改过。实测 pg 5 条误报里 4 条是这一类。
+        # 只豁免 Edit：它必须带 old_string 且成功，说明角色手上的内容与磁盘一致
+        # （对不上就失败，失败的调用已按 failed_ids 跳过）。Write 是整文件覆盖，
+        # 命中 old_string 这层证据不存在，故不豁免——否则 compact 后盲覆盖会被放过。
         own_written: dict[tuple[str, str], int] = {}
         for c in calls:
             _n = c["name"] or ""
@@ -1175,8 +1073,8 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
                     continue
-                if (fp and own_written.get(
-                        (c["src"], _key(fp)), c["order"]) < c["order"]):
+                if (name == "Edit" and fp
+                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
@@ -1423,16 +1321,6 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                     summary["notices"] += 1
         except Exception as e:
             LOGGER.warning("TrajectoryQualityChecker failed: %s", e)
-
-        # LeverageAccumulationChecker: 观测 24h 内可复用资产积累（无资产=通过）
-        try:
-            lev = LeverageAccumulationChecker()
-            for role in sampled:
-                lev_result = lev.check(role["name"], f"eval_{role['name']}")
-                # 始终 passed（观测型），仅上报 leverage_count 供看板
-                summary["leverage_count"] = summary.get("leverage_count", 0) + lev_result["leverage_count"]
-        except Exception as e:
-            LOGGER.warning("LeverageAccumulationChecker failed: %s", e)
 
     LOGGER.info(
         "eval_check done: checked=%d passed=%d failed=%d skipped=%d notices=%d blockers=%d",

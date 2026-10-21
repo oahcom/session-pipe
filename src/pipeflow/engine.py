@@ -92,9 +92,6 @@ def _resolve_eval_gate(bb) -> str | None:
     except Exception:
         return "eval_gate_blocked"
 
-_POLL_SLEEP = _TUNING.get("poll_sleep", 5)
-_REMINDER_INTERVAL = _TUNING.get("reminder_interval", 120)
-
 # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用它作
 # StopHook 条件时 bool([]) 为 False → 死循环
 UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
