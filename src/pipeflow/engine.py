@@ -989,11 +989,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                  if s.id == _pr["current_step_id"]), None)
                 if _pr_step is None:
                     continue
-                # 提醒与推进都要在这里做：主循环随后看不到这个实例了。
-                self._remind_step_done(_pr, _pr_step, _pr_sr, _pr["current_step_id"],
-                                       self._lifecycle)
                 self._advance_production_wf(_pr["instance_id"], self._lifecycle, _pr["template_id"],
                                             _pr["current_step_id"], _pr_sr)
+                # 提醒放在推进之后，与主循环同序：提醒走 _send_to_role（60s~90s 超时），
+                # 排在推进前会把推进堵住、吃光 tick 预算（codex 复审 2026-10-22 第 2 轮）。
+                self._remind_step_done(_pr, _pr_step, _pr_sr, _pr["current_step_id"],
+                                       self._lifecycle)
         except Exception as _pr_e:
             LOGGER.warning("advance pre-pass failed: %s", _pr_e)
 
