@@ -23,10 +23,10 @@ session-roles（定义层）
 
 | 项目 | Python 源文件 | 行数 | 其他 |
 |------|-------------|------|------|
-| hermes-session-roles | 6 个 `.py` | ~1040 | 19 角色 JSON, 50 人格 JSON, 18 prompt 文件 |
-| session-launcher | ~15 个 `.py` | ~3500 | 文档、测试、配置 |
-| session-pipeline | ~13 个 `.py` | ~4000 | 测试 136 个 |
-| **总计** | **~34 个 `.py`** | **~8500** | **100+ 数据/配置/文档文件** |
+| hermes-session-roles | 7 个 `.py` / 1480 行 | 19 角色 JSON, 10 人格 JSON（50 profiles + 3 QA）, 18 prompt |
+| session-launcher | 31 个 `.py` / 8505 行 | 文档、测试、配置 |
+| session-pipeline | 44 个 `.py` / 20402 行 | 测试 1271 例（pytest --collect-only） |
+| **总计** | **82 个 `.py` / ~30400 行** | 2026-10-22 按 `git ls-tree HEAD` 递归实测 |
 
 ## 系统入口
 
@@ -117,7 +117,7 @@ pipeflow/daemon.py:51-76    while True (sleep 10s) — 系统唯一的执行循�
 `engine.py` 有 3 处绕过 `lifecycle/manager.py` 直接写 SQL：`_advance_production_wf()`, `_tick()`, `_scan_tasks()`。这些绕过丢失了 RLock 保护和审批流程。
 
 ### 4. `/loop` 在 tmux 环境不可用
-`_ensure_role_alive()` 注入 `/loop` 是无效操作——不报错，但 CCS 不会进入工作循环。修复方案：`engine.py:582` 将 `"--drive", "loop"` 改为 `"--drive", "ondemand"`。
+`_ensure_role_alive()` 注入 `/loop` 是无效操作——不报错，但 CCS 不会进入工作循环。（2026-10-22 复核：这条修复方案已失效——`engine.py` 里 `/loop` 出现 0 处、582 行是 `has_active_template()`；拉起 CCS 实际用 `--drive infinite`（`role_lifecycle.py:747`）。原文保留为历史记录。）
 
 ### 5. 角色契约字段消费缺口
 `workgroup`, `cron_schedule`, `sla_seconds` 等字段定义但未消费。`input_signals`, `eval_criteria` 仅注入 prompt 无运行时执行。详见 session-roles ARCHITECTURE.md 的 Consumed fields audit。
