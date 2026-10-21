@@ -70,7 +70,7 @@ def _make_transcript(path: Path) -> None:
         "type": "assistant",
         "message": {"id": f"m{n}", "type": "message", "role": "assistant", "content": [
             {"type": "tool_use", "id": "c3", "name": "Write",
-             "input": {"file_path": "/tmp/blind.py", "content": "y=1"}},
+             "input": {"file_path": "/data/blind.py", "content": "y=1"}},
         ]},
     }))
     n += 1
@@ -103,7 +103,7 @@ def test_blind_edit_only_flagged() -> None:
         # 仅 1 条 blind_edit 发现
         blind = [f for f in result["findings"] if f["issue"] == "blind_edit"]
         assert len(blind) == 1, f"expected exactly 1 blind_edit, got {len(blind)}"
-        assert blind[0]["file"] == "/tmp/blind.py"
+        assert blind[0]["file"] == "/data/blind.py"
         assert result["checked_traces"] >= 1
     finally:
         jf.unlink(missing_ok=True)

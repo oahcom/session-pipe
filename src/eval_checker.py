@@ -1010,6 +1010,18 @@ class TrajectoryQualityChecker:
             """
             return os.path.realpath(os.path.expanduser(fp)) if fp else ""
 
+        def _is_scratch(fp: str) -> bool:
+            """临时目录里的文件不是盲改目标：草稿没有需要保护的既有内容。
+
+            实测 2026-10-22 24h 全 19 角色只剩 2 处 blind_edit，全在 /tmp：
+            engineer /tmp/eng_sim2.py、knowledge_curator /tmp/inspect_rw.py，
+            仓内 0 处。这两处让门禁每轮 checked=2 failed=2、角色再花一轮自证；
+            而 Claude Code 对 Write 的返回本身就是"no need to Read it back"。
+            ponytail: 天花板=/tmp 下真有人放需要保护的交付物时会被放过；
+            升级路径=改成只豁免配置里的草稿目录白名单。
+            """
+            return _key(fp).startswith(("/tmp/", "/var/tmp/"))
+
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
 
@@ -1185,7 +1197,8 @@ class TrajectoryQualityChecker:
                 if (fp and own_written.get(
                         (c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
-                if fp and _key(fp) not in read_files and not bash_read:
+                if (fp and _key(fp) not in read_files and not bash_read
+                        and not _is_scratch(fp)):
                     findings.append({
                         "issue": "blind_edit", "tool": name,
                         "file": fp, "id": cid,

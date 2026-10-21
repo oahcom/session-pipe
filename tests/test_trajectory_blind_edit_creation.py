@@ -99,7 +99,7 @@ def test_path_mismatch_and_error_echo_not_exempted() -> None:
     """豁免不能扩大成放过一切写：路径不符 / 结果无创建标记 都要照判盲改。"""
     cases = [
         ("-mismatch", "other.py", f"File created successfully at: {os.path.join(os.sep, 'tmp', 'other.py')}"),
-        ("-pathonly", "/tmp/probe_echo.py", "/tmp/probe_echo.py"),  # 结果只回显路径，无创建标记
+        ("-pathonly", "/data/probe_echo.py", "/data/probe_echo.py"),  # 结果只回显路径，无创建标记
     ]
     for tag, target, result in cases:
         sess = _TRANSCRIPTS_DIR / f"-probe-selfcreate{tag}-role"
@@ -134,12 +134,12 @@ def test_path_mismatch_and_error_echo_not_exempted() -> None:
 def test_non_creation_write_still_flagged() -> None:
     """对照：结果不含"新建"标记的写仍判盲改（豁免不能扩大成放过一切写）。"""
     sess = _TRANSCRIPTS_DIR / "-probe-selfupdate-role"
-    jf = _make(sess, _write_seq(0, "c9", "/tmp/probe_updated.py", "ok"))
+    jf = _make(sess, _write_seq(0, "c9", "/data/probe_updated.py", "ok"))
     try:
         res = TrajectoryQualityChecker().check("selfupdate", "t")
         blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
         assert len(blind) == 1, f"盲改未被标记: {res['findings']}"
-        assert blind[0]["file"] == "/tmp/probe_updated.py"
+        assert blind[0]["file"] == "/data/probe_updated.py"
     finally:
         jf.unlink(missing_ok=True)
         try:
@@ -217,7 +217,7 @@ def test_one_success_result_keeps_blind_edit() -> None:
     反之（只看 error 就跳过）会变成「先失败一次，后面盲写全部免检」的后门。
     """
     sess = _TRANSCRIPTS_DIR / "-probe-mixedretry-role"
-    lines = _write_seq(0, "cm", "/tmp/probe_mixed.py", "ok")
+    lines = _write_seq(0, "cm", "/data/probe_mixed.py", "ok")
     lines.append(_turn(1, "user", [
         {"type": "tool_result", "tool_use_id": "cm", "is_error": True,
          "content": "<tool_use_error>InputValidationError: Write was called with "
@@ -271,7 +271,7 @@ def test_edit_of_own_written_file_not_flagged() -> None:
 def test_edit_before_own_write_still_flagged() -> None:
     """顺序不能反：先 Edit 后 Write 时，那次 Edit 仍算盲改。"""
     sess = _TRANSCRIPTS_DIR / "-probe-ownwrite-order-role"
-    path = "/tmp/probe_own_order.py"
+    path = "/data/probe_own_order.py"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "ce2", "name": "Edit",
@@ -373,11 +373,11 @@ def test_same_file_different_path_form_not_flagged() -> None:
 def test_bash_basename_must_be_path_component() -> None:
     """bash 里出现同名前缀的**别的**文件不算读过：`myx_probe.md` 不豁免 `x_probe.md`。"""
     sess = _TRANSCRIPTS_DIR / "-probe-bashbase-role"
-    target = "/tmp/x_probe.md"
+    target = "/data/x_probe.md"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "b1", "name": "Bash",
-             "input": {"command": "cat /tmp/myx_probe.md"}},
+             "input": {"command": "cat /data/myx_probe.md"}},
         ]),
         _turn(1, "user", [
             {"type": "tool_result", "tool_use_id": "b1", "is_error": False,
@@ -409,7 +409,7 @@ def test_bash_basename_must_be_path_component() -> None:
 def test_bash_absolute_path_must_point_at_same_file() -> None:
     """带绝对路径的 bash 读取必须指向同一文件：同名异目录的 decoy 不豁免。"""
     sess = _TRANSCRIPTS_DIR / "-probe-bashpath-role"
-    decoy, target = "/tmp/decoy/x_path.md", "/tmp/other/x_path.md"
+    decoy, target = "/data/decoy/x_path.md", "/data/other/x_path.md"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "b3", "name": "Bash",
@@ -511,6 +511,33 @@ def test_second_write_of_own_file_not_flagged() -> None:
             pass
 
 
+
+def test_scratch_write_not_flagged() -> None:
+    """草稿文件（/tmp）的写不算盲改：没有既有内容可被覆盖。"
+
+    实测 24h 全 19 角色只剩 2 处 blind_edit，全在 /tmp（engineer /tmp/eng_sim2.py、
+    knowledge_curator /tmp/inspect_rw.py），仓内 0 处；结果文案是
+    'The file … has been updated successfully'，查不到"新建"标记，所以照判，
+    角色每轮都要多花一轮自证。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-scratch-role"
+    path = "/tmp/probe_scratch.py"
+    lines = _write_seq(0, "ct1", path,
+                       f"The file {path} has been updated successfully. "
+                       '"(file state is current in your context)"')
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("scratch", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"草稿文件的写不该判盲改: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -528,6 +555,7 @@ if __name__ == "__main__":
         test_bash_absolute_path_must_point_at_same_file,
         test_bash_same_absolute_path_still_exempts,
         test_second_write_of_own_file_not_flagged,
+        test_scratch_write_not_flagged,
     )
     for _t in _tests:
         _t()
