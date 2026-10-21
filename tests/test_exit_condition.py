@@ -42,10 +42,6 @@ def _mocked_eng():
     eng = _make_eng()
     eng._bb = MagicMock()
     eng._lm = MagicMock()  # _lifecycle 是 property, 需要 mock _lm 直接
-    # 告警冷却是**类属性**（进程级）：上一条用例写进 (role,title) 后，
-    # 同标题的下一条用例会被 30min 冷却吞掉 → 间歇红。逐例清空。
-    from pipeflow.role_lifecycle import RoleLifecycleMixin
-    RoleLifecycleMixin._ALERT_TS.clear()
     return eng
 
 
@@ -463,14 +459,18 @@ class TestTickExitSchemaBlocked(unittest.TestCase):
         # 需要 bus_category 才能进入 schema 校验路径（空 cat 直接 return）
         step = _step(exit_condition={"bus_category": "notice"}, exit_schema={"required": ["nonexistent"]})
         run = _run()
+        # 冷却表是进程级的，且与 TestTickVerifyBlocked 同 (role,title) → 先清，
+        # 否则本用例被上一个用例的冷却静默成"没写 blocker"。
+        eng._ALERT_TS.clear()
         eng._tick(run, step)
 
-        # 与 TestTickVerifyBlocked 同一口径：同一 _tick 里角色启动失败也会写 blocker，
-        # 次数取决于启动重试/冷却状态 → 全量跑间歇红、单跑绿。只锁契约：
-        # schema 失败必须留下带 "schema" 的 blocker。
-        texts = [c[0][1] + "\n" + str((c[1].get("evidence") if len(c) > 1 else None) or "")
-                 for c in eng._bb.write.call_args_list]
-        self.assertTrue(any("schema" in t for t in texts), texts)
+        # 标题被 _notify_role 的 (role,title) 30min 冷却锁成稳定文案（_gate_prompt），
+        # 失败详情改放 evidence：锁「标题稳定 + evidence 带 schema 报错」。
+        gate = [c for c in eng._bb.write.call_args_list
+                if c[0][1] == "[workflow] test_wf s1 闸门未通过"]
+        self.assertTrue(gate, f"schema 失败必须写闸门 blocker: "
+                              f"{[c[0][1] for c in eng._bb.write.call_args_list]}")
+        self.assertIn("schema error", gate[0][1]["evidence"])
 
 
 class TestTickVerifyBlocked(unittest.TestCase):
@@ -493,14 +493,16 @@ class TestTickVerifyBlocked(unittest.TestCase):
 
         step = _step(exit_condition={"bus_category": "notice"}, verify="test_command")
         run = _run()
+        # 同标题的 schema 用例会占满 (role,title) 冷却（进程级）→ 先清再 tick。
+        eng._ALERT_TS.clear()
         eng._tick(run, step)
 
-        # 不能断言"只写一次"：同一 _tick 里角色启动失败也会写 blocker（实测 7 次），
-        # 次数取决于启动重试与冷却缓存状态 → 全量跑间歇红、单跑绿。这里只锁定契约：
-        # verify 失败必须留下带 "verify" 的 blocker。
-        texts = [c[0][1] + "\n" + str((c[1].get("evidence") if len(c) > 1 else None) or "")
-                 for c in eng._bb.write.call_args_list]
-        self.assertTrue(any("verify" in t for t in texts), texts)
+        # 标题稳定、详情进 evidence（见 _gate_prompt）：verify 的 stderr 必须在。
+        gate = [c for c in eng._bb.write.call_args_list
+                if c[0][1] == "[workflow] test_wf s1 闸门未通过"]
+        self.assertTrue(gate, f"verify 失败必须写闸门 blocker: "
+                              f"{[c[0][1] for c in eng._bb.write.call_args_list]}")
+        self.assertIn("verify error output", gate[0][1]["evidence"])
 
 
 class TestTickCompletedRunSkipped(unittest.TestCase):

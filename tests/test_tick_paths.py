@@ -117,6 +117,8 @@ def test_tick_exit_schema_failure():
 
 def test_tick_verify_failure():
     eng = _build_eng()
+    # 上一个用例（schema 失败）已占满同标题的进程级冷却 → 不清就写不出 blocker。
+    eng._ALERT_TS.clear()
     with patch.object(eng, "_check_exit", return_value=(time.time(), [{"id": 1, "text": "match", "ts": time.time(), "src": "test"}])):
         step = _make_step(verify="false")  # shell false → exit code 1
         run = _make_run()
