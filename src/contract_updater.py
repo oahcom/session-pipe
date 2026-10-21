@@ -133,6 +133,10 @@ _ROLE_ALIAS: dict[str, str] = {}
 # 实测（2026-10-19）：src/test_routing_daemon.py 用 mock.patch 把 PERSONAS_DIR 指到
 # 单 persona 临时目录，填出残缺映射后所有用例复用 → 5 条 contract_updater 测试全量失败。
 _ALIAS_DIR: object = None
+# 目录里一个 persona 都没有时只告警一次：别名表退化成漂移补丁，英文 role_filter
+# 解析为空、覆盖率统计把全部角色当 unmapped —— 静默失效比报错更难查（2026-10-22：
+# 干净导出树里 5 条用例假红，根因就是没人发现 personas 目录不存在）。
+_WARNED_NO_PERSONAS = False
 
 
 # 已知別稱漂移補丁: eval_passrate 的 role_filter 用詞(维护者) 與 persona title(运维者)
@@ -149,11 +153,12 @@ _ROLE_DRIFT_PATCH = {
 
 def _build_role_alias_map() -> dict[str, str]:
     """从 persona JSON 构建 中文title/英文name → name 的别名表 (按目录缓存)。"""
-    global _ALIAS_DIR
+    global _ALIAS_DIR, _WARNED_NO_PERSONAS
     if _ROLE_ALIAS and _ALIAS_DIR == PERSONAS_DIR:
         return _ROLE_ALIAS
     _ROLE_ALIAS.clear()
     _ALIAS_DIR = PERSONAS_DIR
+    _loaded = 0
     for f in PERSONAS_DIR.glob("persona_*.json"):
         try:
             d = json.loads(f.read_text())
@@ -163,9 +168,15 @@ def _build_role_alias_map() -> dict[str, str]:
         if not name:
             continue
         _ROLE_ALIAS[name] = name                       # 英文直过
+        _loaded += 1
         title = d.get("title")
         if title:
             _ROLE_ALIAS[title.strip()] = name           # 中文 title → name
+    if not _loaded and not _WARNED_NO_PERSONAS:
+        _WARNED_NO_PERSONAS = True
+        LOGGER.warning(
+            "personas 目录里没有 persona_*.json（%s）：角色别名表退化为漂移补丁，"
+            "英文 role_filter 解析为空、覆盖率把所有角色算作 unmapped", PERSONAS_DIR)
     _ROLE_ALIAS.update(_ROLE_DRIFT_PATCH)              # 已知漂移補丁
     return _ROLE_ALIAS
 
