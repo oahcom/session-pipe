@@ -318,9 +318,38 @@ def test_send_nonzero_rc_writes_no_audit():
     assert not eng._bb.write.called, "tmux rc=1 却写了「已发继续」"
 
 
+def test_request_rejected_429_is_recovered():
+    """9router 现行 429 文案 `Request rejected (429)` 必须命中恢复词表。
+
+    2026-10-21 实测 closer/maintainer 的 pane 停在这一行，旧词表
+    ("API Error: 429" / "Rate limit exceeded") 一条不中 → 恢复分支整条不可达，
+    两角色各空等 16min，当日 [rate_limit] 审计 0 条（#432582）。
+    """
+    eng = _engine()
+    sent = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-closer\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=(
+                "● API Error: Request rejected (429) · [ollama/gpt-oss:120b] [429]:\n"
+                '{"error":"You reached the Free usage limit."} (reset after 4m 45s)\n'
+                "✻ Cogitated for 16m 23s\n❯ "))
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert any("继续" in c for c in sent), f"Request rejected (429) 应发继续, got {sent}"
+
+
 if __name__ == "__main__":
     for fn in (test_no_workflow_role_recovered_via_tmux,
                test_healthy_role_not_touched,
-               test_backoff_blocks_immediate_retry):
+               test_backoff_blocks_immediate_retry,
+               test_request_rejected_429_is_recovered):
         fn()
         print(f"OK {fn.__name__}")

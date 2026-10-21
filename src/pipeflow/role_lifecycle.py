@@ -207,6 +207,10 @@ class RoleLifecycleMixin:
     _last_rate_recover: dict[str, tuple[float, int]] = {}   # role -> (last_ts, attempt)
     _RATE_LIMIT_PATTERNS = (
         "API Error: 403", "API Error: 429",
+        # 9router 当前 429 文案是 `API Error: Request rejected (429) · [ollama/...]`，
+        # 不含上面两条 → 恢复分支整条不可达。实测 close/maintainer 各空等 16min，
+        # 今日 [rate_limit] 审计 0 条（#432582）。
+        "Request rejected (429)",
         "Rate limit exceeded", "rate_limit_exceeded",
         "FreeTierError", "FreeUsageLimitError",
         "Please run /login",
