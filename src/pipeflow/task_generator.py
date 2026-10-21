@@ -84,6 +84,21 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 
 
 
+def _last_metrics(path: Path) -> dict:
+    """读 workflow-metrics.jsonl 末行；文件不存在/损坏 → {}（不阻断本轮）。"""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode("utf-8", "replace").splitlines()
+        return json.loads(tail[-1]) if tail else {}
+    except (OSError, ValueError, IndexError):
+        return {}
+
+def _same_metrics(last: dict, cur: dict) -> bool:
+    """除 ts 外全部字段相等即视为状态未变（ts 每行必然不同，不能参与比较）。"""
+    return {k: v for k, v in last.items() if k != "ts"} == cur
+
 class TaskGeneratorMixin:
     """WorkflowEngine 的任务生成 mixin。"""
 
@@ -586,17 +601,25 @@ class TaskGeneratorMixin:
             try:
                 _st_rows = conn.execute("SELECT status, COUNT(*) as c FROM workflow_instances GROUP BY status").fetchall()
                 _metrics = {
-                    "ts": time.time(),
                     "total": total,
                     "completed": (_completed["c"] if _completed else 0),
                     "rate": round((_completed["c"] or 0) / max(total, 1) * 100, 1),
                     "running": len(running) if running else _running["c"] if _running else 0,
                     "by_status": {r["status"]: r["c"] for r in _st_rows},
                 }
+                # 状态未变且 300s 内已写过 → 跳过（#432192）：heal_stalled 每 6s tick
+                # 无条件 append 曾让文件膨胀到 30MB（98.9% 重复行）。心跳下限 300s
+                # 保住时间轴连续性，状态变化立即落盘保住事件精度。比对文件末行而
+                # 非内存状态：daemon 重启后仍生效。
+                _now = time.time()
                 _mf = Path.home() / ".hermes" / "state" / "workflow-metrics.jsonl"
                 _mf.parent.mkdir(parents=True, exist_ok=True)
-                with _mf.open("a") as f:
-                    f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
+                _last = _last_metrics(_mf)
+                if not (_last and _same_metrics(_last, _metrics)
+                        and _now - _last.get("ts", 0) < 300):
+                    _metrics["ts"] = _now
+                    with _mf.open("a") as f:
+                        f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
             except (ValueError, KeyError, TypeError):
                 pass
         except Exception as _e:

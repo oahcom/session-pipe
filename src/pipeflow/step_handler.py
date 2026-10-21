@@ -136,7 +136,14 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     ids = set(_WF_ID_RE.findall(text or ""))
     if not ids or wf_id in ids:
         return False
-    claim = re.search(r'(?<![\w-])' + re.escape(template) + r'/' + re.escape(step_id) + r'(?![\w-])',
+    # 模板名带不带 WL-/WF- 前缀都要认：父链注册名是 WL-full_dev_pipeline，而
+    # 角色照抄提示词发出的完成标题是 full_dev_pipeline/s4-complete（前缀由
+    # engine 生成 id 时加，不进提示词）。旧实现按全名精确匹配恒不命中 → 守卫
+    # 恒失效 → 8.7 小时前、属兄弟实例 wf_sub_61581e191d0a 的消息把本步闭合。
+    _tpl = re.sub(r'^(?:WL-|WF-)', '', str(template))
+    # 尾部断言用 (?![\\w]) 不用 (?![\\w-])：角色完成标题固定写 `s4-complete`，
+    # 紧邻的连字符会被 (?![\\w-]) 拒掉 → 即便前缀修好也恒不命中；step_id=s4 仍不会误匹配 s40。
+    claim = re.search(r'(?<![\w-])(?:WL-|WF-)?' + re.escape(_tpl) + r'/' + re.escape(step_id) + r'(?![\w])',
                       text or "")
     return bool(claim)
 
@@ -884,6 +891,12 @@ class StepHandlerMixin:
                             for f in _role_msgs
                         )
                         if _relaxed and _has_anchor:
+                            # 宽松推进不得绕过质量闸门：exit_schema/verify 是"产出真的
+                            # 落盘"的唯一判据，与主路径同一把尺子。缺这道门时角色写了
+                            # 任意同工作流消息就算完成（7 天 6 次：writer/reviewer/
+                            # engineer/closer 各 1~2 次），下游拿不到契约件才回头返工。
+                            if self._quality_gate_blocks(step, run):
+                                return
                             LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
                                         run.workflow_name, step.id, len(_relaxed))
                             run.step_results[step.id] = {
@@ -1110,32 +1123,8 @@ class StepHandlerMixin:
             self._sync_step_results(run.id, run.step_results)
 
             # schema/verify 失败 → 写 blocker 且不推进，等角色补产出后重试
-            if step.exit_schema:
-                ok, errs = self._validate_exit_schema(step, run)
-                if not ok:
-                    self._bb.write("blocker",
-                        f"[workflow] {run.workflow_name} {step.id} schema: {'; '.join(errs)}",
-                        src="workflow_engine")
-                    self._sync_step_results(run.id, run.step_results)
-                    return
-
-            if step.verify:
-                import shlex as _shlex
-                ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
-                vcmd = step.verify
-                # D3 P1 安全修复：对 context 值做 shlex.quote，防止模板变量被 shell 解释
-                for k, val in ctx.items():
-                    vcmd = vcmd.replace(f"{{{k}}}", _shlex.quote(str(val)))
-                # verify 命令可能含 && / 管道等 shell 语法，shlex.split 会把 && 当
-                # 参数传给第一个命令导致 "extra argument" 报错 → 用 shell=True 执行。
-                # verify 命令来自模板注册表（可信内部源），context 值已 shlex.quote 保护。
-                ver = _engine_mod._sp.run(vcmd, shell=True, capture_output=True, timeout=30)
-                if ver.returncode != 0:
-                    self._bb.write("blocker",
-                        f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}",
-                        src="workflow_engine")
-                    self._sync_step_results(run.id, run.step_results)
-                    return
+            if self._quality_gate_blocks(step, run):
+                return
 
             try:
                 self._lifecycle.complete_step(run.id, step.id)
@@ -1389,6 +1378,47 @@ class StepHandlerMixin:
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail in _sync_step_results fallback")
 
+    def _quality_gate_blocks(self, step: Step, run: WorkflowRun) -> bool:
+        """exit_schema + verify 闸门：不通过写 blocker 并返回 True（调用方不推进）。
+
+        两个调用点共用一把尺子：exit 匹配主路径与宽松推进（分类不匹配的兜底）。
+        此前宽松推进直接 complete_step，文件契约缺了也照样算完成——下游拿不到
+        产出才回头返工（7 天 6 次宽松推进实测）。verify 来自模板注册表（可信
+        内部源），context 值已 shlex.quote 保护。
+        """
+        if step.exit_schema:
+            ok, errs = self._validate_exit_schema(step, run)
+            if not ok:
+                self._bb.write("blocker",
+                    f"[workflow] {run.workflow_name} {step.id} schema: {'; '.join(errs)}",
+                    src="workflow_engine")
+                self._sync_step_results(run.id, run.step_results)
+                return True
+        if step.verify:
+            import shlex as _shlex
+            ctx = {**run.context, "workflow_id": run.id, "step_id": step.id}
+            vcmd = step.verify
+            # 对 context 值做 shlex.quote，防止模板变量被 shell 解释
+            for k, val in ctx.items():
+                vcmd = vcmd.replace(f"{{{k}}}", _shlex.quote(str(val)))
+            # verify 可能含 && / 管道，shlex.split 会把它们当参数 → shell=True
+            try:
+                ver = _engine_mod._sp.run(vcmd, shell=True, capture_output=True, timeout=30)
+            except Exception as _e:
+                # 闸门自身故障不等于通过也不等于失败：按失败留痕，交下一轮重试
+                self._bb.write("blocker",
+                    f"[workflow] {run.workflow_name} {step.id} verify 执行异常: {_e}",
+                    src="workflow_engine")
+                self._sync_step_results(run.id, run.step_results)
+                return True
+            if ver.returncode != 0:
+                self._bb.write("blocker",
+                    f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}",
+                    src="workflow_engine")
+                self._sync_step_results(run.id, run.step_results)
+                return True
+        return False
+
     def _validate_exit_schema(self, step: Step, run: WorkflowRun) -> tuple[bool, list[str]]:
         """校验 exit_schema 定义的文件约束。返回 (ok, error_list)。"""
         schema = step.exit_schema
@@ -1434,9 +1464,15 @@ class StepHandlerMixin:
                 all_matches = [fpath] if fpath.exists() else []
                 matched = [m for m in all_matches if m.stat().st_mtime >= _wf_floor] if _wf_floor > 0 else all_matches
 
+            # 通配符有匹配但全是工作流创建前的旧文件 = 本步没有产出。
+            # 旧实现把这种形态当"无本次产出可校验"而跳过内容检查，于是
+            # `*.py` + minLength（无 minCount）的 schema 在零新文件时返回 ok：
+            # 实测两条 engineer 子链 11:30-11:45 workspace 0 写入，11:39:39 仍
+            # 判完成（各 469s），父步 DESIGN.md/*.py 契约同时未达成。
+            _stale_only = bool(all_matches) and not matched and "*" in fname
             if not matched and fpath.is_dir():
                 matched = []  # minFiles 走单独检查，不混入内容检查
-            elif not matched and not ("*" in fname and all_matches):
+            elif not matched and (_stale_only or not ("*" in fname and all_matches)):
                 # 无匹配且非目录、且非"通配符匹配到但全部是历史文件"：
                 # 所有内容检查均失败。历史文件场景跳过内容检查（无本次产出可校验），
                 # 但 minCount 计数仍会执行

@@ -793,6 +793,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
 
         # 确保工作流涉及的角色存活（assignee + target_role + guard.watch）
         self._ensure_guard_roles()
+        # 子链回流先于实例循环：_scan_tasks 写的 subflow_retry/subflow_failed_*
+        # 会被下面循环里基于旧快照的整字典回写覆盖（实测 3 次子链死亡只记到 2），
+        # 把重建上限从 3 放大到 6。先扫一遍让账本落在内存快照之前。
+        try:
+            self._scan_tasks()
+        except Exception as e:
+            LOGGER.debug("early _scan_tasks failed: %s", e)
+
         # SQLite production 工作流 — 复用 _lifecycle 连接避免泄漏
         lm = self._lifecycle
         try:
@@ -802,8 +810,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         try:
             rows = lm.query(
                 # task_id 必选：下方 run context 补齐（integrity 提醒填充任务正文）依赖它
+                # effective_roles 必选：证据门/_has_evidence 用它解析实际执行角色
+                # （engineer↔pg 分流）。缺列时静默回落模板角色 → 分流实例的证据
+                # 永远查不到（三方审查 2026-10-21 实测 A/B）。
                 "SELECT instance_id, template_id, current_step_id, step_results, created_at, "
-                "status, task_id "
+                "status, task_id, effective_roles "
                 "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
             for row in rows:

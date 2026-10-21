@@ -86,6 +86,36 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     return bool(_rows) and _rows[0]["status"] in _ACTIVE_WF_STATUSES
 
 
+def _bus_evidence_ready(engine, row: dict) -> bool:
+    """回收前最后一道检查：bus 上是否已有满足本步 exit_condition 的完成消息。
+
+    回收器此前只认 step_results 的 exit_messages，而 status 恒空的步骤（角色忙/
+    投递失败）根本没有该字段——完成消息早已在 bus 也照判"卡死"（实测 closer s2
+    在上一步完成后 50 分钟才写出完成消息，途中被条件 4 判死，子链连烧 3 条）。
+
+    判据复用 _has_evidence，与 engine.run_once 的完成证据门同源，不新开口径。
+    只放行不闭合：下一 tick 由证据门置 notified，统一走 exit_schema/verify。
+    """
+    _cur = row.get("current_step_id") or ""
+    try:
+        # 模板取内存注册表（JSON 优先、每 tick 热加载）而非 workflow_templates 表：
+        # 表里只有 _upsert_template 落过的模板，测试/新模板查不到会静默放行回收。
+        _wf = engine._workflows.get(row.get("template_id") or "")
+        _step = next((s for s in _wf.steps if s.id == _cur), None) if _wf else None
+        if _step is None:
+            return False
+        _ts, _ = engine._has_evidence(row, _step)
+        if _ts:
+            LOGGER.info("stale-reclaim 拦下 %s/%s：bus 完成证据已就位 (ts=%.0f)",
+                        str(row.get("instance_id", ""))[:12], _cur, _ts)
+            return True
+    except Exception as _e:
+        # 探测失败按无证据处理：不让一次查询异常把回收变成永久豁免
+        LOGGER.debug("stale-reclaim evidence check failed %s: %s",
+                     row.get("instance_id"), _e)
+    return False
+
+
 def _role_producing_recently(role: str, window: float = 300.0) -> bool:
     """角色的会话转录最近 window 秒内是否在写入 —— 还在干活的强信号。
 
@@ -99,9 +129,13 @@ def _role_producing_recently(role: str, window: float = 300.0) -> bool:
     同源思路见 role_lifecycle._recently_producing（bus 产出判活）与
     survival_monitor.py:230 的同款修法注释 —— 本处将同一原则补到判死路径。
 
-    探测不可用（目录缺失 / 无转录）时返回 False：退化为原 pane 判据，
-    不因新信号引入而放过真僵尸。
+    探测不可用（目录缺失 / 无转录 / stat 失败）时返回 False：调用方把它当
+    「另一路证据」与 pane/DB 判据并列（见 _cleanup_stale_workflows 条件 4），
+    返回 True 会让离线角色永不被回收，只能等 24h 全局阈值。代价是目录被
+    临时移走时会误杀一条排队实例 —— 可重试，且远比永久占位轻。
     """
+    if not role:
+        return False
     try:
         # 目录名由工作区路径转义而来：ccs-workspaces-product-architect（下划线→连字符）。
         # 不做替换时带下划线的角色（product_architect 等）恒找不到目录 → 恒 False，
@@ -112,7 +146,10 @@ def _role_producing_recently(role: str, window: float = 300.0) -> bool:
             return False
         _mtime = max((f.stat().st_mtime for f in _d.glob("*.jsonl")), default=0.0)
         return bool(_mtime) and (time.time() - _mtime) < window
-    except OSError:
+    except OSError as _e:
+        # 目录存在但不可读（权限/IO）时，静默 False 会让「探测失败」与
+        # 「确实没产出」无法区分。至少留痕，便于事后归因误杀。
+        LOGGER.debug("role_producing_recently(%s) 探测失败: %s", role, _e)
         return False
 
 
@@ -180,7 +217,7 @@ class WorkflowLifecycleMixin:
                 # current_step_id 必须选：:137/:148 的 d.get("current_step_id", "")
                 # 依赖它，漏选则恒为 "" → 抢救已产出步骤的分支与条件4 双双恒不触发
                 "SELECT instance_id, template_id, created_at, step_results, status, "
-                "current_step_id, assignee "
+                "current_step_id, assignee, effective_roles "
                 "FROM workflow_instances WHERE status IN ('running', 'step_done_ready')"
             ):
                 d = dict(row)
@@ -294,6 +331,11 @@ class WorkflowLifecycleMixin:
                                           f"(timeout_count={_cur_tc}, queued={_cur_q})")
 
                 if reason:
+                    # 完成证据优先于回收：status 空的步骤没有 exit_messages，只看落库
+                    # 字段会把"已完成"判成"卡死"。证据门在 run_once 的实例循环里、
+                    # 排在本回收之后 —— 不在此放行，它永远没机会消费这条消息。
+                    if _bus_evidence_ready(self, d):
+                        continue
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)
                     # ── 回收前抢救: 当前步骤已有 exit_messages(产出证据) → 先尝试闭合 ──
                     try:
@@ -1006,6 +1048,14 @@ class WorkflowLifecycleMixin:
         # 只读子链，不往父步搬文案（理由同上）。
         if not self._has_issue_classification(_msgs_text):
             _msgs_text += self._subflow_last_step_text(wf_id, review_step_id, _done_sr)
+        # 第四条来源：人工驳回只写 rejection_reason（manager.py:541），不进
+        # exit_messages、也不在子链末步。缺此来源时 `wf confirm --reject` 的意见
+        # 100% 解析不出 → 不建返工链 → 退回重投 → 3 次封顶后步骤永久停摆
+        # （coordinator 2026-10-20 13:15 实录：retry=3、无返工链）。
+        if not self._has_issue_classification(_msgs_text):
+            _rej = str(_done_sr.get("rejection_reason") or "")
+            if _rej:
+                _msgs_text += "\n" + _rej
         # 从结构化分类中提取问题列表
         _sys_issues, _biz_issues, _sys_role, _biz_role = self._parse_review_issues(_msgs_text)
         if not _sys_issues and not _biz_issues:

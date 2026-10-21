@@ -190,7 +190,11 @@ def test_evidence_blocks_queue_reclaim(mock_run):
     # 回收之后这个 blocker（三方审查 2026-10-21 实测）。
     lm.execute("UPDATE workflow_instances SET step_results=?, created_at=? WHERE instance_id=?",
                (json.dumps(results, ensure_ascii=False), time.time() - 2 * 3600, rid))
-    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False):
+    # 两个判死信号都必须钉住：条件4 要求 tmux_pane_active(...) is False 且无转录产出。
+    # 只 patch _role_producing_recently 时 tmux 探测返回 None（非 False）→ reason 恒空 →
+    # 回收根本没跑，用例"绿"得毫无意义（2026-10-21 实测：把证据门整个删掉仍绿）。
+    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False), \
+         patch("liveness.tmux_pane_active", return_value=False):
         eng.run_once()
     st = eng.status(rid)
     assert st["status"] != "cancelled", f"已完成却被回收: {st}"
