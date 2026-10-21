@@ -1,14 +1,19 @@
-"""源码热加载限速：多 session 并发改 src/** 时，execv 不得每个 tick 来一次。
 
-实测 2026-10-22 03:46-04:26 的 40 分钟内 execv 8 次（约 5 分钟一次），
-每次重执行丢掉当前 tick 并重跑启动。限速到 1 次/5 分钟。
-"""
-from pipeflow.daemon import _RELOAD_MIN_INTERVAL_SEC, _reload_allowed
+def test_throttled_update_stays_pending():
+    """限速期看到的更新必须排队，冷却后才执行（codex P1 回归）。"""
+    from pipeflow.daemon import _reload_decision
 
+    # 冷却期内：看到新 mtime → pending 收下，但不重执行
+    pending, do = _reload_decision(now_mtime=500.0, seen_mtime=100.0,
+                                   pending_mtime=0.0, now_ts=1000.0, last_reload_ts=900.0)
+    assert pending == 500.0 and do is False
 
-def test_reload_throttled_within_interval():
-    assert _RELOAD_MIN_INTERVAL_SEC == 300
-    assert _reload_allowed(1000.0, 0.0) is True            # 从未加过速 → 允许
-    assert _reload_allowed(1000.0, 900.0) is False         # 100s 前刚重执行 → 拒绝
-    assert _reload_allowed(1000.0, 700.0) is True          # 300s → 允许
-    assert _reload_allowed(1000.0, 1000.0) is False        # 同一时刻 → 拒绝
+    # 下一轮 mtime 没再变，冷却已过 → 仍要执行（关键：不能被当成已处理丢掉）
+    pending2, do2 = _reload_decision(now_mtime=500.0, seen_mtime=100.0,
+                                     pending_mtime=pending, now_ts=1301.0, last_reload_ts=900.0)
+    assert pending2 == 500.0 and do2 is True
+
+    # mtime 未变化时不该触发
+    _, do3 = _reload_decision(now_mtime=100.0, seen_mtime=100.0,
+                              pending_mtime=0.0, now_ts=9999.0, last_reload_ts=0.0)
+    assert do3 is False

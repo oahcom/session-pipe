@@ -13,50 +13,50 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
          └──→ launcher/ccs.py send ← 唯一跨项目调用（subprocess）
 ```
 
-**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`~/.hermes/run/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
+**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`/tmp/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
 
 ## Module inventory
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 1771 | Data-driven workflow execution engine (core, imports mixins below) |
-| **pipeflow/step_handler.py** | 1634 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 1153 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
-| **pipeflow/task_generator.py** | 851 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 1958 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
-| **lifecycle/manager.py** | 1200 | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **template_registry.py** | 837 | 模板注册中心 |
-| **eval_checker.py** | 602 | 安全白名单命令执行检查 |
-| **workflow/client.py** | 496 | High-level API for CCS roles to interact with workflow DB |
+| **pipeflow/engine.py** | 1852 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/step_handler.py** | 1681 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1197 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/task_generator.py** | 874 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 1979 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **template_registry.py** | 937 | 模板注册中心 |
+| **eval_checker.py** | 1459 | 安全白名单命令执行检查 |
+| **workflow/client.py** | 495 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 465 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
-| **reliability.py** | 444 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 472 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
-| **routing/router.py** | 374 | Route table: derive produce/consume from roles_export.json, priority routing |
-| **routing/survival_monitor.py** | 492 | 存活监测 |
-| **routing/rdb.py** | 298 | Route table SQLite persistence + audit log |
-| **routing/auto.py** | 290 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
-| **routing_daemon.py** | 354 | 路由守护进程 |
-| **task_evidence.py** | 317 | 任务证据链 |
-| **contract_updater.py** | 240 | 合约同步 |
-| **conversation_monitor.py** | 228 | 对话监控 |
-| **config_loader.py** | 184 | YAML config loading with env override and hot-reload |
-| **workflow/gateway.py** | 193 | 工作流网关门禁 |
-| **drift_detector.py** | 143 | 架构漂移检测 |
-| **cron_scheduler.py** | 139 | cron 调度器 |
-| **eval_consistency.py** | 137 | 评估一致性 |
-| **routing/consistency.py** | 120 | 路由一致性 |
-| **pipeflow/daemon.py** | 108 | Main loop: `while True: engine.run_once(); sleep(10)` |
-| **workflow_metrics.py** | 103 | 工作流指标 |
-| **workflow/db.py** | 92 | 工作流数据访问 |
-| **output_validator.py** | 90 | 输出格式验证 |
-| **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
-| **paths.py** | 84 | 路径常量 |
-| **workflow/sync.py** | 55 | 工作流同步 |
+| **reliability.py** | 434 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
+| **routing/routes.py** | 612 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
+| **routing/survival_monitor.py** | 640 | 存活监测 |
+| **routing/rdb.py** | 293 | Route table SQLite persistence + audit log |
+| **routing/auto.py** | 260 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
+| **routing_daemon.py** | 591 | 路由守护进程 |
+| **task_evidence.py** | 448 | 任务证据链 |
+| **contract_updater.py** | 431 | 合约同步 |
+| **conversation_monitor.py** | 417 | 对话监控 |
+| **config_loader.py** | 167 | YAML config loading with env override and hot-reload |
+| **workflow/gateway.py** | 188 | 工作流网关门禁 |
+| **drift_detector.py** | 198 | 架构漂移检测 |
+| **cron_scheduler.py** | 128 | cron 调度器 |
+| **eval_consistency.py** | 70 | 评估一致性 |
+| **routing/consistency.py** | 105 | 路由一致性 |
+| **pipeflow/daemon.py** | 420 | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **workflow_metrics.py** | 109 | 工作流指标 |
+| **workflow/db.py** | 96 | 工作流数据访问 |
+| **output_validator.py** | 93 | 输出格式验证 |
+| **routing/polling.py** | 88 | Message polling with cursor (dedup across restarts) |
+| **paths.py** | 105 | 路径常量 |
+| **workflow/sync.py** | 65 | 工作流同步 |
 
-| **pipeflow/db.py** | 328 | Three-layer SQLite: Template → Instance → Task |
-| **p0_exemption.py** | 486 | P0 豁免通道 |
+| **pipeflow/db.py** | 327 | Three-layer SQLite: Template → Instance → Task |
+| **p0_exemption.py** | 496 | P0 豁免通道 |
 
-**Total: 39 modules（不含 `__init__.py`），合计 ~20064 行 Python**（其余行数已过期；机器校验只看 CLAUDE.md，见 `scripts/doccheck.py`）
+**Total: 38 modules（不含 `__init__.py`），合计 ~10700 行 Python**
 
 ## Data flow
 
@@ -88,7 +88,7 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **roles_export.json** (`~/.hermes/data/roles_export.json`) -- route table source from shared_loader.py
 - **Sister Bus** (`~/.hermes/scripts/bus_protocol.py`) -- Blackboard read/write
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
-- **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
+- **Sentinel files** (`/tmp/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
 - **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `pipeline_cursor.db`, `ack_tracker.db`)
 
@@ -121,24 +121,25 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 
 These bypasses lose RLock protection and approval workflow.
 
+### `/loop` injection is a no-op
+
+`_ensure_role_alive()` injects `/loop` into the CCS, but `/loop` is NOT available in tmux environments. The CCS will not error, but it will also not enter a work loop -- it idles after processing each message.
+
+Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` in `engine.py:582`.
+
 ### Cross-project call boundary
 
 `route_to_ccs()` calls `ccs.py send` via subprocess. There is no documented API contract or version check between pipeline → launcher. If launcher changes CLI flags, pipeline silently fails.
 
+### Delivery prechecks
+
+`role_lifecycle._send_to_role` checks CLI busy (`liveness.pane_cli_busy`: bottom-bar `esc to interrupt` / `retrying`) before `ccs send`; busy returns `"busy"` for the next tick instead of starting a 30s child process that blocks the whole tick.
+
 ## Tests
 
-| Test file | Count | Pass |
-|-----------|-------|------|
-| test_workflow_db.py | 36 | 36/36 |
-| test_workflow_engine.py | 31 | 31/31 |
-| test_cross_component.py | 17 | 17/17 |
-| test_router.py | 13 | 13/13 |
-| test_integration.py | 12 | 12/12 |
-| test_role_interaction.py | 10 | 10/10 |
-| test_engine_e2e.py | 6 | 6/6 |
-| test_workflow_daemon.py | 4 | 4/4 |
-| test_router_extend_bh.py | 7 | 7/7 |
-| **Total** | **136** | **136/136** |
+- Full suite: `python3 -m pytest tests/ -q` → 1218 passed (2026-10-22).
+- Per-file counts are not maintained; run the suite for current numbers.
+- `python3 scripts/doccheck.py` 校验本文件与 CLAUDE.md 声明的行数；无自动钩子，代码增删后跑一次 `--fix` 刷新。
 
 ## Red lines
 
@@ -146,5 +147,6 @@ These bypasses lose RLock protection and approval workflow.
 - Do NOT modify bus_protocol core logic
 - Route mapping auto-generated from roles_export.json -- no hardcoding
 - Check CCS alive before dispatching
+- 审批确认（`confirmed_at`）优先于 `exit_messages` 文本判驳，判据收敛在 `review_gate.py`（见 `docs/ADR-APPROVAL-AUTHORITY.md`）
 - Zero external dependencies (stdlib + hermes_bus only)
 - No eval() -- use safe regex pattern matching

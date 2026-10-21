@@ -37,7 +37,7 @@ pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 
 ### 验证命令
 ```bash
 # 测试路由规则
-python3 -m pytest tests/ -q -k router
+python3 tests/test_router.py -x -q
 
 # 列出路由表（router CLI）
 PYTHONPATH=src python3 -m routing.router list
@@ -69,20 +69,20 @@ src/
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（1024 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1659 行）
+    engine.py         ── 编排 + CLI（1851 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（1681 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1183 行）
-    task_generator.py ── 任务生成（846 行）
+    task_generator.py ── 任务生成（874 行）
     wf_lifecycle.py   ── 工作流生命周期（1969 行）
-    daemon.py         ── 工作流守护 while 循环（343 行）
+    daemon.py         ── 工作流守护 while 循环（432 行）
     pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1196 行）
+    manager.py        ── 工作流状态机（1131 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（515 行）
+    client.py         ── CCS 角色工作流客户端（495 行）
     gateway.py        ── 工作流网关门禁（188 行）
     workflow/db.py    ── 工作流数据访问（96 行）
     sync.py           ── 工作流同步（65 行）
