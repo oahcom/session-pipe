@@ -169,8 +169,9 @@ def test_pane_gate_is_load_bearing():
         "pane 状态不影响结论：门控未接入判定，静默/活跃无区别"
 
 
-def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect", age_h=2):
-    """父步挂着子链时跑一次回收，返回被置 cancelled 的 wf_id 列表。"""
+def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect", age_h=2,
+                      rework_status=None):
+    """父步挂着子链/返工链时跑一次回收，返回被置 cancelled 的 wf_id 列表。"""
     now = time.time()
     row = {
         "instance_id": "wf_test_parent",
@@ -184,6 +185,8 @@ def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_archite
 
     class _LM(_FakeLM):
         def query(self, sql, params=()):
+            if "instance_id IN (" in sql:       # 返工链是批量主键查，不是单条
+                return [{"status": rework_status}] if rework_status else []
             if "WHERE instance_id=?" in sql and params and params[0] != "wf_test_parent":
                 return [{"status": sub_status}] if sub_status else []
             return [self._row]
@@ -214,6 +217,14 @@ def test_dead_subflow_still_allows_reclaim():
     sd = {"subflow_id": "wf_sub_dead", "queued": 20,
           "queued_since": time.time() - 7200, "ts": time.time() - 10}
     assert _run_with_subflow(sd, "cancelled", False), "子链已死却连父链也不回收"
+
+def test_live_rework_child_blocks_parent_reclaim():
+    """返工链只记在 rework_ids、不写 subflow_id → 只认 subflow_id 时父链被判死，
+    close_wf 级联杀掉还在跑的返工子链（2026-10-22 wf_85faf589be90/s3、wf_b808ff2f3611/s3）。"""
+    sd = {"status": "rejected", "rework_ids": ["wf_rw_live"], "queued": 6,
+          "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, None, False, rework_status="running") == [], \
+        "返工子链 running 时父链仍被回收：从未交付的返工产物被级联取消"
 
 def test_live_subflow_blocks_global_24h_reclaim():
     """24h 兜底 + 级联会杀掉仍在产出的子链 → 子链活着时条件3 也必须放行。"""
@@ -257,6 +268,7 @@ if __name__ == "__main__":
             test_pane_gate_is_load_bearing,
             test_live_subflow_blocks_parent_reclaim,
             test_dead_subflow_still_allows_reclaim,
+            test_live_rework_child_blocks_parent_reclaim,
             test_live_subflow_blocks_global_24h_reclaim,
             test_select_includes_assignee)
     _fails = 0

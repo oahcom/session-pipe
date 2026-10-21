@@ -82,13 +82,26 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     """
     # ponytail: 每候选一次主键查询（当轮 running 实例 <100），与旧实现同频（旧版在
     # 条件 4 内做同一条）；量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
-    _sf = step_sd.get("subflow_id") or ""
-    if not _sf:
-        return False
     from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
-    _rows = lm.query(
-        "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
-    return bool(_rows) and _rows[0]["status"] in _ACTIVE_WF_STATUSES
+    _sf = step_sd.get("subflow_id") or ""
+    if _sf:
+        _rows = lm.query(
+            "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
+        if _rows and _rows[0]["status"] in _ACTIVE_WF_STATUSES:
+            return True
+    # 返工链不记在 subflow_id 上，而是 rework_ids（list of wf id）。只认 subflow_id 时，
+    # 等返工的父链被判死 → close_wf 级联把仍在跑的返工子链一起杀掉（2026-10-22 两例：
+    # wf_85faf589be90/s3、wf_b808ff2f3611/s3，子链 wf_rw_2664ec3aada3/80322df51ab0）。
+    # 活体判据与子链同源（_ACTIVE_WF_STATUSES）；查不到行 = 链已删，不豁免。
+    _rids = step_sd.get("rework_ids") or []
+    _rids = ([_rids] if isinstance(_rids, str)
+             else (list(_rids) if isinstance(_rids, dict) else _rids))
+    if not _rids:
+        return False
+    _ph = ",".join("?" * len(_rids))
+    return any(r["status"] in _ACTIVE_WF_STATUSES for r in lm.query(
+        f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
+        tuple(_rids)))
 
 
 def _bus_evidence_ready(engine, row: dict) -> bool:
