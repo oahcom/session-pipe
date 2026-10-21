@@ -105,3 +105,15 @@ try:
 except Exception as _bbe:
     import warnings
     warnings.warn(f"conftest: bus DB 隔离失败（测试将写生产 bus）: {_bbe}", stacklevel=1)
+
+
+# 5. 角色转录隔离：_recover_rate_limited_roles 现在以转录里的 API 错误为主判据
+#    （pane 只有视口，实测 24h 1,342 条错误轮里认出 9 次）。不隔离时会读生产
+#    转录：某个真实角色刚出错，就让"pane 干净 → 不发"这类断言随机失败。
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_role_transcripts(tmp_path, monkeypatch):
+    from pipeflow import role_lifecycle as _rl
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)

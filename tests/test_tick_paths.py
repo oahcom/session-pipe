@@ -538,17 +538,43 @@ def test_violation_stop_is_forced_and_carries_ids():
 
 
 def test_forced_send_does_not_add_goal_prefix():
-    """force=True 必须同时跳过 /goal 前缀 —— 否则运维催办变 Stop hook 硬条件。"""
-    import re as _re
-    from pipeflow.role_lifecycle import RoleLifecycleMixin
-    src = RoleLifecycleMixin._send_to_role.__doc__ or ""
-    assert "force" in src
-    # 直接验证语义：force=True 分支不加前缀（代码级断言，防止有人改成无条件加）
-    import inspect
-    code = inspect.getsource(RoleLifecycleMixin._send_to_role)
-    assert _re.search(r"if not force:\s*\n\s*prompt = \"/goal \" \+ prompt", code), \
-        "前缀注入的条件不再是 `not force` → 催办消息会被锁成 Stop hook"
+    """force=True 跳过 /goal 前缀 —— 否则运维催办变 Stop hook 硬条件。
 
+    行为级断言（原实现 inspect.getsource 正则）：并发改 role_lifecycle.py 时
+    getsource 会按旧 lineno 读到别的函数，全量跑间歇性红、单跑绿。
+    """
+    from unittest.mock import MagicMock, patch
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+
+    class _H(RoleLifecycleMixin):
+        def __init__(self):
+            self._bb = MagicMock()
+            self._lm = MagicMock()
+            self._lifecycle = MagicMock()
+        def _is_role_busy(self, *a, **k):
+            return False
+        def _wait_for_role_ready(self, *a, **k):
+            return True
+
+    sent = []
+
+    def fake_run(argv, *a, **k):
+        sent.append(argv)
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def _prompt(force):
+        sent.clear()
+        with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+            _H()._send_to_role("qa", "处理 abc 并写报告", wf_id="wf_x",
+                               step_id="s1", force=force)
+        calls = [c for c in sent if "send" in c and "qa" in c]
+        assert calls, f"未发出 ccs send: {sent}"
+        return next(x for x in calls[-1] if "处理 abc" in x)
+
+    # 真实任务在任务正文前带 /goal（前面可能还有"先查证"等前置段）
+    assert "/goal 处理 abc" in _prompt(False), "真实任务缺 /goal 前缀"
+    assert "/goal " not in _prompt(True), \
+        "催办带了 /goal 前缀 → 会被锁成 Stop hook"
 
 
 # ── 9. 排队回收不得误杀正在产出的角色（活锁回归） ────────────────

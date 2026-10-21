@@ -357,10 +357,17 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     # .get(...) 返回 MagicMock 而非 list，in/not in 判断行为不可靠 → 显式校验类型，
     # 非 list 时退化为"不过滤"，保持旧行为（与未加过滤前一致）。
     try:
-        _my_cats = _rt_mod.get_router().routing.get(role_name, {}).get("consume", [])
+        _router_d = _rt_mod.get_router().routing
+        # "登记了但订阅为空" ≠ "没配置"：optimizer / ccs-monitor 在 routing.db 里
+        # consume=[] 是有意的（它们不该收未定向的 bus 流），旧写法把空表当无配置
+        # → 每条未定向消息都投给它们（实测 pipeline→optimizer 2175 条/天、
+        # →ccs-monitor 1757 条/天，全是 monitor_audit/verification 这类审计流）。
+        _configured = isinstance(_router_d, dict) and role_name in _router_d
+        _my_cats = _router_d.get(role_name, {}).get("consume", []) if _configured else []
         if not isinstance(_my_cats, list):
             _my_cats = []
     except Exception:
+        _configured = False
         _my_cats = []
     def _is_for_me(msg):
         # 回声抑制：role 自己写的消息不推回给它自己（与 route_all 同语义）。
@@ -380,8 +387,9 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         # 528 条 @它 的 task_spec 中位年龄 100h、最老 111h，全是引擎早已投过的重放。
         if directed and msg.get("category") == "task_spec":
             return False
-        if not directed and _my_cats and "*" not in _my_cats \
-                and msg.get("category") not in _my_cats:
+        if (not directed and "*" not in _my_cats
+                and msg.get("category") not in _my_cats
+                and (_configured or _my_cats)):
             return False
         return not tags or directed
     messages = [m for m in raw_msgs if _is_for_me(m)]

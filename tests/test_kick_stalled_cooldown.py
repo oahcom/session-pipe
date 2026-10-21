@@ -35,6 +35,10 @@ cases = [
                                 "kick_stalled_at": now - 599}, 0),
     ("冷却戳=700s前（已过期）", {"status": "notified", "notified_at": now - 900,
                                 "kick_stalled_at": now - 700}, 1),
+    # count>=2 的补位是从这里来的：step_handler 只在 timeout_count==1 重推，
+    # 若本路也跳过已计数步骤，count 2..auto_cancel 期间无任何派发路径（#431798）。
+    ("timeout_count=2 已计数", {"status": "notified", "notified_at": now - 400,
+                               "timeout_count": 2}, 1),
     ("停滞不足180s", {"status": "notified", "notified_at": now - 100}, 0),
     ("status=completed（非 notified）", {"status": "completed", "notified_at": now - 900}, 0),
 ]
