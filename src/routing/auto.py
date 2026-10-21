@@ -204,6 +204,17 @@ if __name__ == "__main__":
     _routetoccsall_flag = "--route-all-to-ccs" in flags
     _dry_run = "--dry-run" in flags
 
+    # 未知 flag 必须硬失败：末尾的 else 分支会 poll + notify_consumers **真发消息**。
+    # 删掉 --dispatch-investigator 后，仍带该 flag 的调用会静默落到广播路径
+    # （每条未消费 fact 都被推一遍），一次拼错 flag 就是一轮全量噪音。
+    _known = {"--daemon", "--health", "--status", "--metrics", "--ack-stats",
+              "--ack-retry", "--config", "--route-all", "--consume",
+              "--route-to-ccs", "--route-all-to-ccs", "--dry-run", "--json"}
+    _unknown = [a for a in argv if a.startswith("-") and a not in _known]
+    if _unknown:
+        print(f"unknown flag: {_unknown[0]}", file=sys.stderr)
+        sys.exit(2)
+
     # ── dispatch ──
     if _daemon_flag:
         _output_json(status(), has_json)
