@@ -84,8 +84,12 @@ def _run(status: str = "running") -> _FakeRun:
     return _FakeRun(status)
 
 
-def test_tmux_step_completed_triggers_exit():
-    """tmux pane 含 's1 完成' → step_completed 信号 → 直接 complete_step。"""
+def test_tmux_step_completed_blocks_when_bus_contract_without_schema():
+    """声明 bus 契约但无 exit_schema → pane 文本不得推进（防假完成）。
+
+    实测 wf_7045df494d/s1：pane 里「s1 闭环（已完成）」在投递 98 秒后触发
+    complete_step，exit_messages 为空——pane 是叙述不是产出证据。
+    """
     eng = FakeEngine()
     step = _step({"bus_category": "workflow", "timeout_minutes": 30})
     run = _run()
@@ -95,8 +99,23 @@ def test_tmux_step_completed_triggers_exit():
                                                completion_evidence="s1 完成")) as mock_sig:
         eng._tick(run, step)
         mock_sig.assert_called_once()
+        assert eng._lifecycle.complete_step.call_count == 0, \
+            "声明 bus 契约且无 exit_schema 时 tmux 信号不得推进"
+
+
+def test_tmux_step_completed_triggers_exit_without_contract():
+    """无 bus 契约的步骤 → tmux 信号仍可推进（否则只能等超时）。"""
+    eng = FakeEngine()
+    step = _step({"timeout_minutes": 30})
+    run = _run()
+
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=ConversationSignal(step_completed=True,
+                                               completion_evidence="s1 完成")) as mock_sig:
+        eng._tick(run, step)
+        mock_sig.assert_called_once()
         assert eng._lifecycle.complete_step.call_count == 1, \
-            "tmux 步骤完成信号应触发 complete_step"
+            "无契约步骤的 tmux 完成信号应触发 complete_step"
         assert eng._lifecycle.complete_step.call_args[0][:2] == ("wf_test", "s1")
 
 

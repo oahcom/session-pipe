@@ -456,15 +456,20 @@ class StepHandlerMixin:
             _has_bus_contract = bool(
                 ec.get("bus_category") or ec.get("text_contains")
                 or ec.get("source_contains"))
-            if _wr_ok and _schema_ok and not _has_bus_contract:
+            # 声明了 bus 契约时，pane 文本不足以自证：必须有**声明且校验通过**的
+            # exit_schema（真实文件落盘）。无 schema 的步骤 pane 文本是角色的
+            # 叙述，`s1 闭环（已完成）`「我在检查 s4 完成的证据」都会命中。
+            # 无 bus 契约的步骤维持原语义，否则那类步骤只能等超时。
+            _contract_ok = bool(step.exit_schema) and _schema_ok
+            if _wr_ok and _schema_ok and (not _has_bus_contract or _contract_ok):
                 try:
                     self._lifecycle.complete_step(run.id, step.id)
                     LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
                 except Exception as _e:
                     LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
                 return  # 产出已确认，跳过 timeout/催办
-            if _has_bus_contract:
-                LOGGER.debug("tmux 信号不推进 %s/%s: 步骤声明了 bus 契约，等真实产出",
+            if _has_bus_contract and not _contract_ok:
+                LOGGER.debug("tmux 信号不推进 %s/%s: 声明了 bus 契约但无已满足的 exit_schema",
                              run.workflow_name, step.id)
         # ── tmux 信号节流与升级 ──
         # 计数存于 step_results["tmux_signals"]（跨 tick 持久化），

@@ -51,6 +51,19 @@ def test_completion_s1_done():
     assert "s1" in sig.completion_evidence
 
 
+
+def test_completion_negated_phrases_not_flagged():
+    """否定/疑问/将来语气的 s<N>+完成 不得判完成（防 pane 假完成）。
+
+    实测 wf_7045df494d/s1：pane 中「s1 闭环（已完成）」触发 98 秒假完成；
+    而旧正则 `(s\\d+ .*完成)` 的裸子串匹配会把下列句子全部误判为完成。
+    """
+    for text in ("s2 还没完成", "s1 完成了吗？", "我在检查 s4 完成的证据",
+                 "s3 完成前不推进", "s2 待完成", "s1 未完成"):
+        sig = parse_conversation_signals(text, "engineer")
+        assert not sig.step_completed, f"否定/疑问句误判完成: {text!r}"
+
+
 def test_completion_step_done_ready():
     """信号1: step_done_ready 显式标记"""
     text = "step_done_ready 状态已标记，等待确认"
