@@ -22,6 +22,10 @@ def _engine():
     eng._lm = MagicMock()
     eng._lm.query.return_value = []          # DB 里没有活跃工作流
     eng._last_rate_recover = {}
+    # 真 Blackboard：这些用例会走到 _bb.write，实测把
+    # "[rate_limit] knowledge_curator 被额度拒绝" 写进生产 bus（21 日 19:01 起
+    # 每半小时一条、attempt 编号还倒着重置）。测试不许写生产通道。
+    eng._bb = MagicMock()
     return eng
 
 
@@ -245,6 +249,51 @@ def test_backoff_blocks_immediate_retry():
 
     resumed = [c for c in sent if "继续" in c]
     assert len(resumed) == 1, f"退避窗口内应只发 1 次, got {len(resumed)}"
+
+
+def test_audit_title_carries_time_so_rows_dont_merge():
+    """审计行标题必须带时刻：bus 按标题 UPSERT 且保留首次 ts。
+
+    attempt 随退避重置反复从 1 起算，同一标题会把今天的注入覆盖到昨天那行上——
+    实测今日 8 次「已发继续」在 facts 里查不到，最后可见行停在 2026-10-20 23:46。
+    """
+    eng = _engine()
+    titles = []
+    eng._bb.write.side_effect = lambda cat, t, **k: titles.append(t)
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="API Error: 403 FreeTierError")
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert titles, "注入后必须有审计行"
+    import re
+    assert re.search(r"已发继续（第 1 次 \d{2}:\d{2}:\d{2}）", titles[0]), \
+        f"标题缺时刻 → 跨天 UPSERT 会合并, got {titles[0]}"
+
+
+def test_send_failure_writes_no_audit_and_does_not_raise():
+    """发送失败时不得写审计（没注入就别谎报），也不得抛异常打断其它角色。"""
+    eng = _engine()
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="API Error: 403 FreeTierError")
+        if "send-keys" in cmd:
+            raise OSError("tmux gone")
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()   # 不应抛
+
+    assert not eng._bb.write.called, "注入失败却写了审计"
 
 
 if __name__ == "__main__":
