@@ -61,6 +61,16 @@ def _is_test_harness_template(template_id: str | None) -> bool:
     return _strip_wf_prefix(template_id).startswith(_TEST_HARNESS_PREFIXES)
 
 
+def _requires_user_brief(wf) -> bool:
+    """首步就委派子链的模板，开工前需要一份真实需求书。
+
+    自动建链只能拿模板简介当需求，而这类模板的第一步把活交给 pm/architect
+    的子链去拆解 → 拆无可拆，必然以「无可排需求」拒收再返工空转。
+    实测：产品交付全流程 自动建链 4 条 0 completed / 3 cancelled。
+    """
+    return bool(wf.steps) and bool(getattr(wf.steps[0], "subflow_template", ""))
+
+
 # 子链驳回判据。子链末步驳回不拦（wf_lifecycle.py:302「末步仍不拦」是有意设计：
 # 无 next_step 可退回、也无返工承接方，硬拦即静默卡死），于是子链仍报 completed
 # → 本文件回流处把父步标 completed → 驳回信号在父链彻底丢失。
@@ -669,6 +679,9 @@ class TaskGeneratorMixin:
             # 与 _check_anomalies 共用同一判据函数，避免测试噪音回环。
             if _is_test_harness_template(_wf_name):
                 continue
+            # 首步委派子链的模板缺真实需求书就派 = 给 pm/architect 送一条必被拒收的链
+            if _requires_user_brief(_wf):
+                continue
             # 取第一个 executor 作为目标角色
             _role = _wf.allowed_executors[0]
             if _role in _busy_roles:
@@ -680,9 +693,9 @@ class TaskGeneratorMixin:
                 continue
             # 价值门槛：自动生成必须有真实需求信号，防止模板空转。
             # 无 bus 需求信号（task_spec/blocker/需求类消息）时跳过自动生成。
+            _demand_text = ""
             try:
                 _demand = self._bb.read(cat="task_spec", limit=10)
-                _demand_text = ""
                 for _f in _demand:
                     if _f.src not in ("workflow_engine", "survival_monitor"):
                         # closer 周期性 backlog 扫描是模板循环产物，不是真实需求
