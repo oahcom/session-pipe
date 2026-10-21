@@ -232,7 +232,12 @@ def daemon_loop(interval: int):
     _src_dir = Path(__file__).resolve().parent
 
     def _src_mtime() -> float:
-        return max((_p.stat().st_mtime for _p in _src_dir.glob("*.py")), default=0.0)
+        # 只看 src/pipeflow/*.py 会漏掉同层的被 import 模块（task_evidence.py、
+        # liveness.py、paths.py …）：改它们不触发重执行 → 修复写着但不生效
+        # （R126 实测 task_evidence.py 改完 20min 仍是旧代码）。两层都要看。
+        return max((_p.stat().st_mtime
+                    for _d in (_src_dir, _src_dir.parent)
+                    for _p in _d.glob("*.py")), default=0.0)
 
     _seen_mtime = _src_mtime()
 
