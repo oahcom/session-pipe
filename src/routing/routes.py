@@ -314,6 +314,16 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                         METRICS.inc("route_errors_total", labels={"consumer": role})
                         results.append({"role": role, "status": "error", "error": str(e)})
                         ACK_TRACKER.record_ack(fid, role, "error", category=cat, error=str(e))
+                # 路由器已接管该条：poll 的 consumer='pipeline' 视图只认 cat='pipeline'
+                # 的 consume 记录，而上面各角色写的是 cat=<role>。不记这一笔，
+                # 全部事实永久留在该视图里，每轮把最新 100 条重投一遍（实测 10 003 条
+                # 全在视图内、7 777 条 >1 天，同一 preview 每 5~6 分钟重复 3 次）。
+                # 只在没有角色报错时记：有 error 的留到下轮重试。
+                if not any(_r.get("status") == "error" for _r in results):
+                    try:
+                        bb.mark_consumed(fid, consumer)
+                    except Exception as _ce:
+                        LOGGER.debug("route claim failed #%s: %s", fid, _ce)
                 HEARTBEAT.beat(cat)
                 METRICS.inc("route_assigned_count", labels={"category": cat})
                 return {
