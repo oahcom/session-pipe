@@ -62,6 +62,32 @@ def test_errored_fact_is_left_for_retry():
         bb.mark_consumed.call_args_list
 
 
+def test_stale_fact_is_claimed_but_not_delivered():
+    """超过 STALE_AFTER_S 的事实只 claim 不投递。
+
+    视图里积压 8.6k 条历史事实（7.7k >24h）。无主事实被 claim 后窗口向老事实滑动，
+    不设闸就会把一天前的任务重新派给角色、并 mint 同标题旧工作流。
+    """
+    import time as _t
+    from routing.routes import route_all, STALE_AFTER_S
+    bb = MagicMock()
+    _rt = MagicMock()
+    _rt.get_router.return_value.routing = {"engineer": {"consume": ["code_fix"]}}
+    msg = {"id": 5151, "category": "code_fix", "text": "[code_fix] 一天前的修复\n证据",
+           "src": "claude", "evidence": "", "priority": 1, "consumers": ["engineer"],
+           "ts": _t.time() - STALE_AFTER_S - 60}
+    with patch("routing.auto.poll_unconsumed", return_value=[msg]), \
+            patch("routing.routes._rt_mod", _rt), \
+            patch("bus_protocol.Blackboard", return_value=bb), \
+            patch("routing.routes.HEARTBEAT"), \
+            patch("routing.routes.METRICS"):
+        res = route_all(consumer="pipeline", dry_run=False)
+    assert res["routed"] == 0, res
+    assert res["details"][0]["reason"] == "stale", res["details"][0]
+    assert any(c.args == (5151, "pipeline") for c in bb.mark_consumed.call_args_list), \
+        bb.mark_consumed.call_args_list
+
+
 def test_orphan_fact_is_claimed_so_view_can_drain():
     """@tag 过滤后没人可派 → 也要记接管。
 

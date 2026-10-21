@@ -159,6 +159,11 @@ def _is_noop_report(title: str, evidence: str = "") -> bool:
 
 
 
+# 超过这个年龄的事实不再投递（只 claim）。6h：角色任务生命周期远短于此，
+# 而视图积压是按天算的（8.6k 条 / 7.7k 条 >24h）。
+STALE_AFTER_S = 6 * 3600
+
+
 def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True) -> dict:
     """自动路由消费：为每条未消费消息并行分配给多个消费者。
 
@@ -168,7 +173,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     - 幂等消费防重复
     - ACK 记录和 metrics
     - 去重：每条处理完且无角色报错的事实补记 consumer='pipeline' 的 consume
-      （旧 cursor 机制已删：随机 instance_id 让游标表只增不读，21 461 行/2.9MB）
+      （旧 cursor 已删：随机 instance_id 让游标只写不读；实测该表 0 行/12KB）
 
     dry_run=True 时只展示分配方案。
     parallel=True 时使用线程池并行。
@@ -193,6 +198,18 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
         import re as _re
         for msg in messages:
             if "error" in msg:
+                continue
+            # 过期不投：无主事实被 claim 后，视图窗口会向老事实滑动（库里积压 8.6k 条，
+            # 7.7k 条 >24h）。不设闸就会把一天前的任务重新派给角色、并 mint 同标题旧工作流。
+            # 只 claim 不投递 —— 与"它从没被看见"的旧行为一致，但不再占住窗口。
+            if time.time() - (msg.get("ts") or time.time()) > STALE_AFTER_S:
+                METRICS.inc("route_stale_skipped")
+                details.append({"id": msg["id"], "category": msg["category"],
+                                "assigned": [], "reason": "stale"})
+                try:
+                    bb.mark_consumed(msg["id"], consumer)
+                except Exception as _se:
+                    LOGGER.warning("route claim (stale) failed #%s: %s", msg["id"], _se)
                 continue
             consumers = msg.get("consumers", [])
             # @role 定向路由：@target 的消息只给 target，其他角色跳过
@@ -323,6 +340,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                     except Exception as _ce:
                         # 静默 = 这条事实永远重投且没人看得见。写失败要进 journal。
                         LOGGER.warning("route claim failed #%s: %s", fid, _ce)
+                        METRICS.inc("route_claim_errors_total")
                 HEARTBEAT.beat(cat)
                 METRICS.inc("route_assigned_count", labels={"category": cat})
                 return {
@@ -335,7 +353,9 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
 
             executor = ThreadPoolExecutor(max_workers=min(8, len(assignments) or 1))
             try:
-                details = list(executor.map(_do_consume_msg, assignments))
+                # extend 而非赋值：规划阶段已把 no_consumer / stale 的跳过原因写进
+                # details，赋值会把它们整批抹掉（调用方永远看不到 reason）。
+                details.extend(executor.map(_do_consume_msg, assignments))
             finally:
                 executor.shutdown(wait=True)
 

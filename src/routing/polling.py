@@ -22,8 +22,9 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
     集成重试、熔断、心跳、指标。
     使用 config.yaml 中的 max_messages_per_poll（Fix 2）。
     去重靠 bus 的 consume 记录（routes._do_consume_msg 记一笔 pipeline 接管），
-    不再用 cursor：旧实现按随机 instance_id 存游标，表长到 21 461 行（2.9MB）
-    且每轮写 1 000+ 次都读不回来（R131）。
+    不再用 cursor：旧实现按随机 instance_id 存游标，写完永远读不回来。
+    实测 2026-10-22：该表 0 行 / 12KB（早期注释"21 461 行/2.9MB"未复现）；
+    每轮写入上限是 max_messages_per_poll=100，不是"1 000+ 次"。
     """
     from bus_protocol import Blackboard
     from config_loader import get_config
@@ -43,7 +44,9 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
         # 关键修复: 必须传 consumer 参数，否则 unconsumed() 返回从未被任何人消费的事实(即 0)
         # limit 下推到 SQL：实测 8,697 行的视图在 Python 侧切片要构造 8,697 个 Fact
         # （54ms/轮，每 60s 一次且 row_factory 逐行建对象）；下推后只取 100 行、1.2ms。
-        return bb.unconsumed(consumer=consumer, limit=effective_limit)
+        # SQL 的 LIMIT 只是省构造 Fact 的优化，不是契约：任何后端（含测试替身）
+        # 都可能返回更多，函数自己的 limit 语义必须在这里兑现。
+        return bb.unconsumed(consumer=consumer, limit=effective_limit)[:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
@@ -62,6 +65,9 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
             "category": f.cat,
             "text": f.t[:100],
             "src": getattr(f, "src", ""),
+            # ts 供路由层判"过期不投"：视图积压 8.6k 条历史事实，不看时间
+            # 就会把一天前的任务重新派给角色（routes.STALE_AFTER_S）。
+            "ts": getattr(f, "ts", 0),
             "evidence": f.e[:120] if f.e else "",
             "priority": _rt_mod.priority(f.cat),
             "consumers": router.get_consumers_prioritized(f.cat),
