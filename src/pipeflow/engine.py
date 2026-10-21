@@ -92,9 +92,6 @@ def _resolve_eval_gate(bb) -> str | None:
     except Exception:
         return "eval_gate_blocked"
 
-_POLL_SLEEP = _TUNING.get("poll_sleep", 5)
-_REMINDER_INTERVAL = _TUNING.get("reminder_interval", 120)
-
 # 未替换变量检测：含 {xxx} 模板变量的 prompt 不应发送，否则角色 /goal 用它作
 # StopHook 条件时 bool([]) 为 False → 死循环
 UNMATCHED_VAR_RE = re.compile(r'\{[a-z_]+\}')
@@ -158,6 +155,18 @@ def _canonical_tid(wf, fallback: str) -> str:
     """
     tid = re.sub(r'^(?:WF-)+', '', getattr(wf, "workflow_id", None) or fallback)
     return tid if tid.startswith(('WL-', 'WF-')) else 'WF-' + tid
+
+
+def _template_ids(name: str) -> list[str]:
+    """同一模板在 DB 里可能有两个键：规范名与裸名别名。
+
+    子链实例按模板 JSON 的 `subflow_template`（裸名，如 pm_requirements）建实例，
+    推进时按实例的 template_id 读模板行；而 JSON→DB 同步写的是规范名 WF-…。
+    只刷规范行 → 裸行永远停在旧定义：实测 pm 仍按旧提示词去读 scout 报告，
+    产出与本次需求无关的 PRD（WF-/裸 两行 steps_json 长度 3792 vs 3783）。
+    """
+    bare = re.sub(r'^(?:WL-|WF-)+', '', name)
+    return [name] if bare == name else [name, bare]
 
 
 def _persist_queue_tick(lm, wf_id: str, step_id: str, queued: int, q_since: float) -> None:
@@ -364,8 +373,9 @@ _TICK_BUDGET_SEC = 60
 # 插入序遍历，尾部实例每轮都排不到（实测 2026-10-22：22 条在飞实例 150s 内零变化，
 # wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 从未投出，父链被回收）。
 # 用断点轮转而不是 ORDER BY：不引入 JSON 依赖（坏 step_results 会让整条查询报错），
-# 也不会让任何一组（如 ts 缺失的）长期霸占预算。进程内状态，重启即从头。
-_LOOP_RESUME_ID = ""
+# 也不会让任何一组（如 ts 缺失的）长期霸占预算。
+# 断点挂在引擎实例上而非模块全局：daemon 单实例跨 tick 复用，测试每用例新建引擎
+# 天然复位——模块全局会让用例互相污染遍历起点（三方审查 2026-10-22 P3）。
 
 
 def _rotate_after(rows, last_id):
@@ -405,6 +415,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self._workflows: dict[str, WorkflowDef] = {}
         self._lm = None
         self._consumed_exit_ids: set[int] = set()
+        # 轮转断点：主循环与预推进各一个。两处 WHERE 不同，共用会频繁遇到锚点不在
+        # 结果里 → 回落表头，白白浪费一圈。
+        # ponytail: 进程内状态，daemon 热重载（os.execv）即归零；开发期重载比一圈
+        # 还勤时轮转等于没修。要抗重载就得把锚点落库，届时再改。
+        self._loop_resume_id = ""
+        self._prepass_resume_id = ""
         self._load_workflows()
 
     @property
@@ -787,13 +803,23 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         if _old is None:
                             _by_id[_js["step_id"]] = _js; _changed += 1
                         elif any(_old.get(_f) != _js.get(_f) for _f in _js):
-                            _by_id[_js["step_id"]] = _js; _changed += 1
-                    if _changed:
-                        LOGGER.warning("[wf] 模板 %s 刷新 %d 个步骤定义（JSON 为权威源）",
-                                       name, _changed)
-                        self._lifecycle.execute(
-                            "UPDATE workflow_templates SET steps_json=? WHERE template_id=?",
-                            (json.dumps(list(_by_id.values()), ensure_ascii=False), name))
+                            # 合并而非整步替换：guard / wait_roles 只存在于 DB
+                            # （JSON 里没有这两个键），整步替换会把它们抹掉。
+                            _by_id[_js["step_id"]] = {**_old, **_js}; _changed += 1
+                    _sj = json.dumps(list(_by_id.values()), ensure_ascii=False)
+                    # 逐键比对而不是只看 _changed：规范行可能早已同步，而裸名别名行
+                    # 自己漂移（子链按裸名读模板）。只认 _changed 时别名永不自愈。
+                    _stale = [t for t in _template_ids(name)
+                              if (self._lifecycle.query(
+                                  "SELECT steps_json FROM workflow_templates WHERE template_id=?",
+                                  (t,)) or [[None]])[0][0] != _sj]
+                    if _stale:
+                        LOGGER.warning("[wf] 模板 %s 刷新 %d 个步骤定义（JSON 为权威源，行 %s）",
+                                       name, _changed, ",".join(_stale))
+                        for _tid in _stale:
+                            self._lifecycle.execute(
+                                "UPDATE workflow_templates SET steps_json=? WHERE template_id=?",
+                                (_sj, _tid))
                 except Exception as _me:
                     LOGGER.error("[wf] upsert 刷新模板步骤失败 %s: %s", name, _me)
                 return
@@ -968,7 +994,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
 
 
     def run_once(self):
-        global _LOOP_RESUME_ID
         _t_tick = time.time()
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
@@ -1001,13 +1026,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 预推进写在 _scan_tasks 之前也意味着它回的整字典快照不会被之后落的
         # 子链账本反向覆盖（那条顺序约束见上面 early _scan_tasks 的注释）。
         try:
-            for _pr in self._lifecycle.query(
+            _pr_rows = _rotate_after(list(self._lifecycle.query(
                     "SELECT instance_id, template_id, current_step_id, step_results "
                     "FROM workflow_instances "
-                    "WHERE status IN ('running','step_done_ready')"):
-                if time.time() - _t_tick > _TICK_BUDGET_SEC:
-                    LOGGER.warning("预推进超 %ds 预算，余下实例下轮再推", _TICK_BUDGET_SEC)
+                    "WHERE status IN ('running','step_done_ready')")),
+                    self._prepass_resume_id)
+            for _pn, _pr in enumerate(_pr_rows):
+                # 首行保底与轮转必须成对：预算自 run_once 起点算（前面 _load_workflows/
+                # 清理/_scan_tasks 都在吃这 60s），无条件 break 就一条都进不去；只保底
+                # 不轮转，则表头那条非 step_done_ready 的实例每轮 continue 掉唯一席位，
+                # 索引尾部的 step_done_ready 反而永久饿死。
+                if _pn and time.time() - _t_tick > _TICK_BUDGET_SEC:
+                    LOGGER.warning("预推进超 %ds 预算，本轮走到 %s（%d/%d 行，%.0fs）",
+                                   _TICK_BUDGET_SEC, self._prepass_resume_id or "-", _pn,
+                                   len(_pr_rows), time.time() - _t_tick)
                     break
+                self._prepass_resume_id = _pr["instance_id"]
                 _pr_sr = json.loads(_pr["step_results"] or "{}")
                 if ((_pr_sr.get(_pr["current_step_id"]) or {}).get("status")
                         not in ("step_done_ready", "completed")):
@@ -1053,13 +1087,16 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 "status, task_id, effective_roles "
                 "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
-            rows = _rotate_after(list(rows), _LOOP_RESUME_ID)
-            for row in rows:
-                if time.time() - _t_tick > _TICK_BUDGET_SEC:
-                    LOGGER.warning("tick 超 %ds 预算，中止本轮剩余实例（下轮续跑）",
-                                   _TICK_BUDGET_SEC)
+            rows = _rotate_after(list(rows), self._loop_resume_id)
+            for _n, row in enumerate(rows):
+                # 首行保底：预推进/清理/_scan_tasks 共用这 60s 预算，它们吃满后若无条件
+                # break，断点原地不动 → 下轮还是同一批表头，轮转结构上救不了整体饥饿。
+                if _n and time.time() - _t_tick > _TICK_BUDGET_SEC:
+                    LOGGER.warning("tick 超 %ds 预算，本轮走到 %s（%d/%d 行，%.0fs）",
+                                   _TICK_BUDGET_SEC, self._loop_resume_id or "-", _n,
+                                   len(rows), time.time() - _t_tick)
                     break
-                _LOOP_RESUME_ID = row["instance_id"]
+                self._loop_resume_id = row["instance_id"]
                 inst = dict(row)
                 if inst.get("status") == "pending":
                     lm.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
