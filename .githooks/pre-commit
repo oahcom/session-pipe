@@ -8,6 +8,27 @@ for f in $(git diff --cached --name-only --diff-filter=ACM | grep '\.py$'); do
 done
 echo "  all staged .py files OK"
 
+# ── ref-guard: 删掉的符号不得还有引用 ──────────────────────────────────
+# 实测 2026-10-22 一天内 main 红过 4 次，两类根因都在这里：
+#   ef2a249 整文件覆盖抹掉 dce5d77 的 own_written 实现（测试仍在调用）
+#   74bf13c main 上 role_lifecycle 缺 pane_cli_busy，导入即 ImportError
+# 只查"暂存区删掉的 def/class 名在删除后仍被 src/tests 引用"——改名、连调用点一起删、
+# 连测试一起删都不会误报。真需保留残留引用设 ALLOW_DANGLING_REF=1。
+if [ "$ALLOW_DANGLING_REF" != "1" ]; then
+  dangling=""
+  for name in $(git diff --cached -U0 -- '*.py' \
+      | sed -nE 's/^-[[:space:]]*(def|class)[[:space:]]+([A-Za-z_][A-Za-z_0-9]*).*/\2/p' | sort -u); do
+    if git grep -q -w "$name" -- 'src/**/*.py' 'src/*.py' 'tests/**/*.py' 'tests/*.py' 2>/dev/null; then
+      dangling="$dangling $name"
+    fi
+  done
+  if [ -n "$dangling" ]; then
+    echo "REF-GUARD 阻止提交: 删除的符号仍被引用 →$dangling" >&2
+    echo "  要么把调用点/测试一起删，要么别删该符号。确需保留残留引用设 ALLOW_DANGLING_REF=1。" >&2
+    exit 1
+  fi
+fi
+
 # ── revert-guard: 拒绝“历史回滚”型裸提交 ──────────────────────────────
 # 暂存内容与 HEAD 不同、却恰好等于近 50 个提交中的某个旧版本，说明工作树/暂存区被旧版本
 # 覆盖；一次裸 commit 会静默回滚已合入的修复。实测 2026-10-22 三个仓同时命中：
