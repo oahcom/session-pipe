@@ -126,7 +126,26 @@ def test_rejected_branch_uses_the_deadline_guard():
     from pipeflow import engine
     src = inspect.getsource(engine.WorkflowEngine.run_once)
     assert "_rejected_escalation_expired(" in src, "rejected 分支未接期限判据"
-    assert 'status="failed"' in src, "超期必须 close failed 收口，否则永远等 24h 兜底"
+    assert "_rework_alive(lm" in src, "超期必须先查返工链，否则会级联取消在写链"
+    assert 'status="failed"' in src, "无活链时超期必须 close failed 收口，否则永远等 24h 兜底"
+
+
+def test_rework_alive_only_for_non_terminal_chain():
+    """续期判据：任一链非终态才算活；查询异常按活处理（宁可晚收，不误杀）。"""
+    from pipeflow import engine
+
+    def _lm(sts):
+        _l = MagicMock()
+        _l.query.return_value = [{"status": s} for s in sts]
+        return _l
+
+    assert engine._rework_alive(_lm(["running"]), ["wf_rw_a"]) is True
+    assert engine._rework_alive(_lm(["completed", "cancelled"]), ["a", "b"]) is False
+    assert engine._rework_alive(_lm([]), ["gone"]) is False, "链已删=无在飞写操作"
+    assert engine._rework_alive(_lm([]), []) is False, "无返工链（重投封顶路径）可直接收口"
+    _bad = MagicMock()
+    _bad.query.side_effect = RuntimeError("db locked")
+    assert engine._rework_alive(_bad, ["wf_rw_a"]) is True, "查询失败不得误判为可收口"
 
 
 if __name__ == "__main__":
