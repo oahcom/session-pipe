@@ -236,6 +236,17 @@ def _transcript_stalled(role: str, max_age: float = _STOPPED_PROGRESS_SEC) -> bo
         return False
 
 
+def _as_bytes(v) -> bytes:
+    """子进程输出归一：生产是 bytes，测试/未来 text=True 可能是 str。"""
+    return v.encode("utf-8", "replace") if isinstance(v, str) else (v or b"")
+
+
+def _start_failed(st) -> bool:
+    """ccs start 是否失败：非零返回码，或 stdout 协议明说 success=false。"""
+    return getattr(st, "returncode", 0) != 0 or \
+        b'"success": false' in _as_bytes(getattr(st, "stdout", b""))
+
+
 def _start_error_text(stdout: bytes | None, stderr: bytes | None) -> str:
     """ccs start 失败时该报哪段输出：stdout 的协议 JSON，不是 stderr 的日志。
 
@@ -243,8 +254,10 @@ def _start_error_text(stdout: bytes | None, stderr: bytes | None) -> str:
     "写入 settings.json"。旧实现 stderr 优先，于是 6 条 blocker 的证据全是这句
     INFO（bus #434228/#434257/#434307），真因 {"success": false, ...} 被吞。
     """
-    out = stdout or b""
-    pick = out if b'"success"' in out else (stderr or out)
+    out, err = _as_bytes(stdout), _as_bytes(stderr)
+    # 只认失败协议：成功 JSON 同样含 "success"，按该字样选源会在 rc≠0 时把
+    # stderr 的真因替换成一句 {"success": true}（codex 20 维 P1）。
+    pick = out if b'"success": false' in out else (err or out)
     return pick.decode("utf-8", "replace")[:300]
 
 
@@ -736,11 +749,16 @@ class RoleLifecycleMixin:
         _env.pop("VIRTUAL_ENV", None)
         _env.pop("CONDA_PREFIX", None)
         try:
-            _engine_mod._sp.run(
+            _st = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "start", role, "--no-attach",
                  "--drive", "infinite", "--no-auto-send"],
                 capture_output=True, timeout=60, env=_env,
             )
+            # 同一条拉起路径的两个入口（daemon/engine tick 走这里）：返回值曾整体
+            # 丢弃，于是"角色起不来"只有 tmux 层的假象，没有原因（codex 20 维 P1）。
+            if _start_failed(_st):
+                LOGGER.warning("CCS %s: ccs start 失败 (rc=%s): %s", role, _st.returncode,
+                               " ".join(_start_error_text(_st.stdout, _st.stderr).split())[:200])
             for _ in range(30):
                 time.sleep(1)
                 if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
@@ -799,16 +817,20 @@ class RoleLifecycleMixin:
                     # 返回值 → 上层只能看到"tmux 没起来"，日志还错报 tmux alive
                     # → 空转 90s → 排队 14 次 → 子链被回收 → 父链断链。
                     # 这里把真实原因抬到日志与 blocker，使资源类阻断可被外部观测。
+                    # 判定用未截断的 stdout：证据只留 300 字符，协议 JSON 若在
+                    # 300 之后，按 _err 判会漏写 blocker（codex 20 维 P2）。
                     _err = _start_error_text(_st.stdout, _st.stderr)
-                    if _st.returncode != 0 or "\"success\": false" in _err:
+                    if _start_failed(_st):
                         LOGGER.error("_wait_for_role_ready: ccs start %s 失败 (rc=%s): %s",
-                                     role, _st.returncode, _err[:200])
+                                     role, _st.returncode, " ".join(_err.split())[:200])
                         try:
                             self._bb.write("blocker",
-                                f"[workflow] 角色 {role} 启动失败，工作流无法投递",
+                                f"[workflow] 角色 {role} 启动失败 (rc={_st.returncode})，"
+                                f"工作流无法投递",
                                 evidence=_err, src="workflow_engine")
                         except Exception:
-                            LOGGER.debug("role-start blocker 写入失败: %s", role)
+                            # blocker 是唯一外部产物：写失败不能只留 DEBUG。
+                            LOGGER.warning("role-start blocker 写入失败: %s", role)
                     # 等待 tmux session 启动
                     for _ in range(10):
                         time.sleep(1)

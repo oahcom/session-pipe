@@ -35,7 +35,8 @@ def test_start_result_is_captured():
 def test_failure_writes_blocker():
     """失败路径必须写 blocker（外部可观测），不能只 LOGGER。"""
     src = _SRC_FILE.read_text(encoding="utf-8")
-    assert "启动失败，工作流无法投递" in src, "缺少角色启动失败的 blocker 文案"
+    assert "启动失败 (rc=" in src and "工作流无法投递" in src, \
+        "缺少角色启动失败的 blocker 文案（应含返回码）"
     assert "ccs start %s 失败 (rc=%s)" in src, "缺少含返回码的 ERROR 日志"
 
 
