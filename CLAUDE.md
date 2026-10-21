@@ -37,7 +37,7 @@ pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 
 ### 验证命令
 ```bash
 # 测试路由规则
-python3 tests/test_router.py -x -q
+python3 -m pytest tests/ -q -k router
 
 # 列出路由表（router CLI）
 PYTHONPATH=src python3 -m routing.router list
@@ -58,34 +58,34 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 ```
 src/
   routing/
-    router.py         ── 路由表 + produce/consume 推导（376 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（515 行）
-    auto.py           ── 自动路由消费 + investigator 分派（281 行）
-    polling.py        ── 消息轮询 + cursor（87 行）
+    router.py         ── 路由表 + produce/consume 推导（361 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（612 行）
+    auto.py           ── 自动路由消费 + investigator 分派（260 行）
+    polling.py        ── 消息轮询 + cursor（88 行）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
-    survival_monitor.py ── 三层存活监测 L1/L2/L3（592 行）
+    survival_monitor.py ── 三层存活监测 L1/L2/L3（640 行）
     consistency.py    ── 路由一致性检查（124 行，生长接入 daemon）
 
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
     engine.py         ── 编排 + CLI（1024 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1146 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（656 行）
-    task_generator.py ── 任务生成（469 行）
-    wf_lifecycle.py   ── 工作流生命周期（1059 行）
-    daemon.py         ── 工作流守护 while 循环（256 行）
+    step_handler.py   ── 步骤处理（1634 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1153 行）
+    task_generator.py ── 任务生成（846 行）
+    wf_lifecycle.py   ── 工作流生命周期（1969 行）
+    daemon.py         ── 工作流守护 while 循环（314 行）
     pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1273 行）
+    manager.py        ── 工作流状态机（1307 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（508 行）
-    gateway.py        ── 工作流网关门禁（201 行）
+    client.py         ── CCS 角色工作流客户端（515 行）
+    gateway.py        ── 工作流网关门禁（188 行）
     workflow/db.py    ── 工作流数据访问（96 行）
-    sync.py           ── 工作流同步（55 行）
+    sync.py           ── 工作流同步（65 行）
 
   p0_exemption.py     ── P0 豁免通道（coordinator/lr/pm）
   config_loader.py    ── 配置加载（YAML + env override + 热重载）
@@ -186,7 +186,7 @@ EOF
 ## 测试
 ```bash
 cd ~/session-pipeline && python3 -m pytest tests/ -x -q
-python3 -m py_compile src/**/*.py
+python3 -m py_compile src/*.py src/*/*.py
 ```
 
 ### 手工验证必须走隔离（防止污染生产）

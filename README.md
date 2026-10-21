@@ -36,7 +36,7 @@ PYTHONPATH=src python3 -c "from routing.router import get_router; print(get_rout
 |------|------|--------|
 | 路由映射 | `routing/router.py` | 从角色 JSON 自动推导 produce/consume |
 | 自动分发 | `routing/auto.py` | 轮询 bus → 按优先级分发给 CCS |
-| 工作流引擎 | `pipeflow/engine.py` | 32 个模板 + 3 个复合链 |
+| 工作流引擎 | `pipeflow/engine.py` | 28 个模板（`~/.hermes/workflows/*.json`）+ subflow 子链 |
 | 步骤状态机 | `lifecycle/manager.py` | 审批/回滚/升级/重分配 |
 | 可靠性 | `reliability.py` | 重试/熔断/心跳/TTL/Metrics |
 
@@ -49,9 +49,9 @@ PYTHONPATH=src python3 -m routing.auto --route-all   # 路由所有
 PYTHONPATH=src python3 -m routing.auto --daemon      # 守护模式
 
 # 工作流
-python3 -m pipeflow.engine list                # 列出模板
-python3 -m pipeflow.engine start <name>        # 启动
-python3 -m pipeflow.engine daemon              # 守护
+PYTHONPATH=src python3 -m pipeflow.engine list          # 列出模板
+PYTHONPATH=src python3 -m pipeflow.engine start <name>  # 启动
+PYTHONPATH=src python3 -m pipeflow.engine daemon        # 守护
 ```
 
 ## 项目结构
