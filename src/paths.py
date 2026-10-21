@@ -39,9 +39,6 @@ WORKFLOWS_DB = Path(os.environ.get("SESSION_PIPELINE_WORKFLOWS_DB", HERMES_STATE
 # total=1042 交替出现，末行去重因此失效（实测 48/60 行是测试产物）。
 METRICS_JSONL = Path(os.environ.get("SESSION_PIPELINE_METRICS_JSONL",
                                     HERMES_STATE / "workflow-metrics.jsonl"))
-CURSOR_DB = HERMES_STATE / "pipeline_cursor.db"
-ROUTING_DB = HERMES_STATE / "routing.db"
-ACK_TRACKER_DB = HERMES_STATE / "ack_tracker.db"
 STARVE_STATE = Path.home() / ".hermes" / "run" / "wf_starve.json"
 # 迭代需求目录（每个需求一个子目录，存 PRD/DESIGN/TASKS 等迭代产物）。
 # env var 覆盖: 测试隔离用。不隔离时跑 pytest 会在生产根下建 test_ws_project
@@ -51,7 +48,6 @@ ITERATION_WORKSPACES = Path(os.environ.get(
     _HOME / ".hermes" / "workspace"))
 # ── 模板与配置 ──
 HERMES_TEMPLATES = _HOME / ".hermes" / "templates"
-HERMES_BACKUPS = _HOME / ".hermes" / "backups"
 WORKFLOW_GUIDE = HERMES_TEMPLATES / "WORKFLOW_GUIDE.md"
 
 # ── 项目根目录 ──
@@ -76,7 +72,6 @@ SESSION_ROLES_PERSONAS = SESSION_ROLES_ROOT / "personas" / "session-roles"
 
 # ── Hermes 工作流 ──
 HERMES_WORKFLOWS = _HOME / ".hermes" / "workflows"
-HERMES_WORKFLOW_CHAINS = HERMES_WORKFLOWS / "chains"
 
 
 def ensure_paths() -> None:
