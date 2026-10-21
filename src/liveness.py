@@ -484,7 +484,7 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
         if (time.time() - float(raw)) < window:
             return True
         # 仅在耗时阶段付这次额外 capture-pane（正常路径不增加 tmux 调用）
-        return _pane_cli_busy(role, timeout)
+        return pane_cli_busy(role, timeout)
     except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
         return None
     except OSError:
@@ -500,7 +500,7 @@ _CLI_BUSY_MARKERS = ("esc to interrupt", "esc to cancel", "ctrl+b to run in back
 _CLI_RETRY_MARKERS = ("retrying in", "attempt")
 
 
-def _pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
+def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
     """pane 静默超窗后，判断 CLI 是否仍在执行（忙态底栏标记）。
 
     返回 None 表示探测失败——调用方按"不可用不判死"处理。
