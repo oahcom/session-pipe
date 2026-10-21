@@ -52,6 +52,36 @@ def test_gate_alert_backoff_then_stop():
         assert len(calls) == 6
 
 
+
+
+def test_number_noise_does_not_reset_backoff():
+    """verify 的 stderr 每次带时长/行号：只差数字不算新原因。"""
+    h = _H()
+    h._bb = MagicMock()
+    now = [1000.0]
+    calls = []
+
+    with patch("pipeflow.step_handler.time.time", side_effect=lambda: now[0]):
+        h._gate_alert("wf/s4/verify", "took 1.23s at line 42", lambda: calls.append(1))
+        now[0] += 10
+        h._gate_alert("wf/s4/verify", "took 9.87s at line 77", lambda: calls.append(1))
+
+    assert len(calls) == 1, "仅数字变化不得当新原因重置退避"
+
+
+def test_gate_pass_clears_backoff():
+    """闸门通过后计数归零：原因消失又复发时要能重新提示。"""
+    h = _H()
+    h._bb = MagicMock()
+    h._gate_alert_at = {"wf/s1/verify": (0.0, "boom", 6)}
+    step = MagicMock(id="s1", exit_schema=None, verify="")
+    run = MagicMock(id="wf", step_results={}, context={})
+
+    assert h._quality_gate_blocks(step, run) is False
+    assert "wf/s1/verify" not in h._gate_alert_at
+
 if __name__ == "__main__":
     test_gate_alert_backoff_then_stop()
+    test_number_noise_does_not_reset_backoff()
+    test_gate_pass_clears_backoff()
     print("PASS: gate alert backoff")

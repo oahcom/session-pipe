@@ -11,7 +11,7 @@ from liveness import (
     PANE_ACTIVE_WINDOW, _STALE_NOTIFIED_SEC,
     _db_fetch, _health_gate, _load_steps_json, _row_get,
     _s0_alive, _s1_thinking, _s2_producing, _s3_assigned, _s4_stepping,
-    _tmux_has_session, role_liveness, tmux_pane_active,
+    _tmux_has_session, pane_cli_busy, role_liveness, tmux_pane_active,
 )
 
 
@@ -506,6 +506,36 @@ class TestL4EffectiveRoleOverride(unittest.TestCase):
         s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
         self.assertTrue(s["busy"], "裸名模板应回退到 WF- 前缀后判忙")
         conn.close()
+
+
+
+
+class TestPaneCliBusy(unittest.TestCase):
+    """底栏判据只看末尾若干行：角色正文里的同名词不算忙。"""
+
+    def _probe(self, text):
+        with patch("liveness.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout=text)):
+            return pane_cli_busy("qa")
+
+    def test_marker_in_body_is_not_busy(self):
+        text = "\n".join(["讨论 esc to interrupt 的含义"]
+                          + [f"输出 {i}" for i in range(20)] + [">"])
+        self.assertFalse(self._probe(text))
+
+    def test_marker_in_bottom_bar_is_busy(self):
+        text = "\n".join([f"输出 {i}" for i in range(20)]
+                          + ["esc to interrupt · 1m23s", ">"])
+        self.assertTrue(self._probe(text))
+
+    def test_retrying_in_bottom_bar_is_busy(self):
+        text = "\n".join([f"输出 {i}" for i in range(20)]
+                          + ["Retrying in 4m 27s · attempt 19/30", ">"])
+        self.assertTrue(self._probe(text))
+
+    def test_probe_failure_is_none(self):
+        with patch("liveness.subprocess.run", side_effect=OSError("no tmux")):
+            self.assertIsNone(pane_cli_busy("qa"))
 
 
 if __name__ == "__main__":

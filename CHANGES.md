@@ -1,5 +1,38 @@
 # CHANGES.md
 
+## 2026-10-22 — 投递预检判据收口（底栏 6 行 + 测试锁真）
+
+### 问题（5 个只读子代理审查 eda4a38/4f02450 后实证）
+1. `pane_cli_busy` 扫整块 pane 末 2000 字符：角色正文里讨论 "esc to interrupt"、贴日志里的
+   "Retrying … attempt" 会被当忙态，该角色所有投递恒返 busy → queued 累加 → 队列预算到期被回收。
+2. 预检用例并不锁预检：同文件前一个用例已把同一 (role,wf,step,prompt) 写进进程级
+   `_LAST_SEND`，删掉预检后同 prompt 去重分支照样返回 busy，三条断言全绿。
+3. 无用例覆盖「预检在 goal 校验之后」与「force 旁路」：把顺序改回去、去掉 force 条件，测试仍全绿。
+4. 首步补 `wf_id` 也没有断言：链路契约用例的 _record 丢掉了 wf_id。
+
+### 修复
+- `liveness`：判据只看底部 6 行（`_PANE_TAIL_LINES`）；拆出 `_pane_busy_markers`，
+  `tmux_pane_active` 走内部函数，测试打桩 `pane_cli_busy` 不影响活跃判定。
+- `tests/conftest.py`：autouse 夹具默认把探针桩成 None，并清 `_LAST_SEND` / `_ALERT_TS`，
+  进程级冷却不再跨用例泄漏；单个用例要忙态自己 patch。
+- 用例：defers/proceeds 断言探针被调用；新增「非法 prompt 不被忙吞」与「force 不被拦」；
+  链路契约记录并断言首跳 wf_id。
+- 闸门退避：文本规范化、闸门通过即清零、4h 裁剪（见上一节）。
+
+### 验证
+- 8 个相关测试文件 → 150 passed
+- 变异验证：把 `if wf_id and not force:` 改成 `if False:` 后 proceeds 用例变红
+  （pane_cli_busy 未被调用），恢复后转绿。
+- `python3 scripts/doccheck.py` → CLEAN（TREE 现在也校验「（N 行，…」形态；TABLE 要求反引号成对）。
+
+### 未采纳（附理由）
+- 删 `wf_id and` 并回退首步 wf_id：该条件在测试/直调路径上仍是有效闸门；
+  首步写 TASKS.md 与其他派单一致，未观察到害处。
+- 删预检的 try/except：`pane_cli_busy` 未捕获 UnicodeDecodeError 等非常规异常，
+  投递失败的代价高于保留 4 行。
+- 给 step_results 的 COALESCE 加 NULLIF：生产库该列为空串的行数为 0（实测），无证据，
+  且文件正被其他 session 改，先不动。
+
 ## 2026-10-22 — 审批密钥通道全链路退场（841e545 + 2a8a016）
 
 ### 问题
@@ -93,13 +126,19 @@ DB 无其他活跃步时直接进入 ccs send；角色 CLI 仍在执行时，分
 实测 reviewer 四轮收到逐字相同的「缺少 REVIEW.md」告警，每轮重跑 3~14 次取证
 （30 次工具调用），零新增结论；且 REVIEW.md 实际存在，归因也错。
 
-### 修复
-`src/pipeflow/step_handler.py` `_gate_alert`：同一 key+text 按 5/10/20/40/80min 退避，
-第 6 次不再发给角色、改写一条 blocker 升级；text 变化 = 新信息立即播报并重置计数。
-新增 `tests/test_gate_alert_backoff.py` 锁住退避、停发、升级、新文本四件事。
+### 修复（归属更正）
+退避实现来自 c02cdc1（`_gate_alert` 的 5/10/20/40/80min 档、第 6 次停发并写 blocker），
+不是 eda4a38 的改动；eda4a38 只补了回归测试。本条最初把它记在本提交名下，现更正。
+
+### 2026-10-22 追加加固
+- 失败文本先规范化（数字/十六进制 → `#`）再作为退避身份：verify 的 stderr 每次带时长/行号，
+  按原文比较会把同一条失败当新原因，退避永远从第 1 档重来。
+- 闸门通过时清掉该步的退避键：原来只在文本变化时归零，同一条确定性失败到第 6 次后
+  永久静默，原因消失又复发也不再有提示。
+- 记录表超 1000 条时按 4h 时间裁剪，不再整体 clear（clear 会把已停发的键重新武装）。
 
 ### 验证
-- `python3 -m pytest tests/test_gate_alert_backoff.py -q` → 1 passed
+- `python3 -m pytest tests/test_gate_alert_backoff.py -q` → 3 passed（退避/停发/升级 + 数字噪声不重置 + 通过即清零）
 
 ## 2026-08-01 — 僵尸工作流抢救修复
 

@@ -484,7 +484,7 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
         if (time.time() - float(raw)) < window:
             return True
         # 仅在耗时阶段付这次额外 capture-pane（正常路径不增加 tmux 调用）
-        return pane_cli_busy(role, timeout)
+        return _pane_busy_markers(role, timeout)
     except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
         return None
     except OSError:
@@ -500,9 +500,19 @@ _CLI_BUSY_MARKERS = ("esc to interrupt", "esc to cancel", "ctrl+b to run in back
 _CLI_RETRY_MARKERS = ("retrying in", "attempt")
 
 
-def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
-    """pane 静默超窗后，判断 CLI 是否仍在执行（忙态底栏标记）。
+_PANE_TAIL_LINES = 6   # 底栏状态行上方的 tip/输入框最多 3~5 行
 
+
+def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
+    """判断 CLI 是否仍在执行；投递前预检用，调用方可无条件调用。"""
+    return _pane_busy_markers(role, timeout)
+
+
+def _pane_busy_markers(role: str, timeout: float = 3.0) -> bool | None:
+    """判断 CLI 是否仍在执行（底栏 esc/retrying 标记）。调用方可无条件调用。
+
+    只看底部若干行：角色正文里讨论 "esc to interrupt"、贴日志里的 "Retrying …
+    attempt" 时，全文匹配会把该角色所有投递永久判忙（排队到被回收）。
     返回 None 表示探测失败——调用方按"不可用不判死"处理。
     """
     try:
@@ -511,7 +521,8 @@ def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
             capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             return None
-        tail = r.stdout[-2000:].lower()
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        tail = "\n".join(lines[-_PANE_TAIL_LINES:]).lower()
         if any(m in tail for m in _CLI_BUSY_MARKERS):
             return True
         # 退避中的 CLI 不显示 esc 提示，只挂 "Retrying in 4m 27s · attempt 19/30"：

@@ -1318,6 +1318,12 @@ class StepHandlerMixin:
         except Exception as _e:
             LOGGER.debug("gate prompt to role failed: %s", _e)
 
+    @staticmethod
+    def _gate_text_id(text: str) -> str:
+        """失败文本的稳定身份：verify 的 stderr 每次都带时长/临时路径/行号，
+        原文比较会把同一条失败当成"新原因"，退避永远不生效。"""
+        return re.sub(r"[0-9a-f]{6,}|\d+(?:\.\d+)?", "#", text)
+
     def _gate_alert(self, key: str, text: str, write) -> None:
         """闸门失败播报：新原因立即报；同一条按 5/10/20/40/80min 退避，第 6 次停发并升级。
 
@@ -1329,10 +1335,13 @@ class StepHandlerMixin:
         _last = getattr(self, "_gate_alert_at", None)
         if _last is None:
             _last = self._gate_alert_at = {}
-        if len(_last) > 1000:      # 常驻 daemon 防增长：丢的是节流记忆
-            _last.clear()          # （最坏影响 = 同一条失败再播一次）
+        if len(_last) > 1000:      # 常驻 daemon 防增长：只裁掉 4h 前的旧记录。
+            _cut = _now - 14400    # 整体 clear 会让已停发的键重新武装（重发 6 轮）。
+            for _k in [k for k, v in _last.items() if v[0] < _cut]:
+                _last.pop(_k, None)
+        _tid = self._gate_text_id(text)
         _rec = _last.get(key)
-        if _rec and _rec[1] == text:
+        if _rec and _rec[1] == _tid:
             _n = _rec[2]
             if _n >= 6:           # 已停发：只留升级记录，不再刷角色
                 return
@@ -1341,7 +1350,7 @@ class StepHandlerMixin:
             _n += 1
         else:
             _n = 1               # 新文本 = 新信息，立即播报
-        _last[key] = (_now, text, _n)
+        _last[key] = (_now, _tid, _n)
         if _n >= 6:
             try:
                 self._bb.write("blocker",
@@ -1391,6 +1400,12 @@ class StepHandlerMixin:
                                  lambda: self._gate_prompt(run, step, _msg))
                 self._sync_step_results(run.id, run.step_results)
                 return True
+        # 闸门已通过 → 退避计数归零：否则同一条确定性失败第 6 次后对该实例
+        # 永久静默，原因消失又复发时角色再也收不到提示。
+        _ga = getattr(self, "_gate_alert_at", None)
+        if _ga:
+            _ga.pop(f"{run.id}/{step.id}/schema", None)
+            _ga.pop(f"{run.id}/{step.id}/verify", None)
         return False
 
     def _validate_exit_schema(self, step: Step, run: WorkflowRun) -> tuple[bool, list[str]]:

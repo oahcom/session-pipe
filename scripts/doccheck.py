@@ -16,9 +16,9 @@ import re
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
-TREE = re.compile(r'([\w/]+\.py)(\s*[─-]+.*?（)(\d+)( 行）)')
+TREE = re.compile(r'([\w/]+\.py)(\s*[─-]+.*?（)(\d+)(\s*行)')
 # 表格两种写法都认：| **path** | 895 | 与 | **`path`** | 895 |
-TABLE = re.compile(r'(\|\s*\*\*`?)([\w/]+\.py)(`?\*\*\s*\|\s*)(\d+)(\s*\|)')
+TABLE = re.compile(r'(\|\s*\*\*)(`?)([\w/]+\.py)\2(\*\*\s*\|\s*)(\d+)(\s*\|)')
 
 
 def _resolve(name: str) -> Path | None:
@@ -40,7 +40,7 @@ def _rows(text: str):
     for m in TREE.finditer(text):
         yield m.group(1), m.start(3), m.end(3)
     for m in TABLE.finditer(text):
-        yield m.group(2), m.start(4), m.end(4)
+        yield m.group(3), m.start(5), m.end(5)
 
 
 def _check(path: Path) -> int:

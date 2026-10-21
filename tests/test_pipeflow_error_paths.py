@@ -25,6 +25,7 @@ os.environ.setdefault("SESSION_PIPELINE_SKIP_TTL_PRUNER", "1")
 
 import pipeflow.engine as engine_mod
 from pipeflow.engine import WorkflowEngine, WorkflowRun, Step
+from pipeflow.role_lifecycle import RoleLifecycleMixin
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -40,6 +41,9 @@ def _build_eng() -> WorkflowEngine:
     eng._lm = MagicMock()
     eng._bb = MagicMock()
     eng._sync_step_results = MagicMock()
+    # 同 prompt 去重是进程级类属性：不清则前一个用例的成功投递会让本用例
+    # 在预检被删掉时也返回 busy（假通过）。
+    RoleLifecycleMixin._LAST_SEND.clear()
     return eng
 
 
@@ -186,13 +190,44 @@ def test_send_to_role_defers_when_cli_busy():
     eng._wait_for_role_ready = MagicMock(return_value=True)
     eng._is_role_busy = MagicMock(return_value=False)  # DB 视角：没有别的活跃步
 
-    with patch("liveness.pane_cli_busy", return_value=True), \
+    with patch("liveness.pane_cli_busy", return_value=True) as probe, \
             patch.object(engine_mod._sp, "run") as mock_run:
         assert eng._send_to_role("scout", "test prompt",
                                  wf_id="wf_123", step_id="s1") == "busy"
 
+    probe.assert_called_once_with("scout")
     mock_run.assert_not_called()
     assert not eng._bb.write.called
+
+
+def test_invalid_prompt_is_not_masked_by_busy():
+    """预检必须排在 goal 校验之后：非法 prompt 走 blocker，不能被忙态吞掉。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    with patch("liveness.pane_cli_busy", return_value=True) as probe:
+        assert eng._send_to_role("scout", "p", wf_id="wf_x", step_id="s1") is False
+
+    probe.assert_not_called()
+    assert eng._bb.write.called
+
+
+def test_force_bypasses_cli_busy():
+    """force=True（超时重推/双节点/完整性提醒）不许被忙预检拦下。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    with patch("liveness.pane_cli_busy", return_value=True) as probe, \
+            patch.object(engine_mod._sp, "run",
+                         return_value=_mock_run_out(returncode=0)):
+        assert eng._send_to_role("scout", "test prompt", wf_id="wf_force",
+                                 step_id="s1", force=True) is True
+
+    probe.assert_not_called()
 
 
 def test_send_to_role_proceeds_when_cli_probe_fails():
@@ -202,11 +237,13 @@ def test_send_to_role_proceeds_when_cli_probe_fails():
     eng._wait_for_role_ready = MagicMock(return_value=True)
     eng._is_role_busy = MagicMock(return_value=False)
 
-    with patch("liveness.pane_cli_busy", side_effect=OSError("tmux gone")), \
+    with patch("liveness.pane_cli_busy", side_effect=OSError("tmux gone")) as probe, \
             patch.object(engine_mod._sp, "run",
                          return_value=_mock_run_out(returncode=0)):
         assert eng._send_to_role("scout", "test prompt",
                                  wf_id="wf_probe_fail", step_id="s1") is True
+
+    probe.assert_called_once_with("scout")
 
 
 # ═══════════════════════════════════════════════════════════════════════

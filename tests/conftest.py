@@ -149,3 +149,19 @@ def _isolate_role_transcripts(tmp_path, monkeypatch):
     from pipeflow import role_lifecycle as _rl
     monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
 
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probes_and_cooldowns(monkeypatch):
+    """投递预检与告警冷却默认不跨用例共享。
+
+    pane_cli_busy 走真实 tmux：服务端卡死时单条 capture-pane 实测 29.6s，
+    未打桩的用例会把整轮测试拖死；默认返回 None（"探测不可用则放行"），
+    需要忙态的用例自己 patch。两个进程级冷却表同理——不清则前一个用例
+    写下的 (role,title)/(role,wf,step) 让后一个用例的告警静默。
+    """
+    import liveness
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    monkeypatch.setattr(liveness, "pane_cli_busy", lambda role, timeout=3.0: None)
+    RoleLifecycleMixin._LAST_SEND.clear()
+    RoleLifecycleMixin._ALERT_TS.clear()

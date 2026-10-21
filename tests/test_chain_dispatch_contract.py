@@ -92,7 +92,7 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
     def _record(role, prompt, wf_id="", step_id="", **kw):
         # 催办/完整性提醒也走 _send_to_role，同一步会多次 send；只把真派单计入契约。
         if "完整性提醒" not in prompt:
-            sent.append((role, step_id, prompt[:60]))
+            sent.append((role, step_id, wf_id, prompt[:60]))
         return True
 
     eng._send_to_role = _record
@@ -116,6 +116,8 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
     for i, role in enumerate(roles[1:], start=2):
         hits = [x for x in sent if (x[0], x[1]) == (role, f"s{i}")]
         assert len(hits) == 1, f"s{i} 应恰好派给 {role} 一次，实投={hits}"
+        # 首跳也必须带 wf_id：不带则投递前 CLI 忙预检整段跳过（tick 仍可能被拖停）。
+        assert hits[0][2] == rid, f"s{i} 投递缺 wf_id: {hits[0]}"
 
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
