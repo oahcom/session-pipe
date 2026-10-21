@@ -60,6 +60,15 @@ def _parse_tick_sec(name, default):
     return max(_v, -1)
 
 
+# 源码热加载最小间隔（秒）：实测 2026-10-22 03:46-04:26 的 40 分钟内 execv 8 次
+# （多 session 同时改 src/**），每次重执行都丢掉当前 tick 并重跑启动流程。
+# 不是禁用热加载（分支上的修复就永远不生效），而是限速：最多 1 次 / 5 分钟。
+_RELOAD_MIN_INTERVAL_SEC = 300
+
+
+def _reload_allowed(now_ts, last_reload_ts, interval=_RELOAD_MIN_INTERVAL_SEC):
+    """距上次重执行 ≥ interval 才允许 execv（跨进程用墙钟，monotonic 不可比）。"""
+    return (now_ts - last_reload_ts) >= interval
 _TICK_STACK_DUMP_SEC = _parse_tick_sec("TICK_STACK_DUMP_SEC", 180)
 _TICK_SLOW_SEC = _parse_tick_sec("TICK_SLOW_SEC", 60)
 
@@ -313,6 +322,11 @@ def daemon_loop(interval: int):
         return max((_mt(_p) for _p in _src_files), default=0.0)
 
     _seen_mtime = _src_mtime()
+    try:
+        _last_reload = float(os.environ.get("_WF_LAST_RELOAD", "0") or 0)
+    except ValueError:
+        _last_reload = 0.0
+
 
     try:
         while not shutdown:
@@ -355,10 +369,19 @@ def daemon_loop(interval: int):
                             # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
                             # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
                             # 锁随新进程重新获取，任何监管方式下都能生效。
-                            LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
-                                        _now_mtime)
-                            logging.shutdown()
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                            _now_ts = time.time()
+                            if not _reload_allowed(_now_ts, _last_reload):
+                                # 收下新 mtime，否则每轮都重走这条路径再 sleep 2s
+                                _seen_mtime = _now_mtime
+                                LOGGER.info(
+                                    "源码已更新，但距上次重执行 %.0fs < %ds，本轮不重启",
+                                    _now_ts - _last_reload, _RELOAD_MIN_INTERVAL_SEC)
+                            else:
+                                LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
+                                            _now_mtime)
+                                os.environ["_WF_LAST_RELOAD"] = str(_now_ts)
+                                logging.shutdown()
+                                os.execv(sys.executable, [sys.executable] + sys.argv)
                 except OSError as _e:
                     LOGGER.debug("源码 mtime 探测失败: %s", _e)
             finally:
