@@ -17,3 +17,9 @@ def test_throttled_update_stays_pending():
     _, do3 = _reload_decision(now_mtime=100.0, seen_mtime=100.0,
                               pending_mtime=0.0, now_ts=9999.0, last_reload_ts=0.0)
     assert do3 is False
+
+    # 边界：正好 300s 允许重执行（>= 而非 >）——原 _reload_allowed 的契约，
+    # 该函数因无人调用已删，边界语义由本断言继续锁住
+    _, do_boundary = _reload_decision(now_mtime=500.0, seen_mtime=100.0,
+                                      pending_mtime=0.0, now_ts=1200.0, last_reload_ts=900.0)
+    assert do_boundary is True
