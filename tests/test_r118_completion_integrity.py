@@ -107,3 +107,93 @@ def test_reject_reason_feeds_rework():
         SimpleNamespace(id="s3"), results)
     assert "P1 | 契约未满足" in host.captured, f"驳回理由未进入解析: {host.captured!r}"
     assert ok is False  # 走不到建链（lm 返回 None 行），但解析源已验证
+
+
+def test_recursive_glob_matches_subdir_output(tmp_path, monkeypatch):
+    """schema 写 **/*.py 时必须递归：角色产出常在 src/、tools/、cli/ 下。"""
+    ws = tmp_path / "scout"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "mod.py").write_text("z" * 500, encoding="utf-8")
+    monkeypatch.setattr(sh, "_CCS_WORKSPACES", tmp_path)
+
+    run = SimpleNamespace(created_at=time.time() - 1, workflow_name="t")
+    step = SimpleNamespace(id="s1", target_role="scout",
+                           exit_schema={"properties": {"**/*.py": {"minLength": 50}}})
+    ok, errs = _eng(tmp_path)._validate_exit_schema(step, run)
+    assert ok is True, f"子目录里的真产出被判没有: {errs}"
+
+
+class _RejHost(WorkflowLifecycleMixin):
+    """真实解析 + 伪造写入点：验证无标记的驳回能否合成一条业务返工链。"""
+
+    def __init__(self):
+        self._bb = MagicMock()
+        self._workflows = {"engineer_feature": SimpleNamespace(
+            steps=[SimpleNamespace(id="s1", target_role="engineer", title="修",
+                                   prompt_template="fix", exit_condition={}, exit_schema=None,
+                                   max_retries=0, type="single")])}
+        self.ins = []
+
+    def _subflow_last_step_text(self, *a, **kw):
+        return ""
+
+    def _rework_tpl_for(self, *a, **kw):
+        return "engineer_feature"
+
+
+def test_unclassified_reject_creates_rework():
+    """驳回只有人话（无【业务问题】标记）也要建返工链，不能空手回退重投。"""
+    host = _RejHost()
+    conn = MagicMock()
+
+    def _exec(sql, params=()):
+        host.ins.append(" ".join(sql.split()))
+        m = MagicMock()
+        m.fetchone.return_value = ({"step_results": "{}"} if "SELECT step_results" in sql else None)
+        return m
+
+    conn.execute.side_effect = _exec
+    tx = MagicMock()
+    tx.__enter__.return_value = conn
+    tx.__exit__.return_value = False
+    lm = MagicMock()
+    lm._conn_tx.return_value = tx
+
+    results = {"s2": {"status": "rejected", "rejection_reason": "PRD 缺验收标准，回退重写"}}
+    ok = host._create_rework_subflow(
+        "wf_y", lm, "tpl", "s2",
+        SimpleNamespace(id="s2", title="review", target_role="engineer"),
+        SimpleNamespace(id="s3"), results)
+    assert ok is True, "无标记驳回没有建出返工链"
+    assert any(s.startswith("INSERT OR IGNORE INTO workflow_instances") for s in host.ins)
+
+def test_glob_falls_back_to_subdir_when_root_empty(tmp_path, monkeypatch):
+    """契约写 `*.py` 但角色把产出落在 src/：根目录零匹配时回落到递归。"""
+    ws = tmp_path / "scout"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "real.py").write_text("q" * 500, encoding="utf-8")
+    monkeypatch.setattr(sh, "_CCS_WORKSPACES", tmp_path)
+
+    run = SimpleNamespace(created_at=time.time() - 1, workflow_name="t")
+    step = SimpleNamespace(id="s1", target_role="scout",
+                           exit_schema={"properties": {"*.py": {"minLength": 50}}})
+    ok, errs = _eng(tmp_path)._validate_exit_schema(step, run)
+    assert ok is True, f"子目录里的本次产出被判没有: {errs}"
+
+
+def test_subdir_fallback_still_rejects_stale_only(tmp_path, monkeypatch):
+    """回落不能放过旧文件：根目录与子目录都只有旧文件时仍判失败。"""
+    ws = tmp_path / "scout"
+    (ws / "src").mkdir(parents=True)
+    old = ws / "src" / "old.py"
+    old.write_text("x" * 500, encoding="utf-8")
+    import os
+    t = time.time() - 7 * 24 * 3600
+    os.utime(old, (t, t))
+    monkeypatch.setattr(sh, "_CCS_WORKSPACES", tmp_path)
+
+    run = SimpleNamespace(created_at=time.time(), workflow_name="t")
+    step = SimpleNamespace(id="s1", target_role="scout",
+                           exit_schema={"properties": {"*.py": {"minLength": 50}}})
+    ok, errs = _eng(tmp_path)._validate_exit_schema(step, run)
+    assert ok is False, f"子目录旧文件冒充产出仍通过: {errs}"

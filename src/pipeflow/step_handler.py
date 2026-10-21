@@ -1475,7 +1475,16 @@ class StepHandlerMixin:
             _wf_floor = (getattr(run, 'created_at', 0) or 0) - 2
             if "*" in fname:
                 import glob as _gl
-                all_matches = [Path(m) for m in _gl.glob(str(fpath))]
+                # `**` 才递归：角色常把产出写进 src//tools//cli（7 天 24 个 .py
+                # 里 20 个不在根目录），非递归 glob 会把真产出判成没有。
+                all_matches = [Path(m) for m in _gl.glob(str(fpath), recursive=True)]
+                if not all_matches and "**" not in fname:
+                    # 根目录零匹配才回落到递归：契约说的是"产出该类型文件"，没有
+                    # 目录语义。只对"根目录一个都没有"生效，已有根目录产出的判定
+                    # 完全不变（不放松 _stale_only，旧文件仍然不算产出）。
+                    all_matches = [Path(m) for m in
+                                   _gl.glob(str(fpath.parent / "**" / fpath.name),
+                                            recursive=True)]
                 # 过滤：只检查工作流创建后被修改/新建的文件（本次任务产出），
                 # 排除 workspace 历史遗留文件导致的 minLength/mustContain 误报
                 # 计数检查（minCount）不依赖 matched——即使 matched 为空也需执行
@@ -1495,9 +1504,8 @@ class StepHandlerMixin:
             if not matched and fpath.is_dir():
                 matched = []  # minFiles 走单独检查，不混入内容检查
             elif not matched and (_stale_only or not ("*" in fname and all_matches)):
-                # 无匹配且非目录、且非"通配符匹配到但全部是历史文件"：
-                # 所有内容检查均失败。历史文件场景跳过内容检查（无本次产出可校验），
-                # 但 minCount 计数仍会执行
+                # 无匹配，或匹配到的全是历史文件：都算"本步没有产出"，内容判据全部失败。
+                # 旧行为对第二种跳过内容检查 → 零新文件也通过；minCount 计数仍会执行。
                 # 必须覆盖全部"内容判据"属性：漏掉任何一个，以它为唯一判据的
                 # exit_schema 在文件完全不存在时也会通过（mustContainAnyOf 实测
                 # 返回 ok=True，步骤直接盖戳完成）。
@@ -1505,7 +1513,12 @@ class StepHandlerMixin:
                                  "mustContainUrl", "mustNotContain", "checksum",
                                  "maxAgeMinutes"):
                     if prop_key in props:
-                        errs.append(f"缺少产出: {fname}")
+                        # 区分"从未存在"与"只有旧文件"：后者要么是角色改了文件名，
+                        # 要么是 schema 写的模式和实际落盘位置对不上（子目录/分槽名），
+                        # 两种都必须让超时 blocker 可读，否则只能靠猜。
+                        errs.append(f"缺少产出: {fname}" + (
+                            f"（{len(all_matches)} 个匹配均早于本实例创建）"
+                            if _stale_only else ""))
                         break
                 # minCount 必须在此处单独判：零匹配时 continue 会跳过下方计数，
                 # fresh=0 的 schema 会凭空通过（实测 mc_zero_probe => (True, [])）。
