@@ -10,11 +10,16 @@
 
 子 agent 拿到这些数据后自行判断哪些 task 有实际收益。
 """
-import sqlite3, json, subprocess, time
+import os, sqlite3, json, subprocess, time
 from pathlib import Path
 
-DB = Path.home() / ".hermes" / "state" / "workflows.db"
-WORKSPACES = Path.home() / "ccs-workspaces"
+# env 覆盖: 与 paths.py 同源的两个变量。不隔离时 engine.run_once 会往生产库
+# INSERT workflow_logs 并往真实 ccs-workspaces/<role>/TASKS.md 追加负反馈
+# （2026-10-22 审计实测：test_workcycle_e2e 一轮即新增 1 行 + 1 条 negative）。
+DB = Path(os.environ.get("SESSION_PIPELINE_WORKFLOWS_DB") or
+          Path.home() / ".hermes" / "state" / "workflows.db") 
+WORKSPACES = Path(os.environ.get("SESSION_PIPELINE_CCS_WORKSPACES") or
+                  Path.home() / "ccs-workspaces")
 BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
 
 # 系统文件：不是角色产出，不应计入证据

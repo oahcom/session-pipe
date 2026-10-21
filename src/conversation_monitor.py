@@ -12,6 +12,7 @@ from pathlib import Path
 
 import hashlib
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -26,7 +27,10 @@ _DEFAULT_FORBIDDEN = ["run_tests", "edit_config", "deploy",
                       "start_ccs", "edit_persona_json"]
 
 # 缓存文件路径
-_FORBIDDEN_CACHE = Path.home() / ".hermes" / "run" / "forbidden_ops_cache.json"
+# env 覆盖: 测试跑 engine._tick 会用空缓存覆盖生产文件（实测 1005B/13 角色 → 35B 空表，
+# 违规检测静默失灵到下次刷新）。HERMES_RUN_DIR 未设时行为不变。
+_RUN_DIR = Path(os.environ.get("HERMES_RUN_DIR") or Path.home() / ".hermes" / "run")
+_FORBIDDEN_CACHE = _RUN_DIR / "forbidden_ops_cache.json"
 _forbidden_ops_loaded = False
 _forbidden_ops_lock = threading.Lock()
 

@@ -311,7 +311,10 @@ class AckTracker:
     - stats: ACK 状态统计
     """
 
-    _DEFAULT_DB = Path.home() / ".hermes" / "state" / "ack_tracker.db"
+    # env 覆盖: 模块级 ACK_TRACKER 在 import 时即建连（读 5.7MB 生产库 + WAL），
+    # 测试不隔离就会对生产库建表取锁。
+    _DEFAULT_DB = Path(os.environ.get("SESSION_PIPELINE_ACK_DB") or
+                       Path.home() / ".hermes" / "state" / "ack_tracker.db")
 
     def __init__(self, db_path: str | None = None):
         self._db_path = Path(db_path) if db_path else self._DEFAULT_DB
