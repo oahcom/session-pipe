@@ -1164,11 +1164,28 @@ class RoleLifecycleMixin:
             _out = getattr(_result, "stdout", "") or ""
             if isinstance(_out, bytes):
                 _out = _out.decode("utf-8", "ignore")
-            if '"reason": "busy"' in _out or '"reason":"busy"' in _out:
-                LOGGER.info("send-to-role %s 角色思考中，未投递（排队等下轮）", role)
+            _resp = {}
+            try:
+                _resp = json.loads(_out) if _out.lstrip().startswith("{") else {}
+            except (ValueError, TypeError):
+                _resp = {}
+            _err = str(_resp.get("error") or "")
+            # 忙 ≠ 失败，另外两类「暂缓判定」也不能当失败：
+            # core.send 对首次探测失败返回 "探测失败 1/3"、首次 tmux 投递失败返回
+            # "tmux 投递失败 1/3"（连败计数未满 3，红线 3 防抖动误报），语义是稍后重试。
+            # 全按失败计则引擎 10s/tick 内三连推 → 角色一次抖动即被判 delivery_blocked
+            # 终态（实测 wf_76d0bcc006/s1 冻结 daemon 后无人判死正是同一处判据的镜像）。
+            # 只有连败确认（3/3 后返回 "未运行"）、门禁拒绝、红线拦截才是真失败。
+            if _resp.get("reason") == "busy" or "暂缓 fallback" in _err:
+                LOGGER.info("send-to-role %s 角色忙/探测暂缓，未投递（排队等下轮）", role)
                 return "busy"
-            LOGGER.warning("send-to-role %s ccs send 退出码=%s (wf=%s step=%s)",
+            _m = re.search(r"tmux 投递失败.*?\((\d+)/(\d+)\)", _err)
+            if _m and int(_m.group(1)) < int(_m.group(2)):
+                LOGGER.info("send-to-role %s tmux 投递暂缓 %s/%s（排队等下轮）",
+                            role, _m.group(1), _m.group(2))
+                return "busy"
+            LOGGER.warning("send-to-role %s ccs send 退出码=%s (wf=%s step=%s) err=%s",
                            role, getattr(_result, "returncode", None),
-                           wf_id[:12] if wf_id else "?", step_id)
-            return False  # 非零退出码 = 投递失败：调用方据此不盖戳，下轮重试
+                           wf_id[:12] if wf_id else "?", step_id, _err[:200])
+            return False  # 非零退出码且非暂缓 = 投递失败：调用方据此不盖戳，下轮重试
         return True  # 投递成功（ccs send 正常退出）

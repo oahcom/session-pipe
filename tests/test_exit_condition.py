@@ -476,6 +476,8 @@ class TestTickVerifyBlocked(unittest.TestCase):
         # verify 阻断推进；不隔离它就会让"写了几次 blocker"取决于重试状态，
         # 全量跑间歇红、单跑绿，还额外烧 90s。
         eng._ensure_role_alive = MagicMock(return_value=True)
+        # 投递路径里的 _wait_for_role_ready 会真实 sleep（单跑 90s）——本用例不验它。
+        eng._wait_for_role_ready = MagicMock(return_value=False)
         eng._check_exit = MagicMock(return_value=(time.time(), [{"id": 1, "text": "match", "ts": time.time(), "src": "test"}]))
         eng._validate_exit_schema = MagicMock(return_value=(True, []))
 
