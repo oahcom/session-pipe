@@ -48,11 +48,9 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
         # 都可能返回更多，函数自己的 limit 语义必须在这里兑现。
         if effective_limit <= 0:
             return []  # max_messages_per_poll=0 是"不轮询"，不是"不限"（旧行为是空列表）
-        try:
-            return bb.unconsumed(consumer=consumer, limit=effective_limit)[:effective_limit]
-        except TypeError:
-            # 老版 bus 没有 limit 形参（跨仓部署顺序不保证），退回本地切片
-            return bb.unconsumed(consumer=consumer)[:effective_limit]
+        # [:effective_limit] 是契约兜底（bus 若返回更多仍按本函数的 limit 语义裁剪），
+        # 不做 try/except 兼容：形参两侧同批上线，吞 TypeError 会盖住函数内部真错并二次调用。
+        return bb.unconsumed(consumer=consumer, limit=effective_limit)[:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
