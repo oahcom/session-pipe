@@ -11,6 +11,7 @@ eval_checker.py — eval_criteria 运行时执行器。
 """
 
 import ast, json, logging, os, random, re, shlex, subprocess, sys, time
+from datetime import datetime
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -43,6 +44,14 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
 
 # thrash loop 判定：同一 Bash command 连续重复 ≥ 此次数且无其他 distinct 命令插入
 _THRASH_REPEAT_MIN = 4
+
+# 子代理遵从只看近窗。不设窗 = 一次旧轮次永久拉低该角色比例，本文件已在
+# orphan_call / schema 自纠两处踩过同一坑（跨 102 session 永久追责）。
+_SUBAGENT_WINDOW_S = 24 * 3600
+
+# 引擎强制子代理指令的标题（wf_lifecycle._subagent_directive 注入）：
+# 子代理合规统计靠它切轮，改文案必须同步这里。
+_SUBAGENT_DIRECTIVE_MARK = "本步必须使用子代理（引擎强制）"
 
 # ── extract "验证:" from criterion ──
 
@@ -792,6 +801,20 @@ class LeverageAccumulationChecker:
         return True
 
 
+def _ts_recent(ts: str, cutoff: float) -> bool:
+    """transcript 时间戳是否在 cutoff 之后。ts 为 ISO UTC（…Z）。
+
+    解析失败按「不新」处理：宁可少算一轮，也不把无法定时的事实当成新证据。
+    """
+    if not ts:
+        return False
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return dt.timestamp() >= cutoff
+
+
 def _result_text(blk: dict) -> str:
     """把 tool_result 的 content 规整成纯文本（str / list[str] / list[dict] 皆可）。"""
     ct = blk.get("content", "")
@@ -837,7 +860,8 @@ class TrajectoryQualityChecker:
         """读取所有 jsonl，提取有序 (tool_use, tool_result) 调用序列。
 
         返回扁平列表，每项 {kind, name, input, id, error, order, src}。
-        kind ∈ {use, result}。order 为全局单调递增序号，保留跨文件时序。
+        kind ∈ {use, result, say}。say 是纯字符串输入行（人类/引擎派单），带 ts。
+        order 为全局单调递增序号，保留跨文件时序。
         src 为该调用所属 jsonl 文件名——orphan_call 判据需要按 transcript
         边界区分"会话到此为止"与"角色中途漏收结果"（见 check 内注释）。
         """
@@ -856,12 +880,30 @@ class TrajectoryQualityChecker:
                             except json.JSONDecodeError:
                                 continue
                             content = d.get("message", {}).get("content")
+                            # 人类/引擎输入是纯字符串；强制子代理指令正落在这类消息里。
+                            # 保留其位置，判据才能切出「收到指令之后」的工具调用窗口。
+                            if isinstance(content, str):
+                                if content.strip():
+                                    order += 1
+                                    calls.append({
+                                        "kind": "say", "name": None, "input": {},
+                                        "id": None, "error": None, "order": order,
+                                        "text": content, "src": str(jf),
+                                        "ts": d.get("timestamp", ""),
+                                    })
+                                continue
                             if not isinstance(content, list):
                                 continue
                             for blk in content:
                                 if not isinstance(blk, dict):
                                     continue
                                 if blk.get("type") == "tool_use":
+                                    # 解析失败的重试残影：同一调用会各留一条可解析与
+                                    # 一条 __unparsedToolInput（实测 2760 对，0 例外）。
+                                    # 两条同 id 会让「写调用↔创建结果」配错号，把新建写
+                                    # 误判成盲改（R129 pg/reviewer 14 条全是这一类）。
+                                    if "__unparsedToolInput" in (blk.get("input") or {}):
+                                        continue
                                     order += 1
                                     calls.append({
                                         "kind": "use", "name": blk.get("name"),
@@ -965,14 +1007,32 @@ class TrajectoryQualityChecker:
                 tail_use_ids.add(c["id"])
 
         # 新建文件不算盲改：把“写调用→新建文件路径”映射出来，免除该调用的盲改判定。
-        created_by_call: dict[tuple[str, str], str] = {}
+        # 同一 transcript 内 tool_use id 会重复（实测 3839 处），不能按 id 做唯一键：
+        # 顺序配对 use→result，让同 id 的第二条写不继承前一条的新建豁免。
+        # 路径捕获到行尾（不是 \S+）：路径可含空格，截断会同时造成误报与漏报。
+        created_by_call: dict[tuple[str, str, int], str] = {}
+        _pending: dict[tuple[str, str], int] = {}   # (src, id) → 最近一条 Write use 的序号
         for c in calls:
-            # is_error 结果不认：错误回显可能自带 input 文本（含该短语）。
-            if c["kind"] == "result" and c["id"] and not c["error"]:
-                m = re.search(r"File created successfully at:\s*(\S+)",
-                              c.get("text") or "")
+            if c["kind"] == "use" and c["name"] == "Write" and c["id"]:
+                _pending[(c["src"], c["id"])] = c["order"]
+            elif c["kind"] == "result" and c["id"] and not c["error"]:
+                _k = (c["src"], c["id"])
+                if _k not in _pending:
+                    continue
+                _line0 = (c.get("text") or "").split(chr(10))[0]
+                m = re.match(
+                    r"File created successfully at: (.+?)(?: \(file state|$)",
+                    _line0)
                 if m:
-                    created_by_call[(c["src"], c["id"])] = m.group(1)
+                    created_by_call[(_k[0], _k[1], _pending[_k])] = m.group(1).strip()
+
+        # 写没落地就不构成盲改：pg 的「No such tool available: Write」曾被报成
+        # blind_edit（文件根本没写）。同 id 可能有成功+失败两条结果（重试残影），
+        # 只要有一条成功就说明写发生过，仍按盲改判定。
+        _ok_ids = {c["id"] for c in calls
+                   if c["kind"] == "result" and c["id"] and not c["error"]}
+        failed_ids = {c["id"] for c in calls
+                      if c["kind"] == "result" and c["id"] and c["error"]} - _ok_ids
 
         def _close_thrash():
             nonlocal repeat_run, repeat_window_start, last_cmd
@@ -984,6 +1044,11 @@ class TrajectoryQualityChecker:
             repeat_run, repeat_window_start, last_cmd = 0, None, None
 
         for c in calls:
+            if c["kind"] == "say":
+                # 人类/引擎的输入是轮次边界：既不是「Bash 无进展」，也不是盲改的读取证据。
+                _close_thrash()
+                continue
+
             if c["kind"] == "result":
                 if c["id"]:
                     result_ids.add(c["id"])
@@ -1016,7 +1081,9 @@ class TrajectoryQualityChecker:
                 # 此结果对应此前发出的该写调用（result id == tool_use_id）。
                 # 路径也必须相符：只认「这条写调用自己新建了这个文件」。
                 # 不让任意含该文案的结果豁免（错误回显 input 时也含此短语）。
-                if cid and created_by_call.get((c["src"], cid)) == fp:
+                if cid and cid in failed_ids:
+                    continue
+                if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
                     continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
@@ -1061,7 +1128,37 @@ class TrajectoryQualityChecker:
             "passed": passed,
             "findings": findings,
             "checked_traces": checked_traces,
+            "subagent": self._subagent_compliance(calls),
         }
+
+    def _subagent_compliance(self, calls: list[dict]) -> dict:
+        """统计「收到引擎强制子代理指令的轮次里，实际派了子代理的比例」。
+
+        观测型，不参与 passed：指令落地的判定标准（哪些步骤强制、例外是否成立）
+        还没有实测定论，此时把它做成硬门槛会重演「恒真验证」反向的错误——
+        用一条未经验证的判据去否决算得出正确结论的角色。
+
+        切轮边界取 say 消息（人类/引擎的输入行）。例外条款（1-2 条命令可得结论
+        可自办）无法判定，故只报数不下结论。
+        """
+        mark = _SUBAGENT_DIRECTIVE_MARK
+        cutoff = time.time() - _SUBAGENT_WINDOW_S
+        rounds = 0
+        followed = 0
+        for i, c in enumerate(calls):
+            if c["kind"] != "say" or mark not in (c.get("text") or ""):
+                continue
+            if not _ts_recent(c.get("ts", ""), cutoff):
+                continue
+            rounds += 1
+            # 本轮到下一次输入之间的工具调用即该轮的响应窗口。
+            for nxt in calls[i + 1:]:
+                if nxt["kind"] == "say":
+                    break
+                if nxt["kind"] == "use" and nxt["name"] == "Agent":
+                    followed += 1
+                    break
+        return {"rounds": rounds, "followed": followed}
 
 
 def run_eval_check(role_filter: str | None = None) -> dict:
@@ -1192,6 +1289,22 @@ def run_eval_check(role_filter: str | None = None) -> dict:
             traj = TrajectoryQualityChecker()
             for role in sampled:
                 traj_result = traj.check(role["name"], f"eval_{role['name']}")
+                # 子代理遵从：观测型，不计入 passed/failed，只落 bus 供人读。
+                # 只有真的派过指令才报，避免给没收到指令的角色刷 0 值噪音。
+                _sub = traj_result.get("subagent") or {}
+                if _sub.get("rounds", 0) > 0:
+                    _write_bus(
+                        "verification",
+                        f"[eval_checker] 子代理遵从: {role['name']} "
+                        f"{_sub['followed']}/{_sub['rounds']} 轮",
+                        evidence=(
+                            f"role={role['name']} 近 {_SUBAGENT_WINDOW_S // 3600}h "
+                            f"收到引擎强制子代理指令 {_sub['rounds']} 轮，"
+                            f"其中派了 Agent 的 {_sub['followed']} 轮。"
+                            f"例外条款（1-2 条命令可得结论可自办）无法自动判定，"
+                            f"此值仅作观察，不判角色对错。"
+                        ),
+                    )
                 if not traj_result["passed"] and traj_result.get("checked_traces", 0) > 0:
                     summary["failed"] += 1
                     summary["checked"] += 1
