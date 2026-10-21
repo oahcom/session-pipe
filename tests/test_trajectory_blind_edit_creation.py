@@ -573,6 +573,63 @@ def test_scratch_edit_still_flagged() -> None:
             pass
 
 
+
+
+def test_own_workspace_write_not_flagged() -> None:
+    """角色写自己 ccs-workspaces 里的报告不算盲改：那是它自己的产出物。
+
+    实测 maintainer 每天整篇重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT，
+    窗口收紧后这 3 条一度变成新的红灯。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-ownws-role"
+    path = "/home/administrator/ccs-workspaces/ownws--probe/REPORT.md"
+    lines = _write_seq(0, "co1", path,
+                       f"The file {path} has been updated successfully.")
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("ownws--probe", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"自己 workspace 的报告写不该判盲改: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_stale_transcript_not_judged() -> None:
+    """超过 24h 的转录不参与轨迹判据：历史事件不能把角色永久钉红。
+
+    实测 scout 的 orphan_call 来自 2026-10-19 13:34 的转录（bus #387262），
+    之后每轮都判红，当轮做得再好也翻不了绿。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-stale-role"
+    path = "/data/probe_stale.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "so1", "name": "Write",
+             "input": {"file_path": path, "content": "x=1"}},
+        ]),
+        _turn(1, "assistant", [
+            {"type": "tool_use", "id": "so2", "name": "Bash",
+             "input": {"command": "ls /nonexistent-stale"}},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        stale = 1700000000.0
+        os.utime(jf, (stale, stale))
+        res = TrajectoryQualityChecker().check("stale", "t")
+        assert res["findings"] == [], f"过期转录仍被判定: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -592,6 +649,8 @@ if __name__ == "__main__":
         test_second_write_of_own_file_not_flagged,
         test_scratch_write_not_flagged,
         test_scratch_edit_still_flagged,
+        test_own_workspace_write_not_flagged,
+        test_stale_transcript_not_judged,
     )
     for _t in _tests:
         _t()

@@ -45,6 +45,13 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
 # thrash loop 判定：同一 Bash command 连续重复 ≥ 此次数且无其他 distinct 命令插入
 _THRASH_REPEAT_MIN = 4
 
+# 轨迹判据（orphan/thrash/schema/盲改）同样只看近窗：判据本身无窗口时，
+# 一次历史事件会让角色永久 FAIL —— 实测 scout 的 orphan_call 来自
+# 2026-10-19 13:34 的转录（bus #387262 记的就是它），此后每 10 分钟一轮
+# 全部判红，任何当轮改进都翻不了绿。与 _SUBAGENT_WINDOW_S 同一理由：
+# 判据要看"现在做得怎样"，不是"三天前错过一次"。
+_TRAJ_WINDOW_S = 24 * 3600
+
 # 子代理遵从只看近窗。不设窗 = 一次旧轮次永久拉低该角色比例，本文件已在
 # orphan_call / schema 自纠两处踩过同一坑（跨 102 session 永久追责）。
 _SUBAGENT_WINDOW_S = 24 * 3600
@@ -887,8 +894,14 @@ class TrajectoryQualityChecker:
         """
         calls: list[dict] = []
         order = 0
+        cutoff = time.time() - _TRAJ_WINDOW_S
         for sess in sorted(sessions):
             for jf in sorted(sess.glob("*.jsonl")):
+                try:
+                    if jf.stat().st_mtime < cutoff:
+                        continue
+                except OSError:
+                    continue
                 try:
                     with jf.open(encoding="utf-8", errors="ignore") as fh:
                         for line in fh:
@@ -1010,8 +1023,14 @@ class TrajectoryQualityChecker:
             """
             return os.path.realpath(os.path.expanduser(fp)) if fp else ""
 
+        _own_root = os.path.realpath(
+            str(Path.home() / "ccs-workspaces" / role.lower().replace("_", "-"))).rstrip(os.sep) + os.sep
+
         def _is_scratch(fp: str) -> bool:
-            """临时目录里的草稿：只豁免 Write，不豁免 Edit。
+            """角色的草稿区：/tmp 与它自己的 ccs-workspaces 目录。只豁免 Write。
+
+            自己的 workspace 里是它自己产出的报告（maintainer 的 HEALTH_CHECK /
+            DIAGNOSIS / FIX_REPORT 每天整篇重写），没有"别人的既有内容"可覆盖。
 
             Write 是全量覆盖，Claude Code 的返回本身写着 "no need to Read it back"，
             草稿也没有需要保护的既有内容：实测 24h 全 19 角色只剩 2 处 blind_edit，
@@ -1025,7 +1044,8 @@ class TrajectoryQualityChecker:
             ponytail: 天花板=/tmp 下写报告类交付物（12.2% 是 .md/.txt）时不判盲改；
             升级路径=改成草稿目录白名单配置。
             """
-            return _key(fp).startswith(("/tmp/", "/var/tmp/"))
+            k = _key(fp)
+            return k.startswith(("/tmp/", "/var/tmp/")) or k.startswith(_own_root)
 
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
