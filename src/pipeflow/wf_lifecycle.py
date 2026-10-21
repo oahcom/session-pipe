@@ -768,10 +768,14 @@ class WorkflowLifecycleMixin:
         # 已通知，只剩 30min 超时重推兜底（codex 三方审查 P1-2，2026-10-17）。
         # _mark_step_delivery_failed 内部判据是 `status == "notified"`，恰好适用。
         if _delivered is not True:
+            # 把 sender 的三态原样带给记账方：'busy' 是排队（下轮正常重试），
+            # False 才是真失败（变量未替换/goal 被拒/未就绪超时）。旧文案两种
+            # 根因合成一句"角色忙或变量未替换"，7 天 103 条 blocker 无法归因。
+            _why = "busy" if _delivered == "busy" else "refused"
             if _delivered == "busy":
                 LOGGER.debug("advance skip: %s 角色忙，已回退 step 待下轮重推",
                              next_step.target_role)
-            self._mark_step_delivery_failed(lm, wf_id, next_step.id)
+            self._mark_step_delivery_failed(lm, wf_id, next_step.id, why=_why)
             return
 
 
@@ -954,7 +958,12 @@ class WorkflowLifecycleMixin:
         return False
 
 
-    def _mark_step_delivery_failed(self, lm, wf_id: str, step_id: str):
+    _DELIVERY_WHY = {
+        "busy": "角色忙排队（正常，下轮重试）",
+        "refused": "sender 拒绝（变量未替换 / goal 无实质内容 / 投递异常）",
+    }
+
+    def _mark_step_delivery_failed(self, lm, wf_id: str, step_id: str, why: str = ""):
         """投递失败回退：清掉 notified_at，把该 step 状态归 pending。
 
         锁外调用（_send_to_role 已被进程外 ccs send 占用）。重读 DB 当前
@@ -985,10 +994,15 @@ class WorkflowLifecycleMixin:
                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                              (json.dumps(_sr, ensure_ascii=False), wf_id))
                 conn.commit()
-            LOGGER.warning("delivery_failed 回退 %s/%s → pending，下轮重发", wf_id[:8], step_id)
+            # 根因写在标题里：旧文案把「排队」与「被拒」合成一句，blocker 无法归因
+            # （7 天 103 条同题，实际要分别对着 queue-cap 与 UNMATCHED_VAR 查）。
+            _reason = self._DELIVERY_WHY.get(why, "未标注原因")
+            LOGGER.warning("delivery_failed 回退 %s/%s → pending（%s），下轮重发",
+                           wf_id[:8], step_id, _reason)
             self._bb.write("blocker",
-                f"[workflow] {wf_id[:12]}/{step_id} 投递失败已回退 pending（角色忙或变量未替换）",
-                evidence=f"下一步将重新 advance 重发", src="workflow_engine")
+                f"[workflow] {wf_id[:12]}/{step_id} 投递失败已回退 pending（{_reason}）",
+                evidence=f"下一步将重新 advance 重发；本步 status 已置空等待重投",
+                src="workflow_engine")
         except Exception as _e:
             LOGGER.warning("_mark_step_delivery_failed 失败 %s/%s: %s", wf_id[:8], step_id, _e)
 
@@ -1083,6 +1097,16 @@ class WorkflowLifecycleMixin:
                 _msgs_text += "\n" + _rej
         # 从结构化分类中提取问题列表
         _sys_issues, _biz_issues, _sys_role, _biz_role = self._parse_review_issues(_msgs_text)
+        if not _sys_issues and not _biz_issues:
+            # 人工驳回常只写一句话（「PRD 缺验收标准」），没有【业务问题】标记 →
+            # 解析恒空 → 只能回退重投原步，3 次封顶后停摆（G 审查实测该形态）。
+            # 已知返工对象（映射表内角色）就用这句话建一条业务返工链；表外角色
+            # 维持原语义（盲目重投），避免把 pm/reviewer 产物误派给 engineer。
+            _rej_txt = str(_done_sr.get("rejection_reason") or "").strip()
+            _tgt_role = str(getattr(review_step, "target_role", "") or "")
+            if _rej_txt and _tgt_role in _REWORK_TPL_FOR_ROLE:
+                _biz_issues = [_rej_txt[:300]]
+                _biz_role = _tgt_role
         if not _sys_issues and not _biz_issues:
             LOGGER.info("rework: %s/%s review 无分类问题，跳过返工", wf_id[:8], review_step_id)
             return False
