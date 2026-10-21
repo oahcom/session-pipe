@@ -799,7 +799,9 @@ def _result_text(blk: dict) -> str:
         parts: list[str] = []
         for b in ct:
             if isinstance(b, dict):
-                parts.append(b.get("text", ""))
+                _t = b.get("text")
+                if isinstance(_t, str):
+                    parts.append(_t)
             elif isinstance(b, str):
                 parts.append(b)
         return "\n".join(parts)
@@ -963,13 +965,12 @@ class TrajectoryQualityChecker:
                 tail_use_ids.add(c["id"])
 
         # 新建文件不算盲改：把“写调用→新建文件路径”映射出来，免除该调用的盲改判定。
-        created_by_call: dict[str, str] = {}
+        created_by_call: set[tuple[str, str]] = set()
         for c in calls:
             if c["kind"] == "result" and c["id"]:
-                m = re.search(r"File created successfully at:\s*(\S+)",
-                              c.get("text") or "")
-                if m:
-                    created_by_call[c["id"]] = m.group(1)
+                if re.search(r"File created successfully at:\s*(\S+)",
+                             c.get("text") or ""):
+                    created_by_call.add((c["src"], c["id"]))
 
         def _close_thrash():
             nonlocal repeat_run, repeat_window_start, last_cmd
@@ -1011,7 +1012,7 @@ class TrajectoryQualityChecker:
                 # 新建文件不是「盲改」：文件此前不存在，根本无法先 Read。
                 # Claude Code 的写结果为 "File created successfully at: <path>"，
                 # 此结果对应此前发出的该写调用（result id == tool_use_id）。
-                if cid and cid in created_by_call:
+                if cid and (c["src"], cid) in created_by_call:
                     continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
