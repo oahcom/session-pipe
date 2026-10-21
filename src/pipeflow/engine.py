@@ -311,6 +311,13 @@ from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
                                    _role_producing_recently)
 
 
+# 单 tick 预算：实测 16 个实例一轮 run_once 耗时 399s（2026-10-22 03:31 隔离探针），
+# 主因是 tmux/ccs 调用在内存压力下各自吃满 5~60s 超时。服务重启（TimeoutStopSec=90）
+# 一来就打断整轮 → 一步都推不动。超预算只中止本轮的**剩余实例**，状态在 DB 里，
+# 下一轮接着跑（每实例的处理本身幂等）。
+_TICK_BUDGET_SEC = 60
+
+
 class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMixin, StepHandlerMixin):
     """工作流引擎主类。各 mixin 提供具体职责，此类保留编排与 CLI。"""
 
@@ -857,6 +864,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
 
     def run_once(self):
+        _t_tick = time.time()
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
 
@@ -881,6 +889,29 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         except Exception as e:
             LOGGER.debug("orphan task cleanup in run_once failed: %s", e)
 
+        # 已完成待推进的步骤先单独推进一轮，再进主循环。
+        # 主循环前面压着 _scan_tasks（逐角色 tmux has-session，内存压力下实测
+        # 5s 超时 × N 角色吃满，单 tick 399s）：把"完成一步 → 通知下一步"排在
+        # 它后面，一步都推不动（2026-10-22 实测 4 个实例卡 step_done_ready 1.5~2.4h）。
+        # 预推进写在 _scan_tasks 之前也意味着它回的整字典快照不会被之后落的
+        # 子链账本反向覆盖（那条顺序约束见上面 early _scan_tasks 的注释）。
+        try:
+            for _pr in self._lifecycle.query(
+                    "SELECT instance_id, template_id, current_step_id, step_results "
+                    "FROM workflow_instances "
+                    "WHERE status IN ('running','step_done_ready')"):
+                if time.time() - _t_tick > _TICK_BUDGET_SEC:
+                    LOGGER.warning("预推进超 %ds 预算，余下实例下轮再推", _TICK_BUDGET_SEC)
+                    break
+                _pr_sr = json.loads(_pr["step_results"] or "{}")
+                if ((_pr_sr.get(_pr["current_step_id"]) or {}).get("status")
+                        not in ("step_done_ready", "completed")):
+                    continue
+                self._advance_production_wf(_pr["instance_id"], self._lifecycle, _pr["template_id"],
+                                            _pr["current_step_id"], _pr_sr)
+        except Exception as _pr_e:
+            LOGGER.warning("advance pre-pass failed: %s", _pr_e)
+
         # 确保工作流涉及的角色存活（assignee + target_role + guard.watch）
         self._ensure_guard_roles()
         # 子链回流先于实例循环：_scan_tasks 写的 subflow_retry/subflow_failed_*
@@ -897,6 +928,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             lm.ping()
         except (ValueError, KeyError, TypeError):
             LOGGER.debug("lifecycle ping failed during run_once")
+
         try:
             rows = lm.query(
                 # task_id 必选：下方 run context 补齐（integrity 提醒填充任务正文）依赖它
@@ -908,6 +940,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
             for row in rows:
+                if time.time() - _t_tick > _TICK_BUDGET_SEC:
+                    LOGGER.warning("tick 超 %ds 预算，中止本轮剩余实例（下轮续跑）",
+                                   _TICK_BUDGET_SEC)
+                    break
                 inst = dict(row)
                 if inst.get("status") == "pending":
                     lm.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
@@ -1228,6 +1264,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 步骤已完成 → 自动推进到下一步
                 # step_done_ready/completed 由角色或外部系统标记，无需额外的 completion_check
                 if step_status in ("step_done_ready", "completed"):
+                    # 先推进、再发提醒：提醒走 _send_to_role（role_lifecycle 的 60s 超时，
+                    # 内存压力下实测吃满），排在推进前会把"完成一步 → 通知下一步"堵在
+                    # 一条例行提醒后面（2026-10-22 探针：单 tick 399s，一半卡在这里）。
+                    self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
+                    # 推进后立即把行 status 改为 running（推进到非最后一步时），
+                    # 避免角色重复 wf complete 把行 status 打回 step_done_ready
+                    lm.execute("UPDATE workflow_instances SET status='running' "
+                               "WHERE instance_id=? AND status='step_done_ready'",
+                               (inst["instance_id"],))
                     # 用户要求"每个步骤"都提醒 → step_done_ready 路径也补发完整性提醒
                     try:
                         from pipeflow.integrity import send_bypass_reminder as _sbr
@@ -1262,12 +1307,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                              sync_step_results=_persist_step_done)
                     except Exception:
                         LOGGER.debug("step_done_ready integrity send failed for %s", inst["instance_id"])
-                    self._advance_production_wf(inst["instance_id"], lm, wf_name, step_id, results)
-                    # 推进后立即把行 status 改为 running（推进到非最后一步时），
-                    # 避免角色重复 wf complete 把行 status 打回 step_done_ready
-                    lm.execute("UPDATE workflow_instances SET status='running' "
-                               "WHERE instance_id=? AND status='step_done_ready'",
-                               (inst["instance_id"],))
                     continue
                 # ── rejected 消费──
                 # rejected 曾是只写不读的死状态：写入点 2 处（manager.py W1/W2），
@@ -1490,8 +1529,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             _tb.print_exc()
 
 
-        self._scan_tasks()
-        LOGGER.debug("run_once: _scan_tasks done, querying workflow status...")
+        if time.time() - _t_tick > _TICK_BUDGET_SEC:
+            # _scan_tasks 逐角色 tmux has-session（liveness.py，5s 超时 × N 角色），
+            # 是 tick 后半段的主要耗时。超预算时跳过：它只同步 TASKS.md 状态，
+            # 下一轮重跑无副作用。
+            LOGGER.warning("tick 已超 %ds 预算，跳过 _scan_tasks", _TICK_BUDGET_SEC)
+        else:
+            self._scan_tasks()
+            LOGGER.debug("run_once: _scan_tasks done, querying workflow status...")
 
         # 报告当前工作流概况
         try:
