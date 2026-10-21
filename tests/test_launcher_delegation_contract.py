@@ -2,8 +2,11 @@
 
 codex P1（2f45115）：launcher/src/workflow/client.py 用
 `sys.path.insert(SESSION_PIPELINE_SRC); from workflow.client import WorkflowClient`
-去调 create_task_v2 / confirm / pull_approval。删掉任何一个，launcher 的
-wf approval/create/confirm 就在运行时 AttributeError，编译期看不出来。
+去调 create_task_v2 / confirm。删掉任何一个，launcher 的 wf create/confirm
+就在运行时 AttributeError，编译期看不出来。
+
+pull_approval 已随审批密钥退场一并删除（2026-10-22）：launcher 侧包装与
+wf approval CLI 先删，本仓这只剩这一个 AST 断言在用，留着等于为测试养死代码。
 
 实现用 ast 解析本仓源码，而不是 import：全套测试里 `workflow` 包可能已被
 pipeflow.engine 从别的路径导入（sys.modules 缓存），sys.path.insert 不生效，
@@ -14,7 +17,7 @@ import ast
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent.parent / "src" / "workflow" / "client.py"
-_DELEGATED = ("create_task_v2", "confirm", "pull_approval")
+_DELEGATED = ("create_task_v2", "confirm")
 
 
 def test_launcher_delegated_methods_exist():

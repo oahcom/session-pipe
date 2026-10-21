@@ -99,18 +99,6 @@ def reconfigure() -> None:
     setup_logging(level=log_level, json_output=log_json)
 
 
-# ── 配置热加载 ──────────────────────────────────────────────────────
-
-# 记录上次加载时 config.yaml 的 mtime，变化时才重建全局实例
-
-
-_CONFIG_FILE = Path(os.environ.get(
-    "SESSION_PIPELINE_CONFIG",
-    str(Path.home() / "session-pipeline" / "config" / "config.yaml"),
-))
-
-
-
 
 # ── 优雅关闭 ────────────────────────────────────────────────────────
 

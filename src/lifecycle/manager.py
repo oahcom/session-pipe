@@ -55,7 +55,7 @@ class LifecycleManager:
     - DB 连接/查询: query/query_one/execute/_conn_tx/ping
     - 模板 CRUD: upsert_template/get_wf/get_step/_get_template
     - 实例生命周期: start_wf/complete_step/fail_step/rollback_step/close_wf
-    - 审批流: get_approval_token/confirm_step/_notify_result（密钥签发已退场）
+    - 审批流: confirm_step/_notify_result（密钥签发已退场 2026-10-22）
     - 内部工具: _get_wf_unsafe/_parse_results/_set_step_result_unsafe/_log_unsafe
     """
 
@@ -357,10 +357,9 @@ class LifecycleManager:
         因此卡死 61 分钟，同时把 product_architect 判忙，锁死同角色 3 个其它工作流
         （排队 7~21 次）。返回空表示「无审批人」→ 不发 token → 引擎直接推进。
 
-        返回值有两处消费：发放 approval_token，以及 confirm_step 校验调用者
-        是否有权确认/驳回（本文件 :404-410）。handoff 不发 token（见
-        _complete_handoff_unsafe），但此处的计算必须保留 —— 抽空会让
-        confirm_step 的授权校验失效，任何角色都能把 handoff 打成 rejected。
+        返回值的消费方：confirm_step 校验调用者是否有权确认/驳回。密钥签发已退场
+        （2026-10-22）；此处的计算必须保留 —— 抽空会让 confirm_step 的授权校验失效，
+        任何角色都能把 handoff 打成 rejected。
         """
         st = step.get("type", "")
         target = step.get("target_role", "")
@@ -407,57 +406,13 @@ class LifecycleManager:
         return ""
 
 
-    def get_approval_token(self, wf_id: str, step_id: str,
-                           requester: str = "") -> Optional[str]:
-        """审批人拉取自己的审批密钥（带鉴权与状态门控）。
-
-        为什么需要拉取通道（bus #427318/#427380）：token 只有 `ccs send` 一条
-        推送路径，角色正在思考时 tmux 拒绝注入 → 降级写 bus 时 token 被脱敏成
-        *** → 审批人拿不到钥匙，闸门形同虚设（全库 426 个 token 消费率 0）。
-        推送失败时审批人必须能自己取回。
-
-        fail-closed：requester 为空、无审批人、非审批人一律 PermissionError。
-        引擎自身判断「token 免了没」用 get_approval_token_raw()。
-        """
-        wf = self._get_wf_unsafe(wf_id)
-        if not wf:
-            return None
-        step = self.get_step(wf_id, step_id)
-        # 只认显式请求人：空串不是「内部调用」，是没鉴权。
-        assigner = self._get_assigner_for_step(wf, step or {}, step_id)
-        if not assigner or requester != assigner:
-            raise PermissionError(
-                f"仅审批人可拉取密钥: {requester!r} != {assigner or '无审批人'}")
-        cur = self._parse_results(wf).get(step_id, {})
-        # 只对「等审批」的步骤放行：已消费/已过期/状态已推进的 token 一律不返回，
-        # 否则审批人拿着死钥匙反复 confirm，错误信息还会掩盖真原因。
-        if cur.get("status") != "step_done_ready":
-            return None
-        if cur.get("approval_consumed_at"):
-            return None
-        if cur.get("approval_token_ttl", 0) > 0 and time.time() > cur["approval_token_ttl"]:
-            return None
-        return cur.get("approval_token")
-
-    def get_approval_token_raw(self, wf_id: str, step_id: str) -> Optional[str]:
-        """无鉴权读取（引擎内部：判断该步是否还在等审批，不可作对外入口）。"""
-        wf = self._get_wf_unsafe(wf_id)
-        if not wf:
-            return None
-        return self._parse_results(wf).get(step_id, {}).get("approval_token")
-
-    def approval_ttl_remaining(self, wf_id: str, step_id: str) -> float:
-        """审批密钥剩余有效秒数；无 token 返回 0。"""
-        wf = self._get_wf_unsafe(wf_id)
-        if not wf:
-            return 0.0
-        cur = self._parse_results(wf).get(step_id, {})
-        if not cur.get("approval_token") or cur.get("approval_consumed_at"):
-            return 0.0
-        return max(0.0, float(cur.get("approval_token_ttl", 0)) - time.time())
+    # 审批密钥已退场（2026-10-22，见 _complete_review_unsafe 注释）：签发者、
+    # 消费者、拉取通道三者都已删除。此前保留 get_approval_token /
+    # get_approval_token_raw / approval_ttl_remaining 三方法时，全库 471 张
+    # 死密钥仍然可以被「拉回」，实测 107 条/天「步骤审批请求」灌进角色上下文。
 
     def confirm_step(self, wf_id: str, step_id: str, token: str = "",
-                     approved: bool = True, reason: str = "", allow_expired: bool = False) -> bool:
+                     approved: bool = True, reason: str = "") -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -471,35 +426,15 @@ class LifecycleManager:
                     raise ValueError(
                         f"步骤 {step_id} 状态为 {current.get('status','?')}，非 step_done_ready")
 
-                # ── 审批密钥验证 ──
-                stored_token = current.get("approval_token")
-                if stored_token:
-                    if not token:
-                        raise PermissionError("approval token required but not provided")
-                    if current.get("approval_consumed_at"):
-                        raise PermissionError("token already used")
-                    if time.time() > current.get("approval_token_ttl", 0) and not allow_expired:
-                        raise PermissionError("token expired")
-                    if token != stored_token:
-                        raise PermissionError("invalid token")
-                    # 持钥即放行 = 任何拿到 DB 副本/日志的人都能越权确认。钥匙本来
-                    # 只发给审批人，这里必须再验一次身份（ccs-monitor #427818 实测：
-                    # 副本 DB 越权 confirm 可复现）。引擎自身的自动推进/超时兜底以
-                    # workflow_engine 身份调用，按系统角色豁免。
-                    _step = self.get_step(wf_id, step_id)
-                    _assigner = self._get_assigner_for_step(wf, _step or {}, step_id)
-                    if _assigner and self.role not in (_assigner, "workflow_engine", "system"):
+                # 审批密钥已退场（2026-10-22）：确认只凭「该步审批人」身份鉴权，
+                # 密钥字段恒为空，不再签发也不再消费。存量行若仍挂着旧 approval_token，
+                # 也不拦路——由引擎按 CHANGES_REQUESTED / rejected 文本放行。
+                step = self.get_step(wf_id, step_id)
+                if step:
+                    assigner = self._get_assigner_for_step(wf, step, step_id)
+                    if assigner and self.role != assigner:
                         raise PermissionError(
-                            f"only assigner can confirm: {self.role} != {_assigner}")
-                    current["approval_consumed_at"] = time.time()
-                    current["approval_token"] = None
-                else:
-                    step = self.get_step(wf_id, step_id)
-                    if step:
-                        assigner = self._get_assigner_for_step(wf, step, step_id)
-                        if assigner and self.role != assigner:
-                            raise PermissionError(
-                                f"only assigner can confirm: {self.role} != {assigner}")
+                            f"only assigner can confirm: {self.role} != {assigner}")
 
                 # ── subflow 步骤: 确认前检查子工作流是否完成 ──
                 step_def = self.get_step(wf_id, step_id)
