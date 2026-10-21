@@ -38,7 +38,7 @@ _ENGINE_WRITEBACK_CATS = {"workflow", "task_spec", "scheduler", "monitor_wf_heal
 # persona 的 output_targets 里 → 4 角色 + watchdog 误报「产出越界」，
 # 且形成自指循环：写教训 → 被判漂移 → 再写教训。engineer #370527 取证确认。
 # session_log: base.md 要求所有角色在 /compact 前写核心结论，persona 普遍不声明
-# → 7 天 14 条漂移告警（archivist/codex-dev/coordinator/curator/devops/pm/reviewer）。
+# → 7 天 14 条漂移告警、涉 9 个角色（optimizer 最多，4 条）。
 _ALWAYS_ALLOWED = ({"notice", "architecture", "monitor_audit", "reflexion_lesson", "session_log"}
                    | _ENGINE_WRITEBACK_CATS)
 
