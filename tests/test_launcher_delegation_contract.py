@@ -8,7 +8,7 @@ wf approval/create/confirm 就在运行时 AttributeError，编译期看不出�
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path.home() / "session-pipeline" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # 本仓这份，非 ~/session-pipeline
 from workflow.client import WorkflowClient  # noqa: E402
 
 

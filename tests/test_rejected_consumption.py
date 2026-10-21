@@ -256,8 +256,8 @@ class TestEscalateRejectedAnchor:
             for not_delivered in (False, 'busy'):
                 eng._send_to_role = lambda *a, _r=not_delivered, **k: _r
                 eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-未送达')
-                assert sr.get('rework_escalated_at'), (
-                    f'投递={not_delivered!r} 非送达却未落锚（改走 bus）→ 每 tick 重发升级')
+                assert 'rework_escalated_at' not in sr, (
+                    f'投递={not_delivered!r} 非送达却落了锚 → 升级永久丢失')
 
             eng._send_to_role = lambda *a, **k: True
             eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-已送达')
