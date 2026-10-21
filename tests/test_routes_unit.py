@@ -599,3 +599,131 @@ def test_directed_task_spec_not_routed(mock_metrics, mock_hb):
         mock_rt_mod.get_router.return_value = _engineer_router()
         result = route_to_ccs("engineer", dry_run=True)
     assert result["total"] == 0, "task_spec 锚点不得经路由重投"
+
+
+# ── #436146：route_all 不得替可投递类打 consume（否则 route_to_ccs 的
+#    「忙 → 下轮再试」永远轮不到，消息静默丢失） ──
+
+@patch("routing.routes.set_last_cursor")
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_all_does_not_consume_deliverable_category(mock_metrics, mock_hb, mock_cursor):
+    """可投递类（bug_report）只委派，不 safe_consume、不建 workflow。
+
+    造的是 #436146 的现场：route_all 先消费 → route_to_ccs 的 poll 再也拉不到
+    这条 fact → 角色即使空闲也永远收不到。3h 实测 200 consume / 51 进 pane。
+    """
+    from routing.routes import route_all
+    msgs = [{"id": 201, "category": "bug_report", "text": "修复登录模块非json文本",
+             "priority": 1, "consumers": ["engineer"]}]
+    mock_router = MagicMock()
+    mock_router.routing = {"engineer": {"consume": ["bug_report"]}}
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("bus_protocol.Blackboard"), \
+         patch("routing.routes.WorkflowClient") as mock_wf, \
+         patch("routing.routes.IDEMPOTENT_CONSUME") as mock_idem, \
+         patch("routing.routes.CIRCUIT_BREAKER") as mock_cb:
+        mock_rt_mod.get_router.return_value = mock_router
+        mock_cb.call.side_effect = lambda fn: fn()
+        result = route_all(consumer="test", dry_run=False, instance_id="test_6")
+    d = result["details"][0]
+    assert d["assigned"] == [{"role": "engineer", "status": "delegated"}], d
+    mock_idem.safe_consume.assert_not_called(), "route_all 抢了 route_to_ccs 的 consume"
+    mock_wf.assert_not_called(), "建链交给发送成功的一方，否则构建仍会替未送达的建任务"
+
+
+@patch("routing.routes.set_last_cursor")
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_all_still_consumes_system_category(mock_metrics, mock_hb, mock_cursor):
+    """system 类不走 pane 投递，继续在这里消费（否则永远无人消费、日志告警常亮）。"""
+    from routing.routes import route_all, _SYSTEM_CATEGORIES
+    cat = sorted(_SYSTEM_CATEGORIES)[0]
+    msgs = [{"id": 202, "category": cat, "text": "路由信号",
+             "priority": 1, "consumers": ["engineer"]}]
+    mock_router = MagicMock()
+    mock_router.routing = {"engineer": {"consume": [cat]}}
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("bus_protocol.Blackboard"), \
+         patch("routing.routes.IDEMPOTENT_CONSUME") as mock_idem, \
+         patch("routing.routes.CIRCUIT_BREAKER") as mock_cb:
+        mock_rt_mod.get_router.return_value = mock_router
+        mock_cb.call.side_effect = lambda fn: fn()
+        mock_idem.safe_consume.return_value = {"status": "consumed"}
+        route_all(consumer="test", dry_run=False, instance_id="test_7")
+    mock_idem.safe_consume.assert_called_once()
+
+
+@patch("routing.routes.set_last_cursor")
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_busy_role_still_receives_on_later_route_to_ccs(mock_metrics, mock_hb, mock_cursor):
+    """wf_busy 首轮 deferred 的 fact，次轮（角色空闲）仍能投递 —— 验收 2 的用例。
+
+    完整走 daemon 的两条路径：先 route_all（60s 一轮），再 route_to_ccs（300s 一轮）。
+    修复前 route_all 已把 (fact, engineer) 标 consumed → poll 用 NOT EXISTS(consume)
+    再也拉不到 → 角色即使空闲也永远收不到（#436146 实测 149 条）。
+    判据落在真实 bus 语义上，不用 mock 的 consume 记录。
+    """
+    from routing.routes import route_all, route_to_ccs
+    from bus_protocol import Blackboard
+
+    bb = Blackboard()
+    fid = bb.write("bug_report", f"busy 后仍要能投递 {id(object())}", src="qa")
+    assert fid > 0
+    state = {"busy": True, "sent": []}
+
+    def _fake_run(cmd, *a, **k):
+        s = str(cmd)
+        if "status-role" in s:
+            return MagicMock(returncode=0, stdout='{"alive": true}')
+        if "send" in cmd:
+            if state["busy"]:
+                return MagicMock(returncode=2, stdout='{"success": false, "reason": "busy"}', stderr="")
+            state["sent"].append(cmd[-1])
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return MagicMock(returncode=0, stdout="")
+
+    def _poll(consumer=None, **kw):
+        # 真实语义：该 consumer 未消费才返回
+        still = [f for f in bb.unconsumed(consumer=consumer) if f.id == fid]
+        # consumers 必须给：route_all 靠它判断分给谁（真实 poll 由 router 填）
+        return [{"id": f.id, "category": f.cat, "text": f.t, "priority": 1,
+                 "consumers": ["engineer"]} for f in still]
+
+    with patch("routing.auto.poll_unconsumed", side_effect=_poll), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("subprocess.run", side_effect=_fake_run), \
+         patch("routing.routes.WorkflowClient") as mock_wf:
+        mock_rt_mod.get_router.return_value = _engineer_router()
+        mock_wf.return_value.check_task.return_value = None
+        route_all(consumer="pipeline", dry_run=False, instance_id="test_8")
+        first = route_to_ccs("engineer", dry_run=False)
+        assert first["total"] == 1, f"route_all 把这条 fact 从候选集里删了: {first}"
+        assert first["details"][0]["action"] == "deferred", first
+        state["busy"] = False
+        second = route_to_ccs("engineer", dry_run=False)
+
+    assert second["details"][0]["action"] == "routed", f"busy 后同一条 fact 再也没投出去: {second}"
+    assert state["sent"], "第二轮没有真正发送"
+
+
+def test_ccs_route_log_lines_carry_fact_id_and_role():
+    """ccs-route 日志必须打出真实 fact id 与角色名（旧写法恒为 "[?] #0 → "）。"""
+    from routing_daemon import _log_ccs_routes
+
+    logged = []
+    with patch("routing_daemon.LOGGER") as mock_log:
+        mock_log.info.side_effect = lambda fmt, *a: logged.append(fmt % a if a else fmt)
+        n = _log_ccs_routes({"details": [
+            {"role": "engineer", "routed": 1, "total": 2, "details": [
+                {"id": 435003, "category": "scheduler", "action": "routed"},
+                {"id": 435004, "category": "scheduler", "action": "deferred"},
+            ]},
+            {"role": "devops", "routed": 0, "total": 0, "details": []},
+        ]})
+
+    assert n == 1, logged
+    assert logged == ["ccs-route [scheduler] #435003 → engineer"], logged

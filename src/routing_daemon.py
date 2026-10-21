@@ -97,6 +97,24 @@ def _alert_aged_queue(*, now: float | None = None) -> int:
     return len(aged)
 
 
+def _log_ccs_routes(result: dict) -> int:
+    """逐条记录 route_all_to_ccs 的 pane 投递（fact id + 角色名）。
+
+    result["details"] 是 per-role 结构（role/routed/total/details），逐 fact 的行
+    在嵌套 details 里。旧代码按平铺结构读 d["id"]/d["assigned"]，恒缺失 →
+    实测 3h 114 行全是 "[?] #0 → "，投递链无法从日志复核（#436146）。
+    返回记录条数。
+    """
+    n = 0
+    for rd in result.get("details", []):
+        for x in rd.get("details", []):
+            if x.get("action") != "routed":
+                continue
+            LOGGER.info("ccs-route [%s] #%d → %s",
+                        x.get("category", "?"), x.get("id", 0), rd.get("role", "?"))
+            n += 1
+    return n
+
 
 def _any_live_targets() -> bool:
     """如果存在任意 pid>0 且 tmux_session 非空的 CCS 哨兵则返回 True。"""
@@ -262,13 +280,21 @@ def main():
                 r = route_all()
                 routed_n, total_n = r.get("routed", 0), r.get("total", 0)
                 if routed_n:
+                    # 只逐条打「已消费」（消费=本层处理完）；delegated 是交给
+                    # route_to_ccs 送达、尚未送达，逐条打会在每 60s 窗口刷屏且被
+                    # 误读成已投递（#436146）。汇总一行，逐条投递由 ccs-route 承担。
+                    _delegated = 0
                     for d in r.get("details", []):
-                        roles = [a["role"] for a in d.get("assigned", []) if a.get("status") == "consumed"]
+                        roles = [a["role"] for a in d.get("assigned", [])
+                                 if a.get("status") == "consumed"]
+                        _delegated += any(a.get("status") == "delegated"
+                                          for a in d.get("assigned", []))
                         if roles:
                             LOGGER.info("route → [%s] #%d %s → %s",
                                         d.get("category", "?"), d.get("id", 0),
                                         d.get("title", "")[:50], ",".join(roles))
-                    LOGGER.info("route_all: %d/%d routed", routed_n, total_n)
+                    LOGGER.info("route_all: %d/%d routed (delegated=%d)",
+                                routed_n, total_n, _delegated)
                 elif total_n:
                     LOGGER.debug("route_all: 0/%d 无可消费消息或无匹配消费者", total_n)
                 error_backoff = 0
@@ -286,10 +312,7 @@ def main():
                     ccs_routed = r.get("routed", 0)
                     ccs_total = r.get("total", 0)
                     if ccs_routed:
-                        for d in r.get("details", []):
-                            LOGGER.info("ccs-route [%s] #%d → %s",
-                                        d.get("category", "?"), d.get("id", 0),
-                                        ",".join(d.get("assigned", [])))
+                        _log_ccs_routes(r)
                     LOGGER.info("route_all_to_ccs: %d/%d routed", ccs_routed, ccs_total)
                     try:
                         _alert_aged_queue()

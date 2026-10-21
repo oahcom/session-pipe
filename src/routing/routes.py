@@ -247,6 +247,15 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 results = []
                 for role in assignment["consumers"]:
                     try:
+                        if cat not in _SYSTEM_CATEGORIES:
+                            # 可投递类不在这里消费：consume 会把该 (fact, role) 从
+                            # route_to_ccs 的候选集里删掉（poll 用 NOT EXISTS consume），
+                            # 它那句「忙 → 消息留 bus 下轮再试」就永远轮不到。
+                            # 实测 3h 可投递类 200 条 consume / 51 条进 pane，149 条
+                            # 静默丢失（#436146）。投递与建链都交给发送成功的
+                            # route_to_ccs 做（它本身就近幂等）。
+                            results.append({"role": role, "status": "delegated"})
+                            continue
                         r = CIRCUIT_BREAKER.call(
                             lambda f=fid, rl=role: IDEMPOTENT_CONSUME.safe_consume(bb, f, rl)
                         )
