@@ -5,7 +5,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _contract_personas import persona_dir  # noqa: E402
 from contract_updater import (
     apply_all_suggestions,
     suggest_improvements,
@@ -25,7 +27,8 @@ class TestSuggestImprovements:
             {"role": "engineer", "skipped": 1, "checked": 0},
             {"role": "engineer", "skipped": 1, "checked": 0},
         ]
-        s = suggest_improvements(history)
+        with persona_dir():
+            s = suggest_improvements(history)
         assert len(s) > 0
         assert any(x["type"] == "add_verification_cmd" for x in s)
 

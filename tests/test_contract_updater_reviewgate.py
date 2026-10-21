@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-import contract_updater as cu
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import contract_updater as cu  # noqa: E402
+from _contract_personas import persona_dir  # noqa: E402
 
 
 def _make_history(target: str, with_schema: bool) -> dict:
@@ -31,7 +33,8 @@ def _make_history(target: str, with_schema: bool) -> dict:
 def test_parties_role_resolves():
     # review_gate 真实角色在 dims[].parties, 应优先解析而非文件名回退
     hist = _make_history("/home/administrator/session-launcher/src/user_intent_reminder.py", False)
-    role = cu._parties_role(hist)
+    with persona_dir():
+        role = cu._parties_role(hist)
     assert role == "coordinator", f"parties[coord] 应部分匹配 coordinator, 得 {role}"
     print(f"  [ok] _parties_role -> {role}")
 
@@ -39,7 +42,8 @@ def test_parties_role_resolves():
 def test_resolve_role_prefers_parties_over_filename():
     # 文件 target 无 persona 归属, 但 parties 有真角色 → 不应误告警为文件映射缺失
     hist = _make_history("session-launcher/src/user_intent_reminder.py", False)
-    role = cu._resolve_role_for_suggestion(hist)
+    with persona_dir():
+        role = cu._resolve_role_for_suggestion(hist)
     assert role == "coordinator", f"应取 parties 角色而非文件名, 得 {role}"
     print(f"  [ok] _resolve_role_for_suggestion -> {role}")
 
@@ -47,7 +51,8 @@ def test_resolve_role_prefers_parties_over_filename():
 def test_suggest_from_reviewgate_schema():
     # 用真实 persona 名作为 target 影射 (coordinator 存在)
     hist = _make_history("coordinator", False)
-    sug = cu.suggest_improvements([hist])
+    with persona_dir():
+        sug = cu.suggest_improvements([hist])
     assert len(sug) >= 1, "review_gate schema 下应能产生建议"
     assert sug[0]["role"] != "unknown", f"建议 role 不应为 unknown: {sug[0]}"
     print(f"  [ok] suggest_improvements -> {len(sug)} 条, role={sug[0]['role']}")
