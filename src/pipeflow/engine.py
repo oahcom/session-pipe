@@ -238,7 +238,7 @@ class WorkflowRun:
 from pipeflow.step_handler import StepHandlerMixin, _queue_budget_sec
 from pipeflow.role_lifecycle import RoleLifecycleMixin
 from pipeflow.task_generator import TaskGeneratorMixin
-from pipeflow.wf_lifecycle import WorkflowLifecycleMixin
+from pipeflow.wf_lifecycle import WorkflowLifecycleMixin, _role_producing_recently
 
 
 class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMixin, StepHandlerMixin):
@@ -974,7 +974,13 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         _q_attempts = max(int(getattr(step, "max_retries", 0) or 0) + 3, 4)
                         _q_budget = _queue_budget_sec(step.exit_condition or {}, _q_attempts,
                                                       self._parent_step_minutes(inst))
-                        if time.time() - _q_since >= _q_budget:
+                        # 与 step_handler 同源：角色在产出中就不算「长期被占用」。
+                        # 缺此判据时，单角色串行服务下的排队者永远等不到轮次
+                        # （8h 内 product_architect 14 条子链全部卡在此处被杀）。
+                        # 用 _eff 而非 step.target_role：effective_roles 分流后实际干活的
+                        # 是另一个角色，按模板角色查转录会得出「没在产出」的错结论。
+                        if (time.time() - _q_since >= _q_budget
+                                and not _role_producing_recently(_eff)):
                             LOGGER.warning("run_once: %s/%s 排队 %d 分钟无进展，回收",
                                            inst["instance_id"][:12], step_id,
                                            int((time.time() - _q_since) / 60))

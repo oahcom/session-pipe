@@ -16,7 +16,7 @@ from pathlib import Path
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
 from pipeflow.engine import Step, WorkflowRun
-from pipeflow.wf_lifecycle import _value_audit_failed
+from pipeflow.wf_lifecycle import _value_audit_failed, _role_producing_recently
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 from conversation_monitor import get_conversation_signal
 
@@ -73,9 +73,11 @@ def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> f
 # Stop hook 硬条件：「请继续完成当前步骤」永远无法自证，角色因此被永久锁死
 # （R41 实测 qa 215 条该 hook、全角色累计 943 条）。越界停止指令同理。
 #
-# 为什么也不传 wf_id：忙门控的条件是 `not force and wf_id`，wf_id 为空时本就
-# 不拦；而 wf_id 非空会连带重写角色 TASKS.md 并往 bus 写一条 task_spec ——
-# 一条催办不该产生派发记录。只开 force（跳过前缀+忙门控+搜索提醒）。
+# 不带 wf_id：忙门控的条件是 `not force and wf_id`，force 已开，wf_id 只为
+# 连带效果而存在（重写 TASKS.md）。催办不该改角色的任务文件。
+# 代价（实测）：wf_id 为空时 role_lifecycle:983 的 bus 去重整段被跳过 → 每次
+# 调用都写一条 `@<role> 工作流任务` task_spec。生产 24h 仅 1 条（越界信号本就
+# 稀少），不值得为此引入 wf_id 的副作用。
 #
 # 不带 scheduler_noise：它在 role_lifecycle:891 对 coordinator 是**直接 return
 # False**（调度噪音拦截）。而 coordinator 确会作步骤目标（生产库 WL-full_dev_pipeline
@@ -493,6 +495,13 @@ class StepHandlerMixin:
             _sig_state["idle_count"] = _idle_n
         if sig and sig.violation_found:
             _viol_n = _bump_violation_count(_sig_state, sig.violation_commands)
+            # 去重键不变时 _viol_n 恒等于旧值（见 _bump_violation_count），所以
+            # 「同一批越界命令一直留在 pane 的 80 行窗口里」既升不到 cancel 阈值，
+            # 又会每 tick 重发一次停止指令 —— 两个分支互相抵消。冷却按**越界批次**
+            # 而不是按 tick：同一批只提醒一次，新一批（key 变）立即再提醒。
+            _viol_key = "|".join(sorted(set(sig.violation_commands or [])))[:500]
+            _viol_cool = _sig_state.get("violation_cool_until", 0)
+            _viol_last = _sig_state.get("violation_cool_key", "")
             if _viol_n >= 5 and not self._has_live_subflow(run, step):
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
@@ -502,12 +511,14 @@ class StepHandlerMixin:
                     return
                 except Exception as _e:
                     LOGGER.debug("tmux 越界 cancel_step 失败: %s", _e)
-            else:
+            elif _viol_key != _viol_last or _now >= _viol_cool:
                 try:
                     _stop_tmux_violation(run, step, sig.violation_commands, sig.violation_role,
                                          send_to_role=self._send_to_role)
                 except Exception as _e:
                     LOGGER.debug("tmux 越界停止指令失败: %s", _e)
+                _sig_state["violation_cool_key"] = _viol_key
+                _sig_state["violation_cool_until"] = _now + 300
             # 计数写在 if/else 之外，与上方 idle 分支同构：达阈值时 cancel_step
             # 已接管，随即 return；未达阈值（或 cancel 失败）则累加，供下轮判定。
             _sig_state["violation_count"] = _viol_n
@@ -586,12 +597,19 @@ class StepHandlerMixin:
                         f"排队 {_queued} 次仍未响应（角色 {_eff} 活跃但可能卡死），请介入",
                         wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
                 # 排队上限 = 角色被其他工作流长期占用，子链无法执行 → auto-cancel
+                # 但「被占用」≠「卡死」：实测 8h 内 product_architect 名下 14 条子链
+                # 全部在排队满 60min 时被取消，而同期它真正跑完的子链耗时 113~237min。
+                # 单角色串行处理时，排队预算（声明×次数）永远小于实际服务时间 → 排队
+                # 者永远等不到轮次就被杀，而取消并不释放任何产能，是纯损失（活锁）。
+                # 只在角色确实不在产出时才判死：_role_producing_recently 看 transcript
+                # mtime（与 wf_lifecycle 条件 4 同源），产出中的角色排队属正常等待。
                 _q_budget = _queue_budget_sec(
                     ec, max(max_retries + 3, 4),
                     parent_minutes=self._parent_step_minutes(run))
-                if _queued >= 10 and time.time() - _q_since >= _q_budget:
+                if (_queued >= 10 and time.time() - _q_since >= _q_budget
+                        and not _role_producing_recently(_eff)):
                     _q_age_min = int((time.time() - _q_since) / 60)
-                    LOGGER.warning("auto-cancel subflow: %s queued=%d 已排队 %d 分钟，角色 %s 长期占用",
+                    LOGGER.warning("auto-cancel subflow: %s queued=%d 已排队 %d 分钟，角色 %s 长期无产出",
                                    run.id[:12], _queued, _q_age_min, _eff)
                     try:
                         self._lifecycle.close_wf(

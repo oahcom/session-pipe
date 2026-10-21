@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-_PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
+_PIPELINE_SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
@@ -548,3 +548,81 @@ def test_forced_send_does_not_add_goal_prefix():
     code = inspect.getsource(RoleLifecycleMixin._send_to_role)
     assert _re.search(r"if not force:\s*\n\s*prompt = \"/goal \" \+ prompt", code), \
         "前缀注入的条件不再是 `not force` → 催办消息会被锁成 Stop hook"
+
+
+
+# ── 9. 排队回收不得误杀正在产出的角色（活锁回归） ────────────────
+
+def _queue_cancel_setup(producing: bool):
+    """一个已排队超预算的步骤，角色是否在产出由 producing 决定。"""
+    eng = _build_eng()
+    eng._is_role_busy = MagicMock(return_value=True)
+    step = _make_step(exit_condition={"bus_category": "code_fix", "timeout_minutes": 1})
+    run = _make_run(step_results={"s1": {
+        "status": "notified", "ts": time.time() - 7200,
+        "queued": 50, "queued_since": time.time() - 7200,
+    }})
+    return eng, run, step
+
+
+def test_queue_cancel_skips_role_that_is_producing():
+    """角色在产出时排队超预算 ≠ 卡死，不得 auto-cancel。
+
+    实测 2026-10-21：8h 内 product_architect 名下 14 条子链全部在排队满 60min
+    时被取消，而同期它真跑完的子链耗时 113~237min —— 单角色串行时排队预算
+    永远小于服务时间，取消不释放产能，是纯损失（活锁）。
+    """
+    eng, run, step = _queue_cancel_setup(producing=True)
+    with patch("pipeflow.step_handler.get_conversation_signal", return_value=None), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=True):
+        eng._tick(run, step)
+    eng._lm.close_wf.assert_not_called()
+
+
+def test_queue_cancel_still_fires_when_role_dead():
+    """反向守卫：角色确实不在产出时，排队超预算仍然要回收（否则真僵尸永占位）。"""
+    eng, run, step = _queue_cancel_setup(producing=False)
+    with patch("pipeflow.step_handler.get_conversation_signal", return_value=None), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
+        eng._tick(run, step)
+    eng._lm.close_wf.assert_called_once()
+    assert eng._lm.close_wf.call_args.kwargs.get("status") == "cancelled"
+
+
+# ── 10. 越界停止指令按批次冷却（不得每 tick 重发） ──────────────
+
+def test_violation_stop_sent_once_per_batch():
+    """同一批越界命令留在 pane 窗口里时，停止指令只发一次。
+
+    去重键不变时 _bump_violation_count 返回旧值（升不到 cancel 阈值），
+    旧实现走 else 分支每 tick 重发一次；force=True 后重发真能送达角色。
+    """
+    from conversation_monitor import ConversationSignal
+    eng = _build_eng()
+    sig = ConversationSignal()
+    sig.violation_found = True
+    sig.violation_commands = ["rm -rf /tmp/x"]
+    sig.violation_role = "scout"
+    run = _make_run()
+    step = _make_step()
+    with patch("pipeflow.step_handler.get_conversation_signal", return_value=sig):
+        eng._tick(run, step)
+        eng._tick(run, step)
+        eng._tick(run, step)
+    assert eng._send_to_role.call_count == 1, \
+        f"同一批越界重发了 {eng._send_to_role.call_count} 次"
+
+
+def test_violation_stop_resends_on_new_batch():
+    """命令集合变了 = 新一次越界，必须立即再提醒（不被冷却拦住）。"""
+    from conversation_monitor import ConversationSignal
+    eng = _build_eng()
+    run, step = _make_run(), _make_step()
+    for cmds in (["rm -rf /tmp/x"], ["git push --force"]):
+        sig = ConversationSignal()
+        sig.violation_found = True
+        sig.violation_commands = cmds
+        sig.violation_role = "scout"
+        with patch("pipeflow.step_handler.get_conversation_signal", return_value=sig):
+            eng._tick(run, step)
+    assert eng._send_to_role.call_count == 2, "新一批越界被冷却吞掉了"

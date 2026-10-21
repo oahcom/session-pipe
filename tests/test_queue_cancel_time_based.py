@@ -10,6 +10,7 @@ queued_since→cancel 仅 97~121s 后全被回收。daemon 每 10s 一 tick，
 import sys
 import time
 from pathlib import Path
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -43,7 +44,12 @@ class _Eng(StepHandlerMixin):
 def _no_signal():
     # 真实 conversation_monitor 会读 tmux pane；测试机上有活 pane 时返回
     # step_completed，直接推进而绕过排队分支（实测本用例因此假通过）。
-    return patch("pipeflow.step_handler.get_conversation_signal", return_value=None)
+    # 同理 _role_producing_recently 读的是活体 transcript：用 engineer 这个真实
+    # 角色名时它恒为 True（角色在跑），排队回收被产能守卫拦住。测试必须钉死。
+    st = ExitStack()
+    st.enter_context(patch("pipeflow.step_handler.get_conversation_signal", return_value=None))
+    st.enter_context(patch("pipeflow.step_handler._role_producing_recently", return_value=False))
+    return st
 
 
 def _run(queued, since, timeout_count=0):
