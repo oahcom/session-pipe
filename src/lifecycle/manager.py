@@ -55,7 +55,7 @@ class LifecycleManager:
     - DB 连接/查询: query/query_one/execute/_conn_tx/ping
     - 模板 CRUD: upsert_template/get_wf/get_step/_get_template
     - 实例生命周期: start_wf/complete_step/fail_step/rollback_step/close_wf
-    - 审批流: get_approval_token/confirm_step/_issue_approval_token/_notify_result
+    - 审批流: get_approval_token/confirm_step/_notify_result（密钥签发已退场）
     - 内部工具: _get_wf_unsafe/_parse_results/_set_step_result_unsafe/_log_unsafe
     """
 
@@ -878,131 +878,16 @@ class LifecycleManager:
         return "step_done_ready"
 
     def _complete_review_unsafe(self, wf_id, step_id, step, task_id, results):
+        # 评审步按**结论**推进，不再签发审批密钥（2026-10-22）。
+        # 引擎侧已退场（step_handler「评审步骤不再在 tick 里等审批」）：签出来的
+        # 密钥没有任何消费者，却要向审批人发一条「步骤审批请求」——实测 107 条/天
+        # 灌进角色上下文，指令本身不可执行（密钥在 bus 里被脱敏成 ***）。
+        # 驳回语义改由 bus 文本承担（CHANGES_REQUESTED / rejected 关键词，
+        # wf_lifecycle 的 review_gate 判据消费）。
         self._set_step_result_unsafe(wf_id, step_id, "step_done_ready", results)
         self._log_unsafe(wf_id, task_id, "step_done_ready",
-                         detail=f"review waiting approval: {step_id}")
-        self._issue_approval_token(wf_id, step_id, step, task_id, results)
+                         detail=f"review done by verdict: {step_id}")
         return "step_done_ready"
-
-    def _issue_approval_token(self, wf_id, step_id, step, task_id, results):
-        """生成一次性审批密钥，存入 step_results，ccs send-safe 给 assigner。"""
-        import secrets as _secrets
-        import logging as _log
-        logger = _log.getLogger("lifecycle.approval")
-
-        # 确定审批人。必须在写 token **之前**判：无审批人却先落 token，
-        # engine 的审批门控只看"token 存在"（engine.py 审批门控段）→ 照样拦住
-        # 推进，等 TTL+grace 90 分钟。实测 architect_full_design/s4 因此卡死。
-        wf = self._get_wf_unsafe(wf_id)
-        # 步骤/实例已终态就别再上闸：超时兜底放行后再签发，会把
-        # approval_consumed_at 写回 None，已完成的步骤重新变成待审批（复活）。
-        _cur = self._parse_results(wf).get(step_id, {})
-        if _cur.get("status") == "completed" or wf.get("status") in ("completed", "cancelled"):
-            return
-        assigner = self._get_assigner_for_step(wf, step, step_id)
-        if not assigner:
-            return  # 无审批人（系统发起/自审/首步）→ 不落 token，engine 直接放行
-
-        token = _secrets.token_urlsafe(32)
-        ttl = 3600  # 1 小时
-
-        step_results = self._parse_results(wf)
-        step_results.setdefault(step_id, {}).update({
-            "approval_token": token,
-            "approval_token_ttl": time.time() + ttl,
-            # 签发时刻单独落库：提醒退避按「签发至今」算，从 ttl 反推需要
-            # 硬编码有效期常量，改 ttl 就会算错（下发时间点也要可追溯）。
-            "approval_issued_at": time.time(),
-            "approval_consumed_at": None,
-        })
-        self._conn.execute(
-            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-            (json.dumps(step_results, ensure_ascii=False), wf_id))
-
-        # ── 先提交，再 spawn 子进程 ──
-        # complete_step 在外层持有 BEGIN IMMEDIATE 写锁；ccs send 子进程会经
-        # routing.gatekeeper._log_cross_role_send 向同一 DB 写 cross_role_send 日志，
-        # 争同一把写锁 → child 等 busy_timeout(10s) 后抛 database is locked。
-        # 实测：持锁时 10/10 子进程失败（journal 里 ccs send failed 耗时恒 ~10s 即指纹），
-        # 不持锁时 rc=0。审批请求因此长期走 bus 降级（token 被脱敏，审批人拿不到密钥）。
-        # 本方法是事务内最后一步，此处 commit 不影响后续原子性。
-        self._conn.commit()
-
-        # 构建审批提示词
-        approval_prompt = step.get("approval_prompt", "")
-        if not approval_prompt:
-            step_title = step.get('title', '')
-            completed_by = results.get(step_id, {}).get('completed_by', 'unknown')
-            step_prompt = (step.get('prompt_template', '') or '')[:800]
-            approval_prompt = (
-                f"## 审批请求: 步骤 {step_id} - {step_title}\n\n"
-                f"### 基本信息\n"
-                f"- 工作流: {wf_id}\n"
-                f"- 步骤: {step_id} - {step_title}\n"
-                f"- 执行人: {completed_by}\n"
-                f"- 审批密钥: {token}（有效期 1 小时）\n\n"
-                f"### 审查要点\n"
-                f"1. 完整性 - 是否完成步骤要求的所有产出？\n"
-                f"2. 正确性 - 产出物是否符合质量标准？\n"
-                f"3. 可追溯性 - 产出物路径和来源是否可验证？\n"
-                f"4. 风险 - 是否存在未提及的风险或副作用？\n\n"
-                f"### 步骤原始要求\n"
-                f"{step_prompt}\n"
-            )
-
-        # ccs send-safe 给 assigner
-        try:
-            from workflow.client import get_ccs_cli as _get_ccs_cli
-            import subprocess as _sp
-            msg = (
-                f"[workflow] 步骤审批请求\n\n"
-                f"工作流: {wf_id}\n"
-                f"步骤: {step_id} — {step.get('title', '')}\n"
-                f"密钥: {token}\n"
-                f"有效期: 1小时\n\n"
-                f"审批提示:\n{approval_prompt}"
-            )
-            _ccs_cli = str(_get_ccs_cli()) if not isinstance(_get_ccs_cli(), str) else _get_ccs_cli()
-            result = _sp.run(
-                ["python3", _ccs_cli, "send", assigner, msg,
-                 "--from", "workflow_engine"],
-                capture_output=True, timeout=15)
-            if result.returncode != 0:
-                logger.warning("ccs send failed for %s->%s: %s", self.role, assigner,
-                               result.stderr.decode()[:200])
-                # 降级兜底：ccs send 失败时写 bus，确保审批请求不丢失
-                # （WL-P2-03：ccs send 失败 → 自动降级为 bus 消息写入）
-                try:
-                    from workflow.client import get_ccs_cli  # noqa: F401 复用路径解析
-                    self._bb_write_fallback(wf_id, step_id, token, approval_prompt, assigner)
-                except Exception as _fb_err:
-                    logger.warning("bus fallback failed: %s", _fb_err)
-        except Exception as e:
-            logger.warning("approval token CCS send error: %s", e)
-
-    def _bb_write_fallback(self, wf_id, step_id, token, approval_prompt, assigner):
-        """ccs send 失败时的 bus 降级通知（WL-P2-03）。
-
-        通知的职责只是「告诉审批人有待批」— 凭证由审批人自己用
-        `wf approval <wf_id> <step_id>` 拉取。把 token 塞进共享 bus 再脱敏，
-        等于两件事都没做成：既没人能读到（标题无 @role），也没人能拿到钥匙。
-        """
-        # 脱敏：approval_prompt 内部也嵌有 token 明文（见 _issue_approval_token）
-        safe_prompt = approval_prompt.replace(token, "***")
-        from hermes_bus.blackboard import Blackboard
-        bb = Blackboard()
-        bb.write(
-            "workflow",
-            # 标题必须带 @<assigner>：bus_client._addressed_to() 只匹配标题里的
-            # '@role'，缺了这句降级就等于没投递（估计 #427280 从未被 engineer 读到）。
-            f"@{assigner} [审批降级] 工作流 {wf_id} 步骤 {step_id} 审批请求"
-            f"（ccs send 失败，经 bus 投递）",
-            evidence=(
-                f"审批人: {assigner}\n密钥: 不在此处（共享 bus 不得承载一次性凭证）\n"
-                f"取回命令: wf -r {assigner} approval {wf_id} {step_id}\n"
-                f"有效期: 1小时（剩余见命令输出）\n提示: {safe_prompt}"),
-            src="workflow_engine",
-        )
 
     def _complete_subflow_unsafe(self, wf_id, step_id, step, task_id, results):
         """创建子工作流 + 启动，返回 step_done_ready（等 confirm 时检查子状态）。"""
@@ -1061,7 +946,6 @@ class LifecycleManager:
             (json.dumps(results, ensure_ascii=False), wf_id))
         self._log_unsafe(wf_id, task_id, "subflow_created",
                          detail=f"→ {sub_wf_id} ({sub_tpl_id})")
-        self._issue_approval_token(wf_id, step_id, step, task_id, results)
         return "step_done_ready"
 
     def _complete_gate_unsafe(self, wf_id, step_id, step, task_id, results):
