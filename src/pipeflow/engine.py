@@ -150,6 +150,16 @@ _REQUEUE_DROP = ("status", "rejected_at", "rejected_by", "rejection_reason",
                  )
 
 
+def _canonical_tid(wf, fallback: str) -> str:
+    """模板规范 id —— DB 的 template_id 与实例的 template_id 用的就是它。
+
+    去连续 WF- 前缀（防 DB 回读叠加 WF-WF-… 的非收敛污染，实测 4335 行）；
+    无 WL-/WF- 前缀时补 WF-。
+    """
+    tid = re.sub(r'^(?:WF-)+', '', getattr(wf, "workflow_id", None) or fallback)
+    return tid if tid.startswith(('WL-', 'WF-')) else 'WF-' + tid
+
+
 def _rework_exit(sts: list) -> str:
     """返工链状态集 → 出口：wait / escalate_unfixed / requeue。"""
     if sts and not all(s in _REWORK_TERMINAL for s in sts):
@@ -157,6 +167,16 @@ def _rework_exit(sts: list) -> str:
     if sts and any(s != "completed" for s in sts):
         return "escalate_unfixed"    # failed/cancelled = 修复未交付，重投徒劳
     return "requeue"                 # 已交付（或链已删）→ 重审原步
+
+
+def _blocking_rework_sts(rows) -> list:
+    """返工链状态里真正砍住重审的那部分：系统问题链不阻断。
+
+    maintainer_health_monitor 修的是引擎/模板债，与产品产出能否交付无关；
+    让它阻断会让产品链被维护队列扣死（实测维护者队列 91 深，3 条主链被一条
+    从未投递的维护链扣 8h+，升级后按"链仍活"无限续期到 24h 全局回收）。
+    """
+    return [r["status"] for r in rows if "maintainer" not in (r["template_id"] or "")]
 
 
 def _rejected_wait_anchor(sr: dict, inst: dict):
@@ -399,7 +419,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         continue  # 跳过该模板，不注册到 _workflows
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("workflow schema validation failed for %s", f.name)
-                self._workflows[data["name"]] = WorkflowDef(
+                _wf = WorkflowDef(
                     name=data["name"], title=data.get("title", ""),
                     description=data.get("description", ""), steps=steps,
                     workflow_id=data.get("workflow_id", "WL-" + data["name"]),
@@ -412,6 +432,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     is_subflow=data.get("is_subflow", False),
                     auto_advance=data.get("auto_advance", False),
                 )
+                # 同一模板两个键指向同一对象。DB template_id 与实例 template_id 用
+                # 规范 id（WL-/WF- 前缀），JSON 用 name；只注册 name 时同一定义在
+                # 内存里两份，实例命中的是 DB 旧快照，JSON 修正永不生效 —— 实测
+                # WL-full_dev_pipeline/s4 的 verify 仍是 "P0 not in" 旧判据（55 个
+                # 实例全部死在该步），JSON 早已改成 size>200。
+                self._workflows[data["name"]] = _wf
+                _tid = _canonical_tid(_wf, data["name"])
+                if _tid != data["name"]:
+                    self._workflows[_tid] = _wf
             except Exception as e:
                     LOGGER.warning("[wf] 加载 %s 失败: %s", f.name, e)
         # 将内存中的 JSON 模板 upsert 到 DB（供 lifecycle manager 查询）。
@@ -421,14 +450,13 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         if (self.workflows_dir == _WORKFLOWS_DIR
                 and getattr(self, '_db_path', None) is None):
             try:
+                # 别名与规范名指向同一对象 → 按对象去重，否则同一模板 upsert 两次
+                _seen_obj: set[int] = set()
                 for name, wf in self._workflows.items():
-                    # 使用 workflow_id 作为 template_id（与 DB 约定一致）。
-                    # 规范化去除所有连续 WF- 前缀（防 DB 回读后多次 upsert 叠加 WF-
-                    # 导致 WF-WF-...-WL-... 非收敛死循环，实测 4335 行污染）。
-                    tid = re.sub(r'^(?:WF-)+', '', wf.workflow_id or name)
-                    if not tid.startswith(('WL-', 'WF-')):
-                        tid = 'WF-' + tid
-                    self._upsert_template(tid, wf)
+                    if id(wf) in _seen_obj:
+                        continue
+                    _seen_obj.add(id(wf))
+                    self._upsert_template(_canonical_tid(wf, name), wf)
             except Exception as e:
                 LOGGER.warning("[wf] 启动时 upsert JSON 模板到 DB 失败: %s", e)
 
@@ -491,7 +519,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("[wf] SQLite 模板加载失败: %s", e)
 
     def list_workflows(self) -> list[str]:
-        return sorted(name for name, wf in self._workflows.items() if not wf.is_subflow)
+        # 别名与规范名同对象：按对象去重，避免同一模板列两遍
+        seen_wf: set[int] = set()
+        out: list[str] = []
+        for name, wf in sorted(self._workflows.items()):
+            if wf.is_subflow or id(wf) in seen_wf:
+                continue
+            seen_wf.add(id(wf)); out.append(name)
+        return out
 
     def active_workflow_count(self) -> int:
         """当前活跃工作流数（pending/running/step_done_ready）。"""
@@ -606,6 +641,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
 
         raise ValueError(f"未知工作流: {name}")
 
+    @staticmethod
+    def _step_dict(s) -> dict:
+        """模板步骤 → DB 行字段。唯一构造点：插入与刷新共用同一形状。"""
+        return {"step_id": s.id, "title": s.title, "type": s.type,
+                "target_role": s.target_role,
+                "prompt_template": s.prompt_template,
+                "max_retries": s.max_retries, "verify": s.verify,
+                "subflow_template": s.subflow_template,
+                "dual_node": s.dual_node,
+                "exit_condition": s.exit_condition,
+                "exit_schema": s.exit_schema, "guard": s.guard,
+                "wait_roles": getattr(s, "wait_roles", None),
+                "failure_patterns": getattr(s, "failure_patterns", None)}
+
     def _upsert_template(self, name: str, wf: WorkflowDef):
         """把模板定义写入 DB（start() 时调用，供实例推进依赖 DB 模板行）。
 
@@ -635,63 +684,43 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             # 校验器自身出错 → 记日志后放行（不阻断启动，但暴露问题）
             # （2026-08-12 codex P2：静默 pass 会掩盖校验器 bug → 未校验模板写 DB）
             LOGGER.warning("[wf] upsert 校验异常（放行但需关注）: %s: %s", name, _e)
+        _json_steps = [self._step_dict(s) for s in wf.steps]
         try:
             _existing = self._lifecycle.query(
                 "SELECT 1 FROM workflow_templates WHERE template_id=?", (name,))
             if _existing:
-                # DB 已有同名 → 不整体覆盖（防简化版覆盖完整 JSON 定义），
-                # 但必须补齐 JSON 后新增的步骤：complete_step → get_step 查 DB
-                # 模板，缺步骤时抛"步骤定义不存在"被 DEBUG 吞掉 → 引擎能投递
-                # 该步(从 JSON)却永远无法完成它 → 步骤永久卡死。
-                # 实测 food_chain_loop/s0：JSON 有 8 步，DB 只有 s1-s7，
-                # 8 次运行 6 次死于此步。仅追加缺失步骤，已有步骤保持 DB 版本。
+                # DB 行是 JSON 模板的缓存，不是权威源：JSON 改了必须同步到 DB，
+                # 否则 complete_step → get_step 读到的仍是旧判据（旧实现只补缺失
+                # 步骤、已有步骤保留 DB 版本 → 模板修正永不生效。实测
+                # WL-full_dev_pipeline/s4 的 verify 在 JSON 里已改成 size>200，
+                # DB 仍是恒假的 "P0 not in"，55 个实例全死在 s4）。
+                # DB 独有步骤保留（可能有在飞实例依赖）。
                 try:
                     _row = self._lifecycle.query(
                         "SELECT steps_json FROM workflow_templates WHERE template_id=?",
                         (name,))
                     _db_steps = json.loads(_row[0][0]) if _row and _row[0][0] else []
-                    _have = {(_s.get("step_id") or _s.get("id"))
-                             for _s in _db_steps}
-                    _missing = [s for s in wf.steps if s.id not in _have]
-                    if _missing:
-                        LOGGER.warning("[wf] upsert 补齐 %s 缺失步骤: %s",
-                                       name, [s.id for s in _missing])
-                        _db_steps.extend({
-                            "step_id": s.id, "title": s.title, "type": s.type,
-                            "target_role": s.target_role,
-                            "prompt_template": s.prompt_template,
-                            "max_retries": s.max_retries, "verify": s.verify,
-                            "subflow_template": s.subflow_template,
-                            "dual_node": s.dual_node,
-                            "exit_condition": s.exit_condition,
-                            "exit_schema": s.exit_schema, "guard": s.guard,
-                            "wait_roles": getattr(s, "wait_roles", None),
-                            "failure_patterns": getattr(s, "failure_patterns", None),
-                        } for s in _missing)
+                    _by_id = {(_s.get("step_id") or _s.get("id")): _s for _s in _db_steps}
+                    _changed = 0
+                    for _js in _json_steps:
+                        _old = _by_id.get(_js["step_id"])
+                        if _old is None:
+                            _by_id[_js["step_id"]] = _js; _changed += 1
+                        elif any(_old.get(_f) != _js.get(_f) for _f in _js):
+                            _by_id[_js["step_id"]] = _js; _changed += 1
+                    if _changed:
+                        LOGGER.warning("[wf] 模板 %s 刷新 %d 个步骤定义（JSON 为权威源）",
+                                       name, _changed)
                         self._lifecycle.execute(
                             "UPDATE workflow_templates SET steps_json=? WHERE template_id=?",
-                            (json.dumps(_db_steps, ensure_ascii=False), name))
+                            (json.dumps(list(_by_id.values()), ensure_ascii=False), name))
                 except Exception as _me:
-                    LOGGER.error("[wf] upsert 补齐缺失步骤失败 %s: %s", name, _me)
+                    LOGGER.error("[wf] upsert 刷新模板步骤失败 %s: %s", name, _me)
                 return
         except Exception:
             pass  # DB 查询失败时允许 upsert（兼容首次初始化）
         try:
-            steps = [
-                {"step_id": s.id, "title": s.title, "type": s.type,
-                 "target_role": s.target_role,
-                 "prompt_template": s.prompt_template,
-                 "max_retries": s.max_retries,
-                 "verify": s.verify,
-                 "subflow_template": s.subflow_template,
-                 "dual_node": s.dual_node,
-                 "exit_condition": s.exit_condition,
-                 "exit_schema": s.exit_schema,
-                 "guard": s.guard,
-                 "wait_roles": getattr(s, "wait_roles", None),
-                 "failure_patterns": getattr(s, "failure_patterns", None)}
-                for s in wf.steps
-            ]
+            steps = _json_steps
             self._lifecycle.upsert_template(
                 name, wf.title, wf.description, steps,
                 trigger_scene=wf.trigger_scene,
@@ -792,6 +821,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         if _ok is not True:
             _blocked = f"pane 投递被拦({_ok})；"
             LOGGER.warning("升级 pane 未送达(%s) %s/%s → 改落 bus", _ok, wf_id[:12], step_id)
+        # 顺序：先写持久记录再落锚。反过来时 bus 写抛错、锚已置位，
+        # 下 tick 在 :788 直接 return，升级永久丢失（codex 三轮 P1）。
+        self._bb.write("blocker",
+                       f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
+                       evidence=f"{_blocked}驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
+                       src="workflow_engine")
         _now = time.time()
         sr["rework_escalated_at"] = _now
         try:
@@ -808,10 +843,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             results[step_id] = sr
             lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                        (json.dumps(results, ensure_ascii=False), wf_id))
-        self._bb.write("blocker",
-                       f"[workflow] {wf_id[:12]}/{step_id} {reason} → 升级 coordinator",
-                       evidence=f"{_blocked}驳回理由: {(sr.get('rejection_reason') or '')[:200]}",
-                       src="workflow_engine")
         LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
 
     def run_once(self):
@@ -1169,86 +1200,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     )
                     step_status = "notified"  # 更新状态，让后续 exit_condition/超时检查能执行
 
-                # ── 审批门控 ──
-                # 曾经这里对 step_done_ready 无条件推进（全文件零处引用 approval），
-                # 于是审批密钥机制形同虚设：全库 413 个步骤发放过 token，消费 0 次，
-                # 335 个"需审批"步骤全部无审批完成。handoff/review/subflow 步骤的
-                # 设计意图是"等 assigner 用 token 确认"（见 step_handler._tick 注释），
-                # 判据只看"token 已发放且未被消费"这一条：confirm_step 通过时会把
-                # approval_token 置 None 并写 approval_consumed_at（manager.py:396-397），
-                # 故 token 存在 ⟺ 尚未审批。无 token 的步骤（无审批人/系统发起/
-                # 角色 wf complete 主动声明）不受影响，保持原有放行语义。
-                #
-                _awaiting_approval = False
-                if step_status == "step_done_ready":
-                    _sr_now = results.get(step_id)
-                    # 非 dict 值实测 599 个（'summary'/'files' 等键）——不加守卫
-                    # 会 AttributeError 冒泡到 run_once 的 except，整轮 for 中止
-                    # （与 step_handler.py:206-212 记录的历史缺陷同型）。
-                    if not isinstance(_sr_now, dict):
-                        _sr_now = {}
-                    if _sr_now.get("approval_token"):
-                        _ttl = _sr_now.get("approval_token_ttl", 0)
-                        # 无 ttl（旧数据/手写 token）不能当作"永远等"：
-                        # 原实现 `_ttl>0 and ...` 为假 → else → 永久卡死。
-                        # 视为已过期，走同一条兜底放行。
-                        _expired = _ttl <= 0 or time.time() > _ttl + 1800
-                        if _expired:
-                            try:
-                                lm.confirm_step(inst["instance_id"], step_id,
-                                                token=_sr_now["approval_token"],
-                                                approved=True,
-                                                reason="daemon approval_timeout_fallback",
-                                                allow_expired=True)
-                                LOGGER.warning(
-                                    "approval_timeout_fallback %s/%s: token 超时未消费（ttl=%s），自动 approve",
-                                    wf_name, step_id, _ttl)
-                                # confirm_step 改的是它自己 load 的 results；本 tick 的
-                                # results 仍是 762 行读的旧快照。落到 1054 后 _persist_step_done
-                                # 会把它**整份**写回 → 刚落的 completed 被打回 step_done_ready、
-                                # approval_token 复活，而 current_step_id 已推进 → 步骤 JSON 与
-                                # 行级彻底脱节。实测 wf_rw_46e42f725e74/s1: 19:33:36 confirm
-                                # 落库 completed, 19:33:58 旧快照覆写回 step_done_ready, 父链
-                                # _rework_exit 永久判 wait 卡 7h。重读 DB 消除快照分歧。
-                                _fresh_rows = lm.query(
-                                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
-                                    (inst["instance_id"],))
-                                if _fresh_rows:
-                                    results = json.loads(_fresh_rows[0]["step_results"] or "{}")
-                                    step_status = "completed"
-                            except Exception as _af:
-                                # confirm 失败（如角色 wf complete 改写了 status）
-                                # 若仍等，就是永久 step_done_ready 死锁。累计 3 次
-                                # 失败后清 token 放行，让步骤能推进而不是烂在库里。
-                                _n = (_sr_now.get("approval_fallback_fail", 0) or 0) + 1
-                                _sr_now["approval_fallback_fail"] = _n
-                                results[step_id] = _sr_now
-                                try:
-                                    lm.execute(
-                                        "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                                        (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
-                                except Exception:
-                                    pass
-                                LOGGER.warning("approval fallback failed %s/%s (%d/3): %s",
-                                               inst["instance_id"][:12], step_id, _n, _af)
-                                if _n >= 3:
-                                    _sr_now.pop("approval_token", None)
-                                    results[step_id] = _sr_now
-                                    try:
-                                        lm.execute(
-                                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                                            (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
-                                    except Exception:
-                                        pass
-                                    LOGGER.warning(
-                                        "approval fallback 连续失败 %d 次 → 清 token 放行 %s/%s",
-                                        _n, wf_name, step_id)
-                                else:
-                                    _awaiting_approval = True
-                        else:
-                            _awaiting_approval = True
-                    if _awaiting_approval:
-                        continue  # 等 assigner 确认；超时由上面的 grace 分支放行
+                # 审批密钥门控已删除（2026-10-22）：全库 429 张密钥 0 消费，
+                # 15 个有终态的评审步等待中位数 90.0 分钟（= TTL+grace）后靠超时
+                # 兜底放行。step_done_ready 直接进推进分支，评审结论由
+                # wf_lifecycle 的 review_gate 判据消费（驳回→rejected→返工链）。
 
                 # 步骤已完成 → 自动推进到下一步
                 # step_done_ready/completed 由角色或外部系统标记，无需额外的 completion_check
@@ -1367,9 +1322,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 返工链当子链重复推进（实测 wf_rw_* 全库 0 台，从未回流过）。
                         try:
                             _ph = ",".join("?" * len(_rework_ids))
-                            _sts = [r["status"] for r in lm.query(
-                                f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
-                                tuple(_rework_ids))]
+                            _rework_rows = lm.query(
+                                f"SELECT status, template_id FROM workflow_instances "
+                                f"WHERE instance_id IN ({_ph})", tuple(_rework_ids))
+                            _sts = [r["status"] for r in _rework_rows]
+                            _gate_sts = _blocking_rework_sts(_rework_rows)
                         except Exception as _q:
                             # 查询失败 ≠ 链不存在：置空会落进下面的「无返工链→重投
                             # 原步」，与仍在跑的返工链并发推进同一个 step。
@@ -1382,7 +1339,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # → 被再驳回 → 再建链，形成自旋。实测 wf_3f71a2a78：3 条返工链
                         # 同时压单线程 maintainer，2 条排队 10 tick 后被回收，我的回流把
                         # cancelled 当「已处理」→ 8 分钟内 retry 从 3 涨到 6 仍在涨。
-                        _exit = _rework_exit(_sts)
+                        _exit = _rework_exit(_gate_sts)
                         if _exit == "wait":
                             # 返工链仍在跑：等它，但有上限（返工链自身无 timeout，
                             # 链内卡一步父链就永远等）。超限只喊一次、不停止等。
