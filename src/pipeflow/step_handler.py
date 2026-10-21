@@ -331,6 +331,47 @@ class StepHandlerMixin:
                 _inst = None
         return _er(_inst, step.id, fallback=step.target_role)
 
+    def _has_evidence(self, run, step) -> tuple:
+        """status 为空的步骤是否已有满足 exit_condition 的完成消息（DESIGN T2 / AC1）。
+
+        `status` 同时承担两个语义：投递结果（notified=角色收到）与可消费前提
+        （只有 notified/running 才进 _tick）。角色忙时 status 恒空，于是即使完成
+        消息早已到达也永不消费，直到排队预算耗尽被回收——A2 的 5 例实证消息
+        都写在回收之前。
+
+        判据**完全沿用** _check_exit（cat/src/text_contains/require_wf/软归属），
+        不新增口径。时间下界取实例创建时刻：从未 notified 的步骤没有
+        notified_at/bus_anchor，而实例创建前的消息不可能属于它。
+
+        dual_node 不在此抢跑（node1/node2 两段式由 _tick 管）。
+        返回 (最早匹配 ts, 匹配消息)；无匹配返回 (0.0, [])。
+        """
+        ec = step.exit_condition or {}
+        cat = ec.get("bus_category", "")
+        if not cat or getattr(step, "dual_node", False):
+            return (0.0, [])
+        if isinstance(run, dict):
+            iid, created = run.get("instance_id") or "", run.get("created_at") or 0.0
+            template = run.get("template_id") or ""
+            from liveness import effective_role as _er
+            eff = _er(run, step.id, fallback=step.target_role)
+        else:
+            iid = getattr(run, "id", "") or ""
+            created = getattr(run, "created_at", 0) or 0.0
+            template = getattr(run, "workflow_name", "") or ""
+            eff = self._eff_role(run, step)
+        try:
+            return self._check_exit(
+                cat, ec.get("source_contains", ""), ec.get("text_contains", ""),
+                created_after=created, wf_id=iid if ec.get("require_wf") else "",
+                own_wf_id=iid, template=template, step_id=step.id,
+                wait_roles=getattr(step, "wait_roles", None), eff_role=eff)
+        except Exception as _e:
+            # 探测失败按「无证据」处理：走原有投递/回收路径，不让一次查询异常
+            # 把回收变成永久豁免。
+            LOGGER.debug("evidence check failed %s/%s: %s", str(iid)[:12], step.id, _e)
+            return (0.0, [])
+
     def _has_live_subflow(self, run, step) -> bool:
         """当前步骤是否有"未死"的子链（父步的产出由子链承担）。
 

@@ -851,6 +851,38 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         (json.dumps(results, ensure_ascii=False), inst["instance_id"])
                     )
 
+                # 完成证据优先于投递（DESIGN T2 / AC1）：status 为空 ≠ 任务没做完。
+                # 角色忙（busy）与投递失败都留空 status 以便重试，但完成消息可能
+                # **早已到达**——此时重投是重复派活，而排队预算耗尽后会直接把一条
+                # 已完成的工作流回收（A2 的 5 例实证均属此形态）。
+                #
+                # 只把门打开、不在此处 complete：置 notified 后往下流入 _tick，
+                # 统一走 exit_schema / verify / 审批门控，否则等于开一条绕过质量闸门的捷径。
+                # ts 重置为 now：老实例早已超出 timeout 窗，不重置会先走超时分支
+                # （递增 timeout_count → 自动 cancel）。
+                # bus_anchor = 实例创建时刻（硬下限）：出生前的消息不可能属于本实例。
+                if not step_status:
+                    _ev_ts, _ = self._has_evidence(inst, step)
+                    if _ev_ts:
+                        # 排队账本（queued/queued_since/delivery_fail_count）必须保留：
+                        # 它们正是"角色忙"形态下的现场，丢掉等于抹掉回收判据。
+                        _ev_sr = results.get(step_id)
+                        _ev_sr = dict(_ev_sr) if isinstance(_ev_sr, dict) else {}
+                        results[step_id] = {
+                            **_ev_sr,
+                            "status": "notified",
+                            "ts": time.time(),
+                            "notified_at": _ev_sr.get("notified_at") or time.time(),
+                            "bus_anchor": _ev_sr.get("bus_anchor")
+                                          or inst.get("created_at") or _ev_ts,
+                        }
+                        lm.execute(
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                        step_status = "notified"
+                        LOGGER.info("completion evidence 已到 %s/%s：跳过投递，直接消费",
+                                    inst["instance_id"][:12], step_id)
+
                 # 步骤尚未开始（首次检测到）→ 发初始提示词给角色
                 if not step_status:
                     task_rows = lm.query(
