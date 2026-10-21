@@ -937,10 +937,12 @@ class RoleLifecycleMixin:
             path.write_text(body, encoding="utf-8")
         # 这一步发生在 ccs send 成功之后：抛出去会让 engine.run_once 的整个
         # for row 循环中断（同一类"单点异常停整轮"）。sqlite3.Error = 并发写 WAL
-        # 撞 locked；AttributeError = 脚手架没挂 _lm。
+        # 撞 locked；AttributeError = _lifecycle 懒加载拿不到库（engine.py:410）。
+        # WARNING 不能降级：daemon 跑 INFO，DEBUG 等于零信号，而同步失败会让本步
+        # 整个周期停在旧任务书（notified 已盖戳，不会重投）。
         except (ValueError, KeyError, TypeError, OSError, AttributeError,
                 sqlite3.Error) as _e:
-            LOGGER.debug("TASKS.md 同步失败 %s/%s: %s", role, wf_id[:12], _e)
+            LOGGER.warning("TASKS.md 同步失败 %s/%s: %s", role, wf_id[:12], _e)
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
