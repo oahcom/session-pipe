@@ -1386,6 +1386,23 @@ class StepHandlerMixin:
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail in _sync_step_results fallback")
 
+    def _gate_prompt(self, run, step: Step, msg: str) -> None:
+        """闸门失败：写 bus 之外**直接提示执行角色**补哪个文件。
+
+        只写 bus 时角色根本不去读——实测 wf_rw_6f51b0ff030e/s1 18:55 已声明完成、
+        闸门判缺产出，原样挂到 20:12（77min）父链停在 s4 rejected；
+        wf_rw_50eb6ec9d6fd 同样挂 3h20m 直到 timeout_count=3。
+        """
+        self._bb.write("blocker", msg, src="workflow_engine")
+        try:
+            self._send_to_role(
+                self._eff_role(run, step),
+                f"/goal\n## 闸门未通过（{run.workflow_name}/{step.id}）\n{msg}\n"
+                f"补齐上述产出后重新写 bus 完成声明（标题含 {step.id}-complete）。",
+                wf_id=run.id, step_id=step.id, force=True)
+        except Exception as _e:
+            LOGGER.debug("gate prompt to role failed: %s", _e)
+
     def _gate_alert(self, key: str, text: str, write) -> None:
         """闸门失败播报节流：同一步骤同一条失败 ≥5 分钟才再写一次 bus。
 
@@ -1416,7 +1433,7 @@ class StepHandlerMixin:
             if not ok:
                 _msg = f"[workflow] {run.workflow_name} {step.id} schema: {'; '.join(errs)}"
                 self._gate_alert(f"{run.id}/{step.id}/schema", _msg,
-                                 lambda: self._bb.write("blocker", _msg, src="workflow_engine"))
+                                 lambda: self._gate_prompt(run, step, _msg))
                 self._sync_step_results(run.id, run.step_results)
                 return True
         if step.verify:
@@ -1433,13 +1450,13 @@ class StepHandlerMixin:
                 # 闸门自身故障不算通过：按失败留痕交下一轮重试（同 schema 节流）
                 _msg = f"[workflow] {run.workflow_name} {step.id} verify 执行异常: {_e}"
                 self._gate_alert(f"{run.id}/{step.id}/verify", _msg,
-                                 lambda: self._bb.write("blocker", _msg, src="workflow_engine"))
+                                 lambda: self._gate_prompt(run, step, _msg))
                 self._sync_step_results(run.id, run.step_results)
                 return True
             if ver.returncode != 0:
                 _msg = f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}"
                 self._gate_alert(f"{run.id}/{step.id}/verify", _msg,
-                                 lambda: self._bb.write("blocker", _msg, src="workflow_engine"))
+                                 lambda: self._gate_prompt(run, step, _msg))
                 self._sync_step_results(run.id, run.step_results)
                 return True
         return False

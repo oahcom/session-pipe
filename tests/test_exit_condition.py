@@ -461,15 +461,21 @@ class TestTickExitSchemaBlocked(unittest.TestCase):
         run = _run()
         eng._tick(run, step)
 
-        eng._bb.write.assert_called_once()
-        call_args = eng._bb.write.call_args
-        self.assertIn("schema", call_args[0][1])
+        # 与 TestTickVerifyBlocked 同一口径：同一 _tick 里角色启动失败也会写 blocker，
+        # 次数取决于启动重试/冷却状态 → 全量跑间歇红、单跑绿。只锁契约：
+        # schema 失败必须留下带 "schema" 的 blocker。
+        titles = [c[0][1] for c in eng._bb.write.call_args_list]
+        self.assertTrue(any("schema" in t for t in titles), titles)
 
 
 class TestTickVerifyBlocked(unittest.TestCase):
     @patch("pipeflow.engine._sp")
     def test_verify_fail_blocks_advance(self, mock_sp):
         eng = _mocked_eng()
+        # 角色拉起是另一条路径（30×1s 真实 sleep + 自己写 blocker）。本用例只验
+        # verify 阻断推进；不隔离它就会让"写了几次 blocker"取决于重试状态，
+        # 全量跑间歇红、单跑绿，还额外烧 90s。
+        eng._ensure_role_alive = MagicMock(return_value=True)
         eng._check_exit = MagicMock(return_value=(time.time(), [{"id": 1, "text": "match", "ts": time.time(), "src": "test"}]))
         eng._validate_exit_schema = MagicMock(return_value=(True, []))
 
@@ -482,9 +488,11 @@ class TestTickVerifyBlocked(unittest.TestCase):
         run = _run()
         eng._tick(run, step)
 
-        eng._bb.write.assert_called_once()
-        call_args = eng._bb.write.call_args
-        self.assertIn("verify", call_args[0][1])
+        # 不能断言"只写一次"：同一 _tick 里角色启动失败也会写 blocker（实测 7 次），
+        # 次数取决于启动重试与冷却缓存状态 → 全量跑间歇红、单跑绿。这里只锁定契约：
+        # verify 失败必须留下带 "verify" 的 blocker。
+        titles = [c[0][1] for c in eng._bb.write.call_args_list]
+        self.assertTrue(any("verify" in t for t in titles), titles)
 
 
 class TestTickCompletedRunSkipped(unittest.TestCase):

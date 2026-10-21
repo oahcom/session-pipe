@@ -886,7 +886,6 @@ class RoleLifecycleMixin:
             LOGGER.debug("notify suppressed (cooldown %ds): %s / %s",
                          self._ALERT_COOLDOWN_S, role, title)
             return
-        _ts[_key] = _now
         self._bb.write("blocker", title, evidence=evidence, src="workflow_engine")
         try:
             _engine_mod._sp.run(
@@ -897,6 +896,9 @@ class RoleLifecycleMixin:
             )
         except Exception:
             pass
+        # 冷却记账必须在投递**之后**：写在前面时 bus 写失败或 send 抛错都会吃掉
+        # 30min 窗口，告警静默丢失而状态还在（wf_lifecycle 每轮都会再判到它）。
+        _ts[_key] = _now
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
