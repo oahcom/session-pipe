@@ -324,15 +324,15 @@ def test_tick_integrity_reply后complete_step被调用():
 def test_fail_open后步骤能推进():
     """fail-open后步骤不悬死，完整性状态被清除。
 
-    步骤本身必须是**新鲜**的（notified_at 刚写）：_tick 先判步骤超时再进完整性块，
-    旧的 6000s + timeout_minutes=1 会让它先撞超时分支直接 return，
-    根本到不了 fail-open（实测：age=6000s → complete 保持测试设的 True；
-    age=30s → pending=False complete=False）。原夹具因此长期假红。
+    夹具刻意用"早已超时"的步骤（now-6000s，timeout_minutes=1）：
+    角色忙时 _tick 走排队分支，在完整性块**之前**就 return ——
+    若 fail-open 只在完整性块里做，"角色忙 + 等 integrity 回复"的步骤永远清不掉状态，
+    只能被排队预算杀掉（codex review 2026-10-21 指出，原夹具正好覆盖这条路径）。
     """
     eng = _build_eng()
     run = _make_run(step_results={
-        "s1": {"status": "notified", "ts": time.time() - 5,
-               "notified_at": time.time() - 5}
+        "s1": {"status": "notified", "ts": time.time() - 6000,
+               "notified_at": time.time() - 6000}
     })
     step = _make_step(exit_condition={"bus_category": "notice", "text_contains": "DONE",
                                        "timeout_minutes": 1})
@@ -346,7 +346,13 @@ def test_fail_open后步骤能推进():
         "integrity_retry_count": 3,  # 已达 max_retries
         "integrity_max_retries": 3,
     })
+    # 角色必须判忙，才走得到"排队分支里 fail-open"这条新路径；
+    # 否则断言会被后面常规完整性块满足，新加的分支根本没被执行（codex review P2）。
+    from unittest.mock import MagicMock as _MM
+    eng._is_role_busy = _MM(return_value=True)
+    eng._integ_fail_open_if_due = _MM(wraps=eng._integ_fail_open_if_due)
     eng._tick(run, step)
+    assert eng._integ_fail_open_if_due.called, "角色忙时未走到排队分支的 fail-open"
     # fail-open：pending 被清除，步骤不卡死
     from pipeflow.integrity import load_state
     state = load_state(run.step_results, "s1")

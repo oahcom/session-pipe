@@ -717,6 +717,12 @@ class StepHandlerMixin:
                 # 4 次（默认 _auto_cancel_at）即 cancel —— 若只看次数，排队
                 # ~50s 就绕过了上面的预算门槛，误杀原样复现（codex P1）。
                 # 互锁破环本身不受影响：预算耗尽后仍会降级并回收。
+                #
+                # 完整性 fail-open 必须在这里做：角色忙时本分支要么 return 要么降级，
+                # 后面的完整性块永远到不了；已声明完成、只等 integrity 回复的步骤就
+                # 再也 fail-open 不了，只能被排队预算杀掉（codex review 2026-10-21）。
+                # 只清状态、不推进，等角色空出来下一 tick 照常走 exit 匹配。
+                self._integ_fail_open_if_due(run, step, ec)
                 if (_queued >= _QUEUE_DEGRADE_AT
                         and time.time() - _q_since >= _q_budget):
                     LOGGER.warning("排队 %d 次、%d 分钟无进展 → %s/%s 降级为超时计数解锁回收",
@@ -1385,6 +1391,31 @@ class StepHandlerMixin:
                                    evidence=f"write_err={_e}, rollback_err={_e2}", src="pipeflow")
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail in _sync_step_results fallback")
+
+    def _integ_fail_open_if_due(self, run, step: Step, ec: dict) -> None:
+        """角色忙期间到期的完整性审查直接 fail-open（清状态，不推进）。
+
+        _tick 的排队分支在完整性块之前 return，所以"角色忙 + 等 integrity 回复"
+        的步骤永远等不到 fail-open（codex review 实测：把 _is_role_busy 打成 True，
+        原 fail-open 用例就只能读到测试自己 set 的 complete=True）。
+        """
+        _st = _integ_load({step.id: self._step_sd(run, step)}, step.id)
+        if not _st.complete:
+            return
+        _elapsed = time.time() - self._step_sd(run, step).get(
+            "integrity_last_sent_at", time.time())
+        if _elapsed < ec.get("timeout_minutes", 30) * 60:
+            return
+        # 返回 True = 只是重开一轮审查（pending 仍为 True，状态没清）；
+        # False = 真正的 fail-open。日志必须分支，否则运维会以为闸门被绕过。
+        _reopened = _integ_retry(run.step_results, step.id)
+        self._sync_step_results(run.id, run.step_results)
+        if _reopened:
+            LOGGER.info("integrity busy: %s/%s 重开一轮审查（角色忙，状态保留）",
+                        run.id[:12], step.id)
+        else:
+            LOGGER.warning("integrity fail-open(busy): %s/%s 角色忙期间已超时，清状态等空闲",
+                           run.id[:12], step.id)
 
     def _gate_prompt(self, run, step: Step, msg: str) -> None:
         """闸门失败：写 bus 之外**直接提示执行角色**补哪个文件。
