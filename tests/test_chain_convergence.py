@@ -79,3 +79,51 @@ def test_advance_prompt_carries_step_and_contract(_mock):
     assert "chain/s2-complete" in out, "契约匹配串必须原样出现，否则角色写不中"
     assert "*.py" in out
     _cleanup(d)
+
+def test_rework_alive_ignores_maintainer_chain():
+    """升级续期也不得被系统问题链拖住（否则 24h 钉死照旧）。"""
+    from pipeflow.engine import _rework_alive
+
+    class _LM:
+        def __init__(self, rows): self._rows = rows
+        def query(self, sql, params): return self._rows
+
+    sys_rows = [{"status": "running", "template_id": "maintainer_health_monitor"}]
+    assert _rework_alive(_LM(sys_rows), ["wf_rw_a"]) is False
+    biz_rows = [{"status": "running", "template_id": "architect_full_design"}]
+    assert _rework_alive(_LM(biz_rows), ["wf_rw_a"]) is True
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_dedupe_adopts_live_chain_instead_of_reporting_none(_mock):
+    """重投后再次驳回：库里已有同模板在跑的返工链 → 认领它，不报"没建"。
+
+    返回 False 会让调用方立即重投原步（边修边重审），这是 codex 二轮 P2。
+    """
+    d = _make_env()
+    _write_wf(d, "chain", [_step("s1", type="review")])
+    _write_wf(d, "engineer_feature", [_step("s1", target_role="engineer")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("chain", {})
+    review = eng._workflows["chain"].steps[0]
+    msg = {"s1": {"exit_messages": [{"text":
+           "CHANGES_REQUESTED\n【业务问题→engineer】\n- P1 | 返回值错误 | chain.py:68"}]}}
+    assert eng._create_rework_subflow(rid, eng._lifecycle, "chain", "s1", review, None, msg) is True
+    row = eng._lifecycle.query_one(
+        "SELECT step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+    first = json.loads(row["step_results"])["s1"]["rework_ids"]
+    assert len(first) == 1
+    # 模拟 _REQUEUE_DROP 清空 rework_ids 后的再次驳回
+    eng._lifecycle.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                           (json.dumps({"s1": {"status": ""}}), rid))
+    assert eng._create_rework_subflow(rid, eng._lifecycle, "chain", "s1", review, None, msg) is True
+    row = eng._lifecycle.query_one(
+        "SELECT step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+    again = json.loads(row["step_results"])["s1"]["rework_ids"]
+    assert again == first, f"应认领原链 {first}，实际 {again}"
+    n = eng._lifecycle.query(
+        "SELECT instance_id FROM workflow_instances WHERE parent_wf_id=? AND template_id='engineer_feature'",
+        (rid,))
+    assert len(n) == 1, f"同模板返工链不得重复建，实际 {len(n)} 条"
+    _cleanup(d)
