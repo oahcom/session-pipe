@@ -221,7 +221,12 @@ def test_takeover_reuses_authoritative_child_link():
     assert took is True, "已有活跃子链应判为接管"
     assert not inserts, f"不得新建子链任务: {inserts!r}"
     assert results["s1"]["subflow_id"] == "wf_sub_deadbeef01", "应写回权威子链 id"
-    assert updates and "wf_sub_deadbeef01" in updates[0][0], "应持久化子链指针"
+    # 指针用单键 json_set 落库（4f02450）：SQL 是固定模板，值在 params 里 ——
+    # 断言整份 results 文本里出现 id 会误判成"没持久化"（那份写法会把本 tick
+    # 刚落的 next_step.notified 一并抹掉）。
+    assert updates, "应持久化子链指针"
+    assert updates[0][0] == '$."s1".subflow_id', f"写错键: {updates[0][0]!r}"
+    assert updates[0][1] == "wf_sub_deadbeef01", f"子链 id 未落库: {updates[0]!r}"
 
 
 def test_takeover_fallback_only_claims_live_links():
