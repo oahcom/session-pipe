@@ -847,13 +847,22 @@ class TrajectoryQualityChecker:
         目录用连字符（…-product-architect）。不归一则该角色恒匹配 0 目录，
         check() 走「无可检查对象 → passed=True」的假验证分支（2026-10-16 实测）。
         """
-        out: list[Path] = []
         needle = role.lower().replace("_", "-")
-        for d in _TRANSCRIPTS_DIR.iterdir():
-            if not d.is_dir():
-                continue
-            if needle in d.name.lower().replace("_", "-"):
-                out.append(d)
+
+        def _tail(name: str) -> str:
+            """'-home-…-ccs-workspaces-knowledge-curator' → 'knowledge-curator'。"""
+            n = name.lower().replace("_", "-")
+            n = n.split("-ccs-workspaces-")[-1] if "-ccs-workspaces-" in n else n
+            return re.sub(r"-\d+$", "", n)          # engineer-2 → engineer
+
+        out = [d for d in _TRANSCRIPTS_DIR.iterdir()
+               if d.is_dir() and _tail(d.name) == needle]
+        if not out:
+            # 兜底：目录布局不是 ccs-workspaces 形态时退回子串匹配（真实的
+            # 前缀撞车已由精确匹配挡住：curator 曾把 knowledge-curator 的 19 份
+            # 转录一起算进来，同一条 finding 记给两个角色）。
+            out = [d for d in _TRANSCRIPTS_DIR.iterdir()
+                   if d.is_dir() and needle in d.name.lower().replace("_", "-")]
         return out
 
     def _load_tool_calls(self, sessions: list[Path]) -> list[dict]:
@@ -933,6 +942,13 @@ class TrajectoryQualityChecker:
         calls = self._load_tool_calls(sessions)
         findings: list[dict] = []
 
+        # 工具在该 session 里根本不存在时（"No such tool available"），这次调用从未执行，
+        # 缺键判的是"会不会用该工具"——maintainer 的 Grep 就是这样被误报缺 pattern。
+        _no_tool_ids = {c["id"] for c in calls
+                        if c["kind"] == "result" and c["id"]
+                        and "<tool_use_error>" in (c.get("text") or "")
+                        and "No such tool available" in (c.get("text") or "")}
+
         # ── 1. schema 校验 ──
         for c in calls:
             if c["kind"] != "use":
@@ -945,6 +961,8 @@ class TrajectoryQualityChecker:
             # Claude Code 有时打包 __unparsedToolInput，此时 input 非标准 shape → 跳过严格校验
             # （这些调用仍可被其它维度评估，避免 schema 维度产生噪声虚报）
             if "__unparsedToolInput" in inp:
+                continue
+            if c["id"] in _no_tool_ids:
                 continue
             missing = [k for k in req if k not in inp]
             if missing:
@@ -1033,6 +1051,22 @@ class TrajectoryQualityChecker:
         failed_ids = {(c["src"], c["id"]) for c in calls
                       if c["kind"] == "result" and c["id"] and c["error"]} - _ok_ids
 
+        # 自己写过的文件不算盲改：内容本来就在自己上下文里（Claude Code 也明说
+        # "no need to Read it back"）。只豁免**写之后**的编辑；跨 transcript 不豁免
+        # ——那份内容可能已被别人改过。实测 pg 5 条误报里 4 条是这一类。
+        # compact 后仍豁免：Edit 要带 old_string 且成功，说明角色手上的内容与磁盘一致
+        # （对不上会失败，而失败的写已按 failed_ids 跳过），这正是"没盲改"的证据。
+        # 写工具算两种：内置 Write 与 mcp__*__write_file（实测 573 次，input 同 file_path）。
+        own_written: dict[tuple[str, str], int] = {}
+        for c in calls:
+            _n = c["name"] or ""
+            if (c["kind"] == "use" and (_n == "Write" or _n.endswith("__write_file"))
+                    and c["id"] and (c["src"], c["id"]) in _ok_ids):
+                fp = (c["input"] or {}).get("file_path")
+                if fp:
+                    _k = (c["src"], fp)
+                    own_written[_k] = min(own_written.get(_k, c["order"]), c["order"])
+
         def _close_thrash():
             nonlocal repeat_run, repeat_window_start, last_cmd
             if repeat_run >= _THRASH_REPEAT_MIN and repeat_window_start is not None:
@@ -1083,6 +1117,8 @@ class TrajectoryQualityChecker:
                 if cid and (c["src"], cid) in failed_ids:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
+                    continue
+                if fp and own_written.get((c["src"], fp), c["order"]) < c["order"]:
                     continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
