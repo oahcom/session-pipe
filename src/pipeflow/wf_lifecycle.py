@@ -289,14 +289,7 @@ class WorkflowLifecycleMixin:
                 # 条件 0 例外：步骤自身已终态，子链本就该随之终止。缺这道门时
                 # 24h 兜底会连同活着的子链一起被级联杀掉（在途产出直接丢失）。
                 elif _live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {}):
-                    # 子链活着 = 父步无新产出属正常态，但豁免必须有上界：本 elif
-                    # 短路条件 1-4（含全局阈值）。子链卡审批（行级仍 running）时
-                    # 父链可等到 72h 且零记录 —— 16 个 live 实例里 2 条正是此态。
-                    if age_h > _global_limit_h:
-                        _cond = "5"
-                        reason = (f"等子链 {str(_cur_step.get('subflow_id') or '')[:12]} "
-                                  f"已 {age_h:.1f}h > 上限 {_global_limit_h}h"
-                                  f"（子链仍存活，父步状态={_cur_step.get('status')!r}）")
+                    pass
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
                 elif max_tc >= _auto_cancel_at:
@@ -1280,12 +1273,18 @@ class WorkflowLifecycleMixin:
                     # _REQUEUE_DROP 清空，只按它去重会让每轮驳回新开一条同型链
                     # （实测 maintainer 队列积到 91 深仍在增长，而系统问题链已不再
                     # 阻断父链，重复建只会继续堆队列）。
-                    if conn.execute(
-                            "SELECT 1 FROM workflow_instances WHERE parent_wf_id=? AND template_id=? "
-                            "AND status NOT IN ('completed','failed','cancelled') LIMIT 1",
-                            (wf_id, _tpl)).fetchone():
-                        LOGGER.info("rework 活跃链仍在 %s/%s 类型=%s，不重复创建",
-                                    wf_id[:8], _type_label, _tpl)
+                    _live = conn.execute(
+                        "SELECT instance_id FROM workflow_instances WHERE parent_wf_id=? "
+                        "AND template_id=? AND status NOT IN ('completed','failed','cancelled') "
+                        "LIMIT 1", (wf_id, _tpl)).fetchone()
+                    if _live:
+                        # 必须认领这条在跑的链（写回 rework_ids）而不是"没建"：
+                        # 返回 False 会让调用方按"无返工链"重投原步，边修边重审，
+                        # 新驳回文案还会被丢掉（codex 二轮 P2）。
+                        LOGGER.info("rework 活跃链仍在 %s/%s 类型=%s，认领 %s",
+                                    wf_id[:8], _type_label, _tpl, _live["instance_id"][:12])
+                        _new_reworks.append(_live["instance_id"])
+                        _created_tpls.add(_tpl)
                         continue
                     _sub_wf = self._workflows.get(_tpl)
                     if not _sub_wf or not _sub_wf.steps:

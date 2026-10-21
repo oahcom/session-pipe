@@ -212,10 +212,14 @@ def _rework_alive(lm, rework_ids: list) -> bool:
         return False
     try:
         _ph = ",".join("?" * len(rework_ids))
+        # 系统问题链不算"还在写"：它修的是引擎/模板债，不会动产品产物，
+        # 拿它续期会让父链陪着排队（实测维护队列 91 深）一路续到 24h 回收。
+        # 与 _blocking_rework_sts 同一口径，两处必须一致。
         return any(r["status"] not in _REWORK_TERMINAL
                    for r in lm.query(
-                       f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
-                       tuple(rework_ids)))
+                       f"SELECT status, template_id FROM workflow_instances "
+                       f"WHERE instance_id IN ({_ph})", tuple(rework_ids))
+                   if "maintainer" not in (r["template_id"] or ""))
     except Exception:
         return True
 
@@ -519,14 +523,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("[wf] SQLite 模板加载失败: %s", e)
 
     def list_workflows(self) -> list[str]:
-        # 别名与规范名同对象：按对象去重，避免同一模板列两遍
-        seen_wf: set[int] = set()
-        out: list[str] = []
-        for name, wf in sorted(self._workflows.items()):
-            if wf.is_subflow or id(wf) in seen_wf:
-                continue
-            seen_wf.add(id(wf)); out.append(name)
-        return out
+        # 别名与规范名同对象：按对象去重，列短键（JSON 名），wf list 输出不变
+        _keys: dict[int, list[str]] = {}
+        for name, wf in self._workflows.items():
+            if not wf.is_subflow:
+                _keys.setdefault(id(wf), []).append(name)
+        return sorted(min(_ks, key=len) for _ks in _keys.values())
 
     def active_workflow_count(self) -> int:
         """当前活跃工作流数（pending/running/step_done_ready）。"""
