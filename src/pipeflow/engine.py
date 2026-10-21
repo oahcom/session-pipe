@@ -881,6 +881,48 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                        (json.dumps(results, ensure_ascii=False), wf_id))
         LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
 
+    def _remind_step_done(self, inst, step, results, step_id, lm):
+        """完成一步的完整性提醒（用户要求每个步骤都提醒）。
+
+        预推进与主循环都要发：预推进先跑完的实例，主循环就再也看不到
+        step_done_ready，提醒若只留在主循环会整段丢失（codex 复审 2026-10-22）。
+        """
+        # 用户要求"每个步骤"都提醒 → step_done_ready 路径也补发完整性提醒
+        try:
+            from pipeflow.integrity import send_bypass_reminder as _sbr
+            _sbr_run = SimpleNamespace(id=inst["instance_id"], step_results=results)
+            _sbr_step = SimpleNamespace(
+                id=step_id, target_role=step.target_role,
+                prompt_template=step.prompt_template
+            )
+            def _persist_step_done(*args):
+                """步骤完成回调：将 bypass 提醒状态持久化到 DB（daemon 重启后不重复）。
+
+                只写本步的两个 bypass 标志，不写整份 results：results 是
+                run_once 开头（:924）读的快照，本 tick 里别人的写入（如
+                confirm_step 清 approval_token）会被这份旧快照覆盖回去
+                —— 实测 token 已消费却复活。同 wf_lifecycle 落锚的写法。
+                """
+                try:
+                    _sr = (results or {}).get(step_id) or {}
+                    lm.execute(
+                        "UPDATE workflow_instances SET step_results="
+                        "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) "
+                        "WHERE instance_id=?",
+                        (f'$."{step_id}".integrity_reminder_sent_bypass', True,
+                         f'$."{step_id}".integrity_reminder_sent_bypass_at',
+                         _sr.get("integrity_reminder_sent_bypass_at", time.time()),
+                         inst["instance_id"]))
+                except Exception:
+                    LOGGER.debug("step_done_ready bypass flag persist failed for %s",
+                                 inst["instance_id"])
+            _sbr(_sbr_run, _sbr_step, "step_done_ready",
+                 send_to_role=self._send_to_role,
+                 sync_step_results=_persist_step_done)
+        except Exception:
+            LOGGER.debug("step_done_ready integrity send failed for %s", inst["instance_id"])
+
+
     def run_once(self):
         _t_tick = time.time()
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
@@ -925,6 +967,14 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 if ((_pr_sr.get(_pr["current_step_id"]) or {}).get("status")
                         not in ("step_done_ready", "completed")):
                     continue
+                _pr_wf = self._workflows.get(_pr["template_id"])
+                _pr_step = next((s for s in (_pr_wf.steps if _pr_wf else [])
+                                 if s.id == _pr["current_step_id"]), None)
+                if _pr_step is None:
+                    continue
+                # 提醒与推进都要在这里做：主循环随后看不到这个实例了。
+                self._remind_step_done(_pr, _pr_step, _pr_sr, _pr["current_step_id"],
+                                       self._lifecycle)
                 self._advance_production_wf(_pr["instance_id"], self._lifecycle, _pr["template_id"],
                                             _pr["current_step_id"], _pr_sr)
         except Exception as _pr_e:
@@ -1291,40 +1341,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     lm.execute("UPDATE workflow_instances SET status='running' "
                                "WHERE instance_id=? AND status='step_done_ready'",
                                (inst["instance_id"],))
-                    # 用户要求"每个步骤"都提醒 → step_done_ready 路径也补发完整性提醒
-                    try:
-                        from pipeflow.integrity import send_bypass_reminder as _sbr
-                        _sbr_run = SimpleNamespace(id=inst["instance_id"], step_results=results)
-                        _sbr_step = SimpleNamespace(
-                            id=step_id, target_role=step.target_role,
-                            prompt_template=step.prompt_template
-                        )
-                        def _persist_step_done(*args):
-                            """步骤完成回调：将 bypass 提醒状态持久化到 DB（daemon 重启后不重复）。
-
-                            只写本步的两个 bypass 标志，不写整份 results：results 是
-                            run_once 开头（:924）读的快照，本 tick 里别人的写入（如
-                            confirm_step 清 approval_token）会被这份旧快照覆盖回去
-                            —— 实测 token 已消费却复活。同 wf_lifecycle 落锚的写法。
-                            """
-                            try:
-                                _sr = (results or {}).get(step_id) or {}
-                                lm.execute(
-                                    "UPDATE workflow_instances SET step_results="
-                                    "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) "
-                                    "WHERE instance_id=?",
-                                    (f'$."{step_id}".integrity_reminder_sent_bypass', True,
-                                     f'$."{step_id}".integrity_reminder_sent_bypass_at',
-                                     _sr.get("integrity_reminder_sent_bypass_at", time.time()),
-                                     inst["instance_id"]))
-                            except Exception:
-                                LOGGER.debug("step_done_ready bypass flag persist failed for %s",
-                                             inst["instance_id"])
-                        _sbr(_sbr_run, _sbr_step, "step_done_ready",
-                             send_to_role=self._send_to_role,
-                             sync_step_results=_persist_step_done)
-                    except Exception:
-                        LOGGER.debug("step_done_ready integrity send failed for %s", inst["instance_id"])
+                    self._remind_step_done(inst, step, results, step_id, lm)
                     continue
                 # ── rejected 消费──
                 # rejected 曾是只写不读的死状态：写入点 2 处（manager.py W1/W2），
