@@ -236,6 +236,18 @@ def _transcript_stalled(role: str, max_age: float = _STOPPED_PROGRESS_SEC) -> bo
         return False
 
 
+def _start_error_text(stdout: bytes | None, stderr: bytes | None) -> str:
+    """ccs start 失败时该报哪段输出：stdout 的协议 JSON，不是 stderr 的日志。
+
+    ccs 的 core 模块一 import 就 basicConfig(INFO)，正常启动也会往 stderr 写一行
+    "写入 settings.json"。旧实现 stderr 优先，于是 6 条 blocker 的证据全是这句
+    INFO（bus #434228/#434257/#434307），真因 {"success": false, ...} 被吞。
+    """
+    out = stdout or b""
+    pick = out if b'"success"' in out else (stderr or out)
+    return pick.decode("utf-8", "replace")[:300]
+
+
 class RoleLifecycleMixin:
     """WorkflowEngine 的角色管理 mixin。"""
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
@@ -770,7 +782,7 @@ class RoleLifecycleMixin:
                     # 返回值 → 上层只能看到"tmux 没起来"，日志还错报 tmux alive
                     # → 空转 90s → 排队 14 次 → 子链被回收 → 父链断链。
                     # 这里把真实原因抬到日志与 blocker，使资源类阻断可被外部观测。
-                    _err = (_st.stderr or _st.stdout or b"").decode("utf-8", "replace")[:300]
+                    _err = _start_error_text(_st.stdout, _st.stderr)
                     if _st.returncode != 0 or "\"success\": false" in _err:
                         LOGGER.error("_wait_for_role_ready: ccs start %s 失败 (rc=%s): %s",
                                      role, _st.returncode, _err[:200])
