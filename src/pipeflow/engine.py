@@ -169,6 +169,14 @@ def _rework_exit(sts: list) -> str:
     return "requeue"                 # 已交付（或链已删）→ 重审原步
 
 
+def _is_system_rework(row) -> bool:
+    """该行是否系统问题链。模板名取不到时按"非系统链"——宁可多等一轮也不误放。"""
+    try:
+        return (row["template_id"] or "").replace("WF-", "") == SYSTEM_REWORK_TPL
+    except (KeyError, IndexError):
+        return False
+
+
 def _blocking_rework_sts(rows) -> list:
     """返工链状态里真正砍住重审的那部分：系统问题链不阻断。
 
@@ -176,8 +184,7 @@ def _blocking_rework_sts(rows) -> list:
     让它阻断会让产品链被维护队列扣死（实测维护者队列 91 深，3 条主链被一条
     从未投递的维护链扣 8h+，升级后按"链仍活"无限续期到 24h 全局回收）。
     """
-    return [r["status"] for r in rows
-            if (r["template_id"] or "").replace("WF-", "") != SYSTEM_REWORK_TPL]
+    return [r["status"] for r in rows if not _is_system_rework(r)]
 
 
 def _rejected_wait_anchor(sr: dict, inst: dict):
@@ -220,7 +227,7 @@ def _rework_alive(lm, rework_ids: list) -> bool:
                    for r in lm.query(
                        f"SELECT status, template_id FROM workflow_instances "
                        f"WHERE instance_id IN ({_ph})", tuple(rework_ids))
-                   if (r["template_id"] or "").replace("WF-", "") != SYSTEM_REWORK_TPL)
+                   if not _is_system_rework(r))
     except Exception:
         return True
 
@@ -1054,7 +1061,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 首步从不生成子链（实测 s1 恒无子链）。
                     if step.subflow_template and self._subflow_takeover(
                             lm, inst["instance_id"], wf_name, step, -1, results, step_id):
-                        self._sync_step_results(inst["instance_id"], results)
+                        # 不再整份回写：接管函数自己做了单键写，本分支紧接着 continue，
+                        # results 其余内容无消费方；整份写只会抹掉并发进程刚落的更新。
                         continue   # 子链已接管
                     # 首步不走 _fill_prompt_vars（本函数自行组装 prompt），
                     # 强制子代理指令必须在此再注入一次，否则每条链的 s1 漏掉。
@@ -1229,15 +1237,26 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             prompt_template=step.prompt_template
                         )
                         def _persist_step_done(*args):
-                            """步骤完成回调：将 bypass 提醒状态持久化到 DB（daemon 重启后不重复）。"""
-                            # bypass flag 真落库（daemon 重启后不重复提醒）
+                            """步骤完成回调：将 bypass 提醒状态持久化到 DB（daemon 重启后不重复）。
+
+                            只写本步的两个 bypass 标志，不写整份 results：results 是
+                            run_once 开头（:924）读的快照，本 tick 里别人的写入（如
+                            confirm_step 清 approval_token）会被这份旧快照覆盖回去
+                            —— 实测 token 已消费却复活。同 wf_lifecycle 落锚的写法。
+                            """
                             try:
+                                _sr = (results or {}).get(step_id) or {}
                                 lm.execute(
-                                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                                    (json.dumps(results, ensure_ascii=False), inst["instance_id"])
-                                )
+                                    "UPDATE workflow_instances SET step_results="
+                                    "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) "
+                                    "WHERE instance_id=?",
+                                    (f'$."{step_id}".integrity_reminder_sent_bypass', True,
+                                     f'$."{step_id}".integrity_reminder_sent_bypass_at',
+                                     _sr.get("integrity_reminder_sent_bypass_at", time.time()),
+                                     inst["instance_id"]))
                             except Exception:
-                                LOGGER.debug("step_done_ready persist sr failed for %s", inst["instance_id"])
+                                LOGGER.debug("step_done_ready bypass flag persist failed for %s",
+                                             inst["instance_id"])
                         _sbr(_sbr_run, _sbr_step, "step_done_ready",
                              send_to_role=self._send_to_role,
                              sync_step_results=_persist_step_done)
