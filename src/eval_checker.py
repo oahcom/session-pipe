@@ -989,6 +989,30 @@ class TrajectoryQualityChecker:
                     })
 
         # ── 2. 盲改 + 3. 孤儿调用 + 4. 抖动循环 ──
+        def _key(fp: str) -> str:
+            """路径归一化：'./a.md'、相对路径、绝对路径、软链折成同一个键。
+
+            不归一化时豁免退化成字符串比对——同一个文件写成 './a.md' 与
+            '/abs/a.md' 就被当成两个，Read 过照样判盲改（codex 审 R13 P0）。
+            相对路径按本进程 cwd 解析：不保证指向角色当时的目录，但只要
+            两侧用同一规则，相等就等价——判据要的是"是不是同一个文件"。
+            """
+            return os.path.realpath(os.path.expanduser(fp)) if fp else ""
+
+        def _bash_read(fp: str) -> bool:
+            """命令里出现过同名文件即算读过（roles 实测 basename 100% 命中）。
+
+            basename 必须是完整路径分量：`x.md` 不命中 `my_x.md`/`x.md.bak`
+            （子串匹配会把别的文件当成读过）。也**不**要求命令"读成功"——grep
+            无匹配退出 1 在 Claude Code 里就是 is_error，按成功过滤会丢掉全部
+            grep 读（角色规范要求的正是先 grep 定位）。
+            """
+            base = os.path.basename(fp)
+            if not base:
+                return False
+            pat = r"(?<![\w.-])" + re.escape(base) + r"(?![\w.-])"
+            return any(re.search(pat, b, re.ASCII) for b in bash_blob)
+
         read_files: set[str] = set()
         bash_blob: list[str] = []
         seen_use_ids: set[str] = set()
@@ -1041,7 +1065,7 @@ class TrajectoryQualityChecker:
                     r"File created successfully at: (.+?)(?: \(file state|$)",
                     _line0)
                 if m:
-                    created_by_call[(_k[0], _k[1], _pending[_k])] = m.group(1).strip()
+                    created_by_call[(_k[0], _k[1], _pending[_k])] = _key(m.group(1).strip())
 
         # 写没落地就不构成盲改：pg 的「No such tool available: Write」曾被报成
         # blind_edit（文件根本没写）。同 id 可能有成功+失败两条结果（重试残影），
@@ -1065,7 +1089,7 @@ class TrajectoryQualityChecker:
                     and c["id"] and (c["src"], c["id"]) in _ok_ids):
                 fp = (c["input"] or {}).get("file_path")
                 if fp:
-                    _k = (c["src"], fp)
+                    _k = (c["src"], _key(fp))
                     own_written[_k] = min(own_written.get(_k, c["order"]), c["order"])
 
         # thrash 按 transcript 归并：同一次爆发被「差一两个字符」的变体命令切段时
@@ -1107,7 +1131,7 @@ class TrajectoryQualityChecker:
             if name == "Read":
                 fp = inp.get("file_path")
                 if fp:
-                    read_files.add(fp)
+                    read_files.add(_key(fp))
 
             if name in ("Write", "Edit"):
                 fp = inp.get("file_path")
@@ -1116,8 +1140,7 @@ class TrajectoryQualityChecker:
                 # 只认 Read 会把合规行为判成 blind_edit——实测 scout/engineer/lr
                 # 共 16 处命中，其目标文件全部已被 Bash 读过（basename 100% 命中，
                 # 绝对路径命中仅 2/16，故按 basename 匹配）。
-                bash_read = bool(fp) and any(
-                    os.path.basename(fp) in b for b in bash_blob)
+                bash_read = bool(fp) and _bash_read(fp)
                 # 新建文件不是「盲改」：文件此前不存在，根本无法先 Read。
                 # Claude Code 的写结果为 "File created successfully at: <path>"，
                 # 此结果对应此前发出的该写调用（result id == tool_use_id）。
@@ -1125,12 +1148,12 @@ class TrajectoryQualityChecker:
                 # 不让任意含该文案的结果豁免（错误回显 input 时也含此短语）。
                 if cid and (c["src"], cid) in failed_ids:
                     continue
-                if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
+                if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
                     continue
                 if (name == "Edit" and fp
-                        and own_written.get((c["src"], fp), c["order"]) < c["order"]):
+                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
-                if fp and fp not in read_files and not bash_read:
+                if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
                         "issue": "blind_edit", "tool": name,
                         "file": fp, "id": cid,
