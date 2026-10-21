@@ -62,6 +62,29 @@ def test_errored_fact_is_left_for_retry():
         bb.mark_consumed.call_args_list
 
 
+def test_dry_run_never_writes_claim():
+    """--dry-run 是操作员安全开关：只展示方案，不能写 bus（含 no_consumer / stale 两条新分支）。"""
+    import time as _t
+    from routing.routes import route_all, STALE_AFTER_S
+    bb = MagicMock()
+    _rt = MagicMock()
+    _rt.get_router.return_value.routing = {"engineer": {"consume": ["code_fix"]}}
+    msgs = [
+        {"id": 6161, "category": "code_fix", "text": "[code_fix] @dkk 无主\n证据",
+         "src": "claude", "evidence": "", "priority": 1, "consumers": ["engineer"]},
+        {"id": 6162, "category": "code_fix", "text": "[code_fix] 过期\n证据",
+         "src": "claude", "evidence": "", "priority": 1, "consumers": ["engineer"],
+         "ts": _t.time() - STALE_AFTER_S - 60},
+    ]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+            patch("routing.routes._rt_mod", _rt), \
+            patch("bus_protocol.Blackboard", return_value=bb), \
+            patch("routing.routes.HEARTBEAT"), \
+            patch("routing.routes.METRICS"):
+        route_all(consumer="pipeline", dry_run=True)
+    assert not bb.mark_consumed.called, bb.mark_consumed.call_args_list
+
+
 def test_stale_fact_is_claimed_but_not_delivered():
     """超过 STALE_AFTER_S 的事实只 claim 不投递。
 

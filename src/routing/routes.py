@@ -207,7 +207,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 details.append({"id": msg["id"], "category": msg["category"],
                                 "assigned": [], "reason": "stale"})
                 try:
-                    bb.mark_consumed(msg["id"], consumer)
+                    if not dry_run:
+                        bb.mark_consumed(msg["id"], consumer)
+                    else:
+                        METRICS.inc("route_claim_skipped_dry_run")
                 except Exception as _se:
                     LOGGER.warning("route claim (stale) failed #%s: %s", msg["id"], _se)
                 continue
@@ -231,7 +234,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 # 不记 claim → 它永远留在 pipeline 视图里被每 60s 重扫一次
                 # （实测 24h 416/1813=22.9% 无主事实，领取年龄中位 136min ≈ 136 轮）。
                 try:
-                    bb.mark_consumed(msg["id"], consumer)
+                    if not dry_run:
+                        bb.mark_consumed(msg["id"], consumer)
+                    else:
+                        METRICS.inc("route_claim_skipped_dry_run")
                 except Exception as _ce:
                     LOGGER.warning("route claim (no_consumer) failed #%s: %s", msg["id"], _ce)
                 continue
