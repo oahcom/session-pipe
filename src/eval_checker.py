@@ -185,7 +185,6 @@ def _cmd_is_readonly(first_word: str, cmd: str) -> bool:
     return True
 
 
-_CONTROL_WORDS = frozenset({"for", "while", "if", "then", "do", "done", "fi", "else", "elif", "in"})
 # 白名单检查通过后仍需排除的 bash 控制结构（非命令，但需在 for/while 体内递归检查）
 _SHELL_BUILTINS_READONLY = frozenset({"for", "while", "do", "done", "if", "then", "fi", "else", "elif", "in", "exit", "return", "break", "continue", "true", "false"})
 

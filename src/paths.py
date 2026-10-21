@@ -46,10 +46,6 @@ STARVE_STATE = Path.home() / ".hermes" / "run" / "wf_starve.json"
 ITERATION_WORKSPACES = Path(os.environ.get(
     "SESSION_PIPELINE_ITERATION_WORKSPACES",
     _HOME / ".hermes" / "workspace"))
-# ── 模板与配置 ──
-HERMES_TEMPLATES = _HOME / ".hermes" / "templates"
-WORKFLOW_GUIDE = HERMES_TEMPLATES / "WORKFLOW_GUIDE.md"
-
 # ── 项目根目录 ──
 HERMES_SCRIPTS = Path(_HOME / ".hermes" / "scripts")
 SESSION_LAUNCHER_SRC = Path(_SESSION_LAUNCHER_SRC)
@@ -65,7 +61,6 @@ CCS_CLI = SESSION_LAUNCHER_SRC / "ccs.py"
 CCS_SENTINEL_DIR = Path(os.environ.get(
     "CCS_SENTINEL_DIR", str(Path.home() / ".hermes" / "run" / "ccs-sentinels")))
 LIFECYCLE_SENTINEL_DIR = Path.home() / ".hermes" / "run" / "ccs-lifecycle-sentinels"
-CODEX_SENTINEL_DIR = Path.home() / ".hermes" / "run" / "cdx-sentinels"
 
 # ── 角色目录 ──
 SESSION_ROLES_PERSONAS = SESSION_ROLES_ROOT / "personas" / "session-roles"
