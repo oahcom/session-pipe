@@ -34,6 +34,11 @@ CCS_WORKSPACES = Path(os.environ.get("SESSION_PIPELINE_CCS_WORKSPACES",
 HERMES_STATE = _HOME / ".hermes" / "state"
 # env var 覆盖: 测试隔离用（conftest 设置 SESSION_PIPELINE_WORKFLOWS_DB 指向临时 DB）
 WORKFLOWS_DB = Path(os.environ.get("SESSION_PIPELINE_WORKFLOWS_DB", HERMES_STATE / "workflows.db"))
+# env var 覆盖: 测试隔离用。task_generator 的指标落盘走这里；不隔离时跑 pytest
+# 会把 total=1 的夹具状态写进生产 workflow-metrics.jsonl，与 daemon 的
+# total=1042 交替出现，末行去重因此失效（实测 48/60 行是测试产物）。
+METRICS_JSONL = Path(os.environ.get("SESSION_PIPELINE_METRICS_JSONL",
+                                    HERMES_STATE / "workflow-metrics.jsonl"))
 CURSOR_DB = HERMES_STATE / "pipeline_cursor.db"
 ROUTING_DB = HERMES_STATE / "routing.db"
 ACK_TRACKER_DB = HERMES_STATE / "ack_tracker.db"

@@ -66,11 +66,16 @@ os.environ.setdefault("SESSION_PIPELINE_SKIP_TTL_PRUNER", "1")
 #    默认路径全部落到临时目录，不触碰生产 ~/.hermes/state/workflows.db
 _TEST_STATE_DIR = tempfile.mkdtemp(prefix="pipeline-test-state-")
 os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "workflows.db")
+# 指标文件同样隔离：task_generator 每轮 heal 都 append，不隔离则 pytest 的
+# total=1 夹具行会插进 daemon 的 total=1042 序列，生产文件末行去重失效
+# （实测一轮全量测试后 60 行里 48 行是测试产物）。
+os.environ["SESSION_PIPELINE_METRICS_JSONL"] = os.path.join(_TEST_STATE_DIR, "workflow-metrics.jsonl")
 
 # 3. 确保 paths 模块被加载并覆盖 module-level 常量
 #    （env var 在 paths.py import 时读取；若 paths 已在 sys.modules 缓存则 monkeypatch 补偿）
 import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
+_paths_mod.METRICS_JSONL = Path(os.environ["SESSION_PIPELINE_METRICS_JSONL"])
 
 # 3b. CCS_WORKSPACES 隔离：_send_to_role 会写 <workspace>/<role>/TASKS.md。
 #     不隔离则每个跑到的用例都写进生产 ~/ccs-workspaces/，实测已污染

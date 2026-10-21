@@ -609,17 +609,23 @@ class TaskGeneratorMixin:
                 }
                 # 状态未变且 300s 内已写过 → 跳过（#432192）：heal_stalled 每 6s tick
                 # 无条件 append 曾让文件膨胀到 30MB（98.9% 重复行）。心跳下限 300s
-                # 保住时间轴连续性，状态变化立即落盘保住事件精度。比对文件末行而
-                # 非内存状态：daemon 重启后仍生效。
+                # 保住时间轴连续性，状态变化立即落盘保住事件精度。
+                #
+                # 比对基准优先用**本进程内存**：同文件还有其它写者（并发跑测试的
+                # worktree、旧版进程），读末行会被它们的 total=1 夹具行打断，
+                # 实测 60 行里 48 行是测试产物 → 末行去重形同虚设。仅当本进程
+                # 尚无记录（daemon 重启）时才回读文件末行兜底。
                 _now = time.time()
-                _mf = Path.home() / ".hermes" / "state" / "workflow-metrics.jsonl"
+                # 路径走 paths.METRICS_JSONL 以便 conftest 隔离（同 WORKFLOWS_DB）。
+                from paths import METRICS_JSONL as _mf
                 _mf.parent.mkdir(parents=True, exist_ok=True)
-                _last = _last_metrics(_mf)
+                _last = getattr(self, "_metrics_last", None) or _last_metrics(_mf)
                 if not (_last and _same_metrics(_last, _metrics)
                         and _now - _last.get("ts", 0) < 300):
                     _metrics["ts"] = _now
                     with _mf.open("a") as f:
                         f.write(json.dumps(_metrics, ensure_ascii=False) + "\n")
+                    self._metrics_last = _metrics
             except (ValueError, KeyError, TypeError):
                 pass
         except Exception as _e:
