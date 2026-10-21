@@ -17,23 +17,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from pipeflow.engine import _derive_rework_ids  # noqa: E402
+from pipeflow.engine import _derive_rework_ids, _persist_queue_tick  # noqa: E402
 from workflow.db import create_connection  # noqa: E402
 
 
 class _Lm:
-    """只提供 query：派生逻辑不写库。"""
+    """最小 LifecycleManager 替身：只需要 query / execute。"""
 
     def __init__(self, db=None, boom=False):
         self.db, self.boom = db, boom
 
-    def query(self, sql, params=()):
+    def _con(self):
         if self.boom:
             raise sqlite3.OperationalError("database is locked")
         con = sqlite3.connect(self.db)
         con.row_factory = sqlite3.Row
+        return con
+
+    def query(self, sql, params=()):
+        con = self._con()
         try:
             return con.execute(sql, params).fetchall()
+        finally:
+            con.close()
+
+    def execute(self, sql, params=()):
+        con = self._con()
+        try:
+            con.execute(sql, params)
+            con.commit()
         finally:
             con.close()
 
@@ -82,3 +94,26 @@ def test_ignores_plain_subflow_children(tmp_path):
 def test_query_failure_falls_back_to_old_behaviour():
     """读失败返回空：按旧行为（重投原步）处理，不因一次读失败卡住链。"""
     assert _derive_rework_ids(_Lm(boom=True), "wf_parent", "s3") == []
+
+def test_queue_tick_preserves_sibling_keys(tmp_path):
+    """排队账本按单键写：不能把同一步的 rework_ids / subflow_id 抹掉。
+
+    实测 40 条子链里 20 条父步丢了指针；同一步因此连建多条返工链。
+    """
+    db = _db(tmp_path)
+    _insert(db, "wf_q", "running")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps({"s1": {"status": "", "queued": 5, "queued_since": 100.0,
+                                    "rework_ids": ["wf_rw_x"], "subflow_id": "wf_sub_y"}}),
+                 "wf_q"))
+    con.commit()
+    con.close()
+    _persist_queue_tick(_Lm(db), "wf_q", "s1", 6, 100.0)
+    con = sqlite3.connect(db)
+    sd = json.loads(con.execute("SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                                ("wf_q",)).fetchone()[0])["s1"]
+    con.close()
+    assert sd["queued"] == 6, sd
+    assert sd["rework_ids"] == ["wf_rw_x"], f"rework_ids 被抹掉: {sd}"
+    assert sd["subflow_id"] == "wf_sub_y", f"subflow_id 被抹掉: {sd}"

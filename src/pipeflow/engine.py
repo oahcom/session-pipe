@@ -160,6 +160,19 @@ def _canonical_tid(wf, fallback: str) -> str:
     return tid if tid.startswith(('WL-', 'WF-')) else 'WF-' + tid
 
 
+def _persist_queue_tick(lm, wf_id: str, step_id: str, queued: int, q_since: float) -> None:
+    """排队账本按单键写回。
+
+    本分支每 tick 都跑；整份回写 results 会把并发路径刚落的 subflow_id /
+    rework_ids 一起抹掉（实测 40 条子链里 20 条父步丢了指针，同一步因此连建
+    多条返工链）。单键 json_set 只动这两个键，其余原样留在库里。
+    """
+    lm.execute(
+        "UPDATE workflow_instances SET step_results="
+        "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) WHERE instance_id=?",
+        (f'$."{step_id}".queued', queued,
+         f'$."{step_id}".queued_since', q_since, wf_id))
+
 def _derive_rework_ids(lm, wf_id: str, step_id: str) -> list:
     """从行上反查该步仍在跑的返工链（rework_ids 丢了也能认回来）。
 
@@ -246,7 +259,11 @@ def _rework_alive(lm, rework_ids: list) -> bool:
                        f"SELECT status, template_id FROM workflow_instances "
                        f"WHERE instance_id IN ({_ph})", tuple(rework_ids))
                    if not _is_system_rework(r))
-    except Exception:
+    except Exception as _e:
+        # 查库失败按存活处理（宁可晚收不误杀），但必须留痕：
+        # 裸 except 会把编程错误（列名/行类型不对）也伪装成「链还活着」，
+        # 父链一路续期到 24h 全局回收，零信号。
+        LOGGER.warning("_rework_alive 查询失败，按存活续期: %s", _e)
         return True
 
 
@@ -1206,10 +1223,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             # 随 ts 刷新会让回收判据永远看到"刚排队"
                             "queued_since": _q_sr.get("queued_since") or time.time(),
                         }
-                        lm.execute(
-                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                            (json.dumps(results, ensure_ascii=False), inst["instance_id"])
-                        )
+                        # 单键写，不整份回写（见 _persist_queue_tick 注释）。
+                        _persist_queue_tick(lm, inst["instance_id"], step_id, _q_n,
+                                            results[step_id]["queued_since"])
                         LOGGER.debug("run_once: %s/%s 角色忙，排队 %s 次，跳过计数",
                                      inst["instance_id"][:12], step_id, _q_n)
                         # 排队上限：按**时长**判，不按 tick 次数。daemon 每 10s 一轮，
