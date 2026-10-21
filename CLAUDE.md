@@ -74,7 +74,7 @@ src/
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1205 行）
     task_generator.py ── 任务生成（874 行）
     wf_lifecycle.py   ── 工作流生命周期（2014 行）
-    daemon.py         ── 工作流守护 while 循环（481 行）
+    daemon.py         ── 工作流守护 while 循环（476 行）
     pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
