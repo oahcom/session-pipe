@@ -904,6 +904,8 @@ class RoleLifecycleMixin:
         TASKS.md 主块是旧任务 + [排队] 行，而 prompt 已经是新任务）。读到哪份
         就干哪件事，模板要求"先读 TASKS.md"的角色会干错活。
         """
+        if getattr(self, "_lm", None) is None:  # 无 DB 的纯投递场景（测试/延迟发送）
+            return
         try:
             rows = self._lifecycle.query(
                 "SELECT title, description FROM tasks WHERE task_id="
