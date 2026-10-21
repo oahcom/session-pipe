@@ -9,7 +9,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from pathlib import Path
 
 # Path setup
@@ -21,7 +20,7 @@ from routing import router as _rt_mod
 from paths import CCS_CLI as _CCS_CLI
 from workflow.client import WorkflowClient
 
-from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, set_last_cursor
+from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT
 from reliability import IDEMPOTENT_CONSUME, ACK_TRACKER
 from output_validator import validate_output
 
@@ -160,7 +159,7 @@ def _is_noop_report(title: str, evidence: str = "") -> bool:
 
 
 
-def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True, instance_id: str = "") -> dict:
+def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True) -> dict:
     """自动路由消费：为每条未消费消息并行分配给多个消费者。
 
     P1 改进：
@@ -168,25 +167,21 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     - 使用 ThreadPoolExecutor 并行消费
     - 幂等消费防重复
     - ACK 记录和 metrics
-    - Fix 6：poll_unconsumed 用 cursor 过滤已处理消息，route_all 结束更新 cursor
-    - Fix 7：instance_id 隔离多 pipeline 实例的 cursor
+    - 去重：每条处理完且无角色报错的事实补记 consumer='pipeline' 的 consume
+      （旧 cursor 机制已删：随机 instance_id 让游标表只增不读，21 461 行/2.9MB）
 
     dry_run=True 时只展示分配方案。
     parallel=True 时使用线程池并行。
-    instance_id 为空时自动生成，确保每个 route_all 调用周期有独立 cursor。
     """
     from concurrent.futures import ThreadPoolExecutor
     from bus_protocol import Blackboard
-
-    if not instance_id:
-        instance_id = f"pipeline_{uuid.uuid4().hex[:8]}_{os.getpid()}_{int(time.time())}"
 
     # 延迟导入规避循环依赖（poll_unconsumed 定义在 auto_route.py）
     from routing.auto import poll_unconsumed as _poll
 
     bb = Blackboard()
     router = _rt_mod.get_router()
-    messages = _poll(consumer=consumer, instance_id=instance_id)
+    messages = _poll(consumer=consumer)
     if not messages or "error" in messages[0]:
         METRICS.inc("route_errors_total")
         return {"routed": 0, "total": 0, "details": [], "dry_run": dry_run, "parallel": parallel}
@@ -304,10 +299,6 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                         _wc.close()
                                     except Exception as _e:
                                         LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
-                        try:
-                            set_last_cursor(consumer, "", fid, instance_id)
-                        except Exception as _sc_e:
-                            LOGGER.debug("set_last_cursor failed for %s fid=%s: %s", consumer, fid, _sc_e)
                     except Exception as e:
                         LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
                                      extra={"trace_id": str(fid)})
@@ -340,11 +331,6 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
             finally:
                 executor.shutdown(wait=True)
 
-            # Fix 6：更新持久化 cursor，重启后不再重复处理已消费的消息
-            if details:
-                max_id = max(d.get("id", 0) for d in assignments)
-                if max_id:
-                    set_last_cursor(consumer, "", max_id, instance_id)
 
     routed = sum(1 for d in details if d.get("assigned"))
     result = {

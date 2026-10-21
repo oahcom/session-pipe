@@ -22,8 +22,7 @@ def _make_fact(fid: int, cat: str, text: str, evidence: str = ""):
 
 
 @contextmanager
-def _poll_ctx(facts, *, config_getter=None, cursor=0,
-              circuit_side_effect=None):
+def _poll_ctx(facts, *, config_getter=None, circuit_side_effect=None):
     """一键 mock polling.py 所有外部依赖。
 
     Yields dict with bb, router, metrics, heartbeat mocks 供断言。
@@ -55,7 +54,6 @@ def _poll_ctx(facts, *, config_getter=None, cursor=0,
     logger_mock = mock.MagicMock()
 
     with mock.patch("routing.polling._rt_mod", rt_mock), \
-         mock.patch("routing.polling.get_last_cursor", return_value=cursor), \
          mock.patch("routing.polling.CIRCUIT_BREAKER", cb_mock), \
          mock.patch("routing.polling.METRICS", metrics_mock), \
          mock.patch("routing.polling.HEARTBEAT", hb_mock), \
@@ -150,34 +148,6 @@ class TestPollUnconsumed:
         with _poll_ctx([]):
             from routing.polling import poll_unconsumed
             assert poll_unconsumed() == []
-
-    def test_consumer光标跳过已处理(self):
-        facts = [
-            _make_fact(1, "code_fix", "old"),
-            _make_fact(2, "code_fix", "old2"),
-            _make_fact(3, "code_fix", "new"),
-        ]
-        with _poll_ctx(facts, cursor=2):
-            from routing.polling import poll_unconsumed
-            msgs = poll_unconsumed(consumer="engineer")
-
-        assert len(msgs) == 1
-        assert msgs[0]["id"] == 3
-
-    def test_无consumer不使用光标(self):
-        cursor_spy = mock.MagicMock(return_value=0)
-        with mock.patch("routing.polling._rt_mod"), \
-             mock.patch("routing.polling.get_last_cursor", cursor_spy), \
-             mock.patch("routing.polling.CIRCUIT_BREAKER"), \
-             mock.patch("routing.polling.METRICS"), \
-             mock.patch("routing.polling.HEARTBEAT"), \
-             mock.patch("routing.polling.LOGGER"), \
-             mock.patch("bus_protocol.Blackboard"), \
-             mock.patch("config_loader.get_config"):
-            from routing.polling import poll_unconsumed
-            poll_unconsumed()
-
-        cursor_spy.assert_not_called()
 
     def test_心跳beat被调用(self):
         with _poll_ctx([]) as deps:

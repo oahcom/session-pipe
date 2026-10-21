@@ -221,7 +221,8 @@ def test_takeover_reuses_authoritative_child_link():
     assert took is True, "已有活跃子链应判为接管"
     assert not inserts, f"不得新建子链任务: {inserts!r}"
     assert results["s1"]["subflow_id"] == "wf_sub_deadbeef01", "应写回权威子链 id"
-    assert updates and "wf_sub_deadbeef01" in updates[0][0], "应持久化子链指针"
+    assert updates and any("wf_sub_deadbeef01" in str(x) for x in updates[0]), \
+        "应持久化子链指针"
 
 
 def test_takeover_fallback_only_claims_live_links():

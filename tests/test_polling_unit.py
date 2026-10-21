@@ -1,5 +1,5 @@
 """Unit tests for routing/polling.py — poll_unconsumed error paths.
-Mocks all external deps (Blackboard, config, circuit breaker, metrics, cursor)."""
+Mocks all external deps (Blackboard, config, circuit breaker, metrics)."""
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -27,7 +27,6 @@ def test_poll_config_read_failure_logs_warning():
         patch("routing.polling.METRICS") as mock_metrics,
         patch("routing.polling.LOGGER") as mock_logger,
         patch("routing.polling.CIRCUIT_BREAKER") as mock_cb,
-        patch("routing.polling.get_last_cursor", return_value=0),
         patch("routing.polling.HEARTBEAT"),
         patch("routing.polling._rt_mod.get_router"),
     ):
@@ -54,7 +53,6 @@ def test_poll_circuit_breaker_error_returns_error_dict():
         patch("routing.polling.METRICS") as mock_metrics,
         patch("routing.polling.LOGGER"),
         patch("routing.polling.CIRCUIT_BREAKER") as mock_cb,
-        patch("routing.polling.get_last_cursor", return_value=0),
         patch("routing.polling.HEARTBEAT"),
         patch("routing.polling._rt_mod.get_router"),
     ):
@@ -82,7 +80,6 @@ def test_poll_success_returns_sorted_messages():
         patch("routing.polling.METRICS") as mock_metrics,
         patch("routing.polling.LOGGER"),
         patch("routing.polling.CIRCUIT_BREAKER") as mock_cb,
-        patch("routing.polling.get_last_cursor", return_value=0),
         patch("routing.polling.HEARTBEAT") as mock_hb,
         patch("routing.polling._rt_mod") as mock_rt,
     ):
@@ -116,7 +113,6 @@ def test_poll_category_filter():
         patch("routing.polling.METRICS"),
         patch("routing.polling.LOGGER"),
         patch("routing.polling.CIRCUIT_BREAKER") as mock_cb,
-        patch("routing.polling.get_last_cursor", return_value=0),
         patch("routing.polling.HEARTBEAT"),
         patch("routing.polling._rt_mod") as mock_rt,
     ):

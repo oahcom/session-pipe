@@ -14,38 +14,35 @@ if str(_src) not in sys.path:
 # ── route_all: mock routing.auto.poll_unconsumed + 局部依赖 ──
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_empty_messages(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_empty_messages(mock_metrics, mock_hb):
     """空消息列表 → routed=0。"""
     from routing.routes import route_all
     with patch("routing.auto.poll_unconsumed", return_value=[]), \
          patch("routing.routes._rt_mod"), \
          patch("bus_protocol.Blackboard"):
-        result = route_all(consumer="test", dry_run=True, instance_id="test_1")
+        result = route_all(consumer="test", dry_run=True)
     assert result["routed"] == 0
     assert result["total"] == 0
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_error_message(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_error_message(mock_metrics, mock_hb):
     """消息含 error → routed=0, route_errors_total 递增。"""
     from routing.routes import route_all
     with patch("routing.auto.poll_unconsumed", return_value=[{"error": "bus down"}]), \
          patch("routing.routes._rt_mod"), \
          patch("bus_protocol.Blackboard"):
-        result = route_all(consumer="test", dry_run=True, instance_id="test_2")
+        result = route_all(consumer="test", dry_run=True)
     assert result["routed"] == 0
     mock_metrics.inc.assert_any_call("route_errors_total")
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_dry_run_returns_plan(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_dry_run_returns_plan(mock_metrics, mock_hb):
     """dry_run=True → details 列出分配方案，不实际消费。"""
     from routing.routes import route_all
     msgs = [{
@@ -61,16 +58,15 @@ def test_route_all_dry_run_returns_plan(mock_metrics, mock_hb, mock_cursor):
          patch("routing.routes._rt_mod") as mock_rt_mod, \
          patch("bus_protocol.Blackboard"):
         mock_rt_mod.get_router.return_value = mock_router
-        result = route_all(consumer="test", dry_run=True, instance_id="test_3")
+        result = route_all(consumer="test", dry_run=True)
     assert result["routed"] == 1
     assert len(result["details"]) == 1
     assert "engineer" in result["details"][0]["assigned"]
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_no_consumer(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_no_consumer(mock_metrics, mock_hb):
     """消息 consumers 为空列表 → reason=no_consumer。"""
     from routing.routes import route_all
     msgs = [{
@@ -83,15 +79,14 @@ def test_route_all_no_consumer(mock_metrics, mock_hb, mock_cursor):
          patch("routing.routes._rt_mod") as mock_rt_mod, \
          patch("bus_protocol.Blackboard"):
         mock_rt_mod.get_router.return_value = mock_router
-        result = route_all(consumer="test", dry_run=True, instance_id="test_4")
+        result = route_all(consumer="test", dry_run=True)
     assert result["routed"] == 0
     assert result["details"][0]["reason"] == "no_consumer"
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_system_category_skips_workflow(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_system_category_skips_workflow(mock_metrics, mock_hb):
     """SYSTEM_CATEGORIES 消费后不创建 workflow。"""
     from routing.routes import route_all, SYSTEM_CATEGORIES
     cat = list(SYSTEM_CATEGORIES)[0]
@@ -113,7 +108,7 @@ def test_route_all_system_category_skips_workflow(mock_metrics, mock_hb, mock_cu
         mock_cb.call.side_effect = lambda fn: fn()
         bb = MagicMock()
         mock_bb_cls.return_value = bb
-        route_all(consumer="test", dry_run=False, instance_id="test_5")
+        route_all(consumer="test", dry_run=False)
     mock_wf.assert_not_called()
 
 
@@ -604,10 +599,9 @@ def test_directed_task_spec_not_routed(mock_metrics, mock_hb):
 # ── #436146：route_all 不得替可投递类打 consume（否则 route_to_ccs 的
 #    「忙 → 下轮再试」永远轮不到，消息静默丢失） ──
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_does_not_consume_deliverable_category(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_does_not_consume_deliverable_category(mock_metrics, mock_hb):
     """可投递类（bug_report）只委派，不 safe_consume、不建 workflow。
 
     造的是 #436146 的现场：route_all 先消费 → route_to_ccs 的 poll 再也拉不到
@@ -626,17 +620,16 @@ def test_route_all_does_not_consume_deliverable_category(mock_metrics, mock_hb, 
          patch("routing.routes.CIRCUIT_BREAKER") as mock_cb:
         mock_rt_mod.get_router.return_value = mock_router
         mock_cb.call.side_effect = lambda fn: fn()
-        result = route_all(consumer="test", dry_run=False, instance_id="test_6")
+        result = route_all(consumer="test", dry_run=False)
     d = result["details"][0]
     assert d["assigned"] == [{"role": "engineer", "status": "delegated"}], d
     mock_idem.safe_consume.assert_not_called(), "route_all 抢了 route_to_ccs 的 consume"
     mock_wf.assert_not_called(), "建链交给发送成功的一方，否则构建仍会替未送达的建任务"
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_still_consumes_system_category(mock_metrics, mock_hb, mock_cursor):
+def test_route_all_still_consumes_system_category(mock_metrics, mock_hb):
     """system 类不走 pane 投递，继续在这里消费（否则永远无人消费、日志告警常亮）。"""
     from routing.routes import route_all, _SYSTEM_CATEGORIES
     cat = sorted(_SYSTEM_CATEGORIES)[0]
@@ -652,14 +645,13 @@ def test_route_all_still_consumes_system_category(mock_metrics, mock_hb, mock_cu
         mock_rt_mod.get_router.return_value = mock_router
         mock_cb.call.side_effect = lambda fn: fn()
         mock_idem.safe_consume.return_value = {"status": "consumed"}
-        route_all(consumer="test", dry_run=False, instance_id="test_7")
+        route_all(consumer="test", dry_run=False)
     mock_idem.safe_consume.assert_called_once()
 
 
-@patch("routing.routes.set_last_cursor")
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_busy_role_still_receives_on_later_route_to_ccs(mock_metrics, mock_hb, mock_cursor):
+def test_busy_role_still_receives_on_later_route_to_ccs(mock_metrics, mock_hb):
     """wf_busy 首轮 deferred 的 fact，次轮（角色空闲）仍能投递 —— 验收 2 的用例。
 
     完整走 daemon 的两条路径：先 route_all（60s 一轮），再 route_to_ccs（300s 一轮）。
@@ -699,7 +691,7 @@ def test_busy_role_still_receives_on_later_route_to_ccs(mock_metrics, mock_hb, m
          patch("routing.routes.WorkflowClient") as mock_wf:
         mock_rt_mod.get_router.return_value = _engineer_router()
         mock_wf.return_value.check_task.return_value = None
-        route_all(consumer="pipeline", dry_run=False, instance_id="test_8")
+        route_all(consumer="pipeline", dry_run=False)
         first = route_to_ccs("engineer", dry_run=False)
         assert first["total"] == 1, f"route_all 把这条 fact 从候选集里删了: {first}"
         assert first["details"][0]["action"] == "deferred", first

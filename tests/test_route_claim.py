@@ -32,13 +32,12 @@ def _run(cat="performance", ack="consumed"):
     with patch("routing.auto.poll_unconsumed", return_value=[_msg(cat)]), \
             patch("routing.routes._rt_mod", _rt), \
             patch("bus_protocol.Blackboard", return_value=bb), \
-            patch("routing.routes.set_last_cursor"), \
             patch("routing.routes.HEARTBEAT"), \
             patch("routing.routes.METRICS"):
         import routing.routes as routes
         with patch.object(routes.IDEMPOTENT_CONSUME, "safe_consume",
                           return_value={"status": ack}):
-            route_all(consumer="pipeline", dry_run=False, instance_id="t1")
+            route_all(consumer="pipeline", dry_run=False)
     return bb
 
 

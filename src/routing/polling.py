@@ -8,21 +8,22 @@ import uuid
 from routing import router as _rt_mod
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
-    with_retry, DEFAULT_RETRY, get_last_cursor,
+    with_retry, DEFAULT_RETRY,
 )
 
 
 @with_retry(DEFAULT_RETRY)
 def poll_unconsumed(category: str | None = None, consumer: str | None = None,
-                    instance_id: str = "", limit: int = 100) -> list[dict]:
+                    limit: int = 100) -> list[dict]:
     """拉取未消费消息，按优先级排序。
 
     使用 Blackboard.unconsumed() 直接获取，
     不再 subprocess + 字符串解析。
     集成重试、熔断、心跳、指标。
     使用 config.yaml 中的 max_messages_per_poll（Fix 2）。
-    若指定 consumer，跳过 cursor 之前的消息（Fix 6 防重启重复处理）。
-    instance_id 区分不同 pipeline 实例的 cursor（Fix 7：多实例隔离）。
+    去重靠 bus 的 consume 记录（routes._do_consume_msg 记一笔 pipeline 接管），
+    不再用 cursor：旧实现按随机 instance_id 存游标，表长到 21 461 行（2.9MB）
+    且每轮写 1 000+ 次都读不回来（R131）。
     """
     from bus_protocol import Blackboard
     from config_loader import get_config
@@ -36,13 +37,11 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
                         extra={"trace_id": str(uuid.uuid4())[:8]})
         METRICS.inc("config_errors_total")
         max_per_poll = 100
-    since_id = get_last_cursor(consumer, "", instance_id) if consumer else 0
-
     def _do_poll():
         effective_limit = min(limit, max_per_poll) if limit else max_per_poll
         # ponytail: passing cat filter would reduce overhead; use _consume_cats if available
         # 关键修复: 必须传 consumer 参数，否则 unconsumed() 返回从未被任何人消费的事实(即 0)
-        return [f for f in bb.unconsumed(consumer=consumer) if f.id > since_id][:effective_limit]
+        return bb.unconsumed(consumer=consumer)[:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
