@@ -1,4 +1,4 @@
-# ADR-APPROVAL-AUTHORITY: 审批权威性高于文本关键词判驳
+# ADR-APPROVAL-AUTHORITY: 评审文本三态是唯一判定（`confirmed_at` 仍优先）
 
 ## Status: Accepted (2026-10-20)
 
@@ -32,7 +32,10 @@ stale-rescue 都读它）。
 
 ## Decision
 
-**审批确认（`confirmed_at`）是步骤推进状态的权威来源，优先于 `exit_messages` 文本判据。**
+**评审文本三态（`approved` / `rejected` / `unknown`，由 `review_gate.review_verdict` 产出）是唯一判定：
+`unknown`（review/gate 步且执行者是 reviewer）不推进、`conditional_approved` 算 `approved`；`confirmed_at` 仍优先于文本判据——已确认的步骤
+不再读 `exit_messages`，等价于 `approved`。审批密钥通道 2026-10-22 全链路退场（签发/拉取/确认校验
+三处已删），确认只凭「该步审批人」身份鉴权。**
 
 1. 任何据 `exit_messages` 文本判定「驳回」的消费者，必须先把 `confirmed_at` 作为前置：
    已确认的步骤不再判驳回。
