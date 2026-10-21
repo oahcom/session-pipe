@@ -1,5 +1,24 @@
 # CHANGES.md
 
+## 2026-10-22 — 闸门提示标题改为稳定去重键（747fefa）
+
+### 问题
+`_gate_prompt` 把失败详情（缺失文件名 / verify 报错原文）拼进标题，而 `_notify_role` 的
+30min 冷却按 `(role, title)` 命中 → 每次文本都不同 → 冷却永不命中 → 每 tick 叫醒执行角色一次。
+现场（747fefa 提交信息记载，本条未复算）：qa 13 分钟内收到 18 条同一句「重复自检」提醒，
+只能回同一句 9 字正文；qa 整轮零工具 45/84 = 53.6%（全角色 2.5%）。
+
+### 修复
+`src/pipeflow/step_handler.py` `_gate_prompt`（:1291-1319）：标题固定为
+`[workflow] {run.workflow_name} {step.id} 闸门未通过`（例：`[workflow] engineer_feature s1 闸门未通过`）；缺失文件名与模板要求的 `text_contains`
+标题契约移入 evidence 正文，详情仍随消息送达。
+`tests/test_r119_gate_prompt.py` 同步断言稳定标题 + 详情在 evidence。
+
+### 验证
+- `python3 -m pytest tests/test_r119_gate_prompt.py -q` → `2 passed`（exit=0，本文档写作时实跑）
+- 冷却口径核对：`grep -n _ALERT_COOLDOWN_S src/pipeflow/role_lifecycle.py` → :217 `_ALERT_COOLDOWN_S = 1800`，与「30min 冷却」一致
+- 天花板：冷却表是进程级内存（role_lifecycle.py:215 `ponytail:` 注释），CLI 每 tick 起新进程时最坏退化为每 tick 一条
+
 ## 2026-10-22 — 投递前 CLI 忙预检
 
 ### 问题
