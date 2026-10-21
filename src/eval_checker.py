@@ -52,6 +52,7 @@ _THRASH_REPEAT_MIN = 4
 # 判据要看"现在做得怎样"，不是"三天前错过一次"。
 _TRAJ_WINDOW_S = 24 * 3600
 
+
 # 子代理遵从只看近窗。不设窗 = 一次旧轮次永久拉低该角色比例，本文件已在
 # orphan_call / schema 自纠两处踩过同一坑（跨 102 session 永久追责）。
 _SUBAGENT_WINDOW_S = 24 * 3600
@@ -894,14 +895,8 @@ class TrajectoryQualityChecker:
         """
         calls: list[dict] = []
         order = 0
-        cutoff = time.time() - _TRAJ_WINDOW_S
         for sess in sorted(sessions):
             for jf in sorted(sess.glob("*.jsonl")):
-                try:
-                    if jf.stat().st_mtime < cutoff:
-                        continue
-                except OSError:
-                    continue
                 try:
                     with jf.open(encoding="utf-8", errors="ignore") as fh:
                         for line in fh:
@@ -937,6 +932,7 @@ class TrajectoryQualityChecker:
                                         "input": blk.get("input", {}),
                                         "id": blk.get("id"), "error": None,
                                         "order": order, "src": str(jf),   # 全路径：同名 jsonl 跨目录存在，basename 会撞 key
+                                        "ts": d.get("timestamp", ""),
                                     })
                                 elif blk.get("type") == "tool_result":
                                     order += 1
@@ -948,6 +944,7 @@ class TrajectoryQualityChecker:
                                         "error": blk.get("is_error", False),
                                         "text": _result_text(blk),
                                         "order": order, "src": str(jf),
+                                        "ts": d.get("timestamp", ""),
                                     })
                 except OSError as e:
                     LOGGER.debug("transcript read fail %s: %s", jf, e)
@@ -964,6 +961,16 @@ class TrajectoryQualityChecker:
             return {"passed": True, "findings": [], "checked_traces": 0}
 
         calls = self._load_tool_calls(sessions)
+        # 时间窗按**记录 timestamp** 过滤，不用文件 mtime：活动文件里可能混着几天前的
+        # 记录（codex 审 P1-2：mtime=现在、记录=3 天前 → 旧账照抓）。
+        _cut = time.time() - _TRAJ_WINDOW_S
+        # 缺 timestamp 的记录按"新鲜"保留（不静默丢证据）；有时间戳的按窗口判。
+        _fresh = [c for c in calls
+                  if not (c.get("ts") or "") or _ts_recent(c.get("ts") or "", _cut)]
+        if len(_fresh) != len(calls):
+            LOGGER.info("轨迹窗口 %s: 丢弃 %d/%d 条旧记录（>%ds）",
+                        role, len(calls) - len(_fresh), len(calls), _TRAJ_WINDOW_S)
+        calls = _fresh
         findings: list[dict] = []
 
         # 工具在该 session 里根本不存在时（"No such tool available"），这次调用从未执行，
@@ -1023,8 +1030,15 @@ class TrajectoryQualityChecker:
             """
             return os.path.realpath(os.path.expanduser(fp)) if fp else ""
 
-        _own_root = os.path.realpath(
-            str(Path.home() / "ccs-workspaces" / role.lower().replace("_", "-"))).rstrip(os.sep) + os.sep
+        # 目录名两种写法都真实存在（product_architect 用下划线、ccs-monitor 用连字符），
+        # 只取一种会让另一半角色的豁免恒不生效 —— codex 审出的 P0。
+        _ws_root = Path.home() / "ccs-workspaces"
+        _own_roots = tuple(sorted({
+            os.path.realpath(str(_ws_root / v)).rstrip(os.sep) + os.sep
+            for v in {role.lower(), role.lower().replace("_", "-"), role.lower().replace("-", "_")}
+        }))
+
+        _exempt = 0
 
         def _is_scratch(fp: str) -> bool:
             """角色的草稿区：/tmp 与它自己的 ccs-workspaces 目录。只豁免 Write。
@@ -1045,7 +1059,7 @@ class TrajectoryQualityChecker:
             升级路径=改成草稿目录白名单配置。
             """
             k = _key(fp)
-            return k.startswith(("/tmp/", "/var/tmp/")) or k.startswith(_own_root)
+            return k.startswith(("/tmp/", "/var/tmp/")) or k.startswith(_own_roots)
 
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
@@ -1222,8 +1236,12 @@ class TrajectoryQualityChecker:
                 if (fp and own_written.get(
                         (c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
-                # 草稿的 Write 不算盲改（见 _is_scratch）；Edit 照判。
+                # 草稿/自有产物的 Write 不算盲改（见 _is_scratch）；Edit 照判。
+                # 加"别的 transcript 也在写"的门曾被试过并回退：本角色自己的多个会话
+                # 重写同一份报告是常态（maintainer 3 份报告即刻变 6 条红灯），
+                # 而真正要防的跨角色共享 /tmp 路径实测为 0/353。
                 if _is_scratch(fp) and name == "Write":
+                    _exempt += 1
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
@@ -1263,6 +1281,11 @@ class TrajectoryQualityChecker:
             if oid in tail_use_ids:
                 continue
             findings.append({"issue": "orphan_call", "tool": "?", "id": oid})
+
+        # 豁免必须可见：94394b6 的自有 workspace 豁免曾因 role→目录映射写错而**恒不生效**，
+        # 而失效没有任何输出（codex 审 P0/维度 11）。这里每次豁免都留一条计数日志。
+        if _exempt:
+            LOGGER.info("盲改豁免 %s: %d 条（/tmp 或自有 workspace 的 Write）", role, _exempt)
 
         checked_traces = sum(1 for s in sessions for _ in s.glob("*.jsonl"))
         passed = len(findings) == 0

@@ -10,6 +10,7 @@
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
@@ -19,12 +20,15 @@ if SRC not in sys.path:
 from eval_checker import TrajectoryQualityChecker, _TRANSCRIPTS_DIR
 
 
-def _turn(n: int, role: str, content: list) -> str:
-    return json.dumps({
+def _turn(n: int, role: str, content: list, ts: str | None = None) -> str:
+    row = {
         "type": "assistant" if role == "assistant" else "user",
         "message": {"id": f"m{n}", "type": "message", "role": role,
                     "content": content},
-    })
+    }
+    if ts:                      # 轨迹判据的时间窗按记录 timestamp 判，不用文件 mtime
+        row["timestamp"] = ts
+    return json.dumps(row)
 
 
 def _write_seq(n: int, cid: str, path: str, result: str) -> list:
@@ -578,16 +582,18 @@ def test_scratch_edit_still_flagged() -> None:
 def test_own_workspace_write_not_flagged() -> None:
     """角色写自己 ccs-workspaces 里的报告不算盲改：那是它自己的产出物。
 
-    实测 maintainer 每天整篇重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT，
-    窗口收紧后这 3 条一度变成新的红灯。
+    实测 maintainer 每天整篇重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT。
+    角色名与会话目录必须**真匹配**：上一版 role=ownws--probe 与目录 -probe-ownws-role
+    不匹配，checked_traces=0 也算 passed，于是"豁免恒不生效"溜过去了（codex 审 P1-3）。
     """
     sess = _TRANSCRIPTS_DIR / "-probe-ownws-role"
-    path = "/home/administrator/ccs-workspaces/ownws--probe/REPORT.md"
+    path = "/home/administrator/ccs-workspaces/ownws/REPORT.md"
     lines = _write_seq(0, "co1", path,
                        f"The file {path} has been updated successfully.")
     jf = _make(sess, lines)
     try:
-        res = TrajectoryQualityChecker().check("ownws--probe", "t")
+        res = TrajectoryQualityChecker().check("ownws", "t")
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录，否则等于没测"
         blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
         assert not blind, f"自己 workspace 的报告写不该判盲改: {blind}"
     finally:
@@ -598,30 +604,83 @@ def test_own_workspace_write_not_flagged() -> None:
             pass
 
 
-def test_stale_transcript_not_judged() -> None:
-    """超过 24h 的转录不参与轨迹判据：历史事件不能把角色永久钉红。
+def test_underscore_role_workspace_exempt() -> None:
+    """带下划线的角色名也要认：真实目录是 product_architect（下划线），不是连字符。
 
-    实测 scout 的 orphan_call 来自 2026-10-19 13:34 的转录（bus #387262），
-    之后每轮都判红，当轮做得再好也翻不了绿。
+    codex 审 P0：只按 role.replace("_","-") 拼路径时，product_architect /
+    knowledge_curator / security_auditor 三个角色的豁免恒不生效。
     """
+    sess = _TRANSCRIPTS_DIR / "-probe-pa_probe-role"
+    path = "/home/administrator/ccs-workspaces/pa_probe/REPORT.md"
+    lines = _write_seq(0, "cu1", path,
+                       f"The file {path} has been updated successfully.")
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("pa_probe", "t")
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录"
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"下划线角色的自有 workspace 也该豁免: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+
+def test_stale_record_not_judged() -> None:
+    """超过 24h 的**记录**不参与轨迹判据：历史事件不能把角色永久钉红。
+
+    窗口按记录 timestamp 判（skill 21 节），不按文件 mtime：活动文件里混着几天前的
+    记录时，mtime 看不出来（codex 审 P1-2）。
+    """
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     sess = _TRANSCRIPTS_DIR / "-probe-stale-role"
     path = "/data/probe_stale.py"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "so1", "name": "Write",
              "input": {"file_path": path, "content": "x=1"}},
-        ]),
+        ], ts=old_ts),
         _turn(1, "assistant", [
-            {"type": "tool_use", "id": "so2", "name": "Bash",
-             "input": {"command": "ls /nonexistent-stale"}},
-        ]),
+            {"type": "tool_use", "id": "so2", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ], ts=old_ts),
     ]
     jf = _make(sess, lines)
     try:
-        stale = 1700000000.0
-        os.utime(jf, (stale, stale))
         res = TrajectoryQualityChecker().check("stale", "t")
-        assert res["findings"] == [], f"过期转录仍被判定: {res['findings']}"
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录"
+        assert res["findings"] == [], f"过期记录仍被判定: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_fresh_record_still_judged() -> None:
+    """对照：24h 内的记录照判（窗口不能把所有东西都放过）。"""
+    now_ts = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-freshrec-role"
+    path = "/data/probe_fresh.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "fr1", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ], ts=now_ts),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "fr1", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ], ts=now_ts),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("freshrec", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"窗口内的盲改必须照判: {res['findings']}"
     finally:
         jf.unlink(missing_ok=True)
         try:
@@ -650,7 +709,9 @@ if __name__ == "__main__":
         test_scratch_write_not_flagged,
         test_scratch_edit_still_flagged,
         test_own_workspace_write_not_flagged,
-        test_stale_transcript_not_judged,
+        test_underscore_role_workspace_exempt,
+        test_stale_record_not_judged,
+        test_fresh_record_still_judged,
     )
     for _t in _tests:
         _t()
