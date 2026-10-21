@@ -356,11 +356,20 @@ class RoleLifecycleMixin:
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "继续", "Enter"],
                     capture_output=True, timeout=5,
                 )
-                self._bb.write("monitor_audit",
-                    f"[rate_limit] {role} 被额度拒绝 → 已发继续（第 {attempt + 1} 次）",
-                    evidence=output[-300:], src="workflow_engine")
             except Exception as e:
                 LOGGER.warning("额度恢复发送失败 %s: %s", role, e)
+                continue
+            # 审计与发送分家：发送异常不再吞掉审计，写入失败单独可见。
+            # 标题必须带时刻——bus 按标题 UPSERT 且保留首次 ts，而 attempt 随
+            # 退避重置反复从 1 起算，同一标题把新一轮注入覆盖到昨天那行上：
+            # 实测今日 8 次注入在 facts 里查不到，最后可见行还是 2026-10-20 23:46。
+            try:
+                self._bb.write("monitor_audit",
+                    f"[rate_limit] {role} 被额度拒绝 → 已发继续"
+                    f"（第 {attempt + 1} 次 {time.strftime('%H:%M:%S')}）",
+                    evidence=output[-300:], src="workflow_engine")
+            except Exception as e:
+                LOGGER.warning("额度拒绝审计写入失败 %s: %s", role, e)
 
     def _check_context_overflow(self):
         """检测角色 tmux pane 中 Claude 的上下文溢出信号，自动发 /compact。
