@@ -487,8 +487,13 @@ class StepHandlerMixin:
             if (_idle_n >= 5 and not self._has_live_subflow(run, step)
                     and not _role_producing_recently(_eff)):
                 try:
-                    self._lifecycle.cancel_step(run.id, step.id)
-                    LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次空闲", run.workflow_name, step.id, _idle_n)
+                    # 只有真取消了才记 info：cancel_step 已幂等，返回 False 表示实例早
+                    # 已终态 —— 此时还打"取消成功"会让运维分不清首取消与空操作
+                    # （实测同一实例 31 分钟内 49 行"取消"，全是 10.7s 一 tick 的空转）。
+                    if self._lifecycle.cancel_step(run.id, step.id):
+                        LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次空闲", run.workflow_name, step.id, _idle_n)
+                    else:
+                        LOGGER.debug("tmux 空闲取消空操作(实例已终态): %s/%s", run.workflow_name, step.id)
                     # 必须 return：cancel_step 直接写库，而本函数末尾的 _sync_step_results
                     # 用的是本轮开头载入的内存快照，会把它覆盖回未取消状态 → 步骤复活，
                     # 下 tick 再次 cancel，日志刷屏且计数无上限增长。
