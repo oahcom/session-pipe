@@ -257,6 +257,10 @@ class WorkflowLifecycleMixin:
 
                 _auto_cancel_at = 6
                 reason = ""
+                # 判死来源：只有"空闲/卡死"类条件（2 测试模板超时、4 停滞）允许被
+                # 完成证据放行；终态(0)/超时耗尽(1)/全局上限(3) 是硬上限，证据再齐
+                # 也照回收——否则一条 exit_schema 永远不过的实例会永久免死。
+                _cond = ""
                 # 条件0: 状态对账——当前步骤已是终态(cancelled/failed)但行级仍 running。
                 # 语义上该实例不会再推进，属"僵尸行"。这类残留由历史 cancel_step 缺陷造成
                 # （只写步骤级 status 不写行级，已修），但不修存量会永久占用 running 计数
@@ -265,6 +269,7 @@ class WorkflowLifecycleMixin:
                 _cur_step = sr.get(_cur_id, {}) if isinstance(sr, dict) else {}
                 if (isinstance(_cur_step, dict)
                         and _cur_step.get("status") in ("cancelled", "failed")):
+                    _cond = "0"
                     reason = (f"当前步骤 {_cur_id} 已终态"
                               f"({_cur_step.get('status')})但行级仍 running")
                 # 子链活着 → 父步没有新产出是正常态，条件 1-4 一律不判死。
@@ -275,12 +280,15 @@ class WorkflowLifecycleMixin:
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
                 elif max_tc >= _auto_cancel_at:
+                    _cond = "1"
                     reason = f"timeout_count={max_tc}（已达自动回收阈值{_auto_cancel_at}）"
                 # 条件2: 测试/开发模板超2小时
                 elif tpl in _ZOMBIE_TEMPLATES and age_h > 2:
+                    _cond = "2"
                     reason = f"测试模板 {tpl} 运行{age_h:.0f}h > 2h阈值"
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
                 elif age_h > _global_limit_h:
+                    _cond = "3"
                     reason = f"{_st} 运行{age_h:.0f}h > {_global_limit_h}h全局阈值"
                 # 条件4: running 且当前步骤确已停滞 >1h
                 # 关键修正：仅空 step_results 不足以判 stale——长任务 /goal 步骤完成前 step_results
@@ -312,7 +320,8 @@ class WorkflowLifecycleMixin:
                         _step_ts = (_cur_sr.get("queued_since") or _cur_sr.get("ts")
                                     or created or 0)
                         _stall_h = (now - _step_ts) / 3600 if _step_ts else 0
-                        from pipeflow.step_handler import _QUEUE_DEGRADE_AT as _Q_DEGRADE
+                        from pipeflow.step_handler import (
+                            _QUEUE_DEGRADE_AT as _Q_DEGRADE, _queue_budget_sec)
                         # tc>=1 是引擎已确认超时；queued 达降级阈值且真实停滞 >1h 属同等情况。
                         # 但 tc 递增会把 ts 重置为 now（step_handler 给角色响应窗口那次重写），
                         # _stall_h 上限恒为一个超时窗（<1h）—— tc 分支结构上看不到真实停滞时长，
@@ -320,11 +329,26 @@ class WorkflowLifecycleMixin:
                         # 判死需两个信号**同时**静默：pane 无输出 AND 会话转录无写入。
                         # 只看 pane 会误杀正在深度推理的角色（见 _role_producing_recently）。
                         # None=探测不可用、空 assignee=解析失败，都不算角色已死。
-                        if _cur_tc >= 1 or (_cur_q >= _Q_DEGRADE and _stall_h > 1):
+                        # 排队判死必须与 step_handler 同源：用排队预算（步声明 ×
+                        # 可重试次数，下限 30min），不用固定 1h。实测 232 台回收的
+                        # 停滞中位正好 1.0h、p90 1.4h，而预算 150min —— 排队者在预算
+                        # 40% 处被判死，杀掉的是"还没轮到自己"，不是"卡死"。
+                        _wf4 = self._workflows.get(tpl)
+                        _st4 = next((s for s in _wf4.steps if s.id == _cur), None) if _wf4 else None
+                        # 模板不在内存（DB-only）时退回旧阈值 3600s：放宽改动面，
+                        # 不在未建模的场景上引入更严的判死。
+                        _q_sec = (_queue_budget_sec(
+                            _st4.exit_condition or {},
+                            max(int(getattr(_st4, "max_retries", 0) or 0) + 3, 4),
+                            parent_minutes=self._parent_step_minutes(d))
+                            if _st4 else 3600)
+                        if _cur_tc >= 1 or (_cur_q >= _Q_DEGRADE
+                                            and _stall_h * 3600 >= _q_sec):
                             from liveness import tmux_pane_active
                             _role = (d.get("assignee") or "").strip()
                             if (_role and tmux_pane_active(_role) is False
                                     and not _role_producing_recently(_role)):
+                                _cond = "4"
                                 _reason_step = _cur_sr.get("step", _cur)
                                 reason = (f"running 状态 {_reason_step} 无推进记录 "
                                           f"步骤停滞 {_stall_h:.1f}h / 实例 {age_h:.1f}h "
@@ -334,7 +358,8 @@ class WorkflowLifecycleMixin:
                     # 完成证据优先于回收：status 空的步骤没有 exit_messages，只看落库
                     # 字段会把"已完成"判成"卡死"。证据门在 run_once 的实例循环里、
                     # 排在本回收之后 —— 不在此放行，它永远没机会消费这条消息。
-                    if _bus_evidence_ready(self, d):
+                    # 只放行空闲类判死（2/4）：超时耗尽与全局上限是硬上限，必须保留。
+                    if _cond in ("2", "4") and _bus_evidence_ready(self, d):
                         continue
                     LOGGER.warning("auto-cancel: %s (template=%s) — %s", wf_id, tpl, reason)
                     # ── 回收前抢救: 当前步骤已有 exit_messages(产出证据) → 先尝试闭合 ──

@@ -224,5 +224,53 @@ def test_tick_rescue_respects_exit_schema(mock_run):
     assert st["current_step"] == "s1", f"schema 未过的 exit_messages 被抢救成完成: {st}"
 
 
+@_PATCH
+def test_evidence_does_not_exempt_hard_reclaim(mock_run):
+    """反向（Anti-ISC）：证据齐也挡不住硬上限 —— timeout_count 耗尽照旧回收。"""
+    tag = _tag()
+    d = _env()
+    _write_wf(d, "evhard", [_step("s1", "S1", tag), _step("s2", "S2", tag)])
+    eng = WorkflowEngine(d)
+    rid = eng.start("evhard", {})
+    eng._bb.write("notice", f"{tag}_S1 done", src="test_role")
+    lm = eng._lifecycle
+    results = {"s1": {"status": "", "timeout_count": 6,
+                      "queued_since": time.time() - 30 * 3600}}
+    lm.execute("UPDATE workflow_instances SET step_results=?, created_at=? WHERE instance_id=?",
+               (json.dumps(results, ensure_ascii=False), time.time() - 2 * 3600, rid))
+    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False), \
+         patch("liveness.tmux_pane_active", return_value=False):
+        eng.run_once()
+    assert eng.status(rid)["status"] == "cancelled", f"证据让硬上限失守: {eng.status(rid)}"
+
+
+@_PATCH
+def test_queue_kill_uses_queue_budget_not_fixed_1h(mock_run):
+    """排队判死与排队预算同源：停滞 1.2h < 预算 120min 不杀，4h 才杀。"""
+    tag = _tag()
+    d = _env()
+    # s1 声明 timeout 30min、max_retries 1 → 预算 = 30 × max(1+3,4) = 120min
+    _write_wf(d, "evq", [_step("s1", "S1", tag), _step("s2", "S2", tag)])
+    eng = WorkflowEngine(d)
+    rid = eng.start("evq", {})
+    lm = eng._lifecycle
+    def _set(stall_sec):
+        results = {"s1": {"status": "", "queued": 5,
+                          "queued_since": time.time() - stall_sec}}
+        lm.execute("UPDATE workflow_instances SET step_results=?, created_at=? WHERE instance_id=?",
+                   (json.dumps(results, ensure_ascii=False), time.time() - 2 * 3600, rid))
+    _set(1.2 * 3600)
+    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False), \
+         patch("liveness.tmux_pane_active", return_value=False):
+        eng.run_once()
+    assert eng.status(rid)["status"] != "cancelled", \
+        f"预算 40% 处就杀了排队者: {eng.status(rid)}"
+    _set(4 * 3600)
+    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False), \
+         patch("liveness.tmux_pane_active", return_value=False):
+        eng.run_once()
+    assert eng.status(rid)["status"] == "cancelled", \
+        f"预算耗尽却没回收: {eng.status(rid)}"
+
 if __name__ == "__main__":
     raise SystemExit(__import__("pytest").main([__file__, "-q"]))
