@@ -20,7 +20,7 @@ def _make_history(target: str, with_schema: bool) -> dict:
         "target_type": "file",
         "round_id": "1",
         "dims": json.dumps([
-            {"dim_id": 1, "status": "WARN", "parties": ["codex"]},
+            {"dim_id": 1, "status": "WARN", "parties": ["coord"]},
             {"dim_id": 9, "status": "FAIL", "parties": ["probe"]},
         ]),
         "retry_reasons": "[1, 9]",
@@ -32,7 +32,7 @@ def test_parties_role_resolves():
     # review_gate 真实角色在 dims[].parties, 应优先解析而非文件名回退
     hist = _make_history("/home/administrator/session-launcher/src/user_intent_reminder.py", False)
     role = cu._parties_role(hist)
-    assert role == "codex-dev", f"parties[codex] 应部分匹配 codex-dev, 得 {role}"
+    assert role == "coordinator", f"parties[coord] 应部分匹配 coordinator, 得 {role}"
     print(f"  [ok] _parties_role -> {role}")
 
 
@@ -40,7 +40,7 @@ def test_resolve_role_prefers_parties_over_filename():
     # 文件 target 无 persona 归属, 但 parties 有真角色 → 不应误告警为文件映射缺失
     hist = _make_history("session-launcher/src/user_intent_reminder.py", False)
     role = cu._resolve_role_for_suggestion(hist)
-    assert role == "codex-dev", f"应取 parties 角色而非文件名, 得 {role}"
+    assert role == "coordinator", f"应取 parties 角色而非文件名, 得 {role}"
     print(f"  [ok] _resolve_role_for_suggestion -> {role}")
 
 

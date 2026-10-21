@@ -3,11 +3,14 @@
 
 根因（2026-10-19 生产实测）：
   timeout_count 递增时 step_handler 会把该步 ts 重置为 now（给角色响应窗口），
-  故 _stall_h 的结构上限恒为一个超时窗（<1h）。条件4 的 tc 分支只看
-  `_cur_tc >= 1` 不看 stall → "超时过一次 → 实例满 1h → 杀"，与角色是否
-  仍在工作无关。实测 wf_sub_fb975ff26813：reviewer 正在写 133 行报告
-  （pane 显示 esc to interrupt），19:52:11 被回收，日志自证矛盾 ——
+  故 _stall_h 的结构上限恒为一个超时窗（<1h）。条件4 的 tc 分支若只看
+  `_cur_tc >= 1` → "超时过一次 → 实例满 1h → 杀"，与角色是否仍在工作无关。
+  实测 wf_sub_fb975ff26813：reviewer 正在写 133 行报告（pane 显示 esc to interrupt），
+  19:52:11 被回收，日志自证矛盾 ——
   `步骤停滞 0.0h / 实例 1.0h (timeout_count=2, queued=0)`。
+
+现状：条件4 已改为「死因信号 AND 停滞 ≥ 排队预算」两道同时成立，本文件的
+fixture 因此必须给出真实停滞（> 预算），否则 pane 门控会变成空转的假测试。
 
 契约（缺一则重回误杀）：
   1. tc/queued 分支成立时，pane 明确静默超窗（False）才回收
@@ -118,7 +121,9 @@ def _run(step_sd, pane_state, assignee="reviewer"):
     return _cancelled_wfs(inst, lm, row["instance_id"])
 
 
-_TWO_TIMEOUTS = {"timeout_count": 2, "ts": time.time() - 60, "queued": 0}
+# 停滞必须超过排队预算（默认声明 30min × 4 次 = 7200s）：条件4 是
+# 「死因信号 AND 真实停滞 ≥ 预算」，ts 刚被刷新的实例不该进判死路径。
+_TWO_TIMEOUTS = {"timeout_count": 2, "ts": time.time() - 7500, "queued": 0}
 
 
 def test_active_pane_role_is_not_cancelled():

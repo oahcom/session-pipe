@@ -342,8 +342,13 @@ class WorkflowLifecycleMixin:
                             max(int(getattr(_st4, "max_retries", 0) or 0) + 3, 4),
                             parent_minutes=self._parent_step_minutes(d))
                             if _st4 else 3600)
-                        if _cur_tc >= 1 or (_cur_q >= _Q_DEGRADE
-                                            and _stall_h * 3600 >= _q_sec):
+                        # 死因信号（超时计数/排队降级）**且**停滞已超排队预算才判死。
+                        # 只凭 tc>=1 就杀是实测误杀源：qa 子链 16:25:53 被杀时 tc=1、
+                        # 停滞 0.2h、queued=0，角色正在跑别人的 prompt（饥饿不是卡死），
+                        # 8.5 分钟后重投就恢复。tc 每次超时 +1 且 ts 重置，10min 声明的
+                        # 步骤在角色忙时几分钟就到 1 —— 它证明"超时过"，不证明"死了"。
+                        if ((_cur_tc >= 1 or _cur_q >= _Q_DEGRADE)
+                                and _stall_h * 3600 >= _q_sec):
                             from liveness import tmux_pane_active
                             _role = (d.get("assignee") or "").strip()
                             if (_role and tmux_pane_active(_role) is False

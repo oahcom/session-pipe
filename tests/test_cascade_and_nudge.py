@@ -199,7 +199,9 @@ def test_reclaim_end_to_end_cancels_child():
         from pipeflow.wf_lifecycle import WorkflowLifecycleMixin
         _start(lm, "wf_e2e")
         _add_child(lm, "wf_e2e", "wf_e2e_sub")
-        sd = {"s1": {"timeout_count": 2, "ts": time.time() - 60, "queued": 0}}
+        # 停滞必须超过排队预算（默认声明 30min × 4 = 7200s）才构成条件4：
+        # tc>=1 只证明"超时过"，判死还要"真的没在动"（两道信号 AND）。
+        sd = {"s1": {"timeout_count": 2, "ts": time.time() - 10800, "queued": 0}}
         lm.execute("UPDATE workflow_instances SET created_at=?, step_results=?"
                    " WHERE instance_id=?",
                    (time.time() - 7200, json.dumps(sd), "wf_e2e"))
@@ -218,6 +220,33 @@ def test_reclaim_end_to_end_cancels_child():
         ).fetchone()["status"] == "cancelled", "子链 task 未同步"
 
     from unittest.mock import patch
+    with patch("liveness.tmux_pane_active", lambda role, **k: False):
+        _with_db(_run)
+
+
+def test_timeout_marker_alone_does_not_kill():
+    """只凭 timeout_count>=1 判死会杀掉正在干活的角色。
+
+    实测：qa 子链 tc=1、停滞 0.2h 被回收，而角色在跑别人的 prompt，8.5min 后重投即恢复。
+    条件4 是「死因信号 AND 停滞 ≥ 排队预算」，两条必须同时成立。
+    """
+    import json
+    def _run(lm):
+        from pipeflow.wf_lifecycle import WorkflowLifecycleMixin
+        _start(lm, "wf_fresh")
+        sd = {"s1": {"timeout_count": 3, "ts": time.time() - 600, "queued": 0}}
+        lm.execute("UPDATE workflow_instances SET created_at=?, step_results=?"
+                   " WHERE instance_id=?",
+                   (time.time() - 7200, json.dumps(sd), "wf_fresh"))
+        inst = SimpleNamespace(_workflows={}, _notify_role=lambda *a, **k: None,
+                               _lifecycle=lm)
+        _orig = wf_lifecycle._role_producing_recently
+        wf_lifecycle._role_producing_recently = lambda role, **k: False
+        try:
+            WorkflowLifecycleMixin._cleanup_stale_workflows(inst, lm)
+        finally:
+            wf_lifecycle._role_producing_recently = _orig
+        assert _status(lm, "wf_fresh") == "running", "10 分钟前才产出的角色被当成卡死回收"
     with patch("liveness.tmux_pane_active", lambda role, **k: False):
         _with_db(_run)
 

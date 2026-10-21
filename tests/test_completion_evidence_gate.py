@@ -272,5 +272,34 @@ def test_queue_kill_uses_queue_budget_not_fixed_1h(mock_run):
     assert eng.status(rid)["status"] == "cancelled", \
         f"预算耗尽却没回收: {eng.status(rid)}"
 
+@_PATCH
+def test_starving_role_not_killed_before_budget(mock_run):
+    """饥饿不是卡死：tc>=1 但停滞未超排队预算 → 不回收；超了才回收。"""
+    tag = _tag()
+    d = _env()
+    # qa/工程类声明 30min、max_retries 1 → 预算 = 30 × max(1+3,4) = 120min
+    _write_wf(d, "evstarve", [_step("s1", "S1", tag), _step("s2", "S2", tag)])
+    eng = WorkflowEngine(d)
+    rid = eng.start("evstarve", {})
+    lm = eng._lifecycle
+    def _set(stall_sec):
+        # status=notified、queued 缺失：现场形态是"角色在跑别人的 prompt"
+        results = {"s1": {"status": "notified", "timeout_count": 1,
+                          "ts": time.time() - stall_sec}}
+        lm.execute("UPDATE workflow_instances SET step_results=?, created_at=? WHERE instance_id=?",
+                   (json.dumps(results, ensure_ascii=False), time.time() - 2 * 3600, rid))
+    _set(25 * 60)
+    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False), \
+         patch("liveness.tmux_pane_active", return_value=False):
+        eng.run_once()
+    assert eng.status(rid)["status"] != "cancelled", \
+        f"预算内就被杀了（8.5min 后会恢复的那种误杀）: {eng.status(rid)}"
+    _set(3 * 3600)
+    with patch("pipeflow.wf_lifecycle._role_producing_recently", return_value=False), \
+         patch("liveness.tmux_pane_active", return_value=False):
+        eng.run_once()
+    assert eng.status(rid)["status"] == "cancelled", \
+        f"超预算仍不回收: {eng.status(rid)}"
+
 if __name__ == "__main__":
     raise SystemExit(__import__("pytest").main([__file__, "-q"]))

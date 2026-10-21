@@ -43,8 +43,10 @@ def _launcher_roles():
 
 # 测试角色：既要有产出能力（engineer/reviewer 必须能跑测试），
 # 又要有决策角色（coordinator/architect 不该自己跑测试）。
+# knowledge_curator 必须列进活体名单：键名对不上会话名时 _FORBIDDEN_MAP 查不到
+# 条目（bus #417927 的独立复验结论），该角色跑 pytest 被注入「停止并撤销」。
 _ROLES_THAT_MUST_RUN_TESTS = ("engineer", "reviewer", "maintainer",
-                              "optimizer", "scout", "closer", "curator")
+                              "optimizer", "scout", "closer", "knowledge_curator")
 _ROLES_THAT_MUST_NOT_RUN_TESTS = ("coordinator", "product_architect")
 _ROLES_THAT_MUST_NOT_WRITE_CODE = ("scout", "writer", "pm")
 
