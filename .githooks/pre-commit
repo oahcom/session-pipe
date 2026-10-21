@@ -13,7 +13,8 @@ echo "  all staged .py files OK"
 #   ef2a249 整文件覆盖抹掉 dce5d77 的 own_written 实现（测试仍在调用）
 #   74bf13c main 上 role_lifecycle 缺 pane_cli_busy，导入即 ImportError
 # 只查"暂存区删掉的 def/class 名在删除后仍被 src/tests 引用"——改名、连调用点一起删、
-# 连测试一起删都不会误报。真需保留残留引用设 ALLOW_DANGLING_REF=1。
+# 连测试一起删都不会误报。真需保留残留引用设 ALLOW_DANGLING_REF=1；要整段回滚用
+# git revert <commit>（会被下面的 revert-guard 拦，需同时设 ALLOW_HISTORY_ROLLBACK=1）。
 if [ "$ALLOW_DANGLING_REF" != "1" ]; then
   python3 "$(git rev-parse --show-toplevel)/scripts/check_dangling_refs.py" || exit 1
 fi

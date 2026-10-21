@@ -149,7 +149,23 @@ def _staged_sources() -> tuple[dict[str, str], dict[str, str]]:
     if not touched:
         return {}, {}
     head = _head_shas()
-    return _blobs({p: head[p] for p in touched if p in head}), _blobs(_index_shas())
+    old = _blobs({p: head[p] for p in touched if p in head})
+    new = _blobs(_index_shas())
+    bad = [p for p, src in list(old.items()) + list(new.items())
+           if not _parses(src)]
+    if bad:
+        # 解析不了就只能当"没这个文件"：说明守卫对它们失明，必须喊出来而不是静默放行
+        print("REF-GUARD 警告: 这些文件语法不完整，本次不参与判定 → " + ", ".join(sorted(bad)),
+              file=sys.stderr)
+    return old, new
+
+
+def _parses(src: str) -> bool:
+    try:
+        ast.parse(src)
+    except SyntaxError:
+        return False
+    return True
 
 
 def main() -> int:
