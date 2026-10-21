@@ -35,7 +35,10 @@ def _poll_ctx(facts, *, config_getter=None, cursor=0,
         cb_mock.call.side_effect = lambda fn: fn()
 
     bb_mock = mock.MagicMock()
-    bb_mock.unconsumed.return_value = facts
+    # 忠实于真实 API：unconsumed(cat=...) 在 SQL 层过滤（bus_protocol 实测签名）。
+    # 用 return_value 会让「cat 下推」这条契约在测试里失效，改成按参数筛。
+    bb_mock.unconsumed.side_effect = lambda **kw: [
+        f for f in facts if not kw.get("cat") or f.cat == kw["cat"]]
 
     config_mock = mock.MagicMock()
     if config_getter is None:

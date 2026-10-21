@@ -250,13 +250,16 @@ def _load_alert_ts(path: Path, now: float, ttl: float) -> dict:
     return out
 
 
-def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float, override=()) -> None:
+def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float,
+                   override=(), drop=()) -> None:
     """读盘→合并→裁剪→原子写，全程持跨进程文件锁。
 
     合并而不是整表覆盖：两个进程（workflow-engine / routing_daemon）各持一份内存快照，
     谁后写就把对方刚占的位抹掉 → 同一条告警再投一次（codex 20 维 P1）。
     锁文件独立于数据文件：replace 会换 inode，锁在数据文件上等于没锁。
     临时文件名带 pid：两进程同名 .tmp 互相 replace 会丢更新。
+    drop：必须显式删除的键（角色已恢复）。不能靠"写 0 再等 TTL 裁掉"——TTL 大于
+    当前时间戳时 0 反而留在盘上，恢复清除就失效了。
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +270,8 @@ def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float, override=()) ->
                 # override：投递失败要**提前**时间戳（600s 后重试），合并取 max 会把它顶回去
                 if key in override or val > merged.get(key, 0.0):
                     merged[key] = val
+            for key in drop:
+                merged.pop(key, None)
             # 内存表跟着裁剪：长驻 daemon 的 _ts 否则只增不减（codex 20 维 P1）
             ts.clear()
             ts.update({k: v for k, v in merged.items() if now - v < ttl})
@@ -276,6 +281,37 @@ def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float, override=()) ->
             tmp.replace(path)
     except OSError as e:      # 落盘失败只退化成进程内冷却，不该影响告警投递
         LOGGER.debug("alert cooldown 落盘失败: %s", e)
+
+
+# 额度拒绝的退避（_last_rate_recover）是同一类缺陷：也是进程内字典，daemon 一重启
+# 就从 120s 首档重来。实测 2h 内「上一轮 API 错误中断（0 产出）」注入 29 次、
+# 跨 13 角色 22 个 session（qa 15 分钟 4 次）。用两个 tag 复用上面的读写与文件锁，
+# 不再另开一套。
+_RATE_TS_TAG = "__rate_ts__"
+_RATE_N_TAG = "__rate_n__"
+
+
+def _load_rate_state(path: Path, now: float, ttl: float) -> dict:
+    """role -> (last_ts, attempt)。读失败/坏文件返回空表 = 退避从头开始，不阻断恢复。"""
+    rows = _load_alert_ts(path, now, ttl)
+    return {role: (val, int(rows.get((role, _RATE_N_TAG), 0.0)))
+            for (role, tag), val in rows.items() if tag == _RATE_TS_TAG}
+
+
+def _save_rate_state(path: Path, states: dict, now: float, ttl: float,
+                     delete_roles: tuple = ()) -> None:
+    """写退避状态；delete_roles 里的角色写 0 时间戳 → 被裁剪规则直接从盘上抹掉。
+
+    override：内存表在读盘后已同步，这里写的就是权威值；不 override 会被
+    「取较大者」的合并规则顶回去，恢复清除（0）永远清不掉。
+    """
+    flat = {}
+    for role, (ts, n) in states.items():
+        flat[(role, _RATE_TS_TAG)] = float(ts)
+        flat[(role, _RATE_N_TAG)] = float(n)
+    drop = tuple((role, tag) for role in delete_roles
+                 for tag in (_RATE_TS_TAG, _RATE_N_TAG))
+    _save_alert_ts(path, flat, now, ttl, override=tuple(flat), drop=drop)
 
 
 class RoleLifecycleMixin:
@@ -415,6 +451,8 @@ class RoleLifecycleMixin:
                 # 角色已恢复：清掉退避状态，否则下一次真 403 会从最大退避档
                 # （1800s）起步，恢复要等半小时。
                 self._last_rate_recover.pop(role, None)
+                _save_rate_state(_ALERT_STATE, self._last_rate_recover, now,
+                                self._ALERT_TTL_S, delete_roles=(role,))
                 continue
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt
@@ -434,12 +472,19 @@ class RoleLifecycleMixin:
                 LOGGER.warning("角色卡死: %s 生成中+错误信号+transcript %.0fs 无事件",
                                role, _STOPPED_PROGRESS_SEC)
             with self._COMPACT_LOCK:
+                # 退避状态落盘（与 _ALERT_TS 同一套文件/锁）：daemon 重启后 attempt
+                # 从 0 重新爬，退避曲线等于没有 → 实测 2h 内同一句「上一轮 API 错误
+                # 中断」注入 29 次、跨 13 个角色。
+                self._last_rate_recover.update(
+                    _load_rate_state(_ALERT_STATE, now, self._ALERT_TTL_S))
                 last, attempt = self._last_rate_recover.get(role, (0.0, 0))
                 wait = self._RATE_LIMIT_BACKOFF_SEC[
                     min(attempt, len(self._RATE_LIMIT_BACKOFF_SEC) - 1)]
                 if now - last < wait:
                     continue
                 self._last_rate_recover[role] = (now, attempt + 1)
+                _save_rate_state(_ALERT_STATE, self._last_rate_recover, now,
+                                 self._ALERT_TTL_S)
 
             LOGGER.warning("额度拒绝: %s 命中 403/429，第 %d 次发「继续」重试", role, attempt + 1)
             try:

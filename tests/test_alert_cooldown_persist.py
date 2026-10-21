@@ -111,3 +111,35 @@ def test_failed_delivery_retries_soon(state):
     saved = rl._load_alert_ts(state / "alert_cooldowns.json", time.time(), ttl=1e9)
     gap = time.time() - saved[KEY]
     assert 1100 < gap < 1300, f"失败后应占位 now-1800+600（gap≈1200），实测 {gap:.0f}"
+
+
+# ── 额度拒绝退避（_last_rate_recover）落盘：同一套文件与锁 ──────────────
+
+def test_rate_state_survives_restart(state):
+    """attempt 必须跨重启保留，否则退避曲线每次从 120s 首档重来。"""
+    rl._save_rate_state(state / "alert_cooldowns.json", {"qa": (1000.0, 3)}, 1001.0, ttl=10_000)
+    got = rl._load_rate_state(state / "alert_cooldowns.json", 1001.0, ttl=10_000)
+    assert got["qa"] == (1000.0, 3), f"attempt 丢了：{got}"
+
+
+def test_rate_recovery_clears_disk_entry(state):
+    """角色恢复后必须把盘上的退避清掉，否则下次真 403 直接从 1800s 起步。"""
+    path = state / "alert_cooldowns.json"
+    rl._save_rate_state(path, {"qa": (1000.0, 4), "pm": (1000.0, 1)}, 1001.0, ttl=10_000)
+    rl._save_rate_state(path, {"pm": (1000.0, 1)}, 1002.0, ttl=10_000, delete_roles=("qa",))
+    got = rl._load_rate_state(path, 1002.0, ttl=10_000)
+    assert "qa" not in got, f"恢复后 qa 仍在盘上：{got}"
+    assert got["pm"] == (1000.0, 1), "别的角色的退避不该被顺手删掉"
+
+
+def test_rate_and_alert_states_share_file_without_clobber(state):
+    """两个命名空间共用一个 JSON：谁的写都不能抹掉对方的键。"""
+    path = state / "alert_cooldowns.json"
+    rl._save_alert_ts(path, {KEY: 1000.0}, 1000.0, ttl=10_000)
+    rl._save_rate_state(path, {"qa": (1000.0, 2)}, 1001.0, ttl=10_000)
+    rl._save_alert_ts(path, {("closer", "另一条告警"): 1002.0}, 1002.0, ttl=10_000)
+    alerts = rl._load_alert_ts(path, 1002.0, ttl=10_000)
+    rates = rl._load_rate_state(path, 1002.0, ttl=10_000)
+    assert alerts.get(KEY) == 1000.0, "告警键被退避写的合并抹掉了"
+    assert alerts.get(("closer", "另一条告警")) == 1002.0
+    assert rates.get("qa") == (1000.0, 2), "退避键被后来的告警写抹掉了"

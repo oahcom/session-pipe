@@ -40,9 +40,13 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
 
     def _do_poll():
         effective_limit = min(limit, max_per_poll) if limit else max_per_poll
-        # ponytail: passing cat filter would reduce overhead; use _consume_cats if available
         # 关键修复: 必须传 consumer 参数，否则 unconsumed() 返回从未被任何人消费的事实(即 0)
-        return [f for f in bb.unconsumed(consumer=consumer) if f.id > since_id][:effective_limit]
+        # cat 下推到 SQL（2026-10-22）：原来把**全部**未消费事实载进内存再切片、出了
+        # 本函数才按 cat 过滤 —— 实测单 consumer 未消费 9000+ 条（scout 9060 /
+        # reviewer 9019 / pm 8223），每次 poll 都白搬一遍。limit 不下推：SQL 先 LIMIT
+        # 再丢 since_id 之前的旧 id，会让游标之后的条目被饿掉。
+        return [f for f in bb.unconsumed(consumer=consumer, cat=category)
+                if f.id > since_id][:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
@@ -54,8 +58,6 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
     HEARTBEAT.beat("pipeline")
     messages: list[dict] = []
     for f in facts:
-        if category and f.cat != category:
-            continue
         messages.append({
             "id": f.id,
             "category": f.cat,
