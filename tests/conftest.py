@@ -167,3 +167,12 @@ def _isolate_probes_and_cooldowns(request, monkeypatch):
         monkeypatch.setattr(liveness, "pane_cli_busy", lambda role, timeout=3.0: None)
     RoleLifecycleMixin._LAST_SEND.clear()
     RoleLifecycleMixin._ALERT_TS.clear()
+    # 另外三张进程级冷却/去重表此前没清：429 退避、compact 冷却、bus 去重
+    # （role_lifecycle.py:266/281/292）。前一个用例写下的 (role) 条目会让后一个
+    # 用例的恢复/去重分支静默跳过 —— 表现为"单跑绿、全量红"。
+    for _d in (RoleLifecycleMixin._last_rate_recover, RoleLifecycleMixin._last_compact,
+               RoleLifecycleMixin._last_bus_write):
+        _d.clear()
+    # engine 的轮转游标同样是进程级：不清则上一个用例的 loop 恢复点泄漏到下一个。
+    from pipeflow import engine as _eng
+    monkeypatch.setattr(_eng, "_LOOP_RESUME_ID", "", raising=False)
