@@ -248,6 +248,10 @@ def _start_error_text(stdout: bytes | None, stderr: bytes | None) -> str:
     return pick.decode("utf-8", "replace")[:300]
 
 
+# 告警冷却的 check+占位临界区（见 _notify_role）。进程级，与 _ALERT_TS 同寿命。
+_ALERT_LOCK = threading.Lock()
+
+
 class RoleLifecycleMixin:
     """WorkflowEngine 的角色管理 mixin。"""
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
@@ -390,8 +394,14 @@ class RoleLifecycleMixin:
             # `[rate_limit] 已发继续`，每次换来一段无进展的自检长文。
             _recent = "\n".join(
                 [ln for ln in output.splitlines() if ln.strip()][-20:])
+            # 重置判据必须是**进展**，不是**新鲜度**：传 max_age=inf 让"最后一条
+            # assistant 就是错误轮"无论多老都算未恢复。旧写法用默认 120s，角色卡在
+            # 错误轮不再产新轮时 120s 后谓词翻 False → 清状态 → attempt 恒 1 →
+            # 退避曲线失效（24h 实测 614 次注入、相邻间隔 median 248s = 120s 重置
+            # 再等 120s 的形状，<120s 占 17.6%；attempt 从未爬到 5 档封顶）。
+            # pane 门（前半）不变：真恢复的角色照样立刻清状态、不被拖到 1800s 起步。
             if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS) \
-                    and not _transcript_last_turn_is_api_error(role):
+                    and not _transcript_last_turn_is_api_error(role, max_age=float("inf")):
                 # pane 未命中不代表已恢复：15/15 会话 alternate_on=1，capture-pane
                 # 只有视口，错误文案几分钟就滚出视口（实测 24h 1,342 条错误轮里
                 # pane 只认出 9 次 = 0.67%），转录才是落盘事实。
@@ -408,7 +418,7 @@ class RoleLifecycleMixin:
             # → 漏检 → 误发「继续」（06:31:32 日志）。
             if any("Retrying" in ln and "attempt" in ln for ln in _recent.splitlines()):
                 continue
-            # 能走到这里说明 _recent 已命中错误文案（:319 的前置过滤），
+            # 能走到这里说明 pane 或转录已给出错误信号（上方前置过滤），
             # 所以只需再判"生成中且 transcript 停滞"：两者同时成立才是卡死。
             # 纯生成中的长推理（consumer 813s、maintainer 686s）在前面就退出了。
             if any("esc to interrupt" in ln for ln in _tail):
@@ -889,23 +899,36 @@ class RoleLifecycleMixin:
         _ts = self._ALERT_TS
         _key = (role, title)
         _now = time.time()
-        if _now - _ts.get(_key, 0) < self._ALERT_COOLDOWN_S:
-            LOGGER.debug("notify suppressed (cooldown %ds): %s / %s",
-                         self._ALERT_COOLDOWN_S, role, title)
-            return
+        # 锁只包 check+占位，不包 subprocess：8 线程池会同时看到同一条告警
+        # （Barrier 20 线程实测放行 20 次）。先占位再投递，失败再还回窗口。
+        with _ALERT_LOCK:
+            _gap = _now - _ts.get(_key, 0.0)
+            # 时间回拨时 _gap 为负，旧写法同样 < 窗口 → 最长静默 1.5h。
+            if 0 <= _gap < self._ALERT_COOLDOWN_S:
+                LOGGER.debug("notify suppressed (cooldown %ds): %s / %s",
+                             self._ALERT_COOLDOWN_S, role, title)
+                return
+            _ts[_key] = _now
         self._bb.write("blocker", title, evidence=evidence, src="workflow_engine")
+        _delivered = False
         try:
-            _engine_mod._sp.run(
+            _r = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "send", role,
                  f"[workflow 告警] {title}\n\n{evidence}",
                  "--from", "workflow_engine"],
                 capture_output=True, timeout=15,
             )
-        except Exception:
-            pass
-        # 冷却记账必须在投递**之后**：写在前面时 bus 写失败或 send 抛错都会吃掉
-        # 30min 窗口，告警静默丢失而状态还在（wf_lifecycle 每轮都会再判到它）。
-        _ts[_key] = _now
+            # subprocess.run 在 rc≠0 时不抛异常（同 R121 的教训）：只看异常会把
+            # "没叫醒"记成"已叫醒"，角色收不到而 30min 内不再重试。
+            _delivered = getattr(_r, "returncode", 0) == 0
+        except Exception as _e:
+            LOGGER.warning("notify send 异常（窗口已还回，下轮重试）%s / %s: %s",
+                           role, title, _e)
+        # 冷却只在**真的叫醒之后**保留：bus 写失败 / send 抛错 / rc≠0 都不该吃掉
+        # 30min 窗口（告警静默丢失而状态还在，wf_lifecycle 每轮都会再判到它）。
+        if not _delivered:
+            with _ALERT_LOCK:
+                _ts.pop(_key, None)
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
