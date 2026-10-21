@@ -12,6 +12,7 @@ Workflow Daemon — 驱动工作流引擎，主动推进工作流步骤。
 sys.path 由 paths.py 集中管理，本文件不修改 sys.path。
 """
 
+import faulthandler
 import fcntl
 import json
 import logging
@@ -48,6 +49,11 @@ ensure_paths()
 from pipeflow.engine import WorkflowEngine
 
 INTERVAL = 10  # 秒
+
+# tick 卡死取证：超过 _TICK_STACK_DUMP_SEC 自动打印全部线程栈，超过 _TICK_SLOW_SEC 记一条耗时日志。
+# 用环境变量可调，默认值按「正常 tick < 60s」定（实测健康 tick 数秒级）。
+_TICK_STACK_DUMP_SEC = int(os.environ.get("TICK_STACK_DUMP_SEC", "180"))
+_TICK_SLOW_SEC = int(os.environ.get("TICK_SLOW_SEC", "60"))
 
 # ── 饥饿检测：工作流长期空转 → 触发食物链重启生产 ──
 # 设计背景：引擎只推进已有工作流，不主动创建；当所有工作流终态且超时未重启，
@@ -253,6 +259,11 @@ def daemon_loop(interval: int):
 
     try:
         while not shutdown:
+            # 一次 tick 卡住时进程无日志、无子进程、CPU 近零，外部只能看到"引擎活着但不干活"。
+            # 实测 2026-10-22 02:45→03:03 单 tick 静默 18 分钟，四种归因都无法证伪（无 root 拿不到栈）。
+            # 到点让 Python 自己把当前栈打到 stderr(journal)，换取下一次卡顿的确定根因。
+            _tick_t0 = time.time()
+            faulthandler.dump_traceback_later(_TICK_STACK_DUMP_SEC, repeat=False)
             try:
                 eng.run_once()
                 idled = 0
@@ -261,6 +272,11 @@ def daemon_loop(interval: int):
                 idled += 1
                 if idled % 10 == 0:
                     LOGGER.error("连续失败 %d 轮，最后异常: %s", idled, e)
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+                _tick_dt = time.time() - _tick_t0
+                if _tick_dt > _TICK_SLOW_SEC:
+                    LOGGER.warning("tick 耗时 %.0fs（阈值 %ds）", _tick_dt, _TICK_SLOW_SEC)
             # 饥饿检测：连续空转无活跃工作流 → 写 bus 请求生产者重启食物链
             try:
                 if _active_count(eng) > 0:
