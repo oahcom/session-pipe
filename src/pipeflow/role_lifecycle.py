@@ -57,6 +57,27 @@ _OVERFLOW_ERR_MAX_AGE = 600
 _TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
 
 
+def _read_transcript_tail(role: str, nbytes: int = 65536) -> list[str]:
+    """角色最新 transcript 的尾部行（倒序）。取不到一律 []，判据按"无信号"处理。
+
+    只读尾部：transcript 实测 7.8MB，全量解析 ×20 角色 ×每轮会把 daemon 拖死。
+    64KB 足够覆盖"本轮"错误——角色无法继续产出后，错误必落在文件尾。
+    """
+    import glob as _glob
+    try:
+        _d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+        files = sorted(_glob.glob(str(_d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
+        if not files:
+            return []
+        with open(files[0], "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - nbytes))
+            tail = fh.read().decode("utf-8", "ignore")
+        return list(reversed(tail.splitlines()))
+    except (OSError, ValueError):
+        return []
+
+
 def _transcript_shows_overflow(role: str, max_age: float = _OVERFLOW_ERR_MAX_AGE) -> bool:
     """从角色 transcript 判断近期是否发生上下文溢出。
 
@@ -67,34 +88,57 @@ def _transcript_shows_overflow(role: str, max_age: float = _OVERFLOW_ERR_MAX_AGE
     溢出事件形如：{"type":"assistant","isApiErrorMessage":true,
         "message":{"model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]}}
     """
-    import glob as _glob
-    try:
-        _d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
-        files = sorted(_glob.glob(str(_d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
-        if not files:
+    cutoff = time.time() - max_age
+    for line in _read_transcript_tail(role):
+        if '"isApiErrorMessage":true' not in line.replace(" ", ""):
+            continue
+        if not any(p in line for p in _OVERFLOW_PATTERNS):
+            continue
+        try:
+            _ts = json.loads(line).get("timestamp", "")
+            _dt = datetime.strptime(_ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError, KeyError):
+            return True  # 时间戳不可解析：保守按"刚发生"处理，宁可多 compact 一次
+        return _dt.timestamp() > cutoff
+    return False
+
+
+# API 错误族（额度/上游/鉴权）。"Prompt is too long" 不在其中：溢出归 /compact 那条
+# 路，给它发「继续」只会永远重试同一段超长上下文。
+# 时效：CLI 自己会重试——24h 1,342 条错误轮 85.8% 在 10 分钟内自愈，这条只补
+# "停住不动"的那些。
+_API_ERROR_PATTERNS = ("API Error:", "Please run /login")
+_API_ERROR_AGE = 120
+
+# 「继续」必须带信息：24h 1,247 次注入里 611 次的后续轮没有任何工具调用（另 520
+# 次立刻又撞错），裸「继续」只能被角色复述。重试的单位是**被中断的那次请求**，
+# 不是整个任务（gemini-cli checkpoint 恢复的是那条 tool call，不是重新规划）。
+_RATE_LIMIT_NUDGE = "上一轮 API 错误中断（0 产出）。继续：重发被中断的那次请求，不要重新规划，不要写自检报告。"
+
+
+def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AGE) -> bool:
+    """角色**最后一条** assistant 轮是否就是一条 API 错误（这类轮 output_tokens 恒为 0）。
+
+    WHY 不靠 pane：15/15 ccs 会话 alternate_on=1，capture-pane 只有视口，错误文案
+    几分钟就滚出视口（实测 24h 1,342 条错误轮，pane 只认出 9 次 = 0.67%；
+    maintainer 216→0 / product-architect 119→0 / qa 107→0）。
+    WHY 只看最后一条：错误之后只要再来一条正常轮，就说明已自愈，不许再打断它。
+    """
+    for line in _read_transcript_tail(role):
+        _c = line.replace(" ", "")
+        if '"type":"assistant"' not in _c:
+            continue
+        if '"isApiErrorMessage":true' not in _c:
             return False
-        _pat = _OVERFLOW_PATTERNS
-        cutoff = time.time() - max_age
-        # 尾读 64KB 即可覆盖"本轮"错误：溢出后角色无法继续产出，错误必落在文件尾
-        with open(files[0], "rb") as fh:
-            fh.seek(0, 2)
-            size = fh.tell()
-            fh.seek(max(0, size - 65536))
-            tail = fh.read().decode("utf-8", "ignore")
-        for line in reversed(tail.splitlines()):
-            if '"isApiErrorMessage":true' not in line.replace(" ", ""):
-                continue
-            if not any(p in line for p in _pat):
-                continue
-            try:
-                _ts = json.loads(line).get("timestamp", "")
-                _dt = datetime.strptime(_ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError, KeyError):
-                return True  # 时间戳不可解析：保守按"刚发生"处理，宁可多 compact 一次
-            return _dt.timestamp() > cutoff
-        return False
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
+        if not any(p in line for p in _API_ERROR_PATTERNS):
+            return False
+        try:
+            _dt = datetime.strptime(json.loads(line)["timestamp"],
+                                    "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError, KeyError):
+            return True  # 时间戳不可解析：保守按"刚发生"，宁可多发一句
+        return (time.time() - _dt.timestamp()) < max_age
+    return False
 
 
 _USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
@@ -197,6 +241,13 @@ class RoleLifecycleMixin:
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
     _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
+    # 告警冷却：同一 (role, title) 30min 内只投一次（见 _notify_role）。
+    # 状态放类属性（进程级）而非实例：与 _BACKLOG_ALERT_TS 同口径——限流是进程级
+    # 事实，一个进程里多个 engine 实例各存一份等于没限流。
+    # ponytail: 只在进程内生效；CLI 每次 tick 起新进程时最坏退化为"每次调用一条"。
+    # 需要跨进程时改成写 ~/.hermes/run/alert_cooldown.json，先有证据再加。
+    _ALERT_TS: dict[tuple, float] = {}
+    _ALERT_COOLDOWN_S = 1800
     # ── 模型额度拒绝（403/429）恢复 ──
     # 9router 免费层按出口 IP 计配额：角色 pane 只剩 "API Error: 403" /
     # "Rate limit exceeded"，进程活着但不产出。旧行为只把它排除出 idle 判定
@@ -320,7 +371,11 @@ class RoleLifecycleMixin:
             # `[rate_limit] 已发继续`，每次换来一段无进展的自检长文。
             _recent = "\n".join(
                 [ln for ln in output.splitlines() if ln.strip()][-20:])
-            if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS):
+            if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS) \
+                    and not _transcript_last_turn_is_api_error(role):
+                # pane 未命中不代表已恢复：15/15 会话 alternate_on=1，capture-pane
+                # 只有视口，错误文案几分钟就滚出视口（实测 24h 1,342 条错误轮里
+                # pane 只认出 9 次 = 0.67%），转录才是落盘事实。
                 # 角色已恢复：清掉退避状态，否则下一次真 403 会从最大退避档
                 # （1800s）起步，恢复要等半小时。
                 self._last_rate_recover.pop(role, None)
@@ -357,7 +412,7 @@ class RoleLifecycleMixin:
                     capture_output=True, timeout=5,
                 )
                 _r2 = _engine_mod._sp.run(
-                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "继续", "Enter"],
+                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", _RATE_LIMIT_NUDGE, "Enter"],
                     capture_output=True, timeout=5,
                 )
             except Exception as e:
@@ -366,10 +421,12 @@ class RoleLifecycleMixin:
             # subprocess.run 在 rc≠0 时不抛异常：会话在候选集之后死掉只会得到
             # RC=1（实测 tmux send-keys -t ccs-nonexistent → rc=1），不判 rc 就会
             # 写出「已发继续」假审计。
-            _rc = max(getattr(_r1, "returncode", 0) or 0,
-                      getattr(_r2, "returncode", 0) or 0)
-            if _rc != 0:
-                LOGGER.warning("额度恢复发送失败 %s: tmux rc=%d", role, _rc)
+            # 负数 rc（-9 SIGKILL / -15 SIGTERM）与 None（无法判定）都不是成功：
+            # max() 会把 -9 折成 0 → 写出「已发继续」假审计（审查 P2，实测可复现）。
+            # 默认取 1：判不了失败时就当失败，宁可多等一轮也不要假审计。
+            _rcs = [getattr(x, "returncode", 1) for x in (_r1, _r2)]
+            if any(_rc != 0 for _rc in _rcs):
+                LOGGER.warning("额度恢复发送失败 %s: tmux rc=%s", role, _rcs)
                 continue
             # 审计与发送分家：发送异常不再吞掉审计，写入失败单独可见。
             # 标题必须带完整日期时刻——bus 的 facts.t 是 UNIQUE 且 ON CONFLICT
@@ -531,10 +588,12 @@ class RoleLifecycleMixin:
                 # → pane 判断恒"存活"导致停滞重推整体失效
                 if self._recently_producing(_role):
                     continue
-                # 停滞超过 3 分钟 + pane 不存活 + 无 timeout_count → 重推
-                _tc = _sr.get("timeout_count", 0)
-                if _tc > 0:
-                    continue  # tick 已经在处理
+                # 停滞超过 3 分钟 + 角色近期无产出 + 不忙 → 重推。
+                # 2026-10-21: 原先 `if _tc > 0: continue` 与 step_handler 的
+                # `timeout_count == 1` 合起来制造无派发空窗（count 2..auto_cancel
+                # 期间两路全关，实测 wf_1ce1cf0140/closer 30min21s 零派发，#431798）。
+                # tick 侧已改为每次超时都重推，本路只在角色进入"有计数但无产出"
+                # 时补位；kick_stalled_at 冷却（600s）保证不每 tick 重推。
                 # 角色已有挂起的任务 → 不打扰
                 # 排除自己：检验中就是当前停滞步骤，若不排除会把自身判 busy，
                 # 导致停滞步骤永不重推（2026-08-10 观测 wf_cde32/s1 skip 30 分钟）
@@ -800,7 +859,22 @@ class RoleLifecycleMixin:
         return False
 
     def _notify_role(self, role: str, title: str, evidence: str):
-        """告警通知：写 blocker bus + ccs send 唤醒角色（绕过并发检查）。"""
+        """告警通知：写 blocker bus + ccs send 唤醒角色（绕过并发检查）。
+
+        同一 (role, title) 30min 内只投一次：卡住是**持续状态**，每 tick 重发同一条
+        只是往角色上下文里灌重复噪音（实测 maintainer 30h 收 265 次「工作流多步骤
+        超时: wf_sub_71247」，正文 1→0 来回翻转，且其中 115 次落在 6 小时窗口内）。
+        每条重复告警都要占一整个回合的上下文才能读完，状态没变就不该叫醒人。
+        批量尖峰（同秒 N 台）由调用方聚合（wf_lifecycle:454 的 _recycled 汇总）。
+        """
+        _ts = self._ALERT_TS
+        _key = (role, title)
+        _now = time.time()
+        if _now - _ts.get(_key, 0) < self._ALERT_COOLDOWN_S:
+            LOGGER.debug("notify suppressed (cooldown %ds): %s / %s",
+                         self._ALERT_COOLDOWN_S, role, title)
+            return
+        _ts[_key] = _now
         self._bb.write("blocker", title, evidence=evidence, src="workflow_engine")
         try:
             _engine_mod._sp.run(

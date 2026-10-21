@@ -49,7 +49,7 @@ def test_no_workflow_role_recovered_via_tmux():
         eng._recover_rate_limited_roles()
 
     resumed = {c[c.index("-t") + 1][4:].split(":")[0]
-               for c in sent if "继续" in c}
+               for c in sent if "继续" in " ".join(c)}
     assert resumed == {"curator", "maintainer"}, f"应恢复两个孤儿角色, got {sent}"
 
 
@@ -75,7 +75,7 @@ def test_upstream_connection_lost_is_recovered():
     with patch("pipeflow.engine._sp.run", side_effect=fake_run):
         eng._recover_rate_limited_roles()
 
-    assert any("继续" in c for c in sent), f"upstream 中断应发继续, got {sent}"
+    assert any("继续" in " ".join(c) for c in sent), f"upstream 中断应发继续, got {sent}"
 
 
 def test_recovered_role_not_pinged_again_on_scrollback():
@@ -101,7 +101,7 @@ def test_recovered_role_not_pinged_again_on_scrollback():
     with patch("pipeflow.engine._sp.run", side_effect=fake_run):
         eng._recover_rate_limited_roles()
 
-    assert not any("继续" in c for c in sent), f"已恢复角色不应被重发继续, got {sent}"
+    assert not any("继续" in " ".join(c) for c in sent), f"已恢复角色不应被重发继续, got {sent}"
 
 
 def test_healthy_role_not_touched():
@@ -248,7 +248,7 @@ def test_backoff_blocks_immediate_retry():
         eng._recover_rate_limited_roles()
         eng._recover_rate_limited_roles()
 
-    resumed = [c for c in sent if "继续" in c]
+    resumed = [c for c in sent if "继续" in " ".join(c)]
     assert len(resumed) == 1, f"退避窗口内应只发 1 次, got {len(resumed)}"
 
 
@@ -317,6 +317,27 @@ def test_send_nonzero_rc_writes_no_audit():
 
     assert not eng._bb.write.called, "tmux rc=1 却写了「已发继续」"
 
+def test_send_negative_rc_or_none_is_failure():
+    """负数 rc（-9 SIGKILL / -15 SIGTERM）与 None 都不能算成功。
+
+    max(0, -9) == 0 → 会写出「已发继续」假审计，正是本提交要消灭的那一类。
+    """
+    for _r1, _r2 in ((-9, 0), (0, -15), (None, 0)):
+        eng = _engine()
+
+        def fake_run(cmd, *a, _a=_r1, _b=_r2, **k):
+            if "list-sessions" in cmd:
+                return MagicMock(returncode=0, stdout="ccs-lr\n")
+            if "capture-pane" in cmd:
+                return MagicMock(returncode=0, stdout="API Error: 403 FreeTierError")
+            if "send-keys" in cmd:
+                return MagicMock(returncode=_a if "C-u" in cmd else _b, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+            eng._recover_rate_limited_roles()
+        assert not eng._bb.write.called, f"rc=({_r1},{_r2}) 却写了「已发继续」"
+
 
 def test_request_rejected_429_is_recovered():
     """9router 现行 429 文案 `Request rejected (429)` 必须命中恢复词表。
@@ -343,7 +364,7 @@ def test_request_rejected_429_is_recovered():
     with patch("pipeflow.engine._sp.run", side_effect=fake_run):
         eng._recover_rate_limited_roles()
 
-    assert any("继续" in c for c in sent), f"Request rejected (429) 应发继续, got {sent}"
+    assert any("继续" in " ".join(c) for c in sent), f"Request rejected (429) 应发继续, got {sent}"
 
 
 if __name__ == "__main__":
@@ -353,3 +374,72 @@ if __name__ == "__main__":
                test_request_rejected_429_is_recovered):
         fn()
         print(f"OK {fn.__name__}")
+
+
+# ── R122：pane 只有视口，错误判据必须回到转录 ──
+# 实测 24h 全角色 1,342 条 API 错误轮（output_tokens 恒为 0），pane 只认出 9 次
+# = 0.67%；maintainer 216→0 / product-architect 119→0 / qa 107→0。15/15 ccs 会话
+# alternate_on=1，capture-pane -S -60 拿到的就是视口，错误文案几分钟即滚出。
+
+def _write_turn(tmp_path, role, age_sec, err=True, text="Please run /login · API Error: 403"):
+    import json as _json
+    from datetime import datetime, timezone, timedelta
+    d = tmp_path / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+    d.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc) - timedelta(seconds=age_sec)
+    rec = {"type": "assistant", "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+           "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+    if err:
+        rec["isApiErrorMessage"] = True
+    with open(d / "sess.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(rec) + "\n")
+
+
+def _run_recovery(eng, panes):
+    sent = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="".join(f"ccs-{r}\n" for r in panes))
+        if "capture-pane" in cmd:
+            r = cmd[cmd.index("-t") + 1][4:].split(":")[0]
+            return MagicMock(returncode=0, stdout=panes[r])
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+    return sent
+
+
+def test_pane_blind_recent_api_error_still_recovered(tmp_path, monkeypatch):
+    """pane 干净、转录里最后一条是 30s 前的 API 错误 → 必须恢复。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_turn(tmp_path, "curator", age_sec=30)
+    sent = _run_recovery(_engine(), {"curator": "❯ \n"})
+    assert any("继续" in " ".join(c) for c in sent), f"转录有近期错误却没恢复: {sent}"
+
+
+def test_recovered_after_error_is_not_nudged(tmp_path, monkeypatch):
+    """错误之后已有一条正常轮 → 自愈了，再发就是打断。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_turn(tmp_path, "curator", age_sec=60)
+    _write_turn(tmp_path, "curator", age_sec=10, err=False, text="已修复并提交")
+    sent = _run_recovery(_engine(), {"curator": "❯ \n"})
+    assert not any("继续" in " ".join(c) for c in sent), f"已自愈角色被重发: {sent}"
+
+
+def test_nudge_carries_what_to_retry(tmp_path, monkeypatch):
+    """注入的不是裸「继续」：要指明重发被中断的那次请求。
+
+    实测 24h 1,247 次「继续」里 611 次的后续轮零工具调用（另 520 次立刻又撞错）。
+    """
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_turn(tmp_path, "qa", age_sec=30)
+    sent = _run_recovery(_engine(), {"qa": "❯ \n"})
+    body = [c for c in sent if "继续" in " ".join(c)][0][-2]
+    assert "重发" in body and "不要重新规划" in body, body
