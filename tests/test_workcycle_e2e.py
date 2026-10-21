@@ -264,7 +264,9 @@ def test_review_self_audit_no_deadlock(mock_run):
     rid = eng.start("selfrv", {})
 
     eng.run_once()
-    _done(eng, "s1")
+    # review 步必须带明确结论：R134 起 unknown（无判定词）不推进，见
+    # tests/test_review_gate_verdicts.py。本用例的意图是"不放 token"，不是"无结论也放行"。
+    _done(eng, "s1", extra="APPROVED: 0 P0")
     for _ in range(20):
         time.sleep(0.05)
         eng.run_once()
@@ -303,7 +305,7 @@ def test_rework_chain_first_step_review_no_token(mock_run):
         ("reviewer", rid))
 
     eng.run_once()
-    _done(eng, "s1")
+    _done(eng, "s1", extra="APPROVED: 0 P0")   # 结论必须显式（见上一用例注释）
     for _ in range(20):
         time.sleep(0.05)
         eng.run_once()

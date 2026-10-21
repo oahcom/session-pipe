@@ -353,6 +353,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self._workflows: dict[str, WorkflowDef] = {}
         self._lm = None
         self._consumed_exit_ids: set[int] = set()
+        # 评审 unknown 只播报一次（实例,步骤,文本）。进程内即可：
+        # 重启后最多重播一次，不值得落库。
+        self._unknown_verdict_notified: set[tuple] = set()
         self._load_workflows()
 
     @property

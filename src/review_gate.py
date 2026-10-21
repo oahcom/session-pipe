@@ -156,10 +156,22 @@ def _full_scan(text: str) -> bool:
     return False
 
 
-def is_rejected(text: str) -> bool:
-    """文本是否表达了驳回结论。锚点结论优先，无锚点则全文回退。"""
+APPROVED, REJECTED, UNKNOWN = "approved", "rejected", "unknown"
+
+
+def review_verdict(text: str) -> str:
+    """三态判定：approved / rejected / unknown（空文本或无锚点无关键词）。
+
+    消费方必须区分 unknown：评审人什么都没写不是"通过"。GitHub required
+    review / Temporal 都是 fail-closed——没有明确 APPROVED 就不放行。
+    """
     text = text or ""
     verdict = _anchored_verdict(text)
     if verdict is not None:
-        return not verdict
-    return _full_scan(text)
+        return APPROVED if verdict else REJECTED
+    return REJECTED if _full_scan(text) else UNKNOWN
+
+
+def is_rejected(text: str) -> bool:
+    """存量判据：只问"是否驳回"，unknown 仍返回 False（fail-open）。"""
+    return review_verdict(text) == REJECTED

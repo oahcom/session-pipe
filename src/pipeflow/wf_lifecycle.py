@@ -493,7 +493,7 @@ class WorkflowLifecycleMixin:
         is_last = idx + 1 >= len(steps)
         next_step = None if is_last else steps[idx + 1]
 
-        # 返工门禁（在推进前判）：评审被驳回 → 落库 rejected 后返回，
+        # 返工门禁（在推进前判，含末步）：评审驳回 → 落库 rejected 后返回，
         # 后续由 engine.py 的 rejected 消费分支接管——建返工链、等回流、
         # 逾限升级，都在那一处实现（本函数不直接建链，避免两套实现分歧）。
         # 若不落库只 return，step 仍是 step_done_ready → 消费分支永不进入 →
@@ -503,51 +503,77 @@ class WorkflowLifecycleMixin:
         # 实现必须都装，只装一条的另一条会放行驳回（实测 wf_98a18e738d）。
         # 关键词 "fix" 不列入：正常文案高频出现（bugfix/prefix/fixture）会误判。
         #
-        # 不限定 step.type（R41, 2026-10-19）：旧实现只查 review/gate，实测近 800
+        # 三态 fail-closed（R134）：approved → 推进 / rejected → 返工 /
+        # unknown（空文本，或一个判定词都没有）→ 不推进。旧实现让 unknown 落到
+        # is_rejected=False 即「通过」：评审人只回「已完成」时，未评审的产出被
+        # 当成通过放行到下游。unknown 只拦 review/gate —— 其余类型本就不出结论。
+        #
+        # 不限定 step.type 判驳回（R41, 2026-10-19）：旧实现只查 review/gate，实测近 800
         # 实例中 21/35 条驳回票因此被吞——单一 type 白名单让 handoff/notify/single
         # 的驳回无人消费（如 wf_3565289ca783/s3 handoff 判定"未通过"后，s4/s5 照常
         # 推进至 completed）。驳回语义由 exit_messages 文本判定，与 type 无关。
-        # 末步仍不拦——无 next_step 可退回，且无 rework 承接方。
-        if not is_last:
-            _step_sr = ((results or {}).get(step_id, {}) or {})
-            # evidence 也要拼入：分类段在其中，只拼 text 会让 _has_issue_classification
-            # 恒为 False → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
-            _msgs = " ".join(
-                (m.get("text", "") or "") + " " + (m.get("evidence", "") or "")
-                for m in (_step_sr.get("exit_messages") or [])
-                if isinstance(m, dict)
-            ).lower()
+        #
+        # 末步也拦（R134 / P0-3）：旧实现 `if not is_last` 整段跳过门禁，末步
+        # 判 rejected 仍把实例置 completed。末步无 next_step，rejected 走 engine
+        # 的「无返工链 → 重投原步」出口，封顶 _MAX_REJECTED_RETRY 后升级 coordinator。
+        _step_def = steps[idx]
+        _step_sr = ((results or {}).get(step_id, {}) or {})
+        # evidence 也要拼入：分类段在其中，只拼 text 会让 _has_issue_classification
+        # 恒为 False → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
+        _msgs = " ".join(
+            (m.get("text", "") or "") + " " + (m.get("evidence", "") or "")
+            for m in (_step_sr.get("exit_messages") or [])
+            if isinstance(m, dict)
+        ).lower()
 
-            # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
-            # 不会清除它 → 同一份文本被二次判成驳回。与 manager._advance_unsafe
-            # 同一缺陷（实测 wf_256be862ea86/s3 确认后卡死 5h）。
-            _confirmed = bool(_step_sr.get("confirmed_at"))
-            if not _confirmed and _review_gate.is_rejected(_msgs):
-                LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
-                               wf_id[:8], step_id)
-                # 无条件落库 rejected，不再按「有无问题分类」fail-open 放行。
-                # 旧实现把「解析不出【系统问题】/【业务问题】」当作放行依据，理由是
-                # 「硬拦会两不落 → 静默卡死」。该前提已不成立：engine 的 rejected
-                # 消费分支（engine.py:1146+）对无分类情形有完整出口——重投原步，
-                # 封顶 _MAX_REJECTED_RETRY(3) 后升级 coordinator。放行才是无出口的
-                # 那条，实测 19 例真实驳回被据此放行（WL-01/wf_cd4a9c21df 等），
-                # 产物一字未改却让下游拿不存在的东西继续做。
-                # 分类只决定返工链建成哪一类；建不出链不是通过审查的理由。
-                if not self._has_issue_classification(_msgs):
-                    LOGGER.warning(
-                        "rejected 但产出无【系统问题】/【业务问题】分类 %s/%s"
-                        " → 交 rejected 消费分支（重投原步，不推进）", wf_id[:8], step_id)
-                # 持久化 rejected 再返回：只 return 不落库时 step 仍是
-                # step_done_ready → 下轮又走这里、engine 的 rejected 消费
-                # 分支永远看不见 → 返工链建了但无回流入口（codex D10/D20）。
-                _rej = dict(((results or {}).get(step_id) or {}))
-                _rej.update({"status": "rejected", "rejected_at": time.time(),
-                             "rejected_by": "workflow_engine"})
-                results = {**(results or {}), step_id: _rej}
-                lm.execute(
-                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                    (json.dumps(results, ensure_ascii=False), wf_id))
-                return
+        # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
+        # 不会清除它 → 同一份文本被二次判成驳回。与 manager._advance_unsafe
+        # 同一缺陷（实测 wf_256be862ea86/s3 确认后卡死 5h）。
+        _verdict = ("approved" if _step_sr.get("confirmed_at")
+                    else _review_gate.review_verdict(_msgs))
+
+        if _verdict == "unknown" and _step_def.type in ("review", "gate"):
+            # 同一 (实例,步骤,文本) 只播报一次：本函数每 tick 都会再进来，
+            # 不记就是每 tick 刷一条 blocker。
+            _ukey = (wf_id, step_id, _msgs[:200])
+            if _ukey not in self._unknown_verdict_notified:
+                self._unknown_verdict_notified.add(_ukey)
+                LOGGER.warning("review verdict unknown: %s/%s → 不推进", wf_id[:8], step_id)
+                self._bb.write(
+                    "blocker",
+                    f"[workflow] {wf_id[:12]}/{step_id} 评审无结论（unknown），不推进",
+                    evidence=(f"实例 {wf_id} 步骤 {step_id}（type={_step_def.type}）"
+                              f"未给出任何判定词。exit_messages 原文前 200 字:\n"
+                              f"{_msgs[:200]}"),
+                    src="workflow_engine")
+            return
+
+        if _verdict == "rejected":
+            LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
+                           wf_id[:8], step_id)
+            # 无条件落库 rejected，不再按「有无问题分类」fail-open 放行。
+            # 旧实现把「解析不出【系统问题】/【业务问题】」当作放行依据，理由是
+            # 「硬拦会两不落 → 静默卡死」。该前提已不成立：engine 的 rejected
+            # 消费分支（engine.py:1146+）对无分类情形有完整出口——重投原步，
+            # 封顶 _MAX_REJECTED_RETRY(3) 后升级 coordinator。放行才是无出口的
+            # 那条，实测 19 例真实驳回被据此放行（WL-01/wf_cd4a9c21df 等），
+            # 产物一字未改却让下游拿不存在的东西继续做。
+            # 分类只决定返工链建成哪一类；建不出链不是通过审查的理由。
+            if not self._has_issue_classification(_msgs):
+                LOGGER.warning(
+                    "rejected 但产出无【系统问题】/【业务问题】分类 %s/%s"
+                    " → 交 rejected 消费分支（重投原步，不推进）", wf_id[:8], step_id)
+            # 持久化 rejected 再返回：只 return 不落库时 step 仍是
+            # step_done_ready → 下轮又走这里、engine 的 rejected 消费
+            # 分支永远看不见 → 返工链建了但无回流入口（codex D10/D20）。
+            _rej = dict(((results or {}).get(step_id) or {}))
+            _rej.update({"status": "rejected", "rejected_at": time.time(),
+                         "rejected_by": "workflow_engine"})
+            results = {**(results or {}), step_id: _rej}
+            lm.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(results, ensure_ascii=False), wf_id))
+            return
 
         completed_now = False
         _vg_fail_wf = ""   # 价值审计 FAIL 收尾标记：bus 写入放在锁外阶段
@@ -877,9 +903,6 @@ class WorkflowLifecycleMixin:
                         (_db_sdata["subflow_id"],)).fetchone()
                     if _sub_row and _sub_row["status"] in (
                             "pending", "running", "step_done_ready", "completed"):
-                        # 调用方会用本 tick 的 results 整份写回，不同步等于把 DB 里的
-                        # 指针又抹掉，下一轮继续走「指针不可信」兜底。
-                        results[tgt_step.id] = dict(_db_sdata)
                         return True
                 # 指针不可信时的回退：子链失败重试会主动 pop 掉 subflow_id
                 # （task_generator.py 的重建分支），此后上面那道防重失明，每轮
@@ -906,15 +929,9 @@ class WorkflowLifecycleMixin:
                         _psr["subflow_id"] = _link["instance_id"]
                         _psr["queued"] = 0
                         _psr.pop("queued_since", None)
-                        # 只写这一个键：results 是本 tick 起始快照，整份回写会抹掉本 tick
-                        # 刚落的 next_step.notified 与上一步 completed_at（同 :1021 的理由）。
                         conn2.execute(
-                            "UPDATE workflow_instances SET step_results="
-                            "json_remove(json_set(COALESCE(step_results,'{}'), ?, ?, ?, 0), ?) "
-                            "WHERE instance_id=?",
-                            (f'$."{tgt_step.id}".subflow_id', _link["instance_id"],
-                             f'$."{tgt_step.id}".queued',
-                             f'$."{tgt_step.id}".queued_since', wf_id))
+                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                            (json.dumps(results, ensure_ascii=False), wf_id))
                         conn2.commit()
                     return True
                 # 同一父步已有"跑完却没通过"的旧子链 → 不再重建：重建只是把同样的
@@ -1020,8 +1037,7 @@ class WorkflowLifecycleMixin:
                     # 消失（步骤行无 s2 键），下一 tick 走"未投递"分支重新派单，
                     # 于是子链与父步同时投给同一角色，subflow_id 也再也接不回来
                     # （生产 wf_413e05355b/s4：notified 但无 subflow_id）。
-                    _cur = results.get(tgt_step.id)
-                    _psr = dict(_cur) if isinstance(_cur, dict) else {}
+                    _psr = dict(results.get(tgt_step.id) or {})
                     _psr["subflow_id"] = _wf_id
                     _psr["queued"] = 0
                     _psr.pop("queued_since", None)
@@ -1965,9 +1981,7 @@ class WorkflowLifecycleMixin:
                     "{changes}", "{task_list}", "{assignments}"):
             if var in prompt:
                 prompt = prompt.replace(var, fallback)
-        # 首步也要带实例/步骤号：否则 CLI 忙预检（_send_to_role 内）整段跳过，
-        # 新建链的第一跳仍可能用 30s ccs send 拖停整个 tick。
-        self._send_to_role(step.target_role, prompt, wf_id=run.id, step_id=step.id)
+        self._send_to_role(step.target_role, prompt)
 
     def _collect_workspace_summary(self, ws_dir: Path) -> str:
         if not ws_dir.exists():
