@@ -1,64 +1,43 @@
 # 测试工作流文档
 
-> 更新: 2026-07-24 | 受众: 测试工程师 | 相关: [DOCS.md](DOCS.md)
+> 更新: 2026-10-22 | 受众: 测试工程师 | 相关: [DOCS.md](DOCS.md)
 
-## 如何运行全部测试
+## 运行
 
 ```bash
-# session-pipeline（136 pass / 0 fail）
 cd /home/administrator/session-pipeline
-python3 -m pytest tests/ -v
-
-# hermes-session-roles（24 pass）
-cd /home/administrator/hermes-session-roles
-python3 -m pytest tests/ -v
-
-# session-launcher（22 pass / 2 fail）
-cd /home/administrator/session-launcher
-python3 -m pytest tests/ -v
+python3 -m pytest tests/ -q                 # 全量
+python3 -m pytest tests/ -q --collect-only  # 只收集（秒级，验证导入是否坏）
+python3 -m pytest tests/test_engine_e2e.py -q
 ```
 
-## 已实现测试
+`tests/conftest.py` 已把 `src/` 加入 `sys.path`，无需 `PYTHONPATH`；直接跑 `python3 src/...` 才需要。
 
-### session-pipeline（136 pass / 0 fail）
+## 实测基线（2026-10-22 05:40）
 
-| 测试文件 | 数量 | 通过 | 失败 | 覆盖模块 |
-|---------|------|------|------|----------|
-| test_workflow_db.py | 36 | 36 | 0 | Template/Task/Workflow CRUD, 权限, 状态同步, 进度计算, 链式创建, 日志审计 |
-| test_workflow_engine.py | 31 | 31 | 0 | 加载, start/status/cancel, tick/advance, 超时/重试, 条件步骤, workspace_summary, 持久化 |
-| test_cross_component.py | 17 | 17 | 0 | DB+Client 一致性, DB+Engine 联动, 并发操作, 权限规则, 链式生命周期, Bus联动 |
-| test_router.py | 13 | 13 | 0 | router.py, auto_route.py |
-| test_integration.py | 12 | 12 | 0 | bus_protocol, auto_route, reliability, router |
-| test_role_interaction.py | 10 | 10 | 0 | bus 通信, 角色交互, 路由优先级 |
-| test_engine_e2e.py | 6 | 6 | 0 | CCS 模拟, 超时升级, 多步骤完成, 提醒心跳 |
-| test_router_extend_bh.py | 7 | 7 | 0 | Browser Harness 路由扩展 |
-| test_workflow_daemon.py | 4 | 4 | 0 | daemon_loop, PID 锁 |
-
-### hermes-session-roles（24 pass）
-
-| 测试文件 | 数量 | 覆盖模块 |
-|---------|------|----------|
-| test_search.py | 15 | 中文/英文/同义词搜索 |
-| test_registry.py | 9 | Role/Persona 加载、注册、验证 |
-
-### session-launcher（22 pass / 2 fail）
-
-| 测试文件 | 数量 | 通过 | 失败 | 覆盖模块 |
-|---------|------|------|------|----------|
-| test_ccs_socket.py | 12 | 12 | 0 | Streamer capture, CLI send, socket 监听 |
-| test_e2e_mock.py | 12 | 10 | 2 | Session 生命周期端到端 |
-
-失败详情：
-- `test_e2e_mock.py::test_main_no_work` — assert 2 == 0（exit code 不符预期）
-- `test_e2e_mock.py::test_main_shell_output_format` — export 行输出为空
-
-**总计：182 pass / 2 fail（跨三个项目）**
-
-## 手动测试点
-
-| 场景 | 原因 |
+| 命令 | 结果 |
 |------|------|
-| feed socket 断线重连 | 需真实 socket 服务 |
-| SIGTERM 信号处理 | 需真实 daemon 进程 |
-| 大数据量性能 (>10k 条) | 耗时较长 |
-| DB 重启后状态恢复 | 需持久化 DB 测试 |
+| `--collect-only` | 1218 tests collected, 0 error |
+| `pytest tests/ -q` | **1215 passed, 3 skipped** in 117s |
+
+> 这两个数字只是某个时刻的快照，别当门禁。判定"我的改动有没有引入回归"先跑
+> `--collect-only`（秒级，能抓到导入断裂），再跑全量并只对齐失败集合。
+> 收集错误通常来自**未提交的 src 改动与测试脱节**——先看 import 名对不对，别急着改测试。
+
+## 测试文件规模
+
+`find tests -name 'test_*.py' | wc -l` → 125 个文件。按主题分布（命名即职责，不再逐文件列表）：
+
+| 主题 | 代表文件 |
+|------|----------|
+| 引擎推进/退出 | `test_engine_e2e.py` `test_exit_condition.py` `test_tick_paths.py` |
+| 审批/驳回/返工 | `test_approval_channel_retired.py` `test_confirm_not_re_rejected.py` `test_r118_completion_integrity.py` |
+| 协作模式 | `test_collab_modes.py` `test_collab_regression.py`（合计 26 tests） |
+| 路由 | `test_router.py` `test_routes_unit.py` `test_consistency.py` |
+| 投递/存活 | `test_send_to_role_timeout.py` `test_liveness.py` `test_survival_monitor_unit.py` |
+| 模板/契约 | `test_contract_updater_*.py` `test_container_contract_satisfiable.py` |
+
+## 已知缺口
+
+- `_cleanup_stale_workflows` 条件 4（超时/排队/子链/证据门组合）无专门单测，行为靠 e2e 间接覆盖。
+- 手工验证 `SurvivalMonitor().tick()` 会写生产 bus/哨兵，必须按 [CLAUDE.md](../CLAUDE.md) 三重 env 隔离后再跑。

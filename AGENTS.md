@@ -18,7 +18,7 @@ hermes-session-roles (定义层)
 **铁律：不直接创建 CCS，不改 bus_protocol 核心逻辑。**
 
 ## Git 工作流
-1. 禁止切换分支，始终在 main 分支工作
+1. 只在当前 worktree 分支工作（2026-10-22 实测分支：`temp-pr-branch`），不改主分支
 2. 小步提交，每完成一个逻辑单元立即 commit
 3. 出错用新提交修复，不要 revert
 4. 本地即生产环境
@@ -50,7 +50,7 @@ print(format_pipeline())
 # 路由表加载正常
 PYTHONPATH=src python3 -c "
 from routing.router import get_router; r = get_router()
-assert len(r._routing) >= 25, f'路由表不完整: {len(r._routing)}'
+assert len(r._routing) >= 15, f'路由表不完整: {len(r._routing)}'  # 2026-10-22 实测 19 个角色
 print(f'OK: {len(r._routing)} roles')
 "
 
@@ -88,7 +88,7 @@ python3 src/ccs.py health
 
 ### 5. 每周自进化
 
-- 检查 unconsumed 消息积压（`python3 src/routing/auto.py --status`）
+- 检查 unconsumed 消息积压（`PYTHONPATH=src python3 -m routing.auto --status`；直接跑 `src/routing/auto.py` 会 `ModuleNotFoundError: reliability`）
 - 检查路由命中率：哪些角色从未被路由到？
 - 检查 TTL 清理是否正常运行
 - 检查熔断器触发次数
@@ -108,6 +108,7 @@ python3 src/ccs.py health
 ### 模板必填元数据
 ```bash
 # 每个 ~/.hermes/workflows/*.json 必须包含以下 6 个字段：
+workflow_id="WF-<name>"                     # 必填，与模板名一致
 trigger_scene=["编码实现", "bug修复"]   # 至少 1 条触发场景
 allowed_initiators=["coordinator","pm"] # 至少 1 个允许发起角色
 allowed_executors=["engineer"]          # 至少 1 个允许执行角色

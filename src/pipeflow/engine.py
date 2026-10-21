@@ -359,6 +359,16 @@ from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
 # 下一轮接着跑（每实例的处理本身幂等）。
 _TICK_BUDGET_SEC = 60
 
+# 实例循环按「本步最久没动」排序（ts 缺失 = 从未派出去 = 0，排最前）。
+# WHY：超预算只 break 本轮剩余实例，而查询无 ORDER BY → SQLite 按插入序走，
+# 尾部实例每轮都排不到（实测 2026-10-22：22 条在飞实例 150s 内零变化，
+# wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 不动，最后被回收器当僵尸杀掉）。
+# 排序让「最饿的先吃」：不新增状态、不改调度语义，只改遍历顺序。
+_INSTANCE_ORDER = (
+    "ORDER BY COALESCE(CAST(json_extract(step_results, "
+    "'$.\"' || current_step_id || '\".ts') AS REAL), 0) ASC"
+)
+
 
 class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMixin, StepHandlerMixin):
     """工作流引擎主类。各 mixin 提供具体职责，此类保留编排与 CLI。"""
@@ -1030,7 +1040,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 永远查不到（三方审查 2026-10-21 实测 A/B）。
                 "SELECT instance_id, template_id, current_step_id, step_results, created_at, "
                 "status, task_id, effective_roles "
-                "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
+                "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready') "
+                + _INSTANCE_ORDER
             )
             for row in rows:
                 if time.time() - _t_tick > _TICK_BUDGET_SEC:

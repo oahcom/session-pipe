@@ -28,19 +28,13 @@
 | `confirm_step(wf_id, step_id, token, approved, reason)` | str, str, str, bool, str | `bool` |
 | `fail_step(wf_id, step_id, reason, allow_retry)` | str, str, str, bool | `bool` |
 | `rollback_step(wf_id, step_id)` | str, str | `bool` |
-| `escalate_step(wf_id, step_id, reason)` | str, str, str | `dict` |
-| `reassign_step(wf_id, step_id, new_role)` | str, str, str | `bool` |
 | `get_wf(wf_id)` | str | `Optional[dict]` |
 | `get_step(wf_id, step_id)` | str, str | `Optional[dict]` |
 | `upsert_template(template_id, name, description, steps)` | str, str, str, list | `None` |
-| `get_run(wf_id)` | str | `Optional[dict]` |
 | `get_assigned_workflows(role)` | str | `list[dict]` |
-| `get_workflow_context(wf_id)` | str | `dict` |
-| `get_workflow_progress(wf_id)` | str | `dict` |
-| `check_gate_timeouts()` | — | `list[dict]` |
-| `acknowledge_handoff(wf_id, step_id, role)` | str, str, str | `bool` |
 | `close(wf_id)` | str | `None` |
 
+## Router (`routing/router.py`)
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
@@ -58,16 +52,15 @@
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
-| `route_all(consumer, dry_run, parallel, instance_id)` | str, bool, bool, str | `dict` |
+| `route_all(consumer, dry_run, parallel)` | str, bool, bool | `dict` |
 | `route_to_ccs(role_name, dry_run)` | str, bool | `dict` |
 | `route_all_to_ccs(dry_run)` | bool | `dict` |
-| `dispatch_investigator(category, dry_run)` | str, bool | `dict` |
 
 ## AutoRouting (`routing/auto.py`)
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
-| `poll_unconsumed(category, consumer, instance_id, limit)` | str?, str?, str, int | `list[dict]` |
+| `poll_unconsumed(category=None, consumer=None, limit=100)` | str?, str?, int | `list[dict]` |
 | `consume_with_linkage(fact_id, category, consumer)` | int, str, str | `dict` |
 
 ## Reliability (`reliability.py`)

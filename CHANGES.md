@@ -141,6 +141,7 @@ DB 无其他活跃步时直接进入 ccs send；角色 CLI 仍在执行时，分
 - `python3 -m pytest tests/test_gate_alert_backoff.py -q` → 3 passed（退避/停发/升级 + 数字噪声不重置 + 通过即清零）
 
 ## 2026-08-01 — 僵尸工作流抢救修复
+> 注：本条写于 `engine.py` 拆分前——`_tick` 现在 `src/pipeflow/step_handler.py`，`_cleanup_stale_workflows` 在 `src/pipeflow/wf_lifecycle.py`。
 
 ### 修复内容
 1. `src/pipeflow/engine.py` `_tick`: 当步骤 `step_results[step].exit_messages` 已存在（旧引擎产物/产出证据已就绪）但状态未闭合时，直接调用 `complete_step` 闭合，不依赖已 seen 的 bus 消息重新匹配（bus_anchor 游标跳过旧消息导致永不推进）。
