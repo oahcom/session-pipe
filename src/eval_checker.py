@@ -1029,6 +1029,10 @@ class TrajectoryQualityChecker:
                         return True
             return False
 
+        # 语义边界（判据能回答什么）：盲改问的是"角色有没有看过这个文件"，不是
+        # "看的是不是最新版本"。读过之后别人又改了文件、角色拿着旧内容去 Edit，
+        # 不建模——跨角色交错改动要扫全部 transcript 的时间线，且那是"内容陈旧"
+        # 问题，不是"没看就改"。同理只建模 Write/Edit 两种改文件工具。
         read_files: set[str] = set()
         bash_blob: list[str] = []
         seen_use_ids: set[str] = set()
