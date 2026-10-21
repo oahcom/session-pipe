@@ -232,14 +232,43 @@ def _tmux_wedged(timeout: float = 6.0) -> bool:
         return False  # 没有 tmux 不算卡死，可能是别的 tmux 实例/权限问题
 
 
+def _tmux_stuck_utempter() -> list:
+    """卡住的 utempter 进程（tmux 借 libutempter 写 /var/run/utmp 的 setuid 助手）。
+
+    tmux 链接 libutempter，新 pane 建会话时它 fork 出 utempter 写 utmp 记录；
+    助手卡住时单线程 server 停在 waitpid，整个事件循环停摆——所有 tmux 命令
+    排队 12~50s（实测 2026-10-22 03:44~04:05：助手存活 273s 未退出，
+    server /proc/<pid>/wchan = do_wait）。
+    """
+    try:
+        r = subprocess.run(["pgrep", "-x", "utempter"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [int(x) for x in r.stdout.split() if x.isdigit()]
+
+
+def _tmux_recover() -> bool:
+    """最小代价自愈：杀掉卡住的 utempter 再复探。恢复成功返回 True。
+
+    只损失一条 utmp 记账，pane 与会话毫发无损——比重启 server（丢 17 个
+    角色会话上下文）代价低两个数量级。
+    """
+    for _pid in _tmux_stuck_utempter():
+        try:
+            os.kill(_pid, signal.SIGKILL)
+            LOGGER.warning("tmux 服务端阻塞：杀掉卡住的 utempter pid=%d", _pid)
+        except OSError:
+            pass
+    return not _tmux_wedged()
+
+
 def _tmux_wedge_alarm() -> None:
-    """tick 变慢时探一次 tmux 服务端；卡死则升级（10 分钟最多一条）。
+    """tick 变慢时探一次 tmux 服务端；卡死先自愈，自愈失败才升级（10 分钟一条）。
 
     WHY 单独探：tick 变慢不指向 tmux，日志里只有"tick 耗时 399s"看不出原因。
     2026-10-22 实测：has-session 13~15s、list-sessions 18s、单 tick 399s，
-    5 条链卡在 step_done_ready 1.5~2.4h，2 条链被僵尸回收误杀。根因是 tmux
-    服务端单线程卡在一次写（17 个 pane 的 pty 全满，pane 进程也堵在写）。
-    只能重启服务端解开，故这里报警而不是自动重启——重启会丢 17 个角色会话。
+    5 条链卡在 step_done_ready 1.5~2.4h，2 条链被僵尸回收误杀。
     """
     global _TMUX_ALARM_AT
     _now = time.time()
@@ -248,6 +277,9 @@ def _tmux_wedge_alarm() -> None:
     _TMUX_ALARM_AT = _now  # 探过就记时，避免慢 tick 期每轮付一次探测超时
     if not _tmux_wedged():
         return
+    if _tmux_recover():
+        LOGGER.warning("tmux 服务端已自愈（清掉卡住的 utempter），角色投递恢复")
+        return
     LOGGER.error("tmux 服务端失去响应：角色投递全部阻塞，工作流全链停摆")
     try:
         subprocess.run(
@@ -255,8 +287,9 @@ def _tmux_wedge_alarm() -> None:
              "tmux 服务端卡死：所有角色投递阻塞，工作流全链停摆",
              "--src", "workflow_engine",
              "--evidence",
-             "tmux display-message 超时 6s（健康态 2~60ms），角色 pane 读写全堵。"
-             "恢复：pkill -9 -f 'tmux: server'，再对每个角色执行 "
+             "tmux display-message 超时 6s（健康态 2~60ms），角色 pane 读写全堵；"
+             "已先试自愈（kill 卡住的 utempter）无效。终极恢复：pkill -9 -f "
+             "'tmux: server'，再对每个角色执行 "
              "python3 ~/session-launcher/src/ccs.py start <role> --no-attach"],
             capture_output=True, timeout=10)
     except Exception:
