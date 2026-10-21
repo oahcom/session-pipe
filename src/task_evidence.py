@@ -225,7 +225,10 @@ def _evaluate_with(db):
         # 注意：只跳过 bus feedback，不跳过下方的 negative 复盘分支——
         # 复盘与 TASKS.md 回写自带幂等（_append_role_feedback 按 task_id 去重），
         # 被 continue 连带跳过会让角色的学习信号永久丢失。
-        _sig = f"{a['quality']}|{a['output_count']}|{a['output_size']}|{a['evidence_type']}"
+        # 签名只取"结论"维度：output_count/output_size 每 tick 都在抖（角色还在写），
+        # 带上它们等于每分钟一个新签名 → 实测 83min 内同一任务写 18 条同文案 fact
+        # （engineer s4 / PA s2 / pm s1 / reviewer 共 53 条），每个角色都得读一遍自证。
+        _sig = f"{a['quality']}|{a['evidence_type']}"
         _already_reported = _LAST_ASSESSMENT.get(a["task_id"]) == _sig
         # 签名只在写入**成功后**落账（codex P1-1）。先记后写会让瞬时失败
         # （bus 锁冲突/超时）在 1h 窗口内永不重试——原实现每 tick 重写恰好
