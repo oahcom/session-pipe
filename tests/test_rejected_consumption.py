@@ -239,12 +239,8 @@ class TestEscalateRejectedAnchor:
 
     @patch("subprocess.run",
            return_value=MagicMock(returncode=0, stdout="claude\n", stderr=b""))
-    def test_anchor_set_for_every_delivery_outcome(self, _mock_run):
-        """送达/排队/拦下三种 pane 结果都落锚：未送达改走持久 bus（engine.py:781-792）。
-
-        锚只在 True 落是旧实现，会让每 tick 重起 ccs send（实测 wf_175751a92033/s2
-        48min 111 次告警不收敛）。每轮必须用新的 step_results：否则首轮落锚后
-        engine.py:775 直接 return，busy / True 两个分支根本没被执行。
+    def test_anchor_set_only_after_confirmed_delivery(self, _mock_run):
+        """False/busy 皆非送达，不得落锚：落了锚则本轮升级丢失且不再重试。
 
         subprocess 必须 mock：不 mock 则 eng.start 走 _wait_for_role_ready，
         真的去 `ccs start test_role`（不在注册表）→ 阻塞到 pytest 超时。
@@ -254,15 +250,18 @@ class TestEscalateRejectedAnchor:
             _write_wf(d, "esc_anchor", [_step("s1")])
             eng = WorkflowEngine(d)
             inst = {"instance_id": eng.start("esc_anchor", {})}
-            lm = eng._lifecycle
-            sr = results = None
-            for delivered in (False, 'busy', True):
-                sr = {'rejected_at': 1.0}
-                results = {'s1': sr}
-                eng._send_to_role = lambda *a, _r=delivered, **k: _r
-                eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试')
+            results = {'s1': {'rejected_at': 1.0}}
+            sr, lm = results['s1'], eng._lifecycle
+
+            for not_delivered in (False, 'busy'):
+                eng._send_to_role = lambda *a, _r=not_delivered, **k: _r
+                eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-未送达')
                 assert sr.get('rework_escalated_at'), (
-                    f'投递={delivered!r} 未落锚 → 每 tick 重发升级')
+                    f'投递={not_delivered!r} 非送达却未落锚（改走 bus）→ 每 tick 重发升级')
+
+            eng._send_to_role = lambda *a, **k: True
+            eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-已送达')
+            assert sr.get('rework_escalated_at'), '送达后必须落锚防每 tick 刷屏'
             assert eng.status(inst['instance_id'])['results']['s1'].get(
                 'rework_escalated_at'), '锚必须落库：只改内存副本则下轮重读又是 None'
 

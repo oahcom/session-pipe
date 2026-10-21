@@ -13,6 +13,15 @@ if _src in sys.path:
     sys.path.remove(_src)
 sys.path.insert(0, _src)
 
+# 模块级即建连的路径（routing.RoutingDB / reliability.ACK_TRACKER /
+# conversation_monitor 的 forbidden_ops 缓存）必须在任何 src 导入前改到 tmp：
+# 实测 2026-10-22 未隔离时 pytest 会建表/写生产 routing.db、ack_tracker.db，
+# 并把 1005B/13 角色的 forbidden_ops_cache.json 覆盖成 35B 空表。
+_run_dir = tempfile.mkdtemp(prefix="pytest-hermes-run-")
+os.environ.setdefault("HERMES_RUN_DIR", _run_dir)
+os.environ.setdefault("ROUTING_DB_PATH", os.path.join(_run_dir, "routing.db"))
+os.environ.setdefault("SESSION_PIPELINE_ACK_DB", os.path.join(_run_dir, "ack_tracker.db"))
+
 # 0. 保存真实 bus_protocol/config_loader 引用（test_reliability_unit 会篡改
 #    sys.modules 为 MagicMock，后续模块需恢复真实版本）
 _real_bus_protocol = None

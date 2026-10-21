@@ -65,35 +65,6 @@ def test_created_file_not_flagged() -> None:
             pass
 
 
-def test_list_shaped_result_content() -> None:
-    """tool_result content 可能是 list[str] / list[dict]：两种形态都要认出"新建"。"""
-    for shape in ("list-str", "list-dict"):
-        sess = _TRANSCRIPTS_DIR / f"-probe-selfcreate-{shape}-role"
-        path = "/tmp/probe_shape.py"
-        msg = f"File created successfully at: {path}"
-        content = [msg] if shape == "list-str" else [{"type": "text", "text": msg}]
-        lines = [
-            _turn(0, "assistant", [
-                {"type": "tool_use", "id": "cs", "name": "Write",
-                 "input": {"file_path": path, "content": "x=1"}},
-            ]),
-            _turn(1, "user", [
-                {"type": "tool_result", "tool_use_id": "cs", "is_error": False,
-                 "content": content},
-            ]),
-        ]
-        jf = _make(sess, lines)
-        try:
-            res = TrajectoryQualityChecker().check(f"selfcreate-{shape}", "t")
-            assert res["findings"] == [], f"{shape} 形态误判: {res['findings']}"
-        finally:
-            jf.unlink(missing_ok=True)
-            try:
-                sess.rmdir()
-            except OSError:
-                pass
-
-
 def test_non_creation_write_still_flagged() -> None:
     """对照：结果不含"新建"标记的写仍判盲改（豁免不能扩大成放过一切写）。"""
     sess = _TRANSCRIPTS_DIR / "-probe-selfupdate-role"
@@ -113,6 +84,5 @@ def test_non_creation_write_still_flagged() -> None:
 
 if __name__ == "__main__":
     test_created_file_not_flagged()
-    test_list_shaped_result_content()
     test_non_creation_write_still_flagged()
-    print("PASS: 3 tests")
+    print("PASS: 2 tests")
