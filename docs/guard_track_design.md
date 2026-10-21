@@ -131,7 +131,7 @@ if step.track:
 | `run_once` tick 循环 | 每 tick 检查当前步骤的 `guard`，调用 `_ensure_role_alive` |
 | `_tick` | 步骤 `track` 时，检查 bus 消息年龄，超时写 audit + 提醒 |
 
-### 文件：`src/pipeflow/template_registry.py`
+### 文件：`src/template_registry.py`
 
 | 位置 | 改动 |
 |------|------|
