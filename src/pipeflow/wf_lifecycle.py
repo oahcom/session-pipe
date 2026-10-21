@@ -1104,6 +1104,19 @@ class WorkflowLifecycleMixin:
             # 维持原语义（盲目重投），避免把 pm/reviewer 产物误派给 engineer。
             _rej_txt = str(_done_sr.get("rejection_reason") or "").strip()
             _tgt_role = str(getattr(review_step, "target_role", "") or "")
+            if _rej_txt and _tgt_role not in _REWORK_TPL_FOR_ROLE:
+                # 门禁步的 target_role 是 reviewer 自己，返工对象是被审的上一步产出
+                # （生产 3/3 条真实驳回都是 s4 门禁驳 s3 产物，旧写法全被跳过）
+                _wf = self._workflows.get(wf_name) or self._workflows.get(
+                    re.sub(r"^(?:WL-|WF-)", "", str(wf_name)))
+                _steps = list(getattr(_wf, "steps", None) or [])
+                _i = next((_k for _k, _s in enumerate(_steps)
+                           if getattr(_s, "id", None) == getattr(review_step, "id", None)), 0)
+                for _s in reversed(_steps[:_i]):
+                    _r = str(getattr(_s, "target_role", "") or "")
+                    if _r in _REWORK_TPL_FOR_ROLE:
+                        _tgt_role = _r
+                        break
             if _rej_txt and _tgt_role in _REWORK_TPL_FOR_ROLE:
                 _biz_issues = [_rej_txt[:300]]
                 _biz_role = _tgt_role

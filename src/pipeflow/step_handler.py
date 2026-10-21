@@ -1478,13 +1478,16 @@ class StepHandlerMixin:
                 # `**` 才递归：角色常把产出写进 src//tools//cli（7 天 24 个 .py
                 # 里 20 个不在根目录），非递归 glob 会把真产出判成没有。
                 all_matches = [Path(m) for m in _gl.glob(str(fpath), recursive=True)]
-                if not all_matches and "**" not in fname:
-                    # 根目录零匹配才回落到递归：契约说的是"产出该类型文件"，没有
-                    # 目录语义。只对"根目录一个都没有"生效，已有根目录产出的判定
-                    # 完全不变（不放松 _stale_only，旧文件仍然不算产出）。
-                    all_matches = [Path(m) for m in
-                                   _gl.glob(str(fpath.parent / "**" / fpath.name),
-                                            recursive=True)]
+                if "**" not in fname and _wf_floor > 0:
+                    # 根目录没有"新"匹配才把子目录并进来（契约只说产出该类型文件，
+                    # 没有目录语义；根目录 44 个旧 .py + 新产出在 src/ 是实测形态）。
+                    # 并集只可能让新文件被看到，旧文件仍然因 mtime 落在 all_matches
+                    # 里参与 _stale_only 判定，不会放松"历史文件不算产出"。
+                    if not any(m.stat().st_mtime >= _wf_floor for m in all_matches):
+                        seen = {str(m) for m in all_matches}
+                        all_matches += [Path(m) for m in _gl.glob(
+                            str(fpath.parent / "**" / fpath.name), recursive=True)
+                            if str(m) not in seen]
                 # 过滤：只检查工作流创建后被修改/新建的文件（本次任务产出），
                 # 排除 workspace 历史遗留文件导致的 minLength/mustContain 误报
                 # 计数检查（minCount）不依赖 matched——即使 matched 为空也需执行

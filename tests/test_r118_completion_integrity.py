@@ -197,3 +197,66 @@ def test_subdir_fallback_still_rejects_stale_only(tmp_path, monkeypatch):
                            exit_schema={"properties": {"*.py": {"minLength": 50}}})
     ok, errs = _eng(tmp_path)._validate_exit_schema(step, run)
     assert ok is False, f"子目录旧文件冒充产出仍通过: {errs}"
+
+def test_stale_root_plus_fresh_subdir_passes(tmp_path, monkeypatch):
+    """生产形态（wf_rw_6f51b0）：根目录 44 个旧 .py，本步产出落在 src/ 下。
+
+    旧实现只在"根目录零匹配"时回落递归，于是新产出不可见、步骤被判缺产出。
+    """
+    ws = tmp_path / "scout"
+    (ws / "src").mkdir(parents=True)
+    import os
+    t_old = time.time() - 7 * 24 * 3600
+    for i in range(3):
+        p = ws / f"legacy{i}.py"
+        p.write_text("x" * 500, encoding="utf-8")
+        os.utime(p, (t_old, t_old))
+    (ws / "src" / "mine.py").write_text("w" * 500, encoding="utf-8")
+    monkeypatch.setattr(sh, "_CCS_WORKSPACES", tmp_path)
+
+    run = SimpleNamespace(created_at=time.time() - 1, workflow_name="t")
+    step = SimpleNamespace(id="s1", target_role="scout",
+                           exit_schema={"properties": {"*.py": {"minLength": 50}}})
+    ok, errs = _eng(tmp_path)._validate_exit_schema(step, run)
+    assert ok is True, f"根目录旧文件遮蔽了子目录新产出: {errs}"
+
+
+def test_gate_reject_walks_back_to_rework_role():
+    """门禁步(s4 reviewer)驳上一步 qa 产物：返工对象应回到最近的 engineer。
+
+    生产 3/3 条真实驳回都是这个形态，旧写法因 reviewer/qa 不在返工映射里而跳过，
+    步骤 retry 封顶后永久停摆。
+    """
+    host = _RejHost()
+    host._workflows["WL-full_dev_pipeline"] = SimpleNamespace(steps=[
+        SimpleNamespace(id="s2", target_role="engineer", title="e", prompt_template="x",
+                        exit_condition={}, exit_schema=None, max_retries=0, type="single"),
+        SimpleNamespace(id="s3", target_role="qa", title="q", prompt_template="x",
+                        exit_condition={}, exit_schema=None, max_retries=0, type="single"),
+        SimpleNamespace(id="s4", target_role="reviewer", title="r", prompt_template="x",
+                        exit_condition={}, exit_schema=None, max_retries=0, type="gate"),
+    ])
+    conn = MagicMock()
+
+    def _exec(sql, params=()):
+        host.ins.append(" ".join(sql.split()))
+        m = MagicMock()
+        m.fetchone.return_value = ({"step_results": "{}"} if "SELECT step_results" in sql else None)
+        return m
+
+    conn.execute.side_effect = _exec
+    tx = MagicMock()
+    tx.__enter__.return_value = conn
+    tx.__exit__.return_value = False
+    lm = MagicMock()
+    lm._conn_tx.return_value = tx
+
+    results = {"s4": {"status": "rejected",
+                      "rejection_reason": "子链 x 末步驳回: CODE_REVIEW reviewer_pr_review/s1-complete — CHANGES_REQUESTED 业务 1P1"}}
+    ok = host._create_rework_subflow(
+        "wf_z", lm, "WL-full_dev_pipeline", "s4",
+        SimpleNamespace(id="s4", title="review", target_role="reviewer"),
+        SimpleNamespace(id="s5"), results)
+    assert ok is True, "门禁驳回没有建出返工链"
+    assert any(s.startswith("INSERT OR IGNORE INTO workflow_instances") for s in host.ins)
+
