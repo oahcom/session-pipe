@@ -102,3 +102,31 @@ if __name__ == "__main__":
     test_advance_happens_before_scan_tasks(None)
     test_zero_budget_stops_advance(None)
     print("ok")
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0, stdout="claude\n", stderr=""))
+def test_prepass_sends_step_done_reminder(_sp):
+    """预推进也必须发"每步完整性提醒"（codex 复审 2026-10-22 指出的丢失点）。
+
+    预推进先跑完的实例，主循环再也看不到 step_done_ready → 该分支的
+    send_bypass_reminder 若不搬进预推进，提醒整段消失（用户要求每个步骤都提醒）。
+    """
+    d = _env()
+    _wf(d, "tbflow", ["s1", "s2"])
+    eng = _fast(WorkflowEngine(d))
+    rid = eng.start("tbflow", {})
+    _ready(eng, rid)
+
+    import pipeflow.integrity as integ
+    seen = []
+    real = integ.send_bypass_reminder
+
+    def _spy(run, step, status, **kw):
+        seen.append((getattr(run, "id", ""), getattr(step, "id", ""), status))
+        return real(run, step, status, **kw)
+
+    with patch.object(integ, "send_bypass_reminder", _spy):
+        eng.run_once()
+
+    assert (rid, "s1", "step_done_ready") in seen, seen
+    assert eng.status(rid)["current_step"] == "s2", "提醒之外仍要推进"
