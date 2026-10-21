@@ -126,7 +126,12 @@ def test_daemon_loop_lock_cleanup_in_finally():
         timer.start()
         # 在主线程调用 daemon_loop -> 注册 handler -> SIGTERM 到来时退出
         daemon.daemon_loop(0.1)
-    assert not lock_file.exists(), "锁文件应在 daemon_loop 退出后被清理"
+    # 契约改为"锁已释放"而非"文件已删除"：删文件会让后继实例锁到新 inode，
+    # 与正在退出的旧实例并存（双进程写同一个 DB）。
+    import fcntl
+    with lock_file.open("a") as _fd:
+        fcntl.flock(_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 拿不到锁会抛 OSError
+    lock_file.unlink(missing_ok=True)
 
 
 def test_cli_defaults():

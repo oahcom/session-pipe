@@ -230,10 +230,11 @@ def daemon_loop(interval: int):
     # 处理：优雅退出，由 systemd Restart=always 用新代码拉起。
     # 连续两次探测到同一新 mtime 才退出 —— 编辑器保存瞬时态不触发重启。
     _src_dir = Path(__file__).resolve().parent
-    _seen_mtime = max((p.stat().st_mtime for p in _src_dir.glob("*.py")), default=0.0)
-    _pending_mtime = 0.0
-    _reload_probe = 0
-    _PROBE_EVERY = max(1, 60 // max(interval, 1))
+
+    def _src_mtime() -> float:
+        return max((_p.stat().st_mtime for _p in _src_dir.glob("*.py")), default=0.0)
+
+    _seen_mtime = _src_mtime()
 
     try:
         while not shutdown:
@@ -256,21 +257,18 @@ def daemon_loop(interval: int):
                         starve_rounds = 0
             except Exception as e:
                 LOGGER.warning("饥饿检测异常: %s", e)
-            _reload_probe += 1
-            if _reload_probe >= _PROBE_EVERY:
-                _reload_probe = 0
-                try:
-                    _now_mtime = max(
-                        (p.stat().st_mtime for p in _src_dir.glob("*.py")), default=0.0)
-                    if _now_mtime > _seen_mtime:
-                        if _pending_mtime == _now_mtime:
-                            LOGGER.info("源码已更新 (mtime=%.0f)，退出由 systemd 重启以加载新代码",
-                                        _now_mtime)
-                            shutdown = True
-                        else:
-                            _pending_mtime = _now_mtime
-                except OSError as _e:
-                    LOGGER.debug("源码 mtime 探测失败: %s", _e)
+            # 每轮都探。旧写法按"轮次"计数（6 轮一探），而忙机上 run_once 一轮要
+            # 几分钟 → 实测 18:18:43 改 daemon.py、18:26 仍不重启，源码修复不生效。
+            try:
+                _now_mtime = _src_mtime()
+                if _now_mtime > _seen_mtime:
+                    time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
+                    if _src_mtime() == _now_mtime:
+                        LOGGER.info("源码已更新 (mtime=%.0f)，退出由 systemd 重启以加载新代码",
+                                    _now_mtime)
+                        shutdown = True
+            except OSError as _e:
+                LOGGER.debug("源码 mtime 探测失败: %s", _e)
             time.sleep(interval)
     except KeyboardInterrupt:
         LOGGER.info("收到 KeyboardInterrupt，正在关闭...")
@@ -281,7 +279,9 @@ def daemon_loop(interval: int):
         if _LOCK_FD is not None:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
             _LOCK_FD.close()
-            _LOCK_FILE.unlink(missing_ok=True)
+            # 不 unlink：删文件会让新实例锁到**新 inode**，与还在退出的旧实例
+            # 同时持锁（实测 18:17:25 系统实例 + 18:17:36 手工实例并存 10s 以上）。
+            # 留文件不碍事，flock 随进程消失即释放。
         LOGGER.info("Workflow Daemon 已停止")
 
 
