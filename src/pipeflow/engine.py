@@ -1463,8 +1463,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         evidence=(f"驳回理由: {(_rej_sr.get('rejection_reason') or '')[:200]}\n"
                                   f"返工链状态: {','.join(_sts) if _sts else '无'}"),
                         src="workflow_engine")
-                    LOGGER.warning("rejected → 无返工链，回退重投 %s/%s (retry=%d)",
-                                   inst["instance_id"][:12], step_id, _retry)
+                    LOGGER.warning("rejected → 回退重投 %s/%s (retry=%d, 返工链=%s)",
+                                   inst["instance_id"][:12], step_id, _retry,
+                                   ",".join(_sts) if _sts else "无")
                     continue
 
 
