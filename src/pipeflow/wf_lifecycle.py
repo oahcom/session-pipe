@@ -852,21 +852,10 @@ class WorkflowLifecycleMixin:
                             (json.dumps(results, ensure_ascii=False), wf_id))
                         conn2.commit()
                     return True
-                # 防污染：目标角色已有其他活跃任务（子链 target 与主链一致），
-                # 此时角色在执行主链步骤，子链创建只会双线占用角色 → 跳过创建。
-                # 观测案例：pm 子链 queued=17（主链 s2 与子链 s1 同时推给 pm）。
-                #
-                # 判据（2026-10-17 修正）：只排除**本主链自身的占用**。
-                # 沿用 exclude="" 会把"本主链刚投递本步"也算成忙 → 恒真 →
-                # 子链永不创建（实测 11/12 条带 subflow 的链零子链，
-                # WL-full_dev_pipeline 历史最佳 0/6 步）。
-                # exclude_wf_id=wf_id：角色被**别的**工作流占用仍跳过（防争抢），
-                # 仅本主链的占用不阻止。
-                if self._is_role_busy(tgt_step.target_role, exclude_wf_id=wf_id,
-                                      pane_fallback=False):
-                    LOGGER.info("subflow skip: %s 忙于其他工作流，子链 %s 不创建",
-                                tgt_step.target_role, tgt_step.subflow_template)
-                    return
+                # 不再按"角色忙"跳过建子链：父步的完成判据就是整条子链，跳过建链
+                # 等于让父步空等角色空闲（实测 wf_b808ff2f3611 17:54 建链、18:08
+                # 才建出子链，14 分钟全耗在 17 次 "subflow skip: pm 忙于其他工作流"）。
+                # 子链只是排队，不等于双线占用；堆积由下面的活跃子链上限兜住。
                 # 并发上限：忙判据只看"当下是否在跑"，看不到"已经堆了多少条"。
                 # 角色每空出来一瞬就建一条新子链，堆到 9 条 running（实测
                 # product_architect）→ 6 个父链的 s1 全部排队等同一个角色。
