@@ -117,8 +117,9 @@ _REJECTED_WAIT_MAX = 3600
 # 实测 wf_a4da845a61 卡 16.3h、wf_83a7b58c4a 卡 11.6h（返工链 s2 timeout_count=3
 # 仍在跑），两者都只能等 24h 全局 cancel，届时已推进的步骤产物全部陪葬。
 # 升级送达后再给 2h：仍无进展则按 failed 收口，理由落在 wf_logs 里可归因。
-# ponytail: 固定期限，不区分返工链是否还活着——2h 后仍在跑的返工链会随父链
-# 级联取消。升级路径：改判「子链最后一次进展距今」，需先给子链记账进展时间戳。
+# 返工链仍活则续期（_rework_alive），避免级联取消在飞写操作留下半成品。
+# ponytail: 续期按「链非终态」判而不看它是否真的在推进；链内卡死时最多续到
+# 24h 全局回收。升级路径：给子链记账最后进展时间戳，停滞才判死。
 _REJECTED_ESCALATED_MAX = 7200
 
 _REWORK_TERMINAL = ("completed", "failed", "cancelled")
@@ -178,6 +179,25 @@ def _rejected_escalation_expired(sr: dict, now: float) -> bool:
     """
     _esc = (sr or {}).get("rework_escalated_at")
     return bool(_esc) and (now - _esc) > _REJECTED_ESCALATED_MAX
+
+
+def _rework_alive(lm, rework_ids: list) -> bool:
+    """返工链是否仍有非终态实例。
+
+    父链升级超时后不能无条件 close：返工链还在跑说明可能有在飞写操作，
+    级联取消会留下不可逆半成品（codex 三方审查 Q2）。仍活则续期，等它
+    自己收口；查询失败按存活处理——宁可晚收，不误杀。
+    """
+    if not rework_ids:
+        return False
+    try:
+        _ph = ",".join("?" * len(rework_ids))
+        return any(r["status"] not in _REWORK_TERMINAL
+                   for r in lm.query(
+                       f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
+                       tuple(rework_ids)))
+    except Exception:
+        return True
 
 
 
@@ -1264,6 +1284,33 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 停在这里等 24h 全局 cancel。放在分支入口一次判齐，不必三处各写。
                     _esc_at = _rej_sr.get("rework_escalated_at")
                     if _rejected_escalation_expired(_rej_sr, time.time()):
+                        # 返工链仍在跑：一级告警早已发出，但此刻收口会级联取消
+                        # 在写的链、留下半成品（codex 三方审查 Q2）。续期而非判死；
+                        # 链全部终态后下一轮 a7 仍会走到下面的 close。终态兜底
+                        # 是 24h 全局回收——续期不会让实例无限留在这个分支。
+                        _rids = _rej_sr.get("rework_ids") or []
+                        if _rework_alive(lm, _rids):
+                            _now = time.time()
+                            try:
+                                # 单键写：与建链/回流各路径的 CAS 写互不覆盖
+                                lm.execute(
+                                    "UPDATE workflow_instances "
+                                    "SET step_results=json_set(COALESCE(step_results,'{}'), ?, ?) "
+                                    "WHERE instance_id=?",
+                                    (f'$."{step_id}".rework_escalated_at', _now,
+                                     inst["instance_id"]))
+                            except Exception as _re:
+                                LOGGER.warning("续期锚写失败 %s/%s: %s",
+                                               inst["instance_id"][:12], step_id, _re)
+                                continue
+                            self._bb.write("blocker",
+                                f"[workflow] {inst['instance_id'][:12]}/{step_id} 升级后"
+                                f" {_REJECTED_ESCALATED_MAX // 3600}h 仍无处置，但返工链仍在跑"
+                                f" → 续期 {_REJECTED_ESCALATED_MAX // 3600}h",
+                                evidence=(f"升级时间: {time.strftime('%F %T', time.localtime(_esc_at))}\n"
+                                          f"活跃返工链: {_rids}"),
+                                src="workflow_engine")
+                            continue
                         self._bb.write("blocker",
                             f"[workflow] {inst['instance_id'][:12]}/{step_id} 升级后"
                             f" {_REJECTED_ESCALATED_MAX // 3600}h 无人处置，按 failed 收口",
