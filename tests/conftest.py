@@ -173,6 +173,3 @@ def _isolate_probes_and_cooldowns(request, monkeypatch):
     for _d in (RoleLifecycleMixin._last_rate_recover, RoleLifecycleMixin._last_compact,
                RoleLifecycleMixin._last_bus_write):
         _d.clear()
-    # engine 的轮转游标同样是进程级：不清则上一个用例的 loop 恢复点泄漏到下一个。
-    from pipeflow import engine as _eng
-    monkeypatch.setattr(_eng, "_LOOP_RESUME_ID", "", raising=False)
