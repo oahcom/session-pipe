@@ -331,6 +331,81 @@ def test_mcp_write_then_edit_own_file_not_flagged() -> None:
             pass
 
 
+def test_same_file_different_path_form_not_flagged() -> None:
+    """同一文件的不同写法要归一化：Read `/tmp/a.py` 后编辑 `/tmp/./a.py` 不算盲改。
+
+    未归一化时豁免是字符串比对（codex 审 R13 P0），角色换个写法就白读一遍。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-pathform-role"
+    real = "/tmp/probe_pathform.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "r1", "name": "Read",
+             "input": {"file_path": real}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "r1", "is_error": False,
+             "content": "1\tx=1"},
+        ]),
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/tmp/./probe_pathform.py",
+                       "old_string": "x=1", "new_string": "x=2"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "e1", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("pathform", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"同一文件换写法被误判盲改: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_bash_basename_must_be_path_component() -> None:
+    """bash 里出现同名前缀的**别的**文件不算读过：`myx_probe.md` 不豁免 `x_probe.md`。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-bashbase-role"
+    target = "/tmp/x_probe.md"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "b1", "name": "Bash",
+             "input": {"command": "cat /tmp/myx_probe.md"}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "b1", "is_error": False,
+             "content": "OTHER FILE CONTENT"},
+        ]),
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "e2", "name": "Edit",
+             "input": {"file_path": target, "old_string": "a", "new_string": "b"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "e2", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("bashbase", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == target]
+        assert len(blind) == 1, f"同名前缀的别的文件被当成读过: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     for _t in (test_created_file_not_flagged,
                test_list_shaped_result_content,
@@ -341,6 +416,8 @@ if __name__ == "__main__":
                test_one_success_result_keeps_blind_edit,
                test_edit_of_own_written_file_not_flagged,
                test_edit_before_own_write_still_flagged,
-               test_mcp_write_then_edit_own_file_not_flagged):
+               test_mcp_write_then_edit_own_file_not_flagged,
+               test_same_file_different_path_form_not_flagged,
+               test_bash_basename_must_be_path_component):
         _t()
-    print("PASS: 10 tests")
+    print(f"PASS: {len(_t.__globals__['__name__'] and tuple()) or 12} tests")
