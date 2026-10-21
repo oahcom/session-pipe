@@ -108,6 +108,51 @@ def test_other_tool_does_not_mask() -> None:
             pass
 
 
+def test_missing_tool_is_not_a_schema_violation() -> None:
+    """工具不存在 → 调用从未执行，缺键不算"不会用该工具"（maintainer 的 Grep 实例）。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-ccs-workspaces-probe-notool"
+    sess.mkdir(parents=True, exist_ok=True)
+    try:
+        _write(sess, "a.jsonl", [
+            _use("c1", "Grep", {"path": "", "query": "bus_client.py"}),
+            json.dumps({"type": "user", "message": {
+                "id": "r1", "type": "message", "role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "c1", "is_error": True,
+                    "content": "<tool_use_error>Error: No such tool available: Grep. "
+                               "Grep is not available in this session</tool_use_error>"}]}}),
+        ])
+        r = TrajectoryQualityChecker().check("probe-notool", "t")
+        bad = [f for f in r["findings"] if f["issue"] == "schema_missing_keys"]
+        assert not bad, f"不存在的工具不该判 schema 违规: {bad}"
+    finally:
+        for p in sess.glob("*.jsonl"):
+            p.unlink()
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_role_sessions_match_exact_segment() -> None:
+    """curator 不得把 knowledge-curator 的转录算成自己的（同一条 finding 记给两个角色）。"""
+    owner = _TRANSCRIPTS_DIR / "-tmp-probe-ccs-workspaces-probe-curator"
+    other = _TRANSCRIPTS_DIR / "-tmp-probe-ccs-workspaces-probe-knowledge-curator"
+    for d in (owner, other):
+        d.mkdir(parents=True, exist_ok=True)
+        _write(d, "a.jsonl", [_use("c1", "Bash", {"command": "true"}), _result("c1")])
+    try:
+        r = TrajectoryQualityChecker().check("probe-curator", "t")
+        assert r["checked_traces"] == 1, f"串到别的角色目录: {r['checked_traces']} 份"
+    finally:
+        for d in (owner, other):
+            for p in d.glob("*.jsonl"):
+                p.unlink()
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     test_selfhealed_schema_error_is_exempt()
     print("PASS: 已自纠被豁免")
@@ -115,3 +160,7 @@ if __name__ == "__main__":
     print("PASS: 未自纠仍被抓")
     test_other_tool_does_not_mask()
     print("PASS: 跨工具不豁免")
+    test_missing_tool_is_not_a_schema_violation()
+    print("PASS: 不存在的工具不判 schema")
+    test_role_sessions_match_exact_segment()
+    print("PASS: 角色目录精确匹配")
