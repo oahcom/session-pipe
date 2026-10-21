@@ -19,17 +19,17 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 1851 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/engine.py** | 1852 | Data-driven workflow execution engine (core, imports mixins below) |
 | **pipeflow/step_handler.py** | 1681 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 1199 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1197 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
 | **pipeflow/task_generator.py** | 874 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
 | **pipeflow/wf_lifecycle.py** | 1979 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
-| **lifecycle/manager.py** | 1196 | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
 | **template_registry.py** | 937 | 模板注册中心 |
-| **eval_checker.py** | 1428 | 安全白名单命令执行检查 |
-| **workflow/client.py** | 515 | High-level API for CCS roles to interact with workflow DB |
+| **eval_checker.py** | 1459 | 安全白名单命令执行检查 |
+| **workflow/client.py** | 495 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 465 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
-| **reliability.py** | 446 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
+| **reliability.py** | 434 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
 | **routing/routes.py** | 612 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
 | **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
 | **routing/survival_monitor.py** | 640 | 存活监测 |
@@ -45,7 +45,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **cron_scheduler.py** | 128 | cron 调度器 |
 | **eval_consistency.py** | 70 | 评估一致性 |
 | **routing/consistency.py** | 105 | 路由一致性 |
-| **pipeflow/daemon.py** | 345 | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **pipeflow/daemon.py** | 420 | Main loop: `while True: engine.run_once(); sleep(10)` |
 | **workflow_metrics.py** | 109 | 工作流指标 |
 | **workflow/db.py** | 96 | 工作流数据访问 |
 | **output_validator.py** | 93 | 输出格式验证 |
@@ -139,7 +139,7 @@ Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` i
 
 - Full suite: `python3 -m pytest tests/ -q` → 1218 passed (2026-10-22).
 - Per-file counts are not maintained; run the suite for current numbers.
-- `python3 scripts/doccheck.py` enforces the line counts in this file and CLAUDE.md.
+- `python3 scripts/doccheck.py` 校验本文件与 CLAUDE.md 声明的行数；无自动钩子，代码增删后跑一次 `--fix` 刷新。
 
 ## Red lines
 
@@ -147,5 +147,6 @@ Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` i
 - Do NOT modify bus_protocol core logic
 - Route mapping auto-generated from roles_export.json -- no hardcoding
 - Check CCS alive before dispatching
+- 审批确认（`confirmed_at`）优先于 `exit_messages` 文本判驳，判据收敛在 `review_gate.py`（见 `docs/ADR-APPROVAL-AUTHORITY.md`）
 - Zero external dependencies (stdlib + hermes_bus only)
 - No eval() -- use safe regex pattern matching
