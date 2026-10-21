@@ -49,7 +49,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **workflow_metrics.py** | 109 | 工作流指标 |
 | **workflow/db.py** | 96 | 工作流数据访问 |
 | **output_validator.py** | 93 | 输出格式验证 |
-| **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
+| **routing/polling.py** | 87 | Message polling (dedup via bus consume records) |
 | **paths.py** | 105 | 路径常量 |
 | **workflow/sync.py** | 63 | 工作流同步 |
 
@@ -66,7 +66,7 @@ Bus new message (Blackboard)
     ▼
 polling.poll_unconsumed() ──→ router.get_consumers_prioritized()
     │                                │
-    │  with cursor dedup              │  from roles_export.json
+    │  with consume-record dedup      │  from roles_export.json
     ▼                                ▼
 routes.route_all() ──→ auto.consume_with_linkage()
     │                                │
@@ -90,7 +90,7 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
 - **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
-- **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `pipeline_cursor.db`, `ack_tracker.db`)
+- **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `ack_tracker.db`) —— `pipeline_cursor.db` 已退役（0 行，无人读）
 
 ## Route table construction
 
@@ -132,7 +132,7 @@ These bypasses lose RLock protection and approval workflow.
 
 ## Tests
 
-- Full suite: `python3 -m pytest tests/ -q`。当前分支**不绿**（未提交改动导致 4 个文件收集失败 + 7 个用例失败），实测基线见 [TEST_WORKFLOW.md](TEST_WORKFLOW.md)；判定回归用定向文件跑。
+- Full suite: `python3 -m pytest tests/ -q`（2026-10-22 实测 1215 passed / 3 skipped）。基线随并发改动漂移，跑法与判据见 [TEST_WORKFLOW.md](TEST_WORKFLOW.md)。
 - Per-file counts are not maintained; run the suite for current numbers.
 - `python3 scripts/doccheck.py` 校验本文件与 CLAUDE.md 声明的行数；无自动钩子，代码增删后跑一次 `--fix` 刷新。
 
