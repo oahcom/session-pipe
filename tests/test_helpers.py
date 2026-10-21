@@ -31,26 +31,7 @@ def ensure_imports():
             sys.path.insert(0, p)
 
 
-# ── 临时数据库 (SET: 维护, TE: 使用) ────────────────────────────
-
-def tmp_db(module: str = "workflow_db") -> tuple:
-    """
-    创建临时 SQLite 数据库。
-
-    TE 用法:
-        path, db = tmp_db()
-        tid = db.create_task("测试任务")
-        assert db.get_task(tid) is not None
-        db.close()
-        Path(path).unlink(missing_ok=True)
-    """
-    f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    f.close()
-    if module == "workflow_db":
-        from pipeflow.db import WorkflowDB
-        return f.name, WorkflowDB(f.name)
-    raise ValueError(f"未知模块: {module}")
-
+# ── 临时工作流目录 (SET: 维护, TE: 使用) ──────────────────────
 
 def tmp_wf_dir() -> Path:
     """创建临时工作流定义目录 (含 runs/ 子目录)。"""

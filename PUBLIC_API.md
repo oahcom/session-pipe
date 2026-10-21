@@ -41,24 +41,6 @@
 | `acknowledge_handoff(wf_id, step_id, role)` | str, str, str | `bool` |
 | `close(wf_id)` | str | `None` |
 
-## WorkflowDB (`pipeflow/db.py`)
-
-| 方法 | 参数 | 返回 |
-|------|------|------|
-| `create_task(title, description, assigner, assignee, priority, tags, context)` | str, str, str, str, int, list, dict | `str` (task_id) |
-| `get_task(task_id)` | str | `Optional[dict]` |
-| `update_task(task_id, **kwargs)` | str | `bool` |
-| `delete_task(task_id, actor)` | str, str | `bool` |
-| `list_tasks(status, assigner, assignee, limit)` | str, str, str, int | `list[dict]` |
-| `create_template(name, description, steps_json, steps_mermaid)` | str, str, dict, str | `str` (template_id) |
-| `get_template(template_id)` | str | `Optional[dict]` |
-| `find_template(name)` | str | `Optional[dict]` |
-| `create_workflow(task_id, template_name, assigner, assignee, context)` | str, str, str, str, dict | `Optional[str]` |
-| `get_workflow(instance_id)` | str | `Optional[dict]` |
-| `update_workflow(instance_id, **kwargs)` | str | `bool` |
-| `chain_workflows(task_id, template_names, assigner, assignee)` | str, list, str, str | `list[str]` |
-
-## Router (`routing/router.py`)
 
 | 函数 | 参数 | 返回 |
 |------|------|------|

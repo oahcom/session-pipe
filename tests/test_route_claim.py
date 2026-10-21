@@ -60,3 +60,26 @@ def test_errored_fact_is_left_for_retry():
     bb = _run("code_review", ack="error")
     assert not any(c.args[0] == 4242 for c in bb.mark_consumed.call_args_list), \
         bb.mark_consumed.call_args_list
+
+
+def test_orphan_fact_is_claimed_so_view_can_drain():
+    """@tag 过滤后没人可派 → 也要记接管。
+
+    不记则它永远留在 pipeline 视图里被每 60s 重扫：24h 实测 416/1813=22.9%
+    的无主事实，领取年龄中位 136min（≈136 轮），视图只能靠 prune 删最旧收场。
+    """
+    from routing.routes import route_all
+    bb = MagicMock()
+    _rt = MagicMock()
+    _rt.get_router.return_value.routing = {"engineer": {"consume": ["code_review"]}}
+    msg = {"id": 4343, "category": "code_review",
+           "text": "[code_review] @dkk 只给总线看\n证据 y", "src": "claude",
+           "evidence": "", "priority": 1, "consumers": ["engineer"]}
+    with patch("routing.auto.poll_unconsumed", return_value=[msg]), \
+            patch("routing.routes._rt_mod", _rt), \
+            patch("bus_protocol.Blackboard", return_value=bb), \
+            patch("routing.routes.HEARTBEAT"), \
+            patch("routing.routes.METRICS"):
+        route_all(consumer="pipeline", dry_run=False)
+    assert any(c.args == (4343, "pipeline") for c in bb.mark_consumed.call_args_list), \
+        bb.mark_consumed.call_args_list
