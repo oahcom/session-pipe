@@ -1065,8 +1065,8 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
                     continue
-                if (name == "Edit" and fp
-                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
+                if (fp and own_written.get(
+                        (c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
