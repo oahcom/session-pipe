@@ -224,6 +224,40 @@ def _start_error_text(stdout: bytes | None, stderr: bytes | None) -> str:
 # 告警冷却的 check+占位临界区（见 _notify_role）。进程级，与 _ALERT_TS 同寿命。
 _ALERT_LOCK = threading.Lock()
 
+# 告警冷却落盘：daemon 重启、CLI 每 tick 起新进程都会清空进程内表。实测同一条
+# verify traceback 33 分钟内注入 4 次（reviewer f706ce80 的 1114/1482/1561/1606），
+# 每次都要角色花一整个回合重读同一段话。
+_ALERT_STATE = Path.home() / ".hermes" / "run" / "alert_cooldowns.json"
+
+
+def _load_alert_ts(path: Path, now: float, ttl: float) -> dict:
+    """读冷却表；坏文件/读失败当空表——限流失效不等于告警丢失。"""
+    try:
+        rows = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for row in rows:
+        try:
+            role, title, ts = row
+            if now - float(ts) < ttl:      # 过期条目直接丢，别让文件无限长
+                out[(role, title)] = float(ts)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float) -> None:
+    """原子替换写：读方要么看到旧表要么看到新表，不会读到半行。"""
+    rows = [[r, t, v] for (r, t), v in ts.items() if now - v < ttl]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rows))
+        tmp.replace(path)
+    except OSError as e:      # 落盘失败只退化成进程内冷却，不该影响告警投递
+        LOGGER.debug("alert cooldown 落盘失败: %s", e)
+
 
 class RoleLifecycleMixin:
     """WorkflowEngine 的角色管理 mixin。"""
@@ -233,10 +267,13 @@ class RoleLifecycleMixin:
     # 告警冷却：同一 (role, title) 30min 内只投一次（见 _notify_role）。
     # 状态放类属性（进程级）而非实例：与 _BACKLOG_ALERT_TS 同口径——限流是进程级
     # 事实，一个进程里多个 engine 实例各存一份等于没限流。
-    # ponytail: 只在进程内生效；CLI 每次 tick 起新进程时最坏退化为"每次调用一条"。
-    # 需要跨进程时改成写 ~/.hermes/run/alert_cooldown.json，先有证据再加。
+    # 落盘（2026-10-22）：原来只在进程内生效，daemon 重启或 CLI 每 tick 新进程都会清空
+    # 内存表 → 实测同一条 verify traceback 33 分钟注入 4 次。现在首用即从
+    # ~/.hermes/run/alert_cooldowns.json 加载，每次占位后原子回写。
     _ALERT_TS: dict[tuple, float] = {}
+    _ALERT_STATE_LOADED = False
     _ALERT_COOLDOWN_S = 1800
+    _ALERT_TTL_S = 3600    # 落盘条目保留 2 倍冷却窗口：够覆盖重启间隔，又不会无限增长
     # 投递失败后的重试间隔（秒）。必须 < _ALERT_COOLDOWN_S：下面写的是
     # now - COOLDOWN + RETRY，RETRY >= COOLDOWN 就写成未来时间戳 → 每 tick 重投。
     _ALERT_RETRY_S = 600
@@ -863,6 +900,9 @@ class RoleLifecycleMixin:
         # 锁只包 check+占位，不包 subprocess：8 线程池会同时看到同一条告警
         # （Barrier 20 线程实测放行 20 次）。先占位 30min，投递失败改占 600s。
         with _ALERT_LOCK:
+            if not self._ALERT_STATE_LOADED:   # 首用读盘，避免 import 期 IO
+                _ts.update(_load_alert_ts(_ALERT_STATE, _now, self._ALERT_TTL_S))
+                self._ALERT_STATE_LOADED = True
             _gap = _now - _ts.get(_key, 0.0)
             # 时间回拨时 _gap 为负，旧写法同样 < 窗口 → 最长静默 1.5h。
             if 0 <= _gap < self._ALERT_COOLDOWN_S:
@@ -870,6 +910,7 @@ class RoleLifecycleMixin:
                              self._ALERT_COOLDOWN_S, role, title)
                 return
             _ts[_key] = _now
+            _save_alert_ts(_ALERT_STATE, _ts, _now, self._ALERT_TTL_S)
         self._bb.write("blocker", title, evidence=evidence, src="workflow_engine")
         _delivered = False
         try:
@@ -895,6 +936,7 @@ class RoleLifecycleMixin:
                            role, title, self._ALERT_RETRY_S)
             with _ALERT_LOCK:
                 _ts[_key] = _now - self._ALERT_COOLDOWN_S + self._ALERT_RETRY_S
+                _save_alert_ts(_ALERT_STATE, _ts, _now, self._ALERT_TTL_S)
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
