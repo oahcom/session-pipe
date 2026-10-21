@@ -1,66 +1,100 @@
 #!/usr/bin/env python3
-"""doccheck — 校验 CLAUDE.md / ARCHITECTURE.md 中声明的行数与真实 wc -l 是否一致。
-沉淀自 "doc-drift-pipeline-launcher" 需求：把文档数字对齐纪律变可复用检查。
+"""doccheck — 校验/刷新文档里声明的文件行数（wc -l 语义：只数换行符）。
 
 用法：
-  python3 scripts/doccheck.py               # 检查 pipeline 项目
+  python3 scripts/doccheck.py          # 检查，不一致则 exit 1
+  python3 scripts/doccheck.py --fix    # 就地把声明行数改成真实行数
   python3 scripts/doccheck.py ../session-launcher/CLAUDE.md
 
-输出：每行 "MISMATCH|MISSING|OK <file> doc=<n> real=<n>"，exit 非 0 若有不一致。
+支持两种写法：
+  树形   router.py ── 路由表（376 行）
+  表格   | **pipeflow/engine.py** | 895 | 说明 |
 """
-import re, sys, os
+import argparse
+import os
+import re
 from pathlib import Path
 
-# doc 中的相对路径 → 真实 path（doc 写的是 src/<basename> 或嵌套）
-def _resolve(base: Path, name: str) -> Path | None:
-    base = base / "src"
-    # 1. 优先完整相对路径匹配（如 pipeflow/db.py → src/pipeflow/db.py）
-    #    解决同名文件冲突（pipeflow/db.py=327 vs workflow/db.py=96）
-    direct = base / name
+BASE = Path(__file__).resolve().parent.parent
+TREE = re.compile(r'([\w/]+\.py)(\s*[─-]+.*?（)(\d+)( 行）)')
+TABLE = re.compile(r'(\|\s*\*\*`)([\w/]+\.py)(`\s*\|\s*)(\d+)(\s*\|)')
+
+
+def _resolve(name: str) -> Path | None:
+    """doc 里的相对路径 → 真实文件。先整段匹配，再退到 basename 唯一匹配。"""
+    direct = BASE / "src" / name
     if direct.exists():
         return direct
-    # 2. 回退：仅 basename 匹配（向后兼容旧文档写法 src/<basename>）
-    for c in base.rglob(os.path.basename(name)):
+    for c in (BASE / "src").rglob(os.path.basename(name)):
         return c
     return None
 
-def _collect(base: Path, text: str):
-    pat = re.compile(r'((?:[\w/]+\.py))\s*[─-]+\s*(?:.*?（(\d+) 行）)?')
-    table = re.compile(r'\|\s*\*\*`(pipeflow/[\w_]+\.py|[\w_]+\.py)`\s*\|\s*(\d+)\s*\|')
-    rows = []
-    for m in pat.finditer(text):
-        f, n = m.group(1), m.group(2)
-        if n:
-            rows.append((f, int(n)))
-    for m in table.finditer(text):
-        f, n = m.group(1), int(m.group(2))
-        rows.append((f, n))
-    return rows
 
-def main():
-    base = Path(__file__).resolve().parent.parent  # scripts/ → 项目根
-    targets = sys.argv[1:] or [
-        str(base / "CLAUDE.md"), str(base / "docs" / "ARCHITECTURE.md"),
-    ]
+def _real_n(p: Path) -> int:
+    return open(p, "rb").read().count(b"\n")
+
+
+def _rows(text: str):
+    """产出 (文件名, 数字在文本中的区间) —— 两种写法统一处理。"""
+    for m in TREE.finditer(text):
+        yield m.group(1), m.start(3), m.end(3)
+    for m in TABLE.finditer(text):
+        yield m.group(2), m.start(4), m.end(4)
+
+
+def _check(path: Path) -> int:
+    bad = 0
+    text = path.read_text(encoding="utf-8")
+    for name, s, e in _rows(text):
+        real_p = _resolve(name)
+        if not real_p:
+            print(f"MISSING_FILE {name}")
+            bad += 1
+            continue
+        real = _real_n(real_p)
+        if int(text[s:e]) != real:
+            print(f"MISMATCH {name} doc={text[s:e]} real={real} ({path})")
+            bad += 1
+    return bad
+
+
+def _fix(path: Path) -> int:
+    text = path.read_text(encoding="utf-8")
+    edits = []
+    for name, s, e in _rows(text):
+        real_p = _resolve(name)
+        if not real_p:
+            continue
+        real = str(_real_n(real_p))
+        if text[s:e] != real:
+            edits.append((s, e, real))
+    for s, e, real in sorted(edits, reverse=True):
+        text = text[:s] + real + text[e:]
+    if edits:
+        path.write_text(text, encoding="utf-8")
+    return len(edits)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="校验/刷新文档与代码行数的一致性")
+    ap.add_argument("targets", nargs="*", help="文档路径，缺省 CLAUDE.md 与 docs/ARCHITECTURE.md")
+    ap.add_argument("--fix", action="store_true", help="把文档里的行数改成真实行数")
+    args = ap.parse_args(argv)
+    targets = args.targets or ["CLAUDE.md", "docs/ARCHITECTURE.md"]
     bad = 0
     for t in targets:
-        p = base / t
+        p = BASE / t
         if not p.exists():
-            print(f"MISSING {t}"); bad += 1; continue
-        for f, doc_n in _collect(base, p.read_text()):
-            real_p = _resolve(base, f)
-            if not real_p:
-                print(f"MISSING_FILE {f}"); bad += 1; continue
-            # 用 wc -l 语义（仅计数换行符）与文档保持一致，
-            # 避免末行无换行时 open() 计数比 wc 多 1 的误判
-            raw = open(real_p, "rb").read()
-            real_n = raw.count(b"\n")  # wc -l 精确语义：仅计换行符
-            if real_n == doc_n:
-                pass  # ok
-            else:
-                print(f"MISMATCH {f} doc={doc_n} real={real_n} ({t})"); bad += 1
+            print(f"MISSING {t}")
+            bad += 1
+            continue
+        if args.fix:
+            print(f"{p}: 已修正 {_fix(p)} 处行数声明")
+        else:
+            bad += _check(p)
     print(f"\n{'CLEAN' if bad == 0 else f'{bad} mismatch(es)'}")
     return 1 if bad else 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

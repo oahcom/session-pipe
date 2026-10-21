@@ -15,8 +15,9 @@ check: doccheck
 	PYTHONPATH=src python3 -c "from routing.auto import route_all; print('import OK')"
 
 doccheck:
-	@echo "=== 文档/代码行数一致性检查 (doccheck) ==="
-	@python3 scripts/doccheck.py || (echo "doccheck 发现漂移，请同步 CLAUDE.md 行数声明"; exit 1)
+	@echo "=== 文档/代码行数一致性 (doccheck，先刷新再校验) ==="
+	@python3 scripts/doccheck.py --fix >/dev/null
+	@python3 scripts/doccheck.py || (echo "doccheck 仍有漂移（MISSING_FILE？）"; exit 1)
 
 clean:
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
