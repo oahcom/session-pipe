@@ -59,22 +59,31 @@ def _as_assigner(path):
 
 
 class _Env:
-    """临时库 + 已签发 token 的 s2；ccs send 恒失败（复现角色忙）。"""
+    """临时库 + 已签发 token 的 s2；ccs send 恒失败（复现角色忙）。
+
+    patch 必须覆盖 **整个 with 体**，不能只包 __enter__：用例里的
+    confirm_step → _notify_result 也会调 subprocess.run("ccs send", ...)，
+    patch 提前退出后那是真投递 —— 实测每轮全跑把 2 条假「审批结果通知」
+    （工作流 wf_pull）真发给 product_architect，累计 435 行、4 个角色收到
+    （product_architect 416 / optimizer 7 / ccs-monitor 7 / consumer 1，bus #431797）。
+    """
 
     def __enter__(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.path = self.tmp.name
         self.tmp.close()
+        self._sp = patch("subprocess.run")
+        _mock = self._sp.start()
+        _mock.return_value = MagicMock(returncode=1, stderr=b"tmux send skipped")
         self.lm = _lm(self.path)
         # s1(single) 完成 → 推进到 s2(review)；再完成 s2 才会签发 token。
-        # 全程让 ccs send 失败，复现「角色忙 → 走 bus 降级」的生产路径。
-        with patch("subprocess.run") as _sp:
-            _sp.return_value = MagicMock(returncode=1, stderr=b"tmux send skipped")
-            self.lm.complete_step("wf_pull", "s1")
-            self.lm.complete_step("wf_pull", "s2")
+        # ccs send 恒失败 → 复现「角色忙 → 走 bus 降级」的生产路径。
+        self.lm.complete_step("wf_pull", "s1")
+        self.lm.complete_step("wf_pull", "s2")
         return self
 
     def __exit__(self, *a):
+        self._sp.stop()
         self.lm.close()
         os.unlink(self.path)
         return False
