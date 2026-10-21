@@ -680,7 +680,10 @@ class TaskGeneratorMixin:
             if _is_test_harness_template(_wf_name):
                 continue
             # 首步委派子链的模板缺真实需求书就派 = 给 pm/architect 送一条必被拒收的链
+            # （产品交付全流程自动建链 4 条 0 completed）。静默跳过会让"这些模板
+            # 从此不再自动建链"变成不可观测事实，故留一条 INFO。
             if _requires_user_brief(_wf):
+                LOGGER.debug("auto-task: %s 跳过（首步委派子链，缺需求书）", _wf_name)
                 continue
             # 取第一个 executor 作为目标角色
             _role = _wf.allowed_executors[0]
