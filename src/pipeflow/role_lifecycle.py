@@ -216,8 +216,11 @@ class RoleLifecycleMixin:
     # 最重一条 product_architect 收 7,290 次、间隔恒 11s（= 每 tick 一次）：每次重发
     # 都要角色花一整个回合重读同一段话，而它早就读过了。
     # 进程级（同 _ALERT_TS）：限流是进程事实。窗口到期仍会重发，丢消息不永久悬空。
+    # 窗口取 900s 而非 5min：实测重投节奏是每 tick 一次（间隔 300–310s），300s 的窗口
+    # 刚好在下次重投前到期，守卫一次都拦不住（实测 2h 内 198 条里 31 条落在 301–310s）。
+    # 同文案重发本来就没有信息增量，宁可少打扰，也不让窗口与 tick 撞线。
     _LAST_SEND: dict[tuple, tuple[int, float]] = {}
-    _SAME_PROMPT_WINDOW_S = 300
+    _SAME_PROMPT_WINDOW_S = 900
     # ── 模型额度拒绝（403/429）恢复 ──
     # 9router 免费层按出口 IP 计配额：角色 pane 只剩 "API Error: 403" /
     # "Rate limit exceeded"，进程活着但不产出。旧行为只把它排除出 idle 判定

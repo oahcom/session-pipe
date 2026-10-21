@@ -675,16 +675,6 @@ class TemplateRegistry:
 
         return full_report.to_dict()
 
-    def get_allowed_roles(self, template_id: str) -> Optional[dict]:
-        """返回模板的允许角色矩阵。"""
-        t = self.get(template_id)
-        if not t:
-            return None
-        return {
-            "allowed_initiators": t.get("allowed_initiators", []),
-            "allowed_executors": t.get("allowed_executors", []),
-        }
-
     # ── 内部辅助 ─────────────────────────────────
 
     @staticmethod
