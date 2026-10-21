@@ -190,84 +190,6 @@ def _bump_violation_count(state: dict, commands: list) -> int:
 class StepHandlerMixin:
     """WorkflowEngine 的步骤处理 mixin：_tick / _sync_step_results / _validate_exit_schema / _check_exit。"""
 
-    # 首次提醒不早于签发后 2 分钟，避免与首次投递撞车。
-    _NUDGE_BACKOFF_SEC = (120, 300, 600, 1200, 2400)
-
-    def _nudge_within_ttl(self, run, step, token: str, ttl: float):
-        """TTL 内的退避提醒（bus #427435/R04）。
-
-        每档只推一次，档位由「签发至今」的跨度决定。用 step_results 里的
-        nudges_sent 计数而不是内存状态：daemon 重启后计数不丢，不同 tick 的
-        run 对象也不共享内存。
-        只在 TTL 内推 token；TTL 外由 _nudge_assigner 继续负责。
-        """
-        # 计数一律从 DB 读：run.step_results 是 tick 开头的旧快照，用它会让
-        # 本 tick 刚写的 nudges_sent 在下一 tick 读不到（同 wf_rw_46e42f725e74
-        # 的旧快照覆写问题）——退避退化成每 tick 一次。
-        _db = self._lifecycle._parse_results(self._lifecycle._get_wf_unsafe(run.id))
-        _sd = _db.get(step.id) or {}
-        sent = int(_sd.get("nudges_sent") or 0)
-        if sent >= len(self._NUDGE_BACKOFF_SEC):
-            return
-        # 签发时刻优先取落库值；老数据没有该字段时按 1h 有效期反推。
-        _issued = float(_sd.get("approval_issued_at") or (ttl - 3600))
-        age = time.time() - _issued
-        if age < self._NUDGE_BACKOFF_SEC[sent]:
-            return
-        self._nudge_assigner(run, step, token)
-        _db.setdefault(step.id, {})["nudges_sent"] = sent + 1
-        self._lifecycle.execute(
-            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-            (json.dumps(_db, ensure_ascii=False), run.id))
-        self._lifecycle.commit()
-
-    def _nudge_assigner(self, run: WorkflowRun, step: Step, token: str):
-        """审批超时保护：把审批请求重新推给 assigner 角色，唤醒它审批。
-
-        仅作为兜底动作（TTL 过期但未超 grace 30min）供角色在线上响应；daemon
-        不在此自动 confirm——那会绕开人工质量闸门。真人角色长时间不审批时，
-        这里持续每轮重新 nudge，直到角色 confirm 或 TTL+30min grace 后由
-        step_handler 的 fallback 自动通过。
-        """
-        # _get_assigner_for_step 只读 type/target_role，此处传最小 dict 而非 Step dataclass
-        assigner = self._lifecycle._get_assigner_for_step(
-            self._lifecycle._get_wf_unsafe(run.id) or {},
-            {"type": step.type, "target_role": step.target_role}, step.id)
-        if not assigner:
-            LOGGER.debug("nudge skipped %s/%s: 无审批人", run.workflow_name, step.id)
-            return
-        _step_def = self._lifecycle.get_step(run.id, step.id) or {}
-        _approval_prompt = _step_def.get("approval_prompt", "") or ""
-        if not _approval_prompt:
-            _approval_prompt = (
-                f"## 审批请求: 步骤 {step.id} - {step.title}\n\n"
-                f"工作流: {run.id}\n审批密钥: {token}\n有效期: 1小时\n\n"
-                f"请尽快确认（approval_token 已过期，daemon 于 TTL+30min grace 后自动通过）。"
-            )
-        msg = (
-            f"[workflow] 审批再次请求（超时保护）\n\n"
-            f"工作流: {run.id}\n步骤: {step.id} — {step.title}\n"
-            f"密钥: {token}\n有效期: 1小时（已过期，daemon 待 TTL+30min grace 后自动通过）\n\n"
-            f"审批提示:\n{_approval_prompt}"
-        )
-        try:
-            from workflow.client import get_ccs_cli
-            _ccs_cli = get_ccs_cli()
-            _ccs_cli = str(_ccs_cli) if not isinstance(_ccs_cli, str) else _ccs_cli
-            import subprocess as _sp
-            # send-safe 的调用方参数是 --by-role（ccs.py:205-210），argv 里传 --from
-            # 会被 argparse 直接 rc=2 拒绝，异常再被下方 except 吞成 warning ——
-            # 这条催办通道自建立起从未成功过一次。
-            _r = _sp.run(["python3", _ccs_cli, "send-safe", assigner, msg,
-                          "--by-role", "workflow_engine"],
-                         capture_output=True, timeout=15)
-            _lvl = "warning" if _r.returncode != 0 else "info"
-            LOGGER.log(getattr(LOGGER, _lvl.upper(), logging.INFO),
-                       "nudge_assigner %s/%s -> %s: rc=%s",
-                       run.workflow_name, step.id, assigner, _r.returncode)
-        except Exception as _e:
-            LOGGER.warning("nudge_assigner %s/%s failed: %s", run.workflow_name, step.id, _e)
-
     @staticmethod
     def _step_sd(run, step) -> dict:
         """取 step_results[step.id] 并归一化为 dict。
@@ -854,11 +776,11 @@ class StepHandlerMixin:
             #    匹配策略：先找引擎发的 task_spec（含 wf 前缀）→ 再匹配该角色在
             #    task_spec 之后写的任意消息（标题可能不含 wf 前缀，按时间窗匹配）。
             # codex P2-1：wait_roles 协作步骤不走 relaxed-advance（避免绕过协作门控）
-            # 新增：review 且有真人 assigner 时，禁止宽松推进，必须等真人审批。
+            # 评审步骤与其他类型同权（2026-10-22）：密钥退场后不再有"等真人审批"
+            # 这条豁免；review 也走宽松推进兜底，否则只能等超时 cancel。
             # handoff 不在此列（2026-10-19）：宽松推进是 exit 未匹配时的兜底，
             # 把 handoff 挡在这里 → 角色写了产出但分类不匹配时既不推进也不兜底，
             # 直接等超时 auto-cancel（与 R95 要根除的"每步白等 90min"同一症状）。
-            _needs_human_approval = step.type == "review"
             # 排队降级路径（_QUEUE_DEGRADE_AT）下来的 timeout_count 首次变 1，此时
             # 角色并未"超时未响应"，只是排了很久队。若不排除，会立即命中下面的
             # relaxed-advance（它只要求角色写过任意同 wf 消息，不限分类）→ 误推进。
@@ -869,72 +791,62 @@ class StepHandlerMixin:
             if (timeout_count >= 1 and not step.dual_node
                     and not getattr(step, "wait_roles", None)
                     and not _from_queue_degrade):
-                # 审批人唯一权威来源是 _get_assigner_for_step（step_results 无 assigner 键）；
-                # 仅超时后才查（内含 DB 查询，避免每 tick 开销）。
-                _assigner = self._lifecycle._get_assigner_for_step(
-                    self._lifecycle._get_wf_unsafe(run.id) or {},
-                    {"type": step.type, "target_role": _eff}, step.id)
-                if _needs_human_approval and _assigner:
-                    # review 且有真人 assigner → 禁止宽松推进，必须等真人审批
-                    LOGGER.debug("skip relaxed-advance %s/%s: review with human assigner=%s",
-                                 run.workflow_name, step.id, _assigner)
-                else:
-                    try:
-                        # 全量读：_has_anchor 需跨分类找 task_spec 锚点（cat 过滤会漏掉），
-                        # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
-                        _role_msgs = self._bb.read(limit=500)
-                        _wf_id = run.id
-                        _notified_ts = self._step_sd(run, step).get("notified_at", 0)
-                        # 归属校验必须看消息正文（t+e）：角色产出标题常不含实例 id，
-                        # 只在 evidence 里写「实例 wf_xxx」。只看标题会把自家产出当别人的。
-                        # 且必须匹配**完整 id**：wf_sub_4…/wf_sub_b… 这类前缀在
-                        # [:8] 截断下大面积碰撞（实测 31 次宽松推进 29 次是别的工作流
-                        # 的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
-                        _relaxed = [
-                            {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
-                            for f in _role_msgs
-                            if f.src == _eff
-                            and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
-                            and f.ts > _notified_ts
-                            and f.ts < time.time() + 60  # 防未来时间戳
-                            and _mentions(f, _wf_id)
-                        ]
-                        # task_spec 锚点确认确实是本工作流任务（同样是完整 id，不做前缀匹配）
-                        _has_anchor = any(
-                            f.cat == "task_spec" and _mentions(f, _wf_id)
-                            for f in _role_msgs
-                        )
-                        if _relaxed and _has_anchor:
-                            # 宽松推进不得绕过质量闸门：exit_schema/verify 是"产出真的
-                            # 落盘"的唯一判据，与主路径同一把尺子。缺这道门时角色写了
-                            # 任意同工作流消息就算完成（7 天 6 次：writer/reviewer/
-                            # engineer/closer 各 1~2 次），下游拿不到契约件才回头返工。
-                            if self._quality_gate_blocks(step, run):
-                                return
-                            LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
-                                        run.workflow_name, step.id, len(_relaxed))
-                            run.step_results[step.id] = {
-                                **self._step_sd(run, step),
-                                "bus_anchor": _relaxed[0]["ts"],
-                                "exit_messages": _relaxed,
-                                "relaxed_advance": True,
-                            }
-                            self._sync_step_results(run.id, run.step_results)
-                            self._bb.write("blocker",
-                                f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
-                                f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
-                                src="workflow_engine")
-                            # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
-                            _integ_send_bypass(run, step, "relaxed",
-                                               send_to_role=self._send_to_role,
-                                               sync_step_results=self._sync_step_results)
-                            try:
-                                self._lifecycle.complete_step(run.id, step.id)
-                            except Exception as _e:
-                                LOGGER.debug("relaxed-advance complete_step 失败: %s", _e)
+                try:
+                    # 全量读：_has_anchor 需跨分类找 task_spec 锚点（cat 过滤会漏掉），
+                    # limit 提升到 500 覆盖更大消息窗口，降低超长负载漏匹配风险
+                    _role_msgs = self._bb.read(limit=500)
+                    _wf_id = run.id
+                    _notified_ts = self._step_sd(run, step).get("notified_at", 0)
+                    # 归属校验必须看消息正文（t+e）：角色产出标题常不含实例 id，
+                    # 只在 evidence 里写「实例 wf_xxx」。只看标题会把自家产出当别人的。
+                    # 且必须匹配**完整 id**：wf_sub_4…/wf_sub_b… 这类前缀在
+                    # [:8] 截断下大面积碰撞（实测 31 次宽松推进 29 次是别的工作流
+                    # 的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
+                    _relaxed = [
+                        {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
+                        for f in _role_msgs
+                        if f.src == _eff
+                        and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
+                        and f.ts > _notified_ts
+                        and f.ts < time.time() + 60  # 防未来时间戳
+                        and _mentions(f, _wf_id)
+                    ]
+                    # task_spec 锚点确认确实是本工作流任务（同样是完整 id，不做前缀匹配）
+                    _has_anchor = any(
+                        f.cat == "task_spec" and _mentions(f, _wf_id)
+                        for f in _role_msgs
+                    )
+                    if _relaxed and _has_anchor:
+                        # 宽松推进不得绕过质量闸门：exit_schema/verify 是"产出真的
+                        # 落盘"的唯一判据，与主路径同一把尺子。缺这道门时角色写了
+                        # 任意同工作流消息就算完成（7 天 6 次：writer/reviewer/
+                        # engineer/closer 各 1~2 次），下游拿不到契约件才回头返工。
+                        if self._quality_gate_blocks(step, run):
                             return
-                    except Exception as _relax_err:
-                        LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
+                        LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
+                                    run.workflow_name, step.id, len(_relaxed))
+                        run.step_results[step.id] = {
+                            **self._step_sd(run, step),
+                            "bus_anchor": _relaxed[0]["ts"],
+                            "exit_messages": _relaxed,
+                            "relaxed_advance": True,
+                        }
+                        self._sync_step_results(run.id, run.step_results)
+                        self._bb.write("blocker",
+                            f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
+                            f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
+                            src="workflow_engine")
+                        # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
+                        _integ_send_bypass(run, step, "relaxed",
+                                           send_to_role=self._send_to_role,
+                                           sync_step_results=self._sync_step_results)
+                        try:
+                            self._lifecycle.complete_step(run.id, step.id)
+                        except Exception as _e:
+                            LOGGER.debug("relaxed-advance complete_step 失败: %s", _e)
+                        return
+                except Exception as _relax_err:
+                    LOGGER.debug("relaxed-advance 检查失败: %s", _relax_err)
 
 
         # ── 完整性提醒阶段（在 timeout 之前，任何步骤完成时都触发）──
@@ -1169,74 +1081,8 @@ class StepHandlerMixin:
             except Exception as _idle_err:
                 LOGGER.debug("idle detection skipped: %s", _idle_err)
 
-            # ── review/subflow 步骤：等真人角色审批 ──
-            # 设计意图：这类步骤的产出需 assigner 确认（manager._get_assigner_for_step
-            # 已算好审批人，_issue_approval_token 已通过 ccs send-safe 把 token 推给审批人）。
-            # daemon 不抢先 auto-advance —— 那会让 review 质量闸门形同虚设。
-            # 仅当模板显式 auto_advance:true（如自驱动 food_chain_loop）才保留 daemon 自动推进。
-            #
-            # handoff 已移出本分支（2026-10-19）：交接不是审批。原实现使每步都等
-            # confirm，而真实 confirm 率仅 1.4% → 每步白等 TTL+grace 90min，
-            # 超过步骤超时上限先被 auto-cancel。无 token 时 _get_assigner_for_step
-            # 返回空 → 本分支的 `if not _token: return` 仍会拦住，故必须一并移出。
-            if step.type in ("review", "subflow"):
-                _tpl = self._workflows.get(run.workflow_name)
-                _auto_advance = getattr(_tpl, "auto_advance", False)
-                if _auto_advance:
-                    # 豁免模板：沿用原 daemon 自动推进（维持自治闭环）
-                    try:
-                        _token = self._lifecycle.get_approval_token_raw(run.id, step.id)
-                        if _token:
-                            self._lifecycle.confirm_step(run.id, step.id, token=_token,
-                                                          approved=True, reason="daemon auto-advance")
-                            LOGGER.info("auto-advance %s/%s -> next step (auto_advance template)",
-                                       run.workflow_name, step.id)
-                    except Exception as e:
-                        LOGGER.debug("auto-advance skipped for %s/%s: %s", run.workflow_name, step.id, e)
-                    return
-                # 非豁免：等角色审批。超时处理 = 重新拉起审批人，而非静默自动通过。
-                try:
-                    _token = self._lifecycle.get_approval_token_raw(run.id, step.id)
-                    if not _token:
-                        return  # 无 token（如系统角色发起、无审批人）→ 保持现状
-                    _db_results = self._lifecycle._parse_results(
-                        self._lifecycle._get_wf_unsafe(run.id))
-                    _ttl = _db_results.get(step.id, {}).get("approval_token_ttl", 0)
-                    # 判定顺序不可颠倒：grace 超时（更严格）必须排在普通 TTL 超时之前。
-                    # 原实现反着写 → `now > _ttl` 在 `now > _ttl+1800` 时仍为真，
-                    # elif 恒不可达 → 「TTL+30min grace 自动通过」这个防永久卡死的兜底
-                    # 从未执行过。实测（2026-10-17）：已 completed/cancelled 的实例仍被
-                    # 逐轮重推审批请求，engineer 44 分钟内收到 33 次（其中 8/10 个 wf_id
-                    # 在 DB 中根本不存在），真实任务反而挤不进去。
-                    if _ttl > 0 and time.time() > _ttl + 1800:
-                        # 极端超时（TTL + 30min grace）：兜底自动通过，防永久卡死
-                        # （修复 lr_tech_decision 卡死根因：reviewer 未消费导致 24h+ stuck）
-                        self._lifecycle.confirm_step(
-                            run.id, step.id, token=_token, approved=True,
-                            reason="daemon approval_timeout_fallback",
-                            allow_expired=True)  # P0-A 修复: token 已过期时也允许确认
-                        LOGGER.warning("approval_timeout_fallback %s/%s: token 超时 30min 未消费，自动 approve",
-                                       run.workflow_name, step.id)
-                        _db_after = self._lifecycle._parse_results(
-                            self._lifecycle._get_wf_unsafe(run.id))
-                        run.step_results[step.id] = _db_after.get(step.id, {})
-                        self._sync_step_results(run.id, run.step_results)
-                        return
-                    # 第一阶段超时（TTL 过期但未过 grace）：重新把审批请求推给审批人，唤醒它响应
-                    # TTL 内也要重推：只等过期才推 = 整个 1 小时有效窗口内
-                    # 审批人无任何提醒，TTL 一到就只剩 30min grace，实际等于
-                    # 自动放行（bus #427435/R04：13 个已完成 s4 中 8 个恰在
-                    # ttl+30.0~30.2min 被 fallback 通过，人未参与）。
-                    # 退避排程 2/5/10/20/40min 后各推一次，避免 10-17 那种
-                    # 44 分钟 33 次的刷屏。
-                    if _ttl > 0 and time.time() <= _ttl:
-                        self._nudge_within_ttl(run, step, _token, _ttl)
-                    if _ttl > 0 and time.time() > _ttl:
-                        self._nudge_assigner(run, step, _token)
-                except Exception as _e:
-                    LOGGER.debug("approval timeout handling skipped for %s/%s: %s",
-                                 run.workflow_name, step.id, _e)
-                return
+            # 评审步骤不再在 tick 里等审批（2026-10-22）：密钥机制已退场，
+            # 结论由 _advance_production_wf 的 review_gate 判据消费。
 
             # lifecycle.manager 已写入 step_results，此处不再重复写入
             return
@@ -1433,7 +1279,11 @@ class StepHandlerMixin:
             self._notify_role(
                 self._eff_role(run, step), msg,
                 f"{run.workflow_name}/{step.id}（实例 {run.id}）闸门未通过："
-                f"补齐上述产出后重新写 bus 完成声明（标题含 {step.id}-complete），"
+                # 标题契约要照抄 exit_condition.text_contains：模板要求的是
+                # "<模板>/<step>-complete"，这里只写 "<step>-complete" 时角色照做也
+                # 永不匹配（69 个步骤是长形态）→ 闸门提示成了死指令。
+                f"补齐上述产出后重新写 bus 完成声明（标题必须含 "
+                f"{(getattr(step, 'exit_condition', None) or {}).get('text_contains') or step.id + '-complete'}），"
                 f"否则本步无法推进。")
         except Exception as _e:
             LOGGER.debug("gate prompt to role failed: %s", _e)
