@@ -17,7 +17,6 @@ import re
 import subprocess
 import threading
 from dataclasses import dataclass, field
-# ponytail: import Optional could be added if signature type hints are needed later
 
 LOGGER = logging.getLogger("conversation_monitor")
 

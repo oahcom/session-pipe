@@ -446,9 +446,7 @@ class TaskGeneratorMixin:
                 _fn()
             except Exception as _d:
                 LOGGER.debug("deferred advance failed: %s", _d)
-        # ponytail: 动态任务生成——每轮 run_once 检查一次每个角色是否需要新任务
         self._generate_tasks_from_state()
-        # ponytail: 任务质量反馈闭环——每轮 run_once 评估最近完成的任务并写入 bus
         try:
             from task_evidence import evaluate_and_feedback
             _feed = evaluate_and_feedback()

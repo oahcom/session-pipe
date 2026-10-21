@@ -410,7 +410,7 @@ class P0Exemption:
             created = t.get("p0_marked_at") or t.get("created_at", 0)
             elapsed = (now - created) / 3600
 
-            # ponytail: 去重护栏——升级链将接入 daemon 30 分钟循环，
+            # 去重护栏——升级链由 routing_daemon.py:419 每 30 分钟调用（已接入，非"将接入"），
             # 必须幂等，否则同一 P0 任务每 30 分钟重复刷 @everyone/supervisor。
             # 用 workflow_logs 记录已通知，复刻 p0_audit_scan 50min 预警的去重模式。
             if elapsed > 12:
