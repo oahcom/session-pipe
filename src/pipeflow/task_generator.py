@@ -341,13 +341,20 @@ class TaskGeneratorMixin:
                                     # completed_by 保持角色名语义（manager.py:454 拿它当通知对象、
                                     # wf_lifecycle.py:965 拿它当子链 assigner），
                                     # 子链 id 放在已有的 step_results["subflow_id"] 里。
-                                    _sdata.setdefault("completed_by", "workflow_engine")
+                                    # 兜底旧值：f2e3050 在 05:16-05:55 曾写入 "subflow:<id>"，
+                                    # 那批行已落库且本块每 tick 重入 —— setdefault 不会盖掉它们。
+                                    if not _sdata.get("completed_by") or                                             str(_sdata["completed_by"]).startswith("subflow:"):
+                                        _sdata["completed_by"] = "workflow_engine"
+                                    # 指针丢失的父步（约 20/40 条子链）靠 DB 行回推 _sf，
+                                    # 回推结果写回一步，否则这步的出处只能再从 DB 反查。
+                                    _sdata.setdefault("subflow_id", _sf)
                                     _sdata["subflow_evidence"] = {
                                         "last_step": (_sub_row_sr["current_step_id"]
                                                       if _sub_row_sr else ""),
                                         "exit_message_ids": [
                                             _m.get("id") for _m in
-                                            ((_sub_last or {}).get("exit_messages") or [])
+                                            ((_sub_last if isinstance(_sub_last, dict) else {})
+                                             .get("exit_messages") or [])
                                             if isinstance(_m, dict) and _m.get("id") is not None],
                                     }
                                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
