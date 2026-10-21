@@ -997,6 +997,7 @@ class TrajectoryQualityChecker:
         last_cmd: str | None = None
         repeat_run: int = 0
         repeat_window_start: int | None = None
+        repeat_src: str = ""
 
         # 会话边界：每个 transcript **末尾连续未配对**的 tool_use 段。
         # 同一轮里 Claude 会并行发多个 tool_use（实测 dfd563da 末尾连发 2 条），
@@ -1067,13 +1068,21 @@ class TrajectoryQualityChecker:
                     _k = (c["src"], fp)
                     own_written[_k] = min(own_written.get(_k, c["order"]), c["order"])
 
+        # thrash 按 transcript 归并：同一次爆发被「差一两个字符」的变体命令切段时
+        # 会重复报（closer 实测 1 次 298 连发被切成 4 条），白占 bus 报告的名额。
+        _thrash: dict[str, dict] = {}
+
         def _close_thrash():
-            nonlocal repeat_run, repeat_window_start, last_cmd
+            nonlocal repeat_run, repeat_window_start, last_cmd, repeat_src
             if repeat_run >= _THRASH_REPEAT_MIN and repeat_window_start is not None:
-                findings.append({
-                    "issue": "thrash_loop", "tool": "Bash",
-                    "command": last_cmd, "count": repeat_run,
-                })
+                _cur = _thrash.get(repeat_src)
+                if _cur is None:
+                    _thrash[repeat_src] = {
+                        "issue": "thrash_loop", "tool": "Bash",
+                        "command": last_cmd, "count": repeat_run,
+                    }
+                else:      # 变体命令切段：同一次爆发的次数应累加（298 = 89+117+64+28）
+                    _cur["count"] += repeat_run
             repeat_run, repeat_window_start, last_cmd = 0, None, None
 
         for c in calls:
@@ -1137,11 +1146,13 @@ class TrajectoryQualityChecker:
                         _close_thrash()
                         last_cmd = cmd
                         repeat_run = 1
+                        repeat_src = c["src"]
                     if repeat_window_start is None:
                         repeat_window_start = c["order"]
                 else:
                     _close_thrash()
         _close_thrash()
+        findings.extend(_thrash.values())
 
         # 孤儿调用：发出但无返回。
         # WHY 要排除每个 transcript 的**末条** tool_use：会话在工具执行中结束
