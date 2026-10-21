@@ -239,8 +239,11 @@ class TestEscalateRejectedAnchor:
 
     @patch("subprocess.run",
            return_value=MagicMock(returncode=0, stdout="claude\n", stderr=b""))
-    def test_anchor_set_only_after_confirmed_delivery(self, _mock_run):
-        """False/busy 皆非送达，不得落锚：落了锚则本轮升级丢失且不再重试。
+    def test_anchor_by_delivery_state(self, _mock_run):
+        """三态：True 落锚 / busy 排队不落锚 / False 被拦落锚。
+
+        busy 落锚会让 engine.py:777 下 tick 直接 return，本可送达的升级永不再发。
+        每轮新建 step_results 并从库重读断言（生产每 tick 也是读库，内存副本不算数）。
 
         subprocess 必须 mock：不 mock 则 eng.start 走 _wait_for_role_ready，
         真的去 `ccs start test_role`（不在注册表）→ 阻塞到 pytest 超时。
@@ -250,24 +253,42 @@ class TestEscalateRejectedAnchor:
             _write_wf(d, "esc_anchor", [_step("s1")])
             eng = WorkflowEngine(d)
             inst = {"instance_id": eng.start("esc_anchor", {})}
-            results = {'s1': {'rejected_at': 1.0}}
-            sr, lm = results['s1'], eng._lifecycle
+            lm = eng._lifecycle
 
-            for not_delivered in (False, 'busy'):
-                eng._send_to_role = lambda *a, _r=not_delivered, **k: _r
-                eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-未送达')
-                assert sr.get('rework_escalated_at'), (
-                    f'投递={not_delivered!r} 非送达却未落锚（改走 bus）→ 每 tick 重发升级')
+            def _anchor_after(delivered) -> object:
+                # 每种状态从干净的库里起步：上一轮写的锚会残留，否则 busy 一例
+                # 读到的是 True 那轮的锚，断言恒假/恒真。
+                lm.execute(
+                    "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                    (json.dumps({'s1': {'rejected_at': 1.0}}), inst['instance_id']))
+                sr = {'rejected_at': 1.0}
+                eng._send_to_role = lambda *a, _r=delivered, **k: _r
+                eng._escalate_rejected(inst, 's1', sr, {'s1': sr}, lm, '锚测试')
+                return eng.status(inst['instance_id'])['results']['s1'].get(
+                    'rework_escalated_at')
 
-            eng._send_to_role = lambda *a, **k: True
-            eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-已送达')
-            assert sr.get('rework_escalated_at'), '送达后必须落锚防每 tick 刷屏'
-            assert eng.status(inst['instance_id'])['results']['s1'].get(
-                'rework_escalated_at'), '锚必须落库：只改内存副本则下轮重读又是 None'
+            notes = []
+
+            class _BB:
+                def write(self, cat, title, **kw):
+                    notes.append((cat, title, kw.get("evidence", "")))
+
+            eng._bb = _BB()
+
+            assert _anchor_after(True), '送达后必须落锚防每 tick 刷屏'
+            notes.clear()
+            assert not _anchor_after('busy'), (
+                'busy 是排队非失败，落锚会让本可送达的升级永不再发')
+            assert notes == [], 'busy 只排队，不该写 bus 记录（会污染升级账本）'
+            notes.clear()
+            assert _anchor_after(False), 'False 被守卫拦下，重投无意义 → 落锚止损'
+            assert len(notes) == 1 and '投递被拦' in notes[0][2], (
+                f'被拦必须留下一条可追溯的 bus 记录: {notes}')
 
             sent = []
             eng._send_to_role = lambda *a, **k: sent.append(1) or True
-            eng._escalate_rejected(inst, 's1', sr, results, lm, '锚测试-二次')
-            assert sent == [], '锚已存在仍重发 → 每 tick 刷屏'
+            sr = eng.status(inst['instance_id'])['results']['s1']  # 从库重读
+            eng._escalate_rejected(inst, 's1', sr, {'s1': sr}, lm, '锚测试-二次')
+            assert sent == [], '库里的锚未阻止重发 → 每 tick 刷屏'
         finally:
             _cleanup(d)
