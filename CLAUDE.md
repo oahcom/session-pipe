@@ -79,7 +79,7 @@ src/
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1312 行）
+    manager.py        ── 工作流状态机（1196 行）
 
   workflow/
     client.py         ── CCS 角色工作流客户端（515 行）
