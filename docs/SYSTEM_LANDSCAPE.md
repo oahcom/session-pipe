@@ -6,7 +6,7 @@
 
 | 项目 | 类比 | 职责 | 代码量 |
 |------|------|------|--------|
-| **hermes-session-roles** | `/etc/passwd` | 角色定义：31 个角色身份 + 57 个 BH 人格 + 提示词模板 | ~2000 行 Python + 31 JSON + 57 JSON + 26 prompts |
+| **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个角色身份 + 50 个 BH 人格 + 提示词模板 | ~2000 行 Python + 19 JSON + 50 JSON + 18 prompts |
 | **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | ~3500 行 Python |
 | **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | ~4000 行 Python |
 
@@ -23,7 +23,7 @@ session-roles（定义层）
 
 | 项目 | Python 源文件 | 行数 | 其他 |
 |------|-------------|------|------|
-| hermes-session-roles | 6 个 `.py` | ~1040 | 31 角色 JSON, 57 人格 JSON, 26 prompt 文件 |
+| hermes-session-roles | 6 个 `.py` | ~1040 | 19 角色 JSON, 50 人格 JSON, 18 prompt 文件 |
 | session-launcher | ~15 个 `.py` | ~3500 | 文档、测试、配置 |
 | session-pipeline | ~13 个 `.py` | ~4000 | 测试 136 个 |
 | **总计** | **~34 个 `.py`** | **~8500** | **100+ 数据/配置/文档文件** |
@@ -66,10 +66,10 @@ session-roles（定义层）
 
 | 目录 | 内容 |
 |------|------|
-| `/tmp/ccs-sentinels/` | CCS 运行状态（role.json，含 PID/生命周期/伙伴/健康） |
-| `/tmp/ccs-health/` | 进程健康数据（watchdog 状态） |
-| `/tmp/ccs-lifecycle-sentinels/` | ondemand 角色生命周期哨兵 |
-| `/tmp/cdx-sentinels/` | Codex session 哨兵 |
+| `~/.hermes/run/ccs-sentinels/` | CCS 运行状态（role.json，含 PID/生命周期/伙伴/健康） |
+| `~/.hermes/run/ccs-health/` | 进程健康数据（watchdog 状态） |
+| `~/.hermes/run/ccs-lifecycle-sentinels/` | ondemand 角色生命周期哨兵 |
+| `~/.hermes/run/cdx-sentinels/` | Codex session 哨兵 |
 
 ## 工作空间
 
@@ -92,34 +92,9 @@ pipeflow/daemon.py:51-76    while True (sleep 10s) — 系统唯一的执行循�
         └── _scan_tasks()                  同步 task 状态 + 子工作流级联推进
 ```
 
-## 角色协作矩阵（31 角色）
+## 角色协作矩阵
 
-> 所有 produce/consume 路由来自 `shared_loader.py` → `roles_export.json` → pipeline Router。
-
-| 角色 | 产出 | 消费 |
-|------|------|------|
-| ccs-monitor | architecture, notice | architecture, notice, blocker, code_fix |
-| closer | architecture | _all_ |
-| codex-dev | code_review, code_fix | code_fix, architecture, performance |
-| coordinator | scheduler, architecture, ccs_health | task_spec, workflow, user_story, test_plan, ... |
-| curator | skill_audit, cleanup, architecture | skill_audit, architecture, code_fix, performance |
-| debate_verifier | debate, verification | debate, task_spec |
-| devops | deployment_plan, deployment_report | architecture, code_fix, security, ... |
-| engineer | code_fix, code_review, architecture | architecture, task_spec, user_story, ... |
-| investigator_general | root_cause_analysis | _all_ |
-| investigator_python | root_cause_analysis | code_fix, architecture |
-| investigator_senior | root_cause_analysis | _all_ |
-| knowledge_curator | architecture, code_fix, cleanup | _all_ |
-| maintainer | code_fix, architecture | security |
-| optimizer | architecture, optimization | architecture, performance, bug_report, code_review |
-| pg | code_fix, code_review | task_spec, tech_decision, ... |
-| pm | user_story, feedback | prd, architecture, test_report, ... |
-| product_architect | prd, system_design, task_spec | architecture, code_fix, blocker, ... |
-| qa | test_plan, test_report, bug_report | task_spec, code_fix, prd, ... |
-| reviewer | code_review, architecture | code_review, architecture, security |
-| scout | architecture, evolution_report | architecture |
-| security_auditor | security_audit, code_fix | security, blocker, code_fix, ... |
-| writer | documentation, changelog | code_fix, architecture, deployment_plan, ... |
+> 路由以 `python3 -m routing.router list` 与 `~/.hermes/data/roles_export.json` 现场输出为准（2026-10-22：原表 31 角色里 codex-dev/debate_verifier/investigator_* 已无 persona JSON，整表删除）。
 
 ## 关键发现（基于代码通读）
 

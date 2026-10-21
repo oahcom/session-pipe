@@ -13,7 +13,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
          └──→ launcher/ccs.py send ← 唯一跨项目调用（subprocess）
 ```
 
-**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`/tmp/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
+**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`~/.hermes/run/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
 
 ## Module inventory
 
@@ -56,7 +56,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **pipeflow/db.py** | 327 | Three-layer SQLite: Template → Instance → Task |
 | **p0_exemption.py** | 496 | P0 豁免通道 |
 
-**Total: 38 modules（不含 `__init__.py`），合计 ~10700 行 Python**
+**模块与行数随树变化：以 `find src -name "*.py" | wc -l` 与 `wc -l src/**/*.py` 现场取值为准（2026-10-22 实测 39 个模块 / 20234 行，原写 38 / ~10700 已过期）**
 
 ## Data flow
 
@@ -88,7 +88,7 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **roles_export.json** (`~/.hermes/data/roles_export.json`) -- route table source from shared_loader.py
 - **Sister Bus** (`~/.hermes/scripts/bus_protocol.py`) -- Blackboard read/write
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
-- **Sentinel files** (`/tmp/ccs-sentinels/`) -- CCS alive check
+- **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
 - **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `pipeline_cursor.db`, `ack_tracker.db`)
 
@@ -134,7 +134,7 @@ These bypasses lose RLock protection and approval workflow.
 
 `_ensure_role_alive()` injects `/loop` into the CCS, but `/loop` is NOT available in tmux environments. The CCS will not error, but it will also not enter a work loop -- it idles after processing each message.
 
-Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` in `engine.py:582`.
+（2026-10-22 复核：这条建议已失效——`engine.py` 里 `--drive` 出现 0 次，真实注入点是 `role_lifecycle.py:671/729`，注入值是 `infinite`。原文保留为历史记录。）
 
 ### Cross-project call boundary
 
