@@ -264,9 +264,14 @@ def daemon_loop(interval: int):
                 if _now_mtime > _seen_mtime:
                     time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
                     if _src_mtime() == _now_mtime:
-                        LOGGER.info("源码已更新 (mtime=%.0f)，退出由 systemd 重启以加载新代码",
+                        # 就地重执行，不退出：退出依赖外部拉起（systemd Restart /
+                        # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
+                        # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
+                        # 锁随新进程重新获取，任何监管方式下都能生效。
+                        LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
                                     _now_mtime)
-                        shutdown = True
+                        logging.shutdown()
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
             except OSError as _e:
                 LOGGER.debug("源码 mtime 探测失败: %s", _e)
             time.sleep(interval)
