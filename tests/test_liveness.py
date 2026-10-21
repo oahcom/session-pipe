@@ -367,6 +367,29 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
             result = tmux_pane_active("qa", window=300)
         self.assertIs(result, False, "真空闲被误判为忙：回收路径失效，卡死实例永驻")
 
+    def test_silent_but_429_retry_is_true(self):
+        """429 客户端退避中：pane 无 esc 提示、转录也不写，但角色没死。
+
+        2026-10-21 15:16:47 实测：maintainer pane 停在 `Request rejected (429)`，
+        随后 410s 转录零写入（> 300s 窗）→ 条件4 判僵尸回收 wf_rw_3df85d1ed26f，
+        而该角色 15:58 写出了 s1-complete。退避行 `Retrying in ... · attempt N/M`
+        必须与 esc 提示同等视为存活。
+        """
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        retry = MagicMock(returncode=0,
+                          stdout="✻ Retrying in 4m 27s · attempt 19/30\n❯ ")
+        with patch("liveness.subprocess.run", side_effect=[ts, retry]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIs(result, True, "退避中被判死：角色活着、任务白丢")
+
+    def test_idle_pane_without_retry_stays_false(self):
+        """只看得到 `attempt` 字样（如历史输出残留）而没 `Retrying` → 不算存活。"""
+        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        idle = MagicMock(returncode=0, stdout="done after attempt 3\n❯ ")
+        with patch("liveness.subprocess.run", side_effect=[ts, idle]):
+            result = tmux_pane_active("qa", window=300)
+        self.assertIs(result, False, "单凭 attempt 放行会让回收路径失效")
+
     def test_busy_probe_failure_is_unknown(self):
         """忙态二次探测失败 → None（保守不杀），不把探测故障翻译成死亡。"""
         ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")

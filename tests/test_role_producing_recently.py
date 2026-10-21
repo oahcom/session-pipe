@@ -46,10 +46,22 @@ def test_fresh_transcript_means_producing(tmp_path, monkeypatch):
 
 
 def test_stale_transcript_means_not_producing(tmp_path, monkeypatch):
-    """转录 20 分钟前写入（> 300s 窗）→ 判定为未产出（允许判死）。"""
+    """转录 20 分钟前写入（> 600s 窗）→ 判定为未产出（允许判死）。"""
     _mk_transcript_dir(tmp_path, "reviewer", age_sec=1200)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     assert _role_producing_recently("reviewer") is False, "转录久未更新应判为未产出"
+
+
+def test_transcript_lagging_pane_is_still_producing(tmp_path, monkeypatch):
+    """转录落盘滞后于 pane：410s 前的写入仍在默认窗内，不得判死。
+
+    2026-10-21 实测 maintainer pane 静默 410s、转录同窗零写入，判死
+    wf_rw_3df85d1ed26f；同日本机 devops 转录滞后 pane 408s、reviewer 295s。
+    默认窗若是 300s，"pane 刚静默、转录没赶上"必被读成两路同时静默。
+    """
+    _mk_transcript_dir(tmp_path, "maintainer", age_sec=410)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert _role_producing_recently("maintainer") is True, "410s 前的转录应仍在默认窗内"
 
 
 def test_missing_transcript_dir_returns_false(tmp_path, monkeypatch):
@@ -94,8 +106,10 @@ if __name__ == "__main__":
     failed = 0
     for fn in (test_fresh_transcript_means_producing,
                test_stale_transcript_means_not_producing,
+               test_transcript_lagging_pane_is_still_producing,
                test_missing_transcript_dir_returns_false,
-               test_window_boundary_is_configurable):
+               test_window_boundary_is_configurable,
+               test_underscore_role_is_resolved):
         mp = _MP()
         with tempfile.TemporaryDirectory() as td:
             try:

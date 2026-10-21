@@ -492,6 +492,12 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
 
 
 _CLI_BUSY_MARKERS = ("esc to interrupt", "esc to cancel", "ctrl+b to run in background")
+# 429/403 客户端重试退避：CLI 自己在数秒后重试，期间 pane 无输出、转录也不写，
+# 两个判活信号同时为静默 → 被条件4 当僵尸回收（实测 maintainer 410s 空档，
+# wf_rw_3df85d1ed26e 15:16:47 被杀，而角色 42 分钟后写出 complete）。
+# 判据与 role_lifecycle._recover_rate_limited_roles 同源（Retrying + attempt）：
+# attempt 用尽后该行消失，回收路径自动恢复，不会造出永不回收的实例。
+_CLI_RETRY_MARKERS = ("retrying in", "attempt")
 
 
 def _pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
@@ -506,6 +512,10 @@ def _pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
         if r.returncode != 0:
             return None
         tail = r.stdout[-2000:].lower()
-        return any(m in tail for m in _CLI_BUSY_MARKERS)
+        if any(m in tail for m in _CLI_BUSY_MARKERS):
+            return True
+        # 退避中的 CLI 不显示 esc 提示，只挂 "Retrying in 4m 27s · attempt 19/30"：
+        # 仅凭 _CLI_BUSY_MARKERS 会把"正在重试"读成"已死"（#433589 后果 A）。
+        return all(m in tail for m in _CLI_RETRY_MARKERS)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None

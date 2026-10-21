@@ -116,7 +116,7 @@ def _bus_evidence_ready(engine, row: dict) -> bool:
     return False
 
 
-def _role_producing_recently(role: str, window: float = 300.0) -> bool:
+def _role_producing_recently(role: str, window: float = 600.0) -> bool:
     """角色的会话转录最近 window 秒内是否在写入 —— 还在干活的强信号。
 
     为什么 pane 静默不足以判死：Claude 深度推理时不产生终端输出，而 review 类
@@ -128,6 +128,12 @@ def _role_producing_recently(role: str, window: float = 300.0) -> bool:
     转录文件在推理与每次工具调用时均写入，比 pane 更贴近在不在工作。
     同源思路见 role_lifecycle._recently_producing（bus 产出判活）与
     survival_monitor.py:230 的同款修法注释 —— 本处将同一原则补到判死路径。
+
+    窗口 600s 而非 pane 的 300s：转录写入**滞后于** pane 输出（同一轮先从 pane
+    可见，落盘要等该事件写完）。实测 2026-10-21 18:30 本机 20 个角色，
+    devops 滞后 408s、reviewer 滞后 295s —— 与 pane 同窗时，"pane 刚静默、
+    转录还没赶上"这一小段会被读成两路同时静默 → 判死。429 客户端退避的单次
+    等待实测最长 4m27s，也在 300s 之外。
 
     探测不可用（目录缺失 / 无转录 / stat 失败）时返回 False：调用方把它当
     「另一路证据」与 pane/DB 判据并列（见 _cleanup_stale_workflows 条件 4），
