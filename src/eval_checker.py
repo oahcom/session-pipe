@@ -53,6 +53,10 @@ _SUBAGENT_WINDOW_S = 24 * 3600
 # 子代理合规统计靠它切轮，改文案必须同步这里。
 _SUBAGENT_DIRECTIVE_MARK = "本步必须使用子代理（引擎强制）"
 
+# 上轮已落 bus 的 (followed, rounds)，按角色。进程级即可：daemon 重启后重发
+# 一次无害，而持久化去重表要多一张表、多一处清理。
+_LAST_SUBAGENT: dict[str, tuple[int, int]] = {}
+
 # ── extract "验证:" from criterion ──
 
 def _extract_cmd(criterion: str) -> str | None:
@@ -1381,8 +1385,15 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                 traj_result = traj.check(role["name"], f"eval_{role['name']}")
                 # 子代理遵从：观测型，不计入 passed/failed，只落 bus 供人读。
                 # 只有真的派过指令才报，避免给没收到指令的角色刷 0 值噪音。
+                # ponytail: 去重按进程内存，跨角色互不影响；天花板是重启后每人多发
+                # 一条，升级路径 = 落 DB 去重表（当前不值得）。
                 _sub = traj_result.get("subagent") or {}
-                if _sub.get("rounds", 0) > 0:
+                _cur = (_sub.get("followed", 0), _sub.get("rounds", 0))
+                # 只在数字变化时写。抽样每 300s 一轮，无条件写会让同一组数字
+                # 反复落到 bus：facts.t 是 UNIQUE + UPSERT，同文本会抬高 ts，
+                # 而 created_after 屏障读的正是这个可变列（旧消息因此复活）。
+                if _cur[1] > 0 and _LAST_SUBAGENT.get(role["name"]) != _cur:
+                    _LAST_SUBAGENT[role["name"]] = _cur
                     _write_bus(
                         "verification",
                         f"[eval_checker] 子代理遵从: {role['name']} "
