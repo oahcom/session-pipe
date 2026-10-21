@@ -72,11 +72,36 @@ def test_backlog_alert_cooldown_suppresses_repeat():
     assert eng._backlog_alert_allowed("qa") is True, "冷却窗口过后应重新放行"
     print("✅ 积压告警 30min 冷却 ✓")
 
+def test_notify_role_cooldown_suppresses_repeat_in_same_window():
+    """同一 (role,title) 30min 只投一次；标题不同照常投；状态是进程级。
+
+    实测 maintainer 30h 收 265 次同标题告警（正文 1→0 反复翻转，滚动 1h 内 100 次、
+    最小间隔 8.4s），每次都占一个完整上下文回合。状态没变就不该再叫醒角色。
+    """
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._ALERT_TS.clear()
+    eng = _get_test_eng()
+    eng._bb = MagicMock()
+    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)):
+        eng._notify_role("maintainer", "工作流多步骤超时: wf_x", "2 个步骤…")
+        eng._notify_role("maintainer", "工作流多步骤超时: wf_x", "0 个步骤…")
+        eng._notify_role("maintainer", "僵尸工作流自动回收: 3 台", "…")
+    assert eng._bb.write.call_count == 2, f"重复标题应被抑制, got {eng._bb.write.call_count}"
+    # 冷却必须跨 engine 实例生效（daemon 每 tick 新建实例也照样限流）
+    eng2 = _get_test_eng()
+    eng2._bb = MagicMock()
+    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)):
+        eng2._notify_role("maintainer", "工作流多步骤超时: wf_x", "2 个步骤…")
+    assert eng2._bb.write.call_count == 0, "冷却不得随 engine 实例重置"
+    RoleLifecycleMixin._ALERT_TS.clear()
+    print("✅ 告警 (role,title) 冷却（进程级）✓")
+
 if __name__ == "__main__":
     for t in (test_event_key_deterministic_and_dimension_sensitive,
               test_can_assign_role_backpressure,
               test_fanout_dedup_skips_duplicate_role,
-              test_backlog_alert_cooldown_suppresses_repeat):
+              test_backlog_alert_cooldown_suppresses_repeat,
+              test_notify_role_cooldown_suppresses_repeat_in_same_window):
         try:
             t()
         except Exception as e:
