@@ -117,3 +117,15 @@ import pytest  # noqa: E402
 def _isolate_role_transcripts(tmp_path, monkeypatch):
     from pipeflow import role_lifecycle as _rl
     monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+
+
+# 6. ccs CLI 隔离：db/workspace/bus 都已重定向，但 _notify_role / _send_to_role
+#    仍会 subprocess 调真 ccs send → 告警真投进角色 pane（scout 实测 1h 内收
+#    28 条虚构实例 wf_EC_* 告警，产物行由 launcher 写进生产 workflows.db）。
+#    argv 形状不变，只把可执行文件换成 /bin/true，断言仍可观测。
+@pytest.fixture(autouse=True)
+def _isolate_ccs_cli(monkeypatch):
+    from pipeflow import role_lifecycle as _rl, wf_lifecycle as _wl
+    from routing import routes as _routes
+    for _m in (_rl, _wl, _routes):
+        monkeypatch.setattr(_m, "_CCS_CLI", Path("/bin/true"), raising=False)
