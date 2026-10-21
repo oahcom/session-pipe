@@ -164,7 +164,7 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 
 - 冷却 `_OVERFLOW_COOLDOWN=300s`；时效 `_OVERFLOW_ERR_MAX_AGE=600s`
 - 回归守卫：`tests/test_context_overflow.py`（含 transcript 四例）
-- **改了本逻辑需重启 `session-pipeline-daemon.service`** —— daemon 无热重载（`session-pipeline.service` 不存在，实测 `Unit ... could not be found`）
+- **改了本逻辑需重启 `workflow-engine.service`**（`systemctl --user restart workflow-engine.service`，它跑 `src/pipeflow/daemon.py`，`_check_context_overflow` 在这条链上）；`session-pipeline-daemon.service` 跑的是 `routing_daemon.py`，与这段逻辑无关。系统单元 `session-pipeline.service` 存在但 inactive。
 
 ## SQLite 运维
 生产 DB 位于 `~/.hermes/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
