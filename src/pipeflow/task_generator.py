@@ -334,6 +334,19 @@ class TaskGeneratorMixin:
                                 else:
                                     _sdata["status"] = "completed"
                                     _sdata["completed_at"] = time.time()
+                                    # 容器步的产出在子链里：只记出处，不搬 exit_messages
+                                    # （父步文案会被返工分类/判词读成"这一步自己的结论"）。
+                                    # 不记则审计口径里这一步是"零产出完成"——24h 实测 18 步，
+                                    # 32% 无 exit_messages 里有一半是这类聚合步，反复被误读。
+                                    _sdata.setdefault("completed_by", f"subflow:{_sf}")
+                                    _sdata["subflow_evidence"] = {
+                                        "subflow_id": _sf,
+                                        "last_step": (_sub_row_sr["current_step_id"]
+                                                      if _sub_row_sr else ""),
+                                        "exit_message_ids": [
+                                            _m.get("id") for _m in (_sub_last.get("exit_messages") or [])
+                                            if isinstance(_m, dict)],
+                                    }
                                 conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
                                     (json.dumps(_sr, ensure_ascii=False), _sub_row["instance_id"]))
                                 conn.commit()
