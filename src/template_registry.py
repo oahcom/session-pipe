@@ -116,11 +116,7 @@ TEMPLATE_SCHEMA = {
                     "properties": {
                         "output_exists": {
                             "type": "array", "items": {"type": "string"}
-                        },
-                        "contains_keyword": {
-                            "type": "array", "items": {"type": "string"}
-                        },
-                        "review_required": {"type": "boolean"}
+                        }
                     }
                 },
                 "failure_patterns": {

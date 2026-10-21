@@ -7,3 +7,25 @@ for f in $(git diff --cached --name-only --diff-filter=ACM | grep '\.py$'); do
   fi
 done
 echo "  all staged .py files OK"
+
+# ── revert-guard: 拒绝“历史回滚”型裸提交 ──────────────────────────────
+# 暂存内容与 HEAD 不同、却恰好等于近 50 个提交中的某个旧版本，说明工作树/暂存区被旧版本
+# 覆盖；一次裸 commit 会静默回滚已合入的修复。实测 2026-10-22 三个仓同时命中：
+#   wt-launcher 倒退 a7e6a1f(测试写生产总线守卫)+e08873b(脏 epoch 守卫)
+#   hermes-session-roles 倒退 72ce807 的 prompts/base.md
+#   session-pipeline 倒退 engine.py 到旧 blob
+# 真需回滚用 git revert <commit>；确要旧内容设 ALLOW_HISTORY_ROLLBACK=1。
+if [ "$ALLOW_HISTORY_ROLLBACK" != "1" ]; then
+  for path in $(git diff --cached --name-only -z | tr '\0' '\n'); do
+    staged=$(git rev-parse ":$path" 2>/dev/null) || continue
+    head=$(git rev-parse "HEAD:$path" 2>/dev/null) || continue
+    [ "$staged" = "$head" ] && continue
+    for c in $(git rev-list --max-count=50 HEAD); do
+      old=$(git rev-parse "$c:$path" 2>/dev/null) || continue
+      if [ "$old" = "$staged" ]; then
+        echo "REVERT-GUARD 阻止提交: $path 的暂存内容等于历史版本 $c，提交会静默回滚已合入的修复。真需回滚用 git revert；确要旧内容设 ALLOW_HISTORY_ROLLBACK=1。" >&2
+        exit 1
+      fi
+    done
+  done
+fi

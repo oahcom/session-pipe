@@ -898,12 +898,6 @@ class TrajectoryQualityChecker:
                                 if not isinstance(blk, dict):
                                     continue
                                 if blk.get("type") == "tool_use":
-                                    # 解析失败的重试残影：同一调用会各留一条可解析与
-                                    # 一条 __unparsedToolInput（实测 2760 对，0 例外）。
-                                    # 两条同 id 会让「写调用↔创建结果」配错号，把新建写
-                                    # 误判成盲改（R129 pg/reviewer 14 条全是这一类）。
-                                    if "__unparsedToolInput" in (blk.get("input") or {}):
-                                        continue
                                     order += 1
                                     calls.append({
                                         "kind": "use", "name": blk.get("name"),
@@ -1007,13 +1001,17 @@ class TrajectoryQualityChecker:
                 tail_use_ids.add(c["id"])
 
         # 新建文件不算盲改：把“写调用→新建文件路径”映射出来，免除该调用的盲改判定。
-        # 同一 transcript 内 tool_use id 会重复（实测 3839 处），不能按 id 做唯一键：
-        # 顺序配对 use→result，让同 id 的第二条写不继承前一条的新建豁免。
+        # 结果只配给「此前最近一条**可解析**的写调用」：解析失败的重试残影
+        # （input 只有 __unparsedToolInput，实测 2760 对）没有 file_path，本身也判不了
+        # 盲改；让它参与配对就会把新建结果抢到自己名下，真正那条写反被报成盲改
+        # （R129：pg 4 / reviewer 5 / ccs-monitor 1 / security-auditor 1 全是这一类）。
+        # 键带序号：同一 id 若真被第二次写复用，第二条不继承第一条的豁免。
         # 路径捕获到行尾（不是 \S+）：路径可含空格，截断会同时造成误报与漏报。
         created_by_call: dict[tuple[str, str, int], str] = {}
-        _pending: dict[tuple[str, str], int] = {}   # (src, id) → 最近一条 Write use 的序号
+        _pending: dict[tuple[str, str], int] = {}   # (src, id) → 最近一条可解析写调用的序号
         for c in calls:
-            if c["kind"] == "use" and c["name"] == "Write" and c["id"]:
+            if (c["kind"] == "use" and c["name"] == "Write" and c["id"]
+                    and "__unparsedToolInput" not in (c["input"] or {})):
                 _pending[(c["src"], c["id"])] = c["order"]
             elif c["kind"] == "result" and c["id"] and not c["error"]:
                 _k = (c["src"], c["id"])
@@ -1029,9 +1027,10 @@ class TrajectoryQualityChecker:
         # 写没落地就不构成盲改：pg 的「No such tool available: Write」曾被报成
         # blind_edit（文件根本没写）。同 id 可能有成功+失败两条结果（重试残影），
         # 只要有一条成功就说明写发生过，仍按盲改判定。
-        _ok_ids = {c["id"] for c in calls
+        # 键带 transcript 路径：裸 id 会跨 transcript 撞车，把别的会话的失败当成本次失败。
+        _ok_ids = {(c["src"], c["id"]) for c in calls
                    if c["kind"] == "result" and c["id"] and not c["error"]}
-        failed_ids = {c["id"] for c in calls
+        failed_ids = {(c["src"], c["id"]) for c in calls
                       if c["kind"] == "result" and c["id"] and c["error"]} - _ok_ids
 
         def _close_thrash():
@@ -1081,7 +1080,7 @@ class TrajectoryQualityChecker:
                 # 此结果对应此前发出的该写调用（result id == tool_use_id）。
                 # 路径也必须相符：只认「这条写调用自己新建了这个文件」。
                 # 不让任意含该文案的结果豁免（错误回显 input 时也含此短语）。
-                if cid and cid in failed_ids:
+                if cid and (c["src"], cid) in failed_ids:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
                     continue

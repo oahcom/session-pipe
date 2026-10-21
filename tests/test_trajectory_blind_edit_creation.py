@@ -211,12 +211,38 @@ def test_failed_write_is_not_blind_edit() -> None:
             pass
 
 
+def test_one_success_result_keeps_blind_edit() -> None:
+    """同 id 一成功一失败（重试残影）：只要有一次写成了，照判盲改。
+
+    反之（只看 error 就跳过）会变成「先失败一次，后面盲写全部免检」的后门。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-mixedretry-role"
+    lines = _write_seq(0, "cm", "/tmp/probe_mixed.py", "ok")
+    lines.append(_turn(1, "user", [
+        {"type": "tool_result", "tool_use_id": "cm", "is_error": True,
+         "content": "<tool_use_error>InputValidationError: Write was called with "
+                    "input that could not be parsed as JSON.</tool_use_error>"},
+    ]))
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("mixedretry", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"有成功结果却放过盲改: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     for _t in (test_created_file_not_flagged,
                test_list_shaped_result_content,
                test_path_mismatch_and_error_echo_not_exempted,
                test_non_creation_write_still_flagged,
                test_unparsed_retry_duplicate_not_blind_edit,
-               test_failed_write_is_not_blind_edit):
+               test_failed_write_is_not_blind_edit,
+               test_one_success_result_keeps_blind_edit):
         _t()
-    print("PASS: 6 tests")
+    print("PASS: 7 tests")

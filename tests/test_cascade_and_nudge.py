@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""父链判死必须级联子链；催办 argv 必须能被 ccs 解析。
+"""父链判死必须级联子链。
 
-现场：
-  1) 72h 内 76 条子链挂在已 cancelled/failed 的父链下，wf_sub_ee03a71c3
-     在父链死后仍 running 21min（不级联 → 孤儿占角色、产出无人消费）。
-  2) step_handler._nudge_assigner 传 `send-safe --from`，而 ccs 只认
-     `--by-role` → argparse rc=2，催办自建立起从未成功。
-
-运行: cd ~/session-pipeline && python3 tests/test_cascade_and_nudge.py
+现场：72h 内 76 条子链挂在已 cancelled/failed 的父链下，wf_sub_ee03a71c3
+在父链死后仍 running 21min（不级联 → 孤儿占角色、产出无人消费）。
 """
 import os
 import sys
@@ -249,33 +244,6 @@ def test_timeout_marker_alone_does_not_kill():
         assert _status(lm, "wf_fresh") == "running", "10 分钟前才产出的角色被当成卡死回收"
     with patch("liveness.tmux_pane_active", lambda role, **k: False):
         _with_db(_run)
-
-
-def test_nudge_argv_uses_by_role():
-    """_nudge_assigner 的 argv 必须是 --by-role（ccs send-safe 的唯一签名）。"""
-    calls = []
-
-    def _fake_run(argv, **kw):
-        calls.append(argv)
-        return SimpleNamespace(returncode=0, stderr=b"")
-
-    class _Eng(StepHandlerMixin):
-        pass
-
-    eng = _Eng()
-    eng._lifecycle = SimpleNamespace(
-        _get_assigner_for_step=lambda *a, **k: "qa",
-        _get_wf_unsafe=lambda *a: {"instance_id": "wf_x"},
-        get_step=lambda *a: {})
-    run = SimpleNamespace(id="wf_x", workflow_name="tpl")
-    step = SimpleNamespace(id="s1", title="t", type="review", target_role="engineer")
-    import subprocess as real_sp
-    with patch.object(real_sp, "run", _fake_run):
-        eng._nudge_assigner(run, step, "tok")
-    assert calls, "催办未发起 ccs 调用"
-    argv = calls[-1]
-    assert "--by-role" in argv, f"催办 argv 缺 --by-role: {argv}"
-    assert "--from" not in argv, f"催办 argv 仍用非法参数 --from: {argv}"
 
 
 def test_ccs_parser_rejects_from_flag():

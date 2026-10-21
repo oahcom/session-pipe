@@ -176,7 +176,8 @@ def _blocking_rework_sts(rows) -> list:
     让它阻断会让产品链被维护队列扣死（实测维护者队列 91 深，3 条主链被一条
     从未投递的维护链扣 8h+，升级后按"链仍活"无限续期到 24h 全局回收）。
     """
-    return [r["status"] for r in rows if "maintainer" not in (r["template_id"] or "")]
+    return [r["status"] for r in rows
+            if (r["template_id"] or "").replace("WF-", "") != SYSTEM_REWORK_TPL]
 
 
 def _rejected_wait_anchor(sr: dict, inst: dict):
@@ -212,10 +213,14 @@ def _rework_alive(lm, rework_ids: list) -> bool:
         return False
     try:
         _ph = ",".join("?" * len(rework_ids))
+        # 系统问题链不算"还在写"：它修的是引擎/模板债，不会动产品产物，
+        # 拿它续期会让父链陪着排队（实测维护队列 91 深）一路续到 24h 回收。
+        # 与 _blocking_rework_sts 同一口径，两处必须一致。
         return any(r["status"] not in _REWORK_TERMINAL
                    for r in lm.query(
-                       f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
-                       tuple(rework_ids)))
+                       f"SELECT status, template_id FROM workflow_instances "
+                       f"WHERE instance_id IN ({_ph})", tuple(rework_ids))
+                   if (r["template_id"] or "").replace("WF-", "") != SYSTEM_REWORK_TPL)
     except Exception:
         return True
 
@@ -295,7 +300,8 @@ class WorkflowRun:
 from pipeflow.step_handler import StepHandlerMixin, _queue_budget_sec
 from pipeflow.role_lifecycle import RoleLifecycleMixin
 from pipeflow.task_generator import TaskGeneratorMixin
-from pipeflow.wf_lifecycle import WorkflowLifecycleMixin, _role_producing_recently
+from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
+                                   _role_producing_recently)
 
 
 class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMixin, StepHandlerMixin):
@@ -519,14 +525,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("[wf] SQLite 模板加载失败: %s", e)
 
     def list_workflows(self) -> list[str]:
-        # 别名与规范名同对象：按对象去重，避免同一模板列两遍
-        seen_wf: set[int] = set()
-        out: list[str] = []
-        for name, wf in sorted(self._workflows.items()):
-            if wf.is_subflow or id(wf) in seen_wf:
-                continue
-            seen_wf.add(id(wf)); out.append(name)
-        return out
+        # 别名与规范名同对象：按对象去重，列短键（JSON 名），wf list 输出不变
+        _keys: dict[int, list[str]] = {}
+        for name, wf in self._workflows.items():
+            if not wf.is_subflow:
+                _keys.setdefault(id(wf), []).append(name)
+        return sorted(min(_ks, key=len) for _ks in _keys.values())
 
     def active_workflow_count(self) -> int:
         """当前活跃工作流数（pending/running/step_done_ready）。"""
@@ -989,6 +993,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 实测 blocker #397347：子链任务 task_sub_80bd6be1.description 逐字
                     # 含「标题: {title}\n描述: {description}」；同族 #397394/#398563。
                     task_desc = UNMATCHED_VAR_RE.sub("", task_desc)
+                    # 首步同样要给验收判据：7 天内 103 台实例 s1 都因标题写不中契约
+                    # 超时重投（推进步那条修法管不到 s1）。
+                    _need = [UNMATCHED_VAR_RE.sub("", x)
+                             for x in self._acceptance_lines(step)]
                     # 任务上下文注入：把 title/desc 放到 prompt 头部，角色立刻知道干什么
                     task_header = (
                         f"[任务] {task_title}\n"
@@ -998,6 +1006,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # → 步骤熬到超时（返工子链即此形态）。
                         f"[实例] {inst['instance_id']}（完成消息标题必须含此 id）\n"
                         f"[工作流目标] {step.title}\n"
+                        + (f"[验收] {'；'.join(_need)}\n" if _need else "")
                         + (f"[任务描述] {task_desc}\n" if task_desc else "")
                         + "\n"
                     )
@@ -1017,7 +1026,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     prompt = prompt.replace("{topic}", task_title)
                     # 补充替换：12个JSON模板使用{task_definition}/{acceptance_criteria}
                     prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
-                    prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
+                    prompt = prompt.replace(
+                        "{acceptance_criteria}",
+                        "；".join(_need) if _need
+                        else (task_desc or "按模板要求完成产出并写入对应bus分类"))
                     # 首步无上一步产出，用任务标题作变量的语义默认值，避免空变量。
                     # 值本身也可能自带 {xxx} 字面量（title/desc 来自模板正文），
                     # 直接 replace 会把键写回文本 → 守卫拦下。故清洗后再用。
@@ -1315,6 +1327,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         except Exception as _rw:
                             LOGGER.warning("rejected 建返工链失败 %s/%s: %s",
                                            inst["instance_id"][:12], step_id, _rw)
+                    _sys_rw_ids = []
                     if _rework_ids:
                         # 返工链回流：等全部终态才决定出口。
                         # 为什么自己查而不走 _scan_tasks 的 subflow_id 通道：那条通道
@@ -1323,10 +1336,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         try:
                             _ph = ",".join("?" * len(_rework_ids))
                             _rework_rows = lm.query(
-                                f"SELECT status, template_id FROM workflow_instances "
+                                f"SELECT instance_id, status, template_id FROM workflow_instances "
                                 f"WHERE instance_id IN ({_ph})", tuple(_rework_ids))
                             _sts = [r["status"] for r in _rework_rows]
-                            _gate_sts = _blocking_rework_sts(_rework_rows)
+                            _sys_rw_ids = [r["instance_id"] for r in _rework_rows
+                                           if (r["template_id"] or "").replace("WF-", "")
+                                           == SYSTEM_REWORK_TPL]
                         except Exception as _q:
                             # 查询失败 ≠ 链不存在：置空会落进下面的「无返工链→重投
                             # 原步」，与仍在跑的返工链并发推进同一个 step。
@@ -1339,7 +1354,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # → 被再驳回 → 再建链，形成自旋。实测 wf_3f71a2a78：3 条返工链
                         # 同时压单线程 maintainer，2 条排队 10 tick 后被回收，我的回流把
                         # cancelled 当「已处理」→ 8 分钟内 retry 从 3 涨到 6 仍在涨。
-                        _exit = _rework_exit(_gate_sts)
+                        _exit = _rework_exit(_blocking_rework_sts(_rework_rows))
                         if _exit == "wait":
                             # 返工链仍在跑：等它，但有上限（返工链自身无 timeout，
                             # 链内卡一步父链就永远等）。超限只喊一次、不停止等。
@@ -1385,6 +1400,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                               if k not in _REQUEUE_DROP}
                     _reset["rejected_retry"] = _retry
                     _reset["status"] = ""
+                    # 系统问题链不阻断重审，但也不能弃养：留在 rework_ids 里，
+                    # 下一轮驳回时去重能认回它，失败时也还能被升级看到。
+                    if _sys_rw_ids:
+                        _reset["rework_ids"] = _sys_rw_ids
                     results[step_id] = _reset
                     lm.execute(
                         "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
