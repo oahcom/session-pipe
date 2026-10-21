@@ -1427,6 +1427,7 @@ class WorkflowLifecycleMixin:
                 _rows = self._lifecycle.query(
                     "SELECT instance_id FROM workflow_instances "
                     "WHERE parent_wf_id=? AND subflow_source_step_id=? "
+                    "AND instance_id NOT LIKE 'wf_rw_%' "
                     "ORDER BY created_at DESC LIMIT 1", (wf_id, step_id))
                 _sf = _rows[0]["instance_id"] if _rows else ""
             except Exception as _e:
