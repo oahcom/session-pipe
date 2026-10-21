@@ -96,6 +96,29 @@ def test_notify_role_cooldown_suppresses_repeat_in_same_window():
     RoleLifecycleMixin._ALERT_TS.clear()
     print("✅ 告警 (role,title) 冷却（进程级）✓")
 
+
+def test_notify_role_does_not_burn_cooldown_when_send_fails():
+    """叫不醒就不许记账：rc≠0 或抛错时，下一次必须仍能重试。
+
+    冷却写在投递之前时，角色没收到告警也会被静默 30min（bus 有 blocker、
+    角色 pane 什么都没有），状态没变就永远补不上。
+    """
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._ALERT_TS.clear()
+    eng = _get_test_eng()
+    eng._bb = MagicMock()
+    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=1)):
+        eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
+    assert RoleLifecycleMixin._ALERT_TS == {}, "rc≠0 仍记了冷却"
+    with patch("pipeflow.engine._sp.run", side_effect=RuntimeError("boom")):
+        eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
+    assert RoleLifecycleMixin._ALERT_TS == {}, "send 抛错仍记了冷却"
+    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)):
+        eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
+    assert len(RoleLifecycleMixin._ALERT_TS) == 1, "投递成功后应记账"
+    RoleLifecycleMixin._ALERT_TS.clear()
+
+
 if __name__ == "__main__":
     for t in (test_event_key_deterministic_and_dimension_sensitive,
               test_can_assign_role_backpressure,
