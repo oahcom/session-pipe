@@ -1011,14 +1011,19 @@ class TrajectoryQualityChecker:
             return os.path.realpath(os.path.expanduser(fp)) if fp else ""
 
         def _is_scratch(fp: str) -> bool:
-            """临时目录里的文件不是盲改目标：草稿没有需要保护的既有内容。
+            """临时目录里的草稿：只豁免 Write，不豁免 Edit。
 
-            实测 2026-10-22 24h 全 19 角色只剩 2 处 blind_edit，全在 /tmp：
-            engineer /tmp/eng_sim2.py、knowledge_curator /tmp/inspect_rw.py，
-            仓内 0 处。这两处让门禁每轮 checked=2 failed=2、角色再花一轮自证；
-            而 Claude Code 对 Write 的返回本身就是"no need to Read it back"。
-            ponytail: 天花板=/tmp 下真有人放需要保护的交付物时会被放过；
-            升级路径=改成只豁免配置里的草稿目录白名单。
+            Write 是全量覆盖，Claude Code 的返回本身写着 "no need to Read it back"，
+            草稿也没有需要保护的既有内容：实测 24h 全 19 角色只剩 2 处 blind_edit，
+            全在 /tmp（engineer /tmp/eng_sim2.py、knowledge_curator /tmp/inspect_rw.py），
+            仓内 0 处；这两处让门禁每轮 checked=2 failed=2、角色还要各花一轮自证。
+
+            Edit/MultiEdit 不豁免：子代理审 1154 个 transcript 发现 /tmp 下 353 个被写
+            路径里 5 个是「起稿后 cp 进仓/系统目录」的（/tmp/20-memory-tuning.conf →
+            systemd drop-in、/tmp/ccs-monitor/pass.sh → 在跑的巡检脚本），首写无害，
+            之后对它们的无 Read Edit 是真盲改，不能按目录放过。
+            ponytail: 天花板=/tmp 下写报告类交付物（12.2% 是 .md/.txt）时不判盲改；
+            升级路径=改成草稿目录白名单配置。
             """
             return _key(fp).startswith(("/tmp/", "/var/tmp/"))
 
@@ -1197,8 +1202,10 @@ class TrajectoryQualityChecker:
                 if (fp and own_written.get(
                         (c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
-                if (fp and _key(fp) not in read_files and not bash_read
-                        and not _is_scratch(fp)):
+                # 草稿的 Write 不算盲改（见 _is_scratch）；Edit 照判。
+                if _is_scratch(fp) and name == "Write":
+                    continue
+                if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
                         "issue": "blind_edit", "tool": name,
                         "file": fp, "id": cid,

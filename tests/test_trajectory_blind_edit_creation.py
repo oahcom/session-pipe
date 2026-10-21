@@ -538,6 +538,41 @@ def test_scratch_write_not_flagged() -> None:
             pass
 
 
+
+
+def test_scratch_edit_still_flagged() -> None:
+    """草稿目录只豁免 Write：Edit 仍判盲改。
+
+    /tmp 里 353 个被写路径中有 5 个是"起稿后 cp 进仓/系统目录"的
+    （/tmp/20-memory-tuning.conf → systemd drop-in、/tmp/ccs-monitor/pass.sh →
+    在跑的巡检脚本）；首写无害，之后对它们的无 Read Edit 是真盲改。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-scratchedit-role"
+    path = "/tmp/probe_scratch_edit.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "ce9", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "ce9", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("scratchedit", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"草稿目录的 Edit 不该被豁免: {res['findings']}"
+        assert blind[0]["file"] == path
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -556,6 +591,7 @@ if __name__ == "__main__":
         test_bash_same_absolute_path_still_exempts,
         test_second_write_of_own_file_not_flagged,
         test_scratch_write_not_flagged,
+        test_scratch_edit_still_flagged,
     )
     for _t in _tests:
         _t()
