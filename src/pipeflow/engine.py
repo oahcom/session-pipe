@@ -171,6 +171,15 @@ def _rejected_wait_anchor(sr: dict, inst: dict):
             or (inst or {}).get("created_at"))
 
 
+def _rejected_escalation_expired(sr: dict, now: float) -> bool:
+    """升级后是否已超终结期限。锚缺失（老数据/未升级）→ False，不追判。
+
+    抽为纯函数与上面两个同因：测试直调真代码，复刻会与引擎漂移。
+    """
+    _esc = (sr or {}).get("rework_escalated_at")
+    return bool(_esc) and (now - _esc) > _REJECTED_ESCALATED_MAX
+
+
 
 @dataclass
 class Step:
@@ -1254,7 +1263,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 都只在 rework_escalated_at 上落锚、然后 continue——没人处置就一直
                     # 停在这里等 24h 全局 cancel。放在分支入口一次判齐，不必三处各写。
                     _esc_at = _rej_sr.get("rework_escalated_at")
-                    if _esc_at and time.time() - _esc_at > _REJECTED_ESCALATED_MAX:
+                    if _rejected_escalation_expired(_rej_sr, time.time()):
                         self._bb.write("blocker",
                             f"[workflow] {inst['instance_id'][:12]}/{step_id} 升级后"
                             f" {_REJECTED_ESCALATED_MAX // 3600}h 无人处置，按 failed 收口",
