@@ -329,8 +329,9 @@ _TICK_BUDGET_SEC = 60
 # 插入序遍历，尾部实例每轮都排不到（实测 2026-10-22：22 条在飞实例 150s 内零变化，
 # wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 从未投出，父链被回收）。
 # 用断点轮转而不是 ORDER BY：不引入 JSON 依赖（坏 step_results 会让整条查询报错），
-# 也不会让任何一组（如 ts 缺失的）长期霸占预算。进程内状态，重启即从头。
-_LOOP_RESUME_ID = ""
+# 也不会让任何一组（如 ts 缺失的）长期霸占预算。
+# 断点挂在引擎实例上而非模块全局：daemon 单实例跨 tick 复用，测试每用例新建引擎
+# 天然复位——模块全局会让用例互相污染遍历起点（三方审查 2026-10-22 P3）。
 
 
 def _rotate_after(rows, last_id):
@@ -370,6 +371,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 评审 unknown 只播报一次（实例,步骤,文本）。进程内即可：
         # 重启后最多重播一次，不值得落库。
         self._unknown_verdict_notified: set[tuple] = set()
+        # 轮转断点：主循环与预推进各一个。两处 WHERE 不同，共用会频繁遇到锚点不在
+        # 结果里 → 回落表头，白白浪费一圈。
+        # ponytail: 进程内状态，daemon 热重载（os.execv）即归零；开发期重载比一圈
+        # 还勤时轮转等于没修。要抗重载就得把锚点落库，届时再改。
+        self._loop_resume_id = ""
+        self._prepass_resume_id = ""
         self._load_workflows()
 
     @property
@@ -891,7 +898,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         LOGGER.warning("rejected 升级 %s/%s: %s", wf_id[:12], step_id, reason)
 
     def run_once(self):
-        global _LOOP_RESUME_ID
         _t_tick = time.time()
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
@@ -924,13 +930,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 预推进写在 _scan_tasks 之前也意味着它回的整字典快照不会被之后落的
         # 子链账本反向覆盖（那条顺序约束见上面 early _scan_tasks 的注释）。
         try:
-            for _pr in self._lifecycle.query(
+            _pr_rows = _rotate_after(list(self._lifecycle.query(
                     "SELECT instance_id, template_id, current_step_id, step_results "
                     "FROM workflow_instances "
-                    "WHERE status IN ('running','step_done_ready')"):
-                if time.time() - _t_tick > _TICK_BUDGET_SEC:
-                    LOGGER.warning("预推进超 %ds 预算，余下实例下轮再推", _TICK_BUDGET_SEC)
+                    "WHERE status IN ('running','step_done_ready')")),
+                    self._prepass_resume_id)
+            for _pn, _pr in enumerate(_pr_rows):
+                # 首行保底与轮转必须成对：预算自 run_once 起点算（前面 _load_workflows/
+                # 清理/_scan_tasks 都在吃这 60s），无条件 break 就一条都进不去；只保底
+                # 不轮转，则表头那条非 step_done_ready 的实例每轮 continue 掉唯一席位，
+                # 索引尾部的 step_done_ready 反而永久饿死。
+                if _pn and time.time() - _t_tick > _TICK_BUDGET_SEC:
+                    LOGGER.warning("预推进超 %ds 预算，本轮走到 %s（%d/%d 行，%.0fs）",
+                                   _TICK_BUDGET_SEC, self._prepass_resume_id or "-", _pn,
+                                   len(_pr_rows), time.time() - _t_tick)
                     break
+                self._prepass_resume_id = _pr["instance_id"]
                 _pr_sr = json.loads(_pr["step_results"] or "{}")
                 if ((_pr_sr.get(_pr["current_step_id"]) or {}).get("status")
                         not in ("step_done_ready", "completed")):
@@ -967,13 +982,16 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 "status, task_id, effective_roles "
                 "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
-            rows = _rotate_after(list(rows), _LOOP_RESUME_ID)
-            for row in rows:
-                if time.time() - _t_tick > _TICK_BUDGET_SEC:
-                    LOGGER.warning("tick 超 %ds 预算，中止本轮剩余实例（下轮续跑）",
-                                   _TICK_BUDGET_SEC)
+            rows = _rotate_after(list(rows), self._loop_resume_id)
+            for _n, row in enumerate(rows):
+                # 首行保底：预推进/清理/_scan_tasks 共用这 60s 预算，它们吃满后若无条件
+                # break，断点原地不动 → 下轮还是同一批表头，轮转结构上救不了整体饥饿。
+                if _n and time.time() - _t_tick > _TICK_BUDGET_SEC:
+                    LOGGER.warning("tick 超 %ds 预算，本轮走到 %s（%d/%d 行，%.0fs）",
+                                   _TICK_BUDGET_SEC, self._loop_resume_id or "-", _n,
+                                   len(rows), time.time() - _t_tick)
                     break
-                _LOOP_RESUME_ID = row["instance_id"]
+                self._loop_resume_id = row["instance_id"]
                 inst = dict(row)
                 if inst.get("status") == "pending":
                     lm.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))

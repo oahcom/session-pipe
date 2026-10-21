@@ -6,8 +6,8 @@
   liveness._tmux_has_session 5s 超时 × N 角色，_send_to_role 60s 超时）；
 - 推进排在这些阶段后面，服务 TimeoutStopSec=90 的重启每次把整轮打断
   → 实测 4 个实例卡在 step_done_ready 1.5~2.4h，一步都推不动。
-本用例锁住两条：① 预推进发生在 _scan_tasks 之前；② 预算为 0 时确实不推进
-（防止把"预算"写成恒真/恒假）。
+本用例锁住两条：① 预推进发生在 _scan_tasks 之前；② 预算恒超时恰好推进一条
+（防止把"预算"写成恒真/恒假，也防退回到"一条都不推进"的整体饥饿）。
 
 运行: cd ~/session-pipeline && python3 -m pytest tests/test_tick_budget.py -q
 """
@@ -82,23 +82,70 @@ def test_advance_happens_before_scan_tasks(_sp):
 
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0, stdout="claude\n", stderr=""))
-def test_zero_budget_stops_advance(_sp):
+def test_zero_budget_advances_exactly_one(_sp):
+    """预算恒超 → 首行保底推进，且不得一次推完。
+
+    旧契约是"预算为 0 → 一条都不推进"，而那正是整体饥饿的成因：预算自 run_once
+    起点算，前置阶段（_load_workflows / 清理 / _scan_tasks）吃满 60s 后主循环连
+    第一条都进不去，断点原地不动，轮转结构上救不了（三方审查 2026-10-22 A-1）。
+    新契约：首行保底（一定推进），其余留到下轮（靠轮转保证不饿死）。
+    """
+    d = _env()
+    _wf(d, "tbflow", ["s1", "s2"])
+    eng = _fast(WorkflowEngine(d))
+    rids = [eng.start("tbflow", {}) for _ in range(2)]
+    for rid in rids:
+        _ready(eng, rid)
+        # 置回 pending：预推进只查 running/step_done_ready，pending 是主循环独有集合，
+        # 这样推进只可能来自主循环，守卫被拆掉时这里必然 0 条。
+        eng._lifecycle.execute(
+            "UPDATE workflow_instances SET status='pending' WHERE instance_id=?", (rid,))
+
+    _old = engine_mod._TICK_BUDGET_SEC
+    engine_mod._TICK_BUDGET_SEC = -1      # 负预算 = 恒超（不依赖时钟分辨率）
+    try:
+        eng.run_once()
+    finally:
+        engine_mod._TICK_BUDGET_SEC = _old
+
+    steps = [eng.status(r)["current_step"] for r in rids]
+    advanced = sum(1 for s in steps if s == "s2")
+    assert advanced == 1, f"预算恒超时主循环必须保底推进恰好一条: {steps}"
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0, stdout="claude\n", stderr=""))
+def test_zero_budget_also_advances_prepass(_sp):
+    """预推进层同样要首行保底（否则预算一紧它就整层空转，白拿 60s 预算）。
+
+    观测点：主循环取行那一刻（SQL 含 effective_roles）该实例是否已在 s2。
+    """
     d = _env()
     _wf(d, "tbflow", ["s1", "s2"])
     eng = _fast(WorkflowEngine(d))
     rid = eng.start("tbflow", {})
     _ready(eng, rid)
 
+    at_main = []
+    real_query = eng._lifecycle.query
+    def _spy(sql, *a, **k):
+        if "effective_roles" in sql:      # 主循环的取行语句
+            at_main.append(eng.status(rid)["current_step"])
+        return real_query(sql, *a, **k)
+    eng._lifecycle.query = _spy
+
     _old = engine_mod._TICK_BUDGET_SEC
-    engine_mod._TICK_BUDGET_SEC = 0       # 预算恒超 → 不推进
+    engine_mod._TICK_BUDGET_SEC = -1
     try:
         eng.run_once()
     finally:
         engine_mod._TICK_BUDGET_SEC = _old
-    assert eng.status(rid)["current_step"] == "s1", "预算为 0 时不得推进"
+
+    assert at_main and set(at_main) == {"s2"}, f"预算恒超时预推进必须先保底推进一条: {at_main}"
 
 
 if __name__ == "__main__":
-    test_advance_happens_before_scan_tasks(None)
-    test_zero_budget_stops_advance(None)
+    # @patch 装饰的用例由装饰器注入 mock，调用时不要再传参
+    test_advance_happens_before_scan_tasks()
+    test_zero_budget_advances_exactly_one()
+    test_zero_budget_also_advances_prepass()
     print("ok")
