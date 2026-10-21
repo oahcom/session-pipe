@@ -231,13 +231,14 @@ def daemon_loop(interval: int):
     # 连续两次探测到同一新 mtime 才退出 —— 编辑器保存瞬时态不触发重启。
     _src_dir = Path(__file__).resolve().parent
 
+    # 整个 src/ 树：engine 会 import src/task_evidence.py、workflow/*、lifecycle/*、
+    # routing/* 等，只 glob pipeflow/*.py 时改这些文件不触发重执行 → 修复写着但
+    # 跑的是旧代码（R126 实测 task_evidence.py 改完 20min 仍是旧行为）。
+    # 清单启动时取一次，之后只 stat（新增文件要等下次重执行才被跟踪）。
+    _src_files = list(_src_dir.parent.rglob("*.py"))
+
     def _src_mtime() -> float:
-        # 只看 src/pipeflow/*.py 会漏掉同层的被 import 模块（task_evidence.py、
-        # liveness.py、paths.py …）：改它们不触发重执行 → 修复写着但不生效
-        # （R126 实测 task_evidence.py 改完 20min 仍是旧代码）。两层都要看。
-        return max((_p.stat().st_mtime
-                    for _d in (_src_dir, _src_dir.parent)
-                    for _p in _d.glob("*.py")), default=0.0)
+        return max((_p.stat().st_mtime for _p in _src_files), default=0.0)
 
     _seen_mtime = _src_mtime()
 
