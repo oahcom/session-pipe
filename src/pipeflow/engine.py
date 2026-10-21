@@ -359,15 +359,23 @@ from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
 # 下一轮接着跑（每实例的处理本身幂等）。
 _TICK_BUDGET_SEC = 60
 
-# 实例循环按「本步最久没动」排序（ts 缺失 = 从未派出去 = 0，排最前）。
-# WHY：超预算只 break 本轮剩余实例，而查询无 ORDER BY → SQLite 按插入序走，
-# 尾部实例每轮都排不到（实测 2026-10-22：22 条在飞实例 150s 内零变化，
-# wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 不动，最后被回收器当僵尸杀掉）。
-# 排序让「最饿的先吃」：不新增状态、不改调度语义，只改遍历顺序。
-_INSTANCE_ORDER = (
-    "ORDER BY COALESCE(CAST(json_extract(step_results, "
-    "'$.\"' || current_step_id || '\".ts') AS REAL), 0) ASC"
-)
+# 主循环轮转断点：本轮在预算处 break，下一轮从断点**之后**接着走。
+# WHY：tick 预算 60s 超限即 break 本轮剩余实例，而查询无 ORDER BY → SQLite 按
+# 插入序遍历，尾部实例每轮都排不到（实测 2026-10-22：22 条在飞实例 150s 内零变化，
+# wf_rw_2664ec3aada3 等 3 条返工链 queued 卡在 235 从未投出，父链被回收）。
+# 用断点轮转而不是 ORDER BY：不引入 JSON 依赖（坏 step_results 会让整条查询报错），
+# 也不会让任何一组（如 ts 缺失的）长期霸占预算。进程内状态，重启即从头。
+_LOOP_RESUME_ID = ""
+
+
+def _rotate_after(rows, last_id):
+    """把 rows 转成「从 last_id 之后继续」；last_id 不在其中则原序返回。"""
+    if not last_id:
+        return rows
+    for i, r in enumerate(rows):
+        if r["instance_id"] == last_id:
+            return rows[i + 1:] + rows[:i + 1]
+    return rows
 
 
 class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMixin, StepHandlerMixin):
@@ -380,18 +388,20 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         self.workflows_dir = Path(workflows_dir).expanduser()
         self.runs_dir = self.workflows_dir / "runs"
         # 非默认目录（测试/沙箱）→ 使用目录内独立 DB，避免污染生产 workflows.db
-        # bus 隔离由 tests/conftest.py 完成：它 patch hermes_bus.blackboard_legacy
-        # 与 hermes_bus.config 的 BLACKBOARD_DB 快照，故此处无参构造的 Blackboard()
-        # 在 pytest 下指向 /tmp/pipeline-test-state-*/blackboard.db。
-        # 实测（2026-10-16）：bb.db_path = /tmp/pipeline-test-state-*/blackboard.db，
-        # 未命中生产路径。裸跑（不经 conftest）仍连生产 —— 这是 Blackboard() 无参
-        # 构造的固有语义，不由本处负责。
+        # bus 同理：裸跑（不经 conftest）时没人设 HERMES_BLACKBOARD_DB，无参
+        # Blackboard() 默认就是生产库——实测 2026-10-21 22:03:45 批次与 22:2x 复跑
+        # `python3 tests/test_exit_condition.py` 各写 21 条 EC_* 测试 facts 进
+        # ~/.hermes/sister_bus/blackboard.db（8+ 条冒充 engineer/qa/reviewer 等真实 src）。
+        # 隔离挂在 workflows_dir 上，沙箱引擎自动带上，不依赖运行方式。
         self._db_path = db_path or (
             str(self.workflows_dir / "test_workflows.db")
             if self.workflows_dir != Path(_WORKFLOWS_DIR)
             else None
         )
-        self._bb = Blackboard()
+        self._bb = Blackboard(
+            db_path=Path(self._db_path).with_name("test_blackboard.db")
+            if self._db_path else None
+        )
         self._workflows: dict[str, WorkflowDef] = {}
         self._lm = None
         self._consumed_exit_ids: set[int] = set()
@@ -958,6 +968,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
 
 
     def run_once(self):
+        global _LOOP_RESUME_ID
         _t_tick = time.time()
         # 每次 tick 重载模板（支持热加载，DB 修改即时生效）
         self._load_workflows()
@@ -1040,14 +1051,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 永远查不到（三方审查 2026-10-21 实测 A/B）。
                 "SELECT instance_id, template_id, current_step_id, step_results, created_at, "
                 "status, task_id, effective_roles "
-                "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready') "
-                + _INSTANCE_ORDER
+                "FROM workflow_instances WHERE status IN ('pending','running','step_done_ready')"
             )
+            rows = _rotate_after(list(rows), _LOOP_RESUME_ID)
             for row in rows:
                 if time.time() - _t_tick > _TICK_BUDGET_SEC:
                     LOGGER.warning("tick 超 %ds 预算，中止本轮剩余实例（下轮续跑）",
                                    _TICK_BUDGET_SEC)
                     break
+                _LOOP_RESUME_ID = row["instance_id"]
                 inst = dict(row)
                 if inst.get("status") == "pending":
                     lm.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?", (inst["instance_id"],))
