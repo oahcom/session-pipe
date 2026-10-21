@@ -260,6 +260,13 @@ class RoleLifecycleMixin:
     # 需要跨进程时改成写 ~/.hermes/run/alert_cooldown.json，先有证据再加。
     _ALERT_TS: dict[tuple, float] = {}
     _ALERT_COOLDOWN_S = 1800
+    # 同一 (role, wf, step) 的**相同 prompt** 在窗口内不重发。
+    # 实测 24h cross_role_send 24,284 条里 20,499 条（84%）是同 target 同文案重复，
+    # 最重一条 product_architect 收 7,290 次、间隔恒 11s（= 每 tick 一次）：每次重发
+    # 都要角色花一整个回合重读同一段话，而它早就读过了。
+    # 进程级（同 _ALERT_TS）：限流是进程事实。窗口到期仍会重发，丢消息不永久悬空。
+    _LAST_SEND: dict[tuple, tuple[int, float]] = {}
+    _SAME_PROMPT_WINDOW_S = 300
     # ── 模型额度拒绝（403/429）恢复 ──
     # 9router 免费层按出口 IP 计配额：角色 pane 只剩 "API Error: 403" /
     # "Rate limit exceeded"，进程活着但不产出。旧行为只把它排除出 idle 判定
@@ -976,6 +983,14 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
             return False  # 投递未发生：明确语义，避免返回 None 被 engine 计数为失败
+        # 相同 prompt 已在窗口内投递过 → 不重发，按排队返回（不盖 notified、不计失败）。
+        # 放在占位符校验之后：非法 prompt 仍走 False（快速暴露），不会被"排队"掩盖。
+        _fp = hash((role, wf_id, step_id, prompt))
+        _prev = RoleLifecycleMixin._LAST_SEND.get((role, wf_id, step_id))
+        if _prev and _prev[0] == _fp and time.time() - _prev[1] < self._SAME_PROMPT_WINDOW_S:
+            LOGGER.info("send-to-role %s 跳过: 同一 prompt 已在 %.0fs 内投递过 (wf=%s step=%s)",
+                        role, time.time() - _prev[1], wf_id[:12], step_id)
+            return "busy"
         # 双要素第二关：goal 应含完成形态动词（输出/报告/修复/设计/实现/审查），
         # 缺少则 warning + bus notice 但不阻断（CrewAI expected_output 模式启发）
         _ACTION_VERBS = ("输出", "报告", "修复", "设计", "实现", "审查", "创建", "更新", "完成", "分析", "验证",
@@ -1169,14 +1184,19 @@ class RoleLifecycleMixin:
                 _resp = json.loads(_out) if _out.lstrip().startswith("{") else {}
             except (ValueError, TypeError):
                 _resp = {}
-            _err = str(_resp.get("error") or "")
+            # 解析成功用 error 字段；失败则退回原始 stdout —— ccs.py 的 stdout 可能
+            # 混入日志前缀/截断 JSON，纯 JSON 解析会丢掉 busy 信号（三方审查 P1）。
+            _err = str(_resp.get("error") or "") or _out
             # 忙 ≠ 失败，另外两类「暂缓判定」也不能当失败：
             # core.send 对首次探测失败返回 "探测失败 1/3"、首次 tmux 投递失败返回
             # "tmux 投递失败 1/3"（连败计数未满 3，红线 3 防抖动误报），语义是稍后重试。
+            # 计数落 ~/.hermes/run/send_fail_streak.json（跨进程持久），第 3 次即返回
+            # "未运行" / "(3/3)" → 走 False，故暂缓分支不会永续。
             # 全按失败计则引擎 10s/tick 内三连推 → 角色一次抖动即被判 delivery_blocked
             # 终态（实测 wf_76d0bcc006/s1 冻结 daemon 后无人判死正是同一处判据的镜像）。
             # 只有连败确认（3/3 后返回 "未运行"）、门禁拒绝、红线拦截才是真失败。
-            if _resp.get("reason") == "busy" or "暂缓 fallback" in _err:
+            if (_resp.get("reason") == "busy" or '"reason": "busy"' in _out
+                    or '"reason":"busy"' in _out or "暂缓 fallback" in _err):
                 LOGGER.info("send-to-role %s 角色忙/探测暂缓，未投递（排队等下轮）", role)
                 return "busy"
             _m = re.search(r"tmux 投递失败.*?\((\d+)/(\d+)\)", _err)
@@ -1188,4 +1208,6 @@ class RoleLifecycleMixin:
                            role, getattr(_result, "returncode", None),
                            wf_id[:12] if wf_id else "?", step_id, _err[:200])
             return False  # 非零退出码且非暂缓 = 投递失败：调用方据此不盖戳，下轮重试
+        # 只有真投递成功才记账：失败/暂缓不占窗口，下轮照常重试。
+        RoleLifecycleMixin._LAST_SEND[(role, wf_id, step_id)] = (_fp, time.time())
         return True  # 投递成功（ccs send 正常退出）
