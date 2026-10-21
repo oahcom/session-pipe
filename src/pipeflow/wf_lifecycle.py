@@ -543,8 +543,11 @@ class WorkflowLifecycleMixin:
                     "blocker",
                     f"[workflow] {wf_id[:12]}/{step_id} 评审无结论（unknown），不推进",
                     evidence=(f"实例 {wf_id} 步骤 {step_id}（type={_step_def.type}）"
-                              f"未给出任何判定词。exit_messages 原文前 200 字:\n"
-                              f"{_msgs[:200]}"),
+                              f"未给出任何判定词。\n"
+                              f"补一行锚点结论即可推进（判据只认行首/结论:/判定:/— 之后的词）：\n"
+                              f"  结论: APPROVED\n"
+                              f"  结论: CHANGES_REQUESTED — <P0/P1/P2 计数>\n"
+                              f"exit_messages 原文前 200 字：\n{_msgs[:200]}"),
                     src="workflow_engine")
             return
 

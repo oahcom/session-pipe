@@ -55,7 +55,7 @@ _ANCHOR = re.compile(
     r"(?:^|\n|判定\s*[:：]|审批\s*[=:：]|结论\s*[:：]|—|–|\s--\s)", re.M)
 
 # 结论词。PASS 系列排除左侧否定（NOT APPROVED / 未通过 不是 PASS）。
-_PASS_WORD = re.compile(r"\bAPPROVED\b|\bPASS(?:ED)?\b|通过|合格|就绪", re.I)
+_PASS_WORD = re.compile(r"\b(?:conditional[ _-])?APPROVED\b|\bPASS(?:ED)?\b|通过|合格|就绪", re.I)
 # `不通过` 必须显式列出：它含"通过"二字，若不先匹配整个词，_PASS_WORD 会把
 # 其中的"通过"当成通过结论（`审批=不通过/CHANGES_REQUESTED` 实测踩到）。
 _REJECT_WORD = re.compile(
