@@ -1228,6 +1228,13 @@ class WorkflowLifecycleMixin:
         # 两个分支都要用同一个"被审产物的人"，算一次（纯查表，无副作用）。
         _subject = self._review_subject_role(wf_name, review_step)
         if not _sys_issues and not _biz_issues:
+            # 解析器滤掉 P2/P3 后条目全空，但分类段本身在：这是"只有建议级问题"
+            # 的驳回，不是"没写分类"。落进兜底会凭一句话造业务问题错派 engineer，
+            # 那条链还会反过来卡住父链（_blocking_rework_sts 只放过系统链）。
+            if re.search(r"【(?:系统|业务)问题|(?:系统|业务)问题[:：]", _msgs_text):
+                LOGGER.info("rework: %s/%s 只有 P2/P3 建议级问题，不建返工链",
+                            wf_id[:8], review_step_id)
+                return False
             # 人工驳回常只写一句话（「PRD 缺验收标准」），没有【业务问题】标记 →
             # 解析恒空 → 只能回退重投原步，3 次封顶后停摆（G 审查实测该形态）。
             # 已知返工对象（映射表内角色）就用这句话建一条业务返工链；表外角色
