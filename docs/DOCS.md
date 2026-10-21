@@ -15,7 +15,7 @@
 | **ISSUES.md** | 排障者 | 历史问题单（已复核状态表） |
 | **CHANGES.md** | 维护者 | 按日期的变更记录（含验证命令与实测输出） |
 | **docs/ARCHITECTURE.md** | 架构师 | 模块清单与行数、数据流、已知缺陷（**行数由 `scripts/doccheck.py` 校验**） |
-| **docs/TECHNICAL_DEEP_DIVE.md** | 高级开发者 | 实现原理、配置热重载、可靠性机制、对话监控、状态同步 |
+| **docs/TECHNICAL_DEEP_DIVE.md** | 高级开发者 | 实现原理、配置加载、可靠性机制、对话监控、状态同步 |
 | **docs/SYSTEM_LANDSCAPE.md** | 全栈工程师 | 三项目全景、端口、DB、角色矩阵 |
 | **docs/TEST_WORKFLOW.md** | 测试工程师 | 测试命令、实测通过数、已知缺口 |
 | **docs/WORKFLOW_TEMPLATE_SPEC.md** | 模板开发者 | 模板 Schema、prompt 三段式、subflow 规则、校验命令 |

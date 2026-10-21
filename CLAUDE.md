@@ -71,7 +71,7 @@ src/
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
     engine.py         ── 编排 + CLI（1963 行，导入下方 mixin）
     step_handler.py   ── 步骤处理（1700 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1201 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1203 行）
     task_generator.py ── 任务生成（897 行）
     wf_lifecycle.py   ── 工作流生命周期（2089 行）
     daemon.py         ── 工作流守护 while 循环（478 行）
@@ -87,7 +87,7 @@ src/
     sync.py           ── 工作流同步（63 行）
 
   p0_exemption.py     ── P0 豁免通道（coordinator/lr/pm）
-  config_loader.py    ── 配置加载（YAML + env override + 热重载）
+  config_loader.py    ── 配置加载（YAML + env override；无热重载，改完重启）
   eval_checker.py     ── 安全白名单命令执行检查
   eval_consistency.py ── 评估一致性
   output_validator.py ── 输出格式验证
@@ -164,7 +164,7 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 
 - 冷却 `_OVERFLOW_COOLDOWN=300s`；时效 `_OVERFLOW_ERR_MAX_AGE=600s`
 - 回归守卫：`tests/test_context_overflow.py`（含 transcript 四例）
-- **改了本逻辑需重启 `session-pipeline.service`** —— daemon 无热重载
+- **改了本逻辑需重启 `session-pipeline-daemon.service`** —— daemon 无热重载（`session-pipeline.service` 不存在，实测 `Unit ... could not be found`）
 
 ## SQLite 运维
 生产 DB 位于 `~/.hermes/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。

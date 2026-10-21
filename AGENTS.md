@@ -69,7 +69,7 @@ print(f'Health: {health_check()[\"status\"]}')
 | D1 正确性 | produce/consume 映射准确 | 对比角色 JSON output_targets |
 | D2 安全性 | 消息不泄露、不注入 | 无 eval/exec |
 | D3 可维护性 | 配置化、不硬编码 | 检查 config.yaml 覆盖 |
-| D4 性能 | 轮询间隔合理、无 N+1 | `max_messages_per_poll`（config **没有** `poll_interval` 键，节奏由 daemon `--interval` 决定） |
+| D4 性能 | 轮询间隔合理、无 N+1 | `max_messages_per_poll`（config **没有** `poll_interval` 键；路由节奏是 `routing_daemon.INTERVAL = 60` 常量，无 CLI 覆写） |
 | D5 一致性 | 优先级表完整 | CATEGORY_PRIORITY 覆盖全部分类 |
 | D6 可测试性 | 路由逻辑可 mock | db_path 参数注入 |
 | D7 可靠性 | 重试/熔断/心跳/TTL 配置 | config.yaml 全部可调 |

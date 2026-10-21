@@ -94,7 +94,7 @@ src/
 | 去重 | bus `log` 表 `(fid, 'pipeline')` consume 记录（`routes._do_consume_msg` 末尾） | 每轮不重投；`pipeline_cursor.db` 已于 2026-10-22 退役 |
 | ACK 跟踪 | `ack_tracker.db` | 消费确认状态 |
 
-## 6. 配置热重载
+## 6. 配置加载（**无**热重载）
 
 `config_loader.py` 只有 `get_config()`（懒加载缓存读，:158）——**没有** `reload_config`，也没有 mtime 热重载；`reconfigure()` 在 `src/reliability.py:40`（重建 CIRCUIT_BREAKER/HEARTBEAT/TTL_PRUNER/DEFAULT_RETRY/GRACEFUL_SHUTDOWN 单例）。改 `config.yaml` 需重启进程。
 

@@ -21,7 +21,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 |--------|-------|----------------|
 | **pipeflow/engine.py** | 1963 | Data-driven workflow execution engine (core, imports mixins below) |
 | **pipeflow/step_handler.py** | 1700 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 1201 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1203 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
 | **pipeflow/task_generator.py** | 897 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
 | **pipeflow/wf_lifecycle.py** | 2089 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
 | **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
