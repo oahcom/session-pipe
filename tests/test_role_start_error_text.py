@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from pipeflow.role_lifecycle import RoleLifecycleMixin, _start_error_text
+from pipeflow.role_lifecycle import RoleLifecycleMixin, _start_error_text, _start_failed
 
 INFO = b'2026-10-21 17:53:59,277 [INFO] core: xieshu settings.json mcp_servers=[]\n'
 ERR = b'{"success": false, "error": "swap only 102MB"}'
@@ -23,6 +23,14 @@ def test_falls_back_to_stderr_when_stdout_has_no_protocol():
 def test_success_json_does_not_outrank_stderr():
     """成功协议不是失败证据：rc≠0 时选它会把真因藏起来（codex 20 维 P1）。"""
     assert "Traceback" in _start_error_text(b'{"success": true}', b"Traceback: boom")
+
+
+def test_str_output_is_normalized():
+    """子进程 mock/text=True 会给 str：旧 helper 在 'b"..." in str' 处 TypeError，
+    被外层 except 吞成"无 blocker"（本轮实测 test_ensure_role_alive_dead_started 失败）。"""
+    assert '"success": false' in _start_error_text('{"success": false, "error": "x"}', "INFO")
+    assert _start_failed(SimpleNamespace(returncode=0, stdout='{"success": false}')) is True
+    assert _start_failed(SimpleNamespace(returncode=0, stdout='{"success": true}')) is False
 
 
 class _SP:
