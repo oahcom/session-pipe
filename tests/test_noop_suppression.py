@@ -9,20 +9,25 @@
 """
 import sys
 import json
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
-def _fresh_scheduler(tmp):
-    """隔离 idle-state 文件，避免污染生产 ~/.hermes/run/cron_idle_state.json。"""
+@pytest.fixture
+def scheduler(tmp_path, monkeypatch):
+    """隔离 idle-state 文件，避免污染生产 ~/.hermes/run/cron_idle_state.json。
+
+    patch 必须覆盖整个用例而不只是构造：_noop_delta/report_idle 调
+    _save_idle_state() 时才读模块全局 _IDLE_STATE_PATH（实测每轮用例往生产
+    文件写 2 次）。
+    """
     import cron_scheduler as cs
-    p = Path(tmp) / "idle.json"
-    with patch.object(cs, "_IDLE_STATE_PATH", p), \
-         patch.object(cs, "PERSONAS_DIR", Path(tmp) / "nonexistent"):
-        return cs.CronScheduler()
+    monkeypatch.setattr(cs, "_IDLE_STATE_PATH", tmp_path / "idle.json")
+    monkeypatch.setattr(cs, "PERSONAS_DIR", tmp_path / "nonexistent")
+    return cs.CronScheduler()
 
 
 def test_noop_report_phrase_hit():
@@ -40,25 +45,21 @@ def test_noop_report_phrase_hit():
     print("✅ no-op 措辞命中 ✓")
 
 
-def test_noop_delta_suppresses_repeat():
+def test_noop_delta_suppresses_repeat(scheduler):
     """DESIGN §9.2：同报告二次上报 → _noop_delta True（状态无变化，抑制）。"""
-    with tempfile.TemporaryDirectory() as tmp:
-        s = _fresh_scheduler(tmp)
-        _r = "服务全绿零僵尸, 无职责内修复动作"
-        assert s._noop_delta("maintainer", _r) is False, "首次上报 = 有变化，放行"
-        assert s._noop_delta("maintainer", _r) is True, "同指纹二次 = 无 delta，抑制"
+    _r = "服务全绿零僵尸, 无职责内修复动作"
+    assert scheduler._noop_delta("maintainer", _r) is False, "首次上报 = 有变化，放行"
+    assert scheduler._noop_delta("maintainer", _r) is True, "同指纹二次 = 无 delta，抑制"
     print("✅ 状态无 delta 抑制 ✓")
 
 
-def test_real_fix_passes():
+def test_real_fix_passes(scheduler):
     """DESIGN §9.3：真修复报告（含 delta）→ 非 no-op 且 delta 为真 → 放行。"""
     from cron_scheduler import _is_noop_report
-    with tempfile.TemporaryDirectory() as tmp:
-        s = _fresh_scheduler(tmp)
-        _fix = "修复 routing 死锁: 门控误锚跨工作流失败判定, 改动 step_handler"
-        assert _is_noop_report(_fix) is False, "真修复不命中 no-op"
-        assert s._noop_delta("maintainer", _fix) is False, "首次 = 放行"
-        assert s._noop_delta("maintainer", _fix + " 追加一行") is False, "指纹变 = 放行"
+    _fix = "修复 routing 死锁: 门控误锚跨工作流失败判定, 改动 step_handler"
+    assert _is_noop_report(_fix) is False, "真修复不命中 no-op"
+    assert scheduler._noop_delta("maintainer", _fix) is False, "首次 = 放行"
+    assert scheduler._noop_delta("maintainer", _fix + " 追加一行") is False, "指纹变 = 放行"
     print("✅ 真修复放行 ✓")
 
 

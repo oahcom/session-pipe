@@ -18,9 +18,12 @@ sys.path.insert(0, _src)
 # 实测 2026-10-22 未隔离时 pytest 会建表/写生产 routing.db、ack_tracker.db，
 # 并把 1005B/13 角色的 forbidden_ops_cache.json 覆盖成 35B 空表。
 _run_dir = tempfile.mkdtemp(prefix="pytest-hermes-run-")
-os.environ.setdefault("HERMES_RUN_DIR", _run_dir)
-os.environ.setdefault("ROUTING_DB_PATH", os.path.join(_run_dir, "routing.db"))
-os.environ.setdefault("SESSION_PIPELINE_ACK_DB", os.path.join(_run_dir, "ack_tracker.db"))
+# 直接赋值而非 setdefault：外部已 export 这三个变量时 setdefault 会让隔离静默失效
+# （实测 2026-10-22 带着 HERMES_RUN_DIR 跑 pytest，forbidden_ops_cache.json 仍被
+# 写到生产 ~/.hermes/run/）。
+os.environ["HERMES_RUN_DIR"] = _run_dir
+os.environ["ROUTING_DB_PATH"] = os.path.join(_run_dir, "routing.db")
+os.environ["SESSION_PIPELINE_ACK_DB"] = os.path.join(_run_dir, "ack_tracker.db")
 
 # 0. 保存真实 bus_protocol/config_loader 引用（test_reliability_unit 会篡改
 #    sys.modules 为 MagicMock，后续模块需恢复真实版本）
@@ -80,6 +83,13 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 # （实测一轮全量测试后 60 行里 48 行是测试产物）。
 os.environ["SESSION_PIPELINE_METRICS_JSONL"] = os.path.join(_TEST_STATE_DIR, "workflow-metrics.jsonl")
 
+# 2b. BUS_DB 的 env 版隔离：contract_updater 等通过 `python3 bus_client.py write`
+#     写 bus，子进程只认 HERMES_BLACKBOARD_DB，in-process 属性重绑管不到（实测
+#     test_contract_updater_role_map 每次把生产 facts 行 ut 刷成当前时间）。
+#     必须在 paths 导入前设，hermes_bus.config 在 import 时就读它。
+_BLACKBOARD_DB_TEST = os.path.join(_TEST_STATE_DIR, "blackboard.db")
+os.environ["HERMES_BLACKBOARD_DB"] = _BLACKBOARD_DB_TEST
+
 # 3. 确保 paths 模块被加载并覆盖 module-level 常量
 #    （env var 在 paths.py import 时读取；若 paths 已在 sys.modules 缓存则 monkeypatch 补偿）
 import paths as _paths_mod
@@ -105,7 +115,6 @@ _paths_mod.ITERATION_WORKSPACES = Path(_TEST_ITER_DIR)
 # 4. BUS_DB 隔离：重定向 Blackboard 到临时 DB，测试不再写生产 blackboard.db。
 #    Blackboard.__init__ 默认用 blackboard_legacy 模块导入时的 BLACKBOARD_DB 快照，
 #    因此需 patch 快照值本身（blackboard_legacy.BLACKBOARD_DB + hermes_bus.config.BLACKBOARD_DB）。
-_BLACKBOARD_DB_TEST = os.path.join(_TEST_STATE_DIR, "blackboard.db")
 try:
     from hermes_bus import blackboard_legacy as _bb_legacy
     _bb_legacy.BLACKBOARD_DB = Path(_BLACKBOARD_DB_TEST)
@@ -115,6 +124,19 @@ except Exception as _bbe:
     import warnings
     warnings.warn(f"conftest: bus DB 隔离失败（测试将写生产 bus）: {_bbe}", stacklevel=1)
 
+
+# 4b. eval_checker 的转录根：trajectory 测试在模块顶层 `from eval_checker import
+#     _TRANSCRIPTS_DIR` 就把值绑死了，fixture 阶段再 patch 已来不及（名字已绑定）。
+#     必须在收集测试模块前改常量，否则 trajectory 测试在 ~/.claude/projects 下建
+#     -probe-*/-tmp-probe-* 目录（实测一轮 12 个 CREATE+12 个 DELETE），并污染
+#     转录统计分母。
+_TRANSCRIPTS_ROOT = Path(tempfile.mkdtemp(prefix="pytest-claude-projects-"))
+try:
+    import eval_checker as _ec
+    _ec._TRANSCRIPTS_DIR = _TRANSCRIPTS_ROOT
+except Exception as _ece:
+    import warnings
+    warnings.warn(f"conftest: 转录根隔离失败（测试将写生产 ~/.claude/projects）: {_ece}", stacklevel=1)
 
 # 5. 角色转录隔离：_recover_rate_limited_roles 现在以转录里的 API 错误为主判据
 #    （pane 只有视口，实测 24h 1,342 条错误轮里认出 9 次）。不隔离时会读生产

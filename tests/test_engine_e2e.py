@@ -37,7 +37,6 @@ def _mock_subprocess():
                lambda *a, **k: MagicMock(returncode=0, stdout="claude\n")):
         yield
 
-HOME = Path.home()
 ROLE = "e2e_test"
 
 def _make_env():
@@ -50,7 +49,8 @@ def _write_wf(wf_dir, name, steps):
     (wf_dir / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False))
 
 def _session_dir(role):
-    return HOME / ".claude" / "projects" / f"-home-administrator-ccs-workspaces-{role}"
+    """模拟会话目录落在 /tmp：生产 ~/.claude/projects 只读（实测每轮在这里建 2 次）。"""
+    return Path(tempfile.gettempdir()) / f"-home-administrator-ccs-workspaces-{role}"
 
 def _touch_session(role, age_seconds=0):
     """模拟 CCS 会话更新（写入当前时间）。"""
