@@ -51,7 +51,9 @@ def _imported_from(src: str) -> dict[str, str]:
     for n in ast.walk(tree):
         if isinstance(n, ast.ImportFrom) and n.module:
             for a in n.names:
-                out[a.asname or a.name] = n.module.split(".")[-1]
+                out.setdefault(a.name, n.module)
+                if a.asname:
+                    out.setdefault(a.asname, n.module)
     return out
 
 
@@ -65,16 +67,18 @@ def dangling_refs(old: dict[str, str], new: dict[str, str]) -> dict[str, set[str
         gone |= _defs(src) - _defs(new.get(path, ""))
     if not gone:
         return {}
-    # 定义搬家：同名函数在别的文件里仍有定义，且引用方 import 的正是那个模块
-    defined_in = {path.rsplit("/", 1)[-1][:-3]: _defs(src)
+    # 定义搬家：同名函数在别的文件里仍有定义，且引用方 import 的正是那个模块。
+    # 必须按完整点路径解析——只比 basename 会让 p1/util.py 与 p2/util.py 互相顶替（codex 复审实测）。
+    defined_in = {path[:-3].replace("/", "."): _defs(src)
                   for path, src in new.items() if path.endswith(".py")}
     hits: dict[str, set[str]] = {}
     for path, src in new.items():
         imported = _imported_from(src)
         for name in _refs(src) & gone:
             mod = imported.get(name)
-            if mod and name in defined_in.get(mod, set()):
-                continue  # 引用方已改 import 指向新位置
+            if mod and any(dotted.endswith(mod) and name in defs
+                           for dotted, defs in defined_in.items()):
+                continue  # 引用方已改 import 指向新定义处
             hits.setdefault(name, set()).add(path)
     return hits
 

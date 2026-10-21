@@ -63,4 +63,17 @@ assert dangling_refs(
     {"a/m.py": "", "a/n.py": "def keep():\n    return 1\n", "a/u.py": "from a.m import keep\nkeep()\n"},
 ) == {"keep": {"a/u.py"}}
 
+
+# 10. 同名 basename 不同目录：p1/util.py 掉了 keep，p2/util.py 有 keep，不能互相顶替（codex 复审发现）
+assert dangling_refs(
+    {"p1/util.py": "def keep():\n    return 1\n", "p2/util.py": "x = 1\n", "u.py": "from p1.util import keep\nkeep()\n"},
+    {"p1/util.py": "", "p2/util.py": "def keep():\n    return 1\n", "u.py": "from p1.util import keep\nkeep()\n"},
+) == {"keep": {"u.py"}}
+
+# 11. 搬家 + 别名导入：from n import keep as k，引用方已改指向 → {}（codex 复审发现）
+assert dangling_refs(
+    {"m.py": "def keep():\n    return 1\n", "n.py": "y = 2\n", "u.py": "from m import keep as k\nk()\n"},
+    {"m.py": "", "n.py": "def keep():\n    return 1\n", "u.py": "from n import keep as k\nk()\n"},
+) == {}
+
 print("表征测试全部通过")
