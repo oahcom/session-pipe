@@ -61,7 +61,7 @@ PYTHONPATH=src python3 -m routing_daemon                      # 路由守护进�
 ```
 src/
 ├── routing/           # 路由系统（router/auto/routes/rdb/polling/survival_monitor）
-├── pipeflow/          # 工作流引擎（engine + 4 个 mixin + daemon/db）
+├── pipeflow/          # 工作流引擎（engine + 5 个 mixin + daemon；无 db.py，DB 在 workflow/db.py）
 ├── lifecycle/         # 步骤状态机
 ├── workflow/          # 工作流客户端/网关/同步
 ├── reliability.py     # 可靠性基础设施

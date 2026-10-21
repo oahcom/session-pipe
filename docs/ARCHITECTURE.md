@@ -46,7 +46,6 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **eval_consistency.py** | 70 | 评估一致性 |
 | **routing/consistency.py** | 105 | 路由一致性 |
 | **pipeflow/daemon.py** | 478 | Main loop: `while True: engine.run_once(); sleep(10)` |
-| **workflow_metrics.py** | 109 | 工作流指标 |
 | **workflow/db.py** | 96 | 工作流数据访问 |
 | **output_validator.py** | 93 | 输出格式验证 |
 | **routing/polling.py** | 99 | Message polling (dedup via bus consume records) |

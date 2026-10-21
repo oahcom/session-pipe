@@ -100,7 +100,6 @@ src/
   reliability_core.py ── 可靠性核心实现
   template_registry.py── 模板注册中心
   task_evidence.py    ── 任务证据链
-  workflow_metrics.py ── 工作流指标
   paths.py            ── 路径常量
 
 注：step 终态含 `delivery_blocked`（投递达上限暂停，engine.py close_wf 收敛行级 status）。
