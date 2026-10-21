@@ -487,7 +487,8 @@ if __name__ == "__main__":
 # 忙门控以 wf_id 为条件，wf_id 为空 → 守卫跳过 → 但调用方也没传 force，
 # 于是 /goal 前缀被加上；且一旦有人补上 wf_id 就会立刻被忙门控拦成 "busy"，
 # 返回值被 `LOGGER.debug` 吞掉。安全护栏在两个方向上都可能是空转。
-# 契约：显式 force + scheduler_noise，且 wf_id/step_id 必须传（否则无法定位）。
+# 契约：显式 force（跳过 /goal 前缀与忙门控），且不得带 wf_id（否则重写
+# TASKS.md + 写 task_spec）；不得带 scheduler_noise（coordinator 目标会被拦截）。
 
 def _capture_send():
     seen = []
@@ -505,8 +506,25 @@ def test_idle_reminder_is_forced_and_carries_ids():
     role, msg, kw = seen[0]
     assert role == "scout"
     assert kw.get("force") is True, "未带 force → /goal 前缀锁死角色"
-    assert kw.get("scheduler_noise") is True, "未标记语义 → coordinator 侧无法区分催办"
     assert "wf_id" not in kw, "催办不该带 wf_id：会连带重写 TASKS.md 并写 task_spec"
+    assert "scheduler_noise" not in kw, \
+        "scheduler_noise 会让 coordinator 目标的催办被 role_lifecycle:891 直接拦截"
+
+
+def test_coordinator_targeted_stop_is_not_swallowed():
+    """coordinator 作为步骤目标时，越界停止指令必须真的能投出去。
+
+    生产库 WL-full_dev_pipeline 有 7 个实例 assignee=coordinator；
+    scheduler_noise=True 在 role_lifecycle:891 对它直接 return False。
+    """
+    from pipeflow.step_handler import _stop_tmux_violation
+    send, seen = _capture_send()
+    run, step = _make_run(), _make_step()
+    _stop_tmux_violation(run, step, ["rm -rf /tmp/x"], "coordinator", send)
+    _, _, kw = seen[0]
+    assert kw.get("force") is True
+    assert not kw.get("scheduler_noise"), "停止指令被标记为噪音 → coordinator 侧静默丢弃"
+
 
 
 def test_violation_stop_is_forced_and_carries_ids():

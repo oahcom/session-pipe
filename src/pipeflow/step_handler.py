@@ -75,8 +75,13 @@ def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> f
 #
 # 为什么也不传 wf_id：忙门控的条件是 `not force and wf_id`，wf_id 为空时本就
 # 不拦；而 wf_id 非空会连带重写角色 TASKS.md 并往 bus 写一条 task_spec ——
-# 一条催办不该产生派发记录。只开 force（跳过前缀+忙门控+搜索提醒）+ 语义标记。
-_TMUX_SIGNAL_KW = {"force": True, "scheduler_noise": True}
+# 一条催办不该产生派发记录。只开 force（跳过前缀+忙门控+搜索提醒）。
+#
+# 不带 scheduler_noise：它在 role_lifecycle:891 对 coordinator 是**直接 return
+# False**（调度噪音拦截）。而 coordinator 确会作步骤目标（生产库 WL-full_dev_pipeline
+# 7 个实例 assignee=coordinator）→ 发给它的越界停止指令会被静默吞掉，安全护栏
+# 变回摆设。催办要的是「送达」，不是「被当成噪音拦下」。
+_TMUX_SIGNAL_KW = {"force": True}
 
 
 def _remind_tmux_idle(run, step, evidence: str, send_to_role) -> None:
@@ -437,13 +442,28 @@ class StepHandlerMixin:
                 if not _schema_ok:
                     LOGGER.info("tmux 信号暂缓 %s/%s: 契约未满足 %s",
                                 run.workflow_name, step.id, "; ".join(_schema_errs))
-            if _wr_ok and _schema_ok:
+            # 契约优先：步骤声明了 bus 契约（bus_category/text_contains/
+            # source_contains）时，tmux 信号**不得**推进。pane 文本是角色的
+            # 叙述，不是产出证据——_COMPLETION_PATTERNS 的 `(s\d+ .*完成)`
+            # 会命中「s1 闭环（已完成）」「s2 还没完成」「s1 完成了吗？」等
+            # 任意含 s<N>+完成 的句子。实测 wf_7045df494d/s1：投递 04:49:27
+            # → 04:51:05 判完成（98 秒），exit_messages 为空，completed_by=
+            # workflow_engine，角色自曝触发源是它上一轮回复里的排版文字。
+            # 7 日内声明了 bus 契约却零 exit_messages 的完成步 347 个。
+            # 保留信号价值：无契约的步骤仍走此路（否则那类步骤只能等超时）。
+            _has_bus_contract = bool(
+                ec.get("bus_category") or ec.get("text_contains")
+                or ec.get("source_contains"))
+            if _wr_ok and _schema_ok and not _has_bus_contract:
                 try:
                     self._lifecycle.complete_step(run.id, step.id)
                     LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
                 except Exception as _e:
                     LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
                 return  # 产出已确认，跳过 timeout/催办
+            if _has_bus_contract:
+                LOGGER.debug("tmux 信号不推进 %s/%s: 步骤声明了 bus 契约，等真实产出",
+                             run.workflow_name, step.id)
         # ── tmux 信号节流与升级 ──
         # 计数存于 step_results["tmux_signals"]（跨 tick 持久化），
         # 防高频骚扰：闲置提醒 ≥3 次/越界 ≥1 次后各自冷却 5 分钟；
