@@ -152,6 +152,30 @@ def test_route_to_ccs_dry_run(mock_metrics, mock_hb):
 
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
+def test_route_to_ccs_empty_consume_is_not_broadcast(mock_metrics, mock_hb):
+    """已登记但 consume=[] 的角色只接定向消息。
+
+    optimizer / ccs-monitor 在 routing.db 里就是 consume=[]；旧写法把空表当
+    "无配置"→ 每条未定向 fact 都投给它（实测 2175 + 1757 条/天，全是审计流）。
+    """
+    from routing.routes import route_to_ccs
+    msgs = [
+        {"id": 41, "category": "monitor_audit", "text": "审计流水", "priority": 5},
+        {"id": 42, "category": "notice", "text": "@optimizer 看一下", "priority": 5},
+    ]
+    mock_router = MagicMock()
+    mock_router.routing = {"optimizer": {"consume": []}}
+    with patch("routing.auto.poll_unconsumed", return_value=msgs),          patch("routing.routes._rt_mod") as mock_rt_mod,          patch("subprocess.run") as mock_run:
+        mock_rt_mod.get_router.return_value = mock_router
+        st = MagicMock(); st.stdout = "未运行"; st.returncode = 0
+        mock_run.return_value = st
+        result = route_to_ccs("optimizer", dry_run=False)
+    assert result["total"] == 1, f"空订阅仍收到未定向消息: {result}"
+    assert result["details"][0]["id"] == 42
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
 def test_route_to_ccs_not_running_skips(mock_metrics, mock_hb):
     """CCS 未运行 → action=skipped。"""
     from routing.routes import route_to_ccs
