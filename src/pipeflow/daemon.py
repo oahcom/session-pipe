@@ -238,7 +238,9 @@ def daemon_loop(interval: int):
     _src_files = list(_src_dir.parent.rglob("*.py"))
 
     def _src_mtime() -> float:
-        return max((_p.stat().st_mtime for _p in _src_files), default=0.0)
+        # 清单是启动时快照：文件被删/改名后 stat 会抛 FileNotFoundError，裸用会把
+        # 每轮探测变成必炸（daemon 直接起不来，代码热加载彻底失效）。缺文件跳过即可。
+        return max((_p.stat().st_mtime for _p in _src_files if _p.exists()), default=0.0)
 
     _seen_mtime = _src_mtime()
 
