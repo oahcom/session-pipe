@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-_SRC = str(Path.home() / "session-pipeline" / "src")
+_SRC = (Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
@@ -147,3 +147,20 @@ def test_is_tautology_normalizes_spaces():
     """空格不影响判定（`echo    PASS` 也应拒）。"""
     for cmd in ('echo    "PASS"', "python3 -c 'import sys; print(  \"PASS\"  )'"):
         assert ec._is_tautology(cmd) is True, f"应判为恒真: {cmd}"
+
+
+def test_word_boundary_not_substring():
+    """判据按词边界比对：'active' 不得被 'inactive' 点亮。"""
+    assert ec._has_word("inactive", ["active"]) is False
+    assert ec._has_word("active", ["active"]) is True
+    assert ec._has_word("服务已 not-approved", ["approved"]) is False
+
+
+def test_all_lines_must_satisfy_when_quanbu():
+    """带「全部返回」的判据：任一行不满足即 FAIL（旧写法 any() + 子串恒真）。"""
+    cmd = "for s in a b; do systemctl --user is-active $s; done"
+    ok = {"stdout": "active\nactive\n", "stderr": "", "returncode": 0, "ok": True}
+    bad = {"stdout": "active\ninactive\n", "stderr": "", "returncode": 0, "ok": True}
+    assert ec._check_passed(ok, cmd + " 全部返回 active", "active")[0] is True
+    assert ec._check_passed(bad, cmd + " 全部返回 active", "active")[0] is False
+

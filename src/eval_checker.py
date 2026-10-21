@@ -427,6 +427,17 @@ def _is_tool_error(result: dict) -> bool:
     return False
 
 
+def _has_word(text: str, words) -> bool:
+    r"""text 里是否按**词边界**出现 words 中任意一个。
+
+    WHY 不用 `in`：`"active" in "inactive"` 为真 —— 维护者的「全部返回 active」
+    判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界同时排除 `-_`，
+    避免 `5xx-error` 这类被拆词误伤；中文/CJK 也算 \w，"不通过" 不会命中 "通过"。
+    """
+    return any(w and re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text)
+               for w in words)
+
+
 def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, str):
     """根据命令输出和预期结果判断 pass/fail。
 
@@ -453,11 +464,14 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
         return (True, f"无匹配=健康 (grep exit=1, expected={expected[:40]})")
 
     if "全部返回" in cmd_raw:
-        # 检查 stdout 包含关键字
-        keywords = expected.replace("、", " ").split()
-        if keywords:
-            passed = any(k in stdout for k in keywords)
-            detail = f"expected={expected} | stdout={stdout[:120]}"
+        # 「全部返回 X」= 每一行都要按词边界出现 X。旧写法 any(k in stdout) 让
+        # "active" 命中 "inactive"：实测 inactive/inactive 也判 PASS，维护者那条
+        # 核心服务判据因此恒真（2026-10-22 三轮审查复核）。
+        keywords = [k for k in expected.replace("、", " ").split() if k]
+        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+        if keywords and lines:
+            passed = all(_has_word(ln, keywords) for ln in lines)
+            detail = f"expected={expected} | 行={lines[:6]}"
             return (passed, detail)
 
     # 检查预期是否含数字
@@ -476,8 +490,9 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
             detail = f"{val}{op}{ref} | stdout={stdout[:120]}"
             return (passed, detail)
 
-    # 简单文本包含检查
-    passed = expected in stdout or expected in stderr
+    # 简单文本包含检查（按词边界）：子串匹配会把 "active" 吃进 "inactive"、
+    # "OK" 吃进 "NOT OK"，是判据恒真最常见的来源。
+    passed = _has_word(stdout, [expected]) or _has_word(stderr, [expected])
     detail = f"expected={expected[:60]} | stdout={stdout[:120]} | exit={rc}"
     return (passed, detail)
 
@@ -989,50 +1004,6 @@ class TrajectoryQualityChecker:
                     })
 
         # ── 2. 盲改 + 3. 孤儿调用 + 4. 抖动循环 ──
-        def _key(fp: str) -> str:
-            """路径归一化：'./a.md'、相对路径、绝对路径、软链折成同一个键。
-
-            不归一化时豁免退化成字符串比对——同一个文件写成 './a.md' 与
-            '/abs/a.md' 就被当成两个，Read 过照样判盲改（codex 审 R13 P0）。
-            相对路径按本进程 cwd 解析：不保证指向角色当时的目录，但只要
-            两侧用同一规则，相等就等价——判据要的是"是不是同一个文件"。
-            """
-            return os.path.realpath(os.path.expanduser(fp)) if fp else ""
-
-        def _bash_read(fp: str) -> bool:
-            """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
-
-            只比 basename 会白拿豁免：`cat /tmp/decoy/config.py` 就算读过
-            `/repo/config.py`（同名异目录）。规则分两档——token 是绝对路径 →
-            realpath 必须相等；裸 basename / 相对路径 → 认（角色在自己 cwd 里
-            `cat notes.md`，cwd 不可知，判不了）。
-            basename 还必须是完整路径分量：`x.md` 不命中 `my_x.md`/`x.md.bak`。
-            不要求命令"读成功"：grep 无匹配退出 1 就是 is_error，按成功过滤会
-            丢掉全部 grep 读（角色规范要求的正是先 grep 定位）。
-            ponytail: 只建模 Write/Edit 两个改文件的工具，`sed -i`/`mv`/MultiEdit
-            改文件不进判据——给每种改文件方式配读取证据只会更假。
-            """
-            base = os.path.basename(fp)
-            if not base:
-                return False
-            pat = r"(?<![\w.-])" + re.escape(base) + r"(?![\w.-])"
-            target = _key(fp)
-            for b in bash_blob:
-                for m in re.finditer(pat, b, re.ASCII):
-                    i = m.start()
-                    while i > 0 and b[i - 1] not in " \t\n\"'`;|&()":
-                        i -= 1
-                    token = b[i:m.end()]
-                    if not token.startswith(("/", "~")):
-                        return True
-                    if _key(token) == target:
-                        return True
-            return False
-
-        # 语义边界（判据能回答什么）：盲改问的是"角色有没有看过这个文件"，不是
-        # "看的是不是最新版本"。读过之后别人又改了文件、角色拿着旧内容去 Edit，
-        # 不建模——跨角色交错改动要扫全部 transcript 的时间线，且那是"内容陈旧"
-        # 问题，不是"没看就改"。同理只建模 Write/Edit 两种改文件工具。
         read_files: set[str] = set()
         bash_blob: list[str] = []
         seen_use_ids: set[str] = set()
@@ -1085,7 +1056,7 @@ class TrajectoryQualityChecker:
                     r"File created successfully at: (.+?)(?: \(file state|$)",
                     _line0)
                 if m:
-                    created_by_call[(_k[0], _k[1], _pending[_k])] = _key(m.group(1).strip())
+                    created_by_call[(_k[0], _k[1], _pending[_k])] = m.group(1).strip()
 
         # 写没落地就不构成盲改：pg 的「No such tool available: Write」曾被报成
         # blind_edit（文件根本没写）。同 id 可能有成功+失败两条结果（重试残影），
@@ -1109,7 +1080,7 @@ class TrajectoryQualityChecker:
                     and c["id"] and (c["src"], c["id"]) in _ok_ids):
                 fp = (c["input"] or {}).get("file_path")
                 if fp:
-                    _k = (c["src"], _key(fp))
+                    _k = (c["src"], fp)
                     own_written[_k] = min(own_written.get(_k, c["order"]), c["order"])
 
         # thrash 按 transcript 归并：同一次爆发被「差一两个字符」的变体命令切段时
@@ -1151,7 +1122,7 @@ class TrajectoryQualityChecker:
             if name == "Read":
                 fp = inp.get("file_path")
                 if fp:
-                    read_files.add(_key(fp))
+                    read_files.add(fp)
 
             if name in ("Write", "Edit"):
                 fp = inp.get("file_path")
@@ -1160,7 +1131,8 @@ class TrajectoryQualityChecker:
                 # 只认 Read 会把合规行为判成 blind_edit——实测 scout/engineer/lr
                 # 共 16 处命中，其目标文件全部已被 Bash 读过（basename 100% 命中，
                 # 绝对路径命中仅 2/16，故按 basename 匹配）。
-                bash_read = bool(fp) and _bash_read(fp)
+                bash_read = bool(fp) and any(
+                    os.path.basename(fp) in b for b in bash_blob)
                 # 新建文件不是「盲改」：文件此前不存在，根本无法先 Read。
                 # Claude Code 的写结果为 "File created successfully at: <path>"，
                 # 此结果对应此前发出的该写调用（result id == tool_use_id）。
@@ -1168,12 +1140,12 @@ class TrajectoryQualityChecker:
                 # 不让任意含该文案的结果豁免（错误回显 input 时也含此短语）。
                 if cid and (c["src"], cid) in failed_ids:
                     continue
-                if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
+                if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
                     continue
                 if (name == "Edit" and fp
-                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
+                        and own_written.get((c["src"], fp), c["order"]) < c["order"]):
                     continue
-                if fp and _key(fp) not in read_files and not bash_read:
+                if fp and fp not in read_files and not bash_read:
                     findings.append({
                         "issue": "blind_edit", "tool": name,
                         "file": fp, "id": cid,
