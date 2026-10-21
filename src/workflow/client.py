@@ -366,15 +366,6 @@ class WorkflowClient:
         ).fetchone()
         return dict(row) if row else None
 
-    def list_my_tasks(self, status: str = None) -> list[dict]:
-        query = "SELECT * FROM workflow_instances WHERE assignee=?"
-        params = [self.role]
-        if status:
-            query += " AND status=?"; params.append(status)
-        query += " ORDER BY created_at DESC"
-        rows = self._conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
-
     def start(self, wf_id: str, step_id: str):
         self._conn.execute(
             "UPDATE workflow_instances SET status='running', current_step_id=? WHERE instance_id=?",
@@ -405,26 +396,6 @@ class WorkflowClient:
         lm.confirm_step(wf_id, step_id, token=token, approved=approved, reason=reason)
         self._log(wf_id=wf_id, action="step_confirmed" if approved else "step_rejected",
                   detail=f"{step_id} by {self.role}: {reason}")
-
-    def pull_approval(self, wf_id: str, step_id: str) -> dict:
-        """审批人拉取自己的审批密钥（推送失败时的唯一可用路径）。
-
-        bus #427318：`ccs send` 因「角色思考中」失败时，降级写 bus 的 token 被
-        脱敏成 ***，审批人拿不到钥匙 → 只能等 TTL+30min 自动放行，闸门失效。
-        本接口让审批人用 `wf -r <role> approval <wf_id> <step_id>` 自行取回。
-        鉴权在 LifecycleManager.get_approval_token(requester=self.role) 内 fail-closed。
-        """
-        from lifecycle.manager import LifecycleManager
-        lm = LifecycleManager(role=self.role, db_path=self.db_path)
-        try:
-            token = lm.get_approval_token(wf_id, step_id, requester=self.role)
-            if not token:
-                return {"ok": False, "error": "该步骤当前无可用审批密钥"
-                        "（已消费 / 已过期 / 状态已推进）"}
-            return {"ok": True, "token": token,
-                    "ttl_remaining": lm.approval_ttl_remaining(wf_id, step_id)}
-        finally:
-            lm.close()
 
     def _sync_task_from_workflows(self, task_id: str):
         from workflow.sync import sync_task_status
@@ -483,22 +454,6 @@ class WorkflowClient:
         self._conn.commit()
         return True
 
-    def archive(self, wf_id: str) -> bool:
-        self._conn.execute("UPDATE workflow_instances SET status='archived' WHERE instance_id=?", (wf_id,))
-        self._conn.commit()
-        self._log(wf_id=wf_id, action="archived")
-        return True
-
-    def list_all(self, status: str = None, limit: int = 50) -> list[dict]:
-        query = "SELECT * FROM workflow_instances WHERE 1=1"
-        params = []
-        if status:
-            query += " AND status=?"; params.append(status)
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-        rows = self._conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
-
     # ── 日志 ──
 
     def get_logs(self, wf_id: str = None, task_id: str = None) -> list[dict]:
@@ -524,56 +479,12 @@ class WorkflowClient:
 
     # ── 委派方法（经 subprocess 调用 launcher partner 模块） ──
 
-    def confirm_delivery(self, task_id: str, target_role: str, timeout: int = 300) -> dict:
-        cmd = [sys.executable, str(CCS_CLI), "partner", "confirm", task_id, target_role, "--as", self.role]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return {"ok": r.returncode == 0, "output": r.stdout}
-
     def check_wake_permission(self, target: str) -> bool:
         cmd = ["python3", str(CCS_CLI), "partner", "check-wake", self.role, target]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return r.returncode == 0
 
-    def resolve_partner(self, role: str) -> dict:
-        cmd = ["python3", str(CCS_CLI), "partner", "resolve", role]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return {"ok": r.returncode == 0, "output": r.stdout}
-
-    def wake_partner(self, role: str, context: str = "", force: bool = False) -> dict:
-        cmd = ["python3", str(CCS_CLI), "partner", "wake", role, "--as", self.role]
-        if context:
-            cmd.extend(["--context", context])
-        if force:
-            cmd.append("--force")
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return {"ok": r.returncode == 0, "output": r.stdout}
-
     # ── Kanban ──
-
-    def kanban_board(self) -> list[dict]:
-        lanes = {"backlog": [], "in_progress": [], "blocked": [], "completed": [], "failed": [], "cancelled": []}
-        rows = self._conn.execute(
-            "SELECT instance_id, template_id, status, current_step_id, assignee, created_at, "
-            "COALESCE(completed_at, created_at) as updated_at "
-            "FROM workflow_instances ORDER BY updated_at DESC LIMIT 50"
-        ).fetchall()
-        for row in rows:
-            wf = dict(row); status = wf["status"]
-            if status in ("pending", "created"):
-                lanes["backlog"].append(wf)
-            elif status in ("running", "step_done_ready"):
-                lanes["in_progress"].append(wf)
-            elif status == "completed":
-                lanes["completed"].append(wf)
-            elif status == "failed":
-                lanes["failed"].append(wf)
-            elif status == "cancelled":
-                lanes["cancelled"].append(wf)
-            elif status in ("blocked", "archived"):
-                lanes["blocked"].append(wf)  # archived → blocked is still active concern
-            else:
-                lanes["blocked"].append(wf)
-        return [{"lane": k, "count": len(v), "items": v} for k, v in lanes.items()]
 
     def close(self):
         self._conn.close()

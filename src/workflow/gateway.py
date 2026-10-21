@@ -172,19 +172,6 @@ class Gate:
 
     # ── P0 豁免 ──────────────────────────────────
 
-    def record_p0_audit(self, role: str, task_id: str,
-                        reason: str, conn: sqlite3.Connection = None):
-        """记录 P0 豁免审计日志。"""
-        target = conn or self._conn
-        target.execute(
-            "INSERT INTO workflow_logs (workflow_instance_id, task_id, "
-            "action, actor, detail, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (None, task_id, "p0_exemption", role,
-             json.dumps({"reason": reason}, ensure_ascii=False), time.time())
-        )
-        target.commit()
-
     # ── 分配者链 ──────────────────────────────────
 
     def route_task(self, task_id: str, from_role: str, to_role: str) -> None:
