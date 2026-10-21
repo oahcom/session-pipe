@@ -22,13 +22,16 @@ TABLE = re.compile(r'(\|\s*\*\*)(`?)([\w/]+\.py)\2(\*\*\s*\|\s*)(\d+)(\s*\|)')
 
 
 def _resolve(name: str) -> Path | None:
-    """doc 里的相对路径 → 真实文件。先整段匹配，再退到 basename 唯一匹配。"""
+    """doc 里的相对路径 → 真实文件。先整段匹配，再退到 basename 唯一匹配。
+
+    basename 命中多个时判为歧义返回 None：否则已删的 `pipeflow/db.py` 会被
+    `workflow/db.py` 顶替，模块没了也校验通过（实测 2026-10-22）。
+    """
     direct = BASE / "src" / name
     if direct.exists():
         return direct
-    for c in (BASE / "src").rglob(os.path.basename(name)):
-        return c
-    return None
+    cands = list((BASE / "src").rglob(os.path.basename(name)))
+    return cands[0] if len(cands) == 1 else None
 
 
 def _real_n(p: Path) -> int:
