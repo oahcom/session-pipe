@@ -66,9 +66,6 @@ def _parse_tick_sec(name, default):
 _RELOAD_MIN_INTERVAL_SEC = 300
 
 
-def _reload_allowed(now_ts, last_reload_ts, interval=_RELOAD_MIN_INTERVAL_SEC):
-    """距上次重执行 ≥ interval 才允许 execv（跨进程用墙钟，monotonic 不可比）。"""
-    return (now_ts - last_reload_ts) >= interval
 
 
 def _reload_decision(now_mtime, seen_mtime, pending_mtime, now_ts, last_reload_ts,
