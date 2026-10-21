@@ -45,7 +45,8 @@ import re
 
 # 判定「该步骤产出表达的是驳回结论」的关键词。
 # 改动本表即同时改动 wf_lifecycle / lifecycle.manager / task_generator 三处判据。
-REJECT_KEYWORDS = ("changes_requested", "rejected", "not_approved", "驳回", "未通过")
+REJECT_KEYWORDS = ("changes_requested", "rejected", "not_approved", "驳回", "未通过",
+                   "no-go", "nogo")
 
 # 「必须出结论」的角色（unknown 才拦得住）。7 天生产库实测，review/gate 类型步骤里
 # unknown+empty 共 41 条，按角色分：maintainer 24（健康检查）、product_architect 9
@@ -66,11 +67,13 @@ _ANCHOR = re.compile(
     r"(?:^|\n|判定\s*[:：]|审批\s*[=:：]|结论\s*[:：]|—|–|\s--\s)", re.M)
 
 # 结论词。PASS 系列排除左侧否定（NOT APPROVED / 未通过 不是 PASS）。
-_PASS_WORD = re.compile(r"\b(?:conditional[ _-])?APPROVED\b|\bPASS(?:ED)?\b|通过|合格|就绪", re.I)
+_PASS_WORD = re.compile(
+    # 通过(?!率)：`通过率81.8% < 90% 验收未达标 No-Go` 曾被判 APPROVED —— 指标名词不是结论。
+    r"\b(?:conditional[ _-])?APPROVED\b|\bPASS(?:ED)?\b|通过(?!率)|合格|就绪", re.I)
 # `不通过` 必须显式列出：它含"通过"二字，若不先匹配整个词，_PASS_WORD 会把
 # 其中的"通过"当成通过结论（`审批=不通过/CHANGES_REQUESTED` 实测踩到）。
 _REJECT_WORD = re.compile(
-    r"\bREJECTED\b|CHANGES_REQUESTED|\bnot_approved\b|驳回|未通过|不通过", re.I)
+    r"\bREJECTED\b|CHANGES_REQUESTED|\bnot_approved\b|驳回|未通过|不通过|\bno[ _-]?go\b", re.I)
 # 结论词左侧的否定修饰（`NOT APPROVED` / `未通过` 里的"未"）。
 _NEG_BEFORE = re.compile(
     r"(?:(?:^|[\s(（])(?:not|never|no)|未|不|非)\s*$", re.I)

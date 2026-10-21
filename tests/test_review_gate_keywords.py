@@ -20,7 +20,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from review_gate import REJECT_KEYWORDS, is_rejected  # noqa: E402
+from review_gate import APPROVED, REJECT_KEYWORDS, is_rejected, review_verdict  # noqa: E402
 
 
 # ── 必须判为驳回（真驳回文案，生产实测样本）──
@@ -66,6 +66,33 @@ def test_dropped_keywords_are_not_in_table():
     """
     assert "需修复" not in REJECT_KEYWORDS
     assert "回退" not in REJECT_KEYWORDS
+
+
+@pytest.mark.parametrize("text", [
+    "RC 判定 NO-GO(闸门1/2/3 未过)",
+    "No-Go: 3 blocking findings, 需返工",
+    "验收结论 nogo",
+])
+def test_no_go_verdict_detected(text):
+    """"no-go" 是生产里真实的驳回结论，词表缺它 → 判 unknown → 被放行。
+
+    7d 实测：含 No-Go 的步骤 16 条，其中 5 条判 unknown、4 条已推进下游
+    （wf_092c460259/s4、wf_7fc3e87130/s4、wf_59263c95f86/s3、wf_sub_45bdd808e/s1）。
+    """
+    assert is_rejected(text), "NO-GO 结论必须判为驳回: %s" % text
+
+
+def test_pass_rate_is_not_a_verdict():
+    """"通过率" 是指标名词，不是"通过"结论。
+
+    实测假批准：wf_02192e3126/s4「通过率81.8% < 90% 验收未达标 No-Go」被
+    _PASS_WORD 的「通过」判成 approved —— 未达标的产物被当通过。
+    """
+    assert review_verdict("通过率81.8% < 90% 验收未达标 No-Go") == "rejected", \
+        "未达标 + No-Go 不得判通过"
+    assert review_verdict("通过率 95%，全部达标") != "approved", \
+        "只报通过率不构成通过结论"
+    assert review_verdict("APPROVED: 0 P0") == "approved", "真正的结论词不受影响"
 
 
 def test_case_insensitive_for_english():
@@ -157,3 +184,12 @@ def test_explicit_pass_verdict_wins(text):
 ])
 def test_explicit_reject_verdict_wins(text):
     assert is_rejected(text), "显式驳回结论必须判驳回"
+
+def test_conditional_approval_counts_as_pass():
+    """条件性批准算通过：`conditional_approved` 不得落成 unknown（unknown 不推进）。
+
+    评审人写「有条件通过」在 R134 fail-closed 之后会卡死链条；PASS 词表因此
+    显式收 `conditional[ _-]APPROVED`。
+    """
+    assert review_verdict("结论: conditional_approved — 2 P2 待补") == APPROVED
+    assert review_verdict("APPROVED (conditional): 2 P2") == APPROVED

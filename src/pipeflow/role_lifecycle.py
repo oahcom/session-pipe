@@ -144,6 +144,28 @@ def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AG
     return False
 
 
+def _transcript_progress_after_error(role: str) -> bool:
+    """最新一轮里是否**真的**有了进展（有工具调用的 assistant 轮）。
+
+    这是「能不能清退避状态」的判据。旧判据（最后一条 assistant 不是 API 错误）会被
+    错误轮自己的**纯文本半成品**骗过：注入「继续」后 CLI 先落一条无 tool_use 的
+    assistant 行，旧判据当场清状态 → attempt 归 1 → 下一次 429 立刻再发（实测
+    3h 内 21 次唤醒，错误→唤醒间隔 1/3/4/9/15s，首档 120s 完全没生效）。
+
+    只认 tool_use：那才是"重发的那次请求真的跑起来了"。纯文本轮不证明任何进展，
+    继续往前找，直到撞上错误轮（返回 False）或带 tool_use 的轮（返回 True）。
+    """
+    for line in _read_transcript_tail(role):
+        _c = line.replace(" ", "")
+        if '"type":"assistant"' not in _c:
+            continue
+        if '"isApiErrorMessage":true' in _c:
+            return False
+        if '"tool_use"' in _c:
+            return True
+    return False
+
+
 # 生成中但 transcript 多久没落事件即判卡死（秒）。
 # 实测 2026-10-21 coordinator：末事件是 05:22:13Z 的 tool_use，之后 31 分钟
 # 无任何行（含 tool_result），pane 一直挂 `Compacting… 55% · esc to interrupt`。
@@ -331,7 +353,7 @@ class RoleLifecycleMixin:
             # 再等 120s 的形状，<120s 占 17.6%；attempt 从未爬到 5 档封顶）。
             # pane 门（前半）不变：真恢复的角色照样立刻清状态、不被拖到 1800s 起步。
             if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS) \
-                    and not _transcript_last_turn_is_api_error(role, max_age=float("inf")):
+                    and _transcript_progress_after_error(role):
                 # pane 未命中不代表已恢复：15/15 会话 alternate_on=1，capture-pane
                 # 只有视口，错误文案几分钟就滚出视口（实测 24h 1,342 条错误轮里
                 # pane 只认出 9 次 = 0.67%），转录才是落盘事实。
@@ -950,22 +972,6 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
             return False  # 投递未发生：明确语义，避免返回 None 被 engine 计数为失败
-        # prompt 已校验完再查 CLI：非法 prompt 必须走 False/blocker，不能被"忙"掩盖。
-        # 只看 CLI 忙态，不看 300s 活动窗——刚干完活的空闲角色会被活动窗判忙
-        # （bus #395128 的同一根因）。ccs send 等忙 pane 单次 30s，整个 tick 会停。
-        if wf_id and not force:
-            from liveness import pane_cli_busy
-            # force=True 不预检：timeout 重推/dual-node/integrity 提醒都是旁路，
-            # 其中 integrity 在发送前就落了 bypass flag，预检返回 busy 会把提醒永久吞掉。
-            try:
-                _cli_busy = pane_cli_busy(role)
-            except Exception as _pe:  # 探针异常不阻断投递（下一 tick 再试）
-                LOGGER.warning("CLI 忙预检失败 %s: %s", role, _pe)
-                _cli_busy = None
-            if _cli_busy is True:
-                LOGGER.info("send-to-role %s 跳过: CLI 仍在执行 (wf=%s step=%s)",
-                            role, wf_id[:12], step_id)
-                return "busy"
         # 相同 prompt 已在窗口内投递过 → 不重发，按排队返回（不盖 notified、不计失败）。
         # 放在占位符校验之后：非法 prompt 仍走 False（快速暴露），不会被"排队"掩盖。
         _fp = hash((role, wf_id, step_id, prompt))
