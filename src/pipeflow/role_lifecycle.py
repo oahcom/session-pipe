@@ -874,6 +874,32 @@ class RoleLifecycleMixin:
             with _ALERT_LOCK:
                 _ts[_key] = _now - self._ALERT_COOLDOWN_S + self._ALERT_RETRY_S
 
+    def _sync_task_file(self, role: str, wf_id: str, step_id: str) -> None:
+        """把 TASKS.md 重写成**刚投递成功**的那个任务。
+
+        原实现只在发消息之前写，判到文件里是别的任务就只追加一行 [排队] 然后
+        照样发 —— 角色手里出现两份互相矛盾的任务书（实测 pm 2026-10-22 05:33：
+        TASKS.md 主块是旧任务 + [排队] 行，而 prompt 已经是新任务）。读到哪份
+        就干哪件事，模板要求"先读 TASKS.md"的角色会干错活。
+        """
+        try:
+            rows = self._lifecycle.query(
+                "SELECT title, description FROM tasks WHERE task_id="
+                "(SELECT task_id FROM workflow_instances WHERE instance_id=?)", (wf_id,))
+            if not rows:
+                return
+            t = rows[0]
+            body = (f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
+                    f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
+                    f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n")
+            path = _CCS_WORKSPACES / role / "TASKS.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.read_text(encoding="utf-8", errors="ignore") == body:
+                return  # 同内容不重写：避免每 tick 刷新 mtime
+            path.write_text(body, encoding="utf-8")
+        except (ValueError, KeyError, TypeError, OSError) as _e:
+            LOGGER.debug("TASKS.md 同步失败 %s/%s: %s", role, wf_id[:12], _e)
+
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
                        scheduler_noise: bool = False):
@@ -1007,81 +1033,9 @@ class RoleLifecycleMixin:
                 f"[workflow] coordinator 调度噪音已拦截: {wf_id}/{step_id}",
                 evidence=prompt[:200], src="workflow_engine")
             return False  # 投递未发生：明确语义，避免 engine 将 None 计为失败
-        # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
-        # 防污染：角色已有其他活跃工作流的任务文件时，拒写本任务（并发任务应排队，
-        # 否则后写者覆盖先写者 → 角色执行错误任务。观测案例：测试风暴覆盖 scout 真实任务）。
-        if wf_id:
-            try:
-                # 走 paths.CCS_WORKSPACES 而非硬编码 Path.home()：该常量支持
-                # SESSION_PIPELINE_CCS_WORKSPACES 覆盖，测试可隔离。硬编码会让
-                # 每个跑测试的用例都写进生产 workspace（实测污染 scout/engineer）。
-                ws_dir = _CCS_WORKSPACES / role
-                ws_dir.mkdir(parents=True, exist_ok=True)
-                task_rows = self._lifecycle.query(
-                    "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
-                    (wf_id,)
-                ) if hasattr(self, '_lifecycle') else []
-                if task_rows:
-                    t = task_rows[0]
-                    tasks_file = ws_dir / "TASKS.md"
-                    _skip_write = False
-                    if tasks_file.exists():
-                        _existing = tasks_file.read_text(encoding="utf-8", errors="ignore")
-                        # 精确边界匹配：只在 "工作流 wf_id /" 格式中匹配，防止 UUID 前缀碰撞
-                        # （如 wf_abc123 不误匹配 wf_abc123def456）
-                        # 本任务是否已在文中。原写法 `A or B if C else False` 被 Python
-                        # 解析为 `(A or B) if C else False`：文件无 "## 来源" 段时整个表达式
-                        # 恒为 False，**无论 wf_id 是否真在文件里** → 引擎永远当作"别的
-                        # 任务占了文件" → 本任务只追加 [排队]、不写入 → ccs send 退出码 1
-                        # → 投递失败 3 次 → 子链 failed → 父链断。
-                        # 实测 reviewer/engineer/qa 的 TASKS.md 均无 "## 来源" 段（该段
-                        # 只在角色产出含来源元数据时才有）→ 三角色中招率 100%。
-                        _wf_in_existing = (f"工作流 {wf_id} /" in _existing
-                                           or wf_id in _existing.split("## 来源")[-1])
-                        # 僵尸主任务检测：主 wf 不在权威库，或在库但**已终态**，都
-                        # 说明它不是"活跃占用"，允许被新任务覆盖。
-                        # 只判"不在库"时，已完成的主任务会永久占住文件 → 新任务永远
-                        # 只能追加 [排队]，而排队行无任何排空路径 → 无界增长
-                        # （实测 engineer 458 行 / qa 211 行，全部指向终态 wf）。
-                        _main_wf = re.search(r"工作流 (wf_[0-9a-f]{12})", _existing)
-                        _stale_main = False
-                        if _main_wf:
-                            _mw = _main_wf.group(1)
-                            try:
-                                _row = self._lifecycle.query(
-                                    "SELECT status FROM workflow_instances WHERE instance_id=?",
-                                    (_mw,))
-                                _stale_main = (not _row
-                                               or _row[0]["status"] not in _ACTIVE_WF_STATUSES)
-                            except Exception:
-                                _stale_main = False  # 查询失败 → 保守按活跃处理（不覆盖）
-                        if (_existing and "工作流任务" in _existing and not _wf_in_existing
-                                and not _stale_main):
-                            # 已有其他工作流的任务文件 → 不覆盖，追加排队标记。
-                            # 幂等：引擎每 tick 重推同一步骤，无此守卫则同一 wf 被追加
-                            # 数十行（实测 engineer/scout TASKS.md 各 27 行重复）。
-                            # 尾随空格是必需边界：标记恒为 "{wf}/{step} 待当前任务..."，
-                            # 无空格则 s1 会误命中 s10（实测 step_id 当前止于 s7，尚未触发）。
-                            if f"[排队] 新任务 {wf_id}/{step_id} " in _existing:
-                                _skip_write = True
-                            else:
-                                LOGGER.info("TASKS.md 防污染: %s 已有其他任务，本任务 %s 排队（不覆盖）", role, wf_id)
-                                tasks_file.write_text(
-                                    _existing.rstrip() +
-                                    f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",
-                                    encoding="utf-8")
-                                _skip_write = True
-                        elif _stale_main:
-                            LOGGER.info("TASKS.md 僵尸主任务 %s 不在权威库，覆盖为新任务 %s",
-                                        _main_wf.group(1), wf_id)
-                    if not _skip_write:
-                        tasks_file.write_text(
-                            f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
-                            f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
-                            f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n",
-                            encoding="utf-8")
-            except (ValueError, KeyError, TypeError):
-                pass
+        # TASKS.md 只由 _sync_task_file 在**投递成功后**写（见该函数）。
+        # 原实现在这里先写一份、判到文件被别的任务占着就只追加 [排队] 再照样发，
+        # 于是角色手里出现两份互相矛盾的任务书。
         # _send_to_role 只发任务，分类恒为 task_spec。
         #
         # 原实现用关键词猜告警（prompt 含"异常"/"持续超时"/"超时自动回收"→ 写 blocker），
@@ -1196,4 +1150,10 @@ class RoleLifecycleMixin:
             return False  # 非零退出码且非暂缓 = 投递失败：调用方据此不盖戳，下轮重试
         # 只有真投递成功才记账：失败/暂缓不占窗口，下轮照常重试。
         RoleLifecycleMixin._LAST_SEND[(role, wf_id, step_id)] = (_fp, time.time())
+        # TASKS.md 以**真正投递成功的那次**为准：上面那份写在发消息之前，判到
+        # 别的任务占着文件就只追加一行 [排队] 照样发 —— 文件说"排队等前一个"、
+        # prompt 说"现在做这个"，同一角色手里两份互相矛盾的任务书（实测 pm
+        # 2026-10-22 05:33：主块是旧任务 + [排队] 行，prompt 已是新任务）。
+        if wf_id:
+            self._sync_task_file(role, wf_id, step_id)
         return True  # 投递成功（ccs send 正常退出）
