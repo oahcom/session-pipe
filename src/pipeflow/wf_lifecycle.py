@@ -305,7 +305,13 @@ class WorkflowLifecycleMixin:
                     _cond = "2"
                     reason = f"测试模板 {tpl} 运行{age_h:.0f}h > 2h阈值"
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
-                elif age_h > _global_limit_h:
+                # 硬上限也必须过活体门：条件4 早就有 _role_producing_recently，条件3 没有。
+                # 实测 2026-10-22：24h 内 5 条触到全局阈值，5/5 的角色在判死前 11~31s
+                # 仍在写转录/调工具 —— 硬砍等于丢弃在途产出，且子链会被级联陪葬。
+                # 上限取 2 倍阈值兜底：真卡住的角色仍会死，只是多给它一个阈值窗口。
+                elif age_h > _global_limit_h and not (
+                        age_h <= _global_limit_h * 2
+                        and _role_producing_recently((d.get("assignee") or "").strip())):
                     _cond = "3"
                     reason = f"{_st} 运行{age_h:.0f}h > {_global_limit_h}h全局阈值"
                 # 条件4: running 且当前步骤确已停滞 >1h

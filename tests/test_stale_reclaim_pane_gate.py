@@ -92,13 +92,13 @@ def _cancelled_wfs(inst, lm, wf_id):
     return [_w for _w, _st in _closed if _st == "cancelled" and _w == wf_id]
 
 
-def _run(step_sd, pane_state, assignee="reviewer"):
+def _run(step_sd, pane_state, assignee="reviewer", age_h=None, producing=False):
     """跑一次 _cleanup_stale_workflows，stub 掉 pane 探测，返回被取消的 wf_id 列表。"""
     now = time.time()
     row = {
         "instance_id": "wf_test_r98",
         "template_id": _TPL,
-        "created_at": now - 7200,          # age_h=2：> 1h 门控，< 24h 全局阈值
+        "created_at": now - (age_h * 3600 if age_h else 7200),   # 默认 age_h=2：> 1h 门控，< 24h 全局阈值
         "status": "running",
         "current_step_id": "s1",
         "assignee": assignee,
@@ -110,9 +110,10 @@ def _run(step_sd, pane_state, assignee="reviewer"):
     orig = liveness.tmux_pane_active
     orig_prod = wf_lifecycle._role_producing_recently
     liveness.tmux_pane_active = lambda role, **k: pane_state
-    # 第二道门（转录新鲜度）与本用例无关，固定为 False 让结论只由 pane 状态决定；
-    # 否则同一实例在跑测试的机器上可能因真实 transcript 新鲜而豁免，测试不确定。
-    wf_lifecycle._role_producing_recently = lambda role, **k: False
+    # 第二道门（转录新鲜度）默认固定为 False，让结论只由 pane 状态决定；否则同一
+    # 实例在跑测试的机器上可能因真实 transcript 新鲜而豁免，测试不确定。
+    # 条件3（全局阈值）的用例显式传 producing=True 来验活体门。
+    wf_lifecycle._role_producing_recently = lambda role, **k: producing
     try:
         WorkflowLifecycleMixin._cleanup_stale_workflows(inst, lm)
     finally:
@@ -219,6 +220,21 @@ def test_live_subflow_blocks_global_24h_reclaim():
     sd = {"subflow_id": "wf_sub_live2", "ts": time.time() - 10}
     assert _run_with_subflow(sd, "running", False, age_h=26) == [], \
         "父链过 24h 阈值时活子链被级联杀掉，在途产出丢失"
+
+def test_producing_role_blocks_global_cap():
+    """过全局阈值但角色仍在产出 → 不得砍（2026-10-22 实测 5/5 全是这种误杀）。"""
+    assert _run({}, False, age_h=26, producing=True) == [], \
+        "角色判死前 11~31s 仍在写转录，仍被全局阈值砍掉 —— 在途产出被丢弃"
+
+def test_silent_role_still_hits_global_cap():
+    """过全局阈值且角色已静默 → 硬上限必须保留，否则真卡死实例永驻。"""
+    assert _run({}, False, age_h=26, producing=False), \
+        "角色已静默 + 过全局阈值却没回收：硬上限被活体门吃掉"
+
+def test_hard_stop_at_double_budget():
+    """两倍阈值后不再看活体：防止话痨角色无限续命（堆文档/刷心跳）。"""
+    assert _run({}, False, age_h=50, producing=True), \
+        "50h（> 2×24h）仍在产出就无限续命：硬兜底失效"
 
 def test_select_includes_assignee():
     """主查询漏选 assignee → 角色解析恒空 → 探测恒 None → 条件4 静默失效。"""
