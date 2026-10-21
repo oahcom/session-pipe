@@ -66,5 +66,29 @@ class TestLifecycleStateMachine(unittest.TestCase):
             "AND action='wf_closed'", ("wf_test_r",)).fetchone()
         self.assertEqual(row["detail"], "workflow cancelled (queue 45min >= 30min)")
 
+    def test_review_without_verdict_blocks_advance(self):
+        """评审步没写判定词 → 不推进（三态 fail-closed 的角色完成路径）。
+
+        unknown 只装在引擎 tick 路径时，角色走 `wf complete`（manager._advance_unsafe）
+        交上来的「已完成，无新动作。」仍被当通过 —— 同一条还原在两条推进路径上
+        判定相反，正是 review_gate 模块 docstring 要消灭的那类分歧。
+        """
+        self.lm.upsert_template("gate_unknown", "GU", "d",
+            [{"step_id": "s1", "title": "review", "target_role": "tester",
+              "type": "review", "prompt_template": "review {topic}",
+              "exit_condition": {"bus_category": "notice"}},
+             {"step_id": "s2", "title": "impl", "target_role": "tester",
+              "prompt_template": "do {topic}",
+              "exit_condition": {"bus_category": "notice"}}])
+        self.assertTrue(self.lm.start_wf("wf_unknown_1", "s1", "gate_unknown"))
+        self.lm._set_step_result_unsafe(
+            "wf_unknown_1", "s1", "completed",
+            {"exit_messages": [{"text": "已完成，无新动作。", "src": "tester"}]})
+        self.assertFalse(self.lm._advance_unsafe("wf_unknown_1", None),
+                         "评审无结论不得推进")
+        wf = self.lm.get_wf("wf_unknown_1")
+        self.assertEqual(wf["current_step_id"], "s1")
+        self.assertEqual(self.lm._parse_results(wf)["s1"]["status"], "step_done_ready")
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to 
 # 视入口而定（daemon 以 src/ 为 cwd 时不缺，pytest 从仓库根跑时缺）。
 if str(Path(__file__).resolve().parents[1]) not in _sys.path:
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from review_gate import is_rejected  # noqa: E402
+from review_gate import review_verdict  # noqa: E402
 
 
 
@@ -991,7 +991,30 @@ class LifecycleManager:
         # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
         # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
         _confirmed = bool(_cur_sr.get("confirmed_at"))
-        if not _confirmed and is_rejected(_msgs):
+        # 三态 fail-closed 也必须装在这条路径上（R141 五维审查 D1/D3）：
+        # unknown 只装在 wf_lifecycle（引擎 tick）时，角色走 `wf complete`
+        # （本函数）交上来的「没写结论」仍被当通过——同一条还原在两条推进
+        # 路径上判定相反，正是 review_gate 模块 docstring 想消灭的那种分歧。
+        _verdict = ("approved" if _confirmed
+                    else review_verdict(_msgs))
+        if _verdict == "unknown" and _cur_step.get("type") in ("review", "gate"):
+            # 状态回写 step_done_ready：本函数四个调用点都不看返回值，只认 DB 里的
+            # status；不写回就等于被调用方随后落的 completed 覆盖（同 rejected 分支
+            # 必须落库的理由）。时间戳让 wf_lifecycle 的 unknown 分支认得出这是
+            # 同一次判定，不必重复播报。
+            _cur_sr = dict(_cur_sr)
+            _cur_sr["status"] = "step_done_ready"
+            _cur_sr["verdict_unknown_at"] = time.time()
+            _sr[current] = _cur_sr
+            self._conn.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(_sr, ensure_ascii=False), wf_id))
+            import logging as _lg
+            _lg.getLogger("lifecycle.review_gate").warning(
+                "review verdict unknown: %s/%s（type=%s）→ 不推进",
+                wf_id[:8], current, _cur_step.get("type"))
+            return False
+        if _verdict == "rejected":
             _sr.setdefault(current, {})["status"] = "rejected"
             self._conn.execute(
                 "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
