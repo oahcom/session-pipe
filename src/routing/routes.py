@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """auto_route_routing.py — 路由分发逻辑（从 auto_route.py 提取）"""
 
+# TODO(split): 609 行，越过 600 红线。拆法：路由表/优先级（纯数据+选择）与
+# 消费/派发（副作用）分成两个模块，先搬纯函数，调用点保持 import 不变。
+
 import json
 import os
 import re
