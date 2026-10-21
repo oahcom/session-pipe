@@ -9,6 +9,7 @@
 Run: cd ~/session-pipeline && python3 -m pytest tests/test_rate_recovery.py -q
 """
 import re
+import time
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -443,3 +444,38 @@ def test_nudge_carries_what_to_retry(tmp_path, monkeypatch):
     sent = _run_recovery(_engine(), {"qa": "❯ \n"})
     body = [c for c in sent if "继续" in " ".join(c)][0][-2]
     assert "重发" in body and "不要重新规划" in body, body
+
+
+def test_reset_predicate_ignores_error_turn_age():
+    """恢复判据必须是「进展」不是「新鲜度」：错误轮再老也算没恢复。
+
+    旧写法用默认 120s 时效：角色卡在错误轮、pane 里文案已滚出视口（实测 pane 只
+    认出 0.67% 的错误轮）时，120s 后谓词翻 False → 清掉退避状态 → attempt 恒 1，
+    退避曲线失效（24h 614 次注入、间隔 median 248s = 重置后再等 120s）。
+    """
+    eng = _engine()
+    eng._last_rate_recover = {"curator": (time.time() - 30, 3)}   # 已在第 4 档退避
+    seen = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-curator\n")
+        if "capture-pane" in cmd:
+            # pane 不含错误文案（已滚出视口）——正是复查要覆盖的那 99%
+            return MagicMock(returncode=0, stdout="✻ Thinking…\n❯ ")
+        return MagicMock(returncode=0, stdout="")
+
+    def fake_last_turn(role, max_age=None):
+        seen.append(max_age)
+        return True   # 转录：最后一条 assistant 就是错误轮（不论多老）
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run), \
+         patch("pipeflow.role_lifecycle._transcript_last_turn_is_api_error",
+               side_effect=fake_last_turn):
+        eng._recover_rate_limited_roles()
+
+    assert seen, "恢复路径没有查转录（pane 只有视口，认不出 99% 的错误）"
+    assert all(_a == float("inf") for _a in seen), \
+        f"重置判据仍在用时效窗口 {seen}：错误轮过期会被当成已恢复"
+    assert "curator" in eng._last_rate_recover, "错误轮未变老就清掉了退避状态"
+    assert eng._last_rate_recover["curator"][1] >= 3, "attempt 被重置，退避曲线失效"
