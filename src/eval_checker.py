@@ -847,13 +847,22 @@ class TrajectoryQualityChecker:
         目录用连字符（…-product-architect）。不归一则该角色恒匹配 0 目录，
         check() 走「无可检查对象 → passed=True」的假验证分支（2026-10-16 实测）。
         """
-        out: list[Path] = []
         needle = role.lower().replace("_", "-")
-        for d in _TRANSCRIPTS_DIR.iterdir():
-            if not d.is_dir():
-                continue
-            if needle in d.name.lower().replace("_", "-"):
-                out.append(d)
+
+        def _tail(name: str) -> str:
+            """'-home-…-ccs-workspaces-knowledge-curator' → 'knowledge-curator'。"""
+            n = name.lower().replace("_", "-")
+            n = n.split("-ccs-workspaces-")[-1] if "-ccs-workspaces-" in n else n
+            return re.sub(r"-\d+$", "", n)          # engineer-2 → engineer
+
+        out = [d for d in _TRANSCRIPTS_DIR.iterdir()
+               if d.is_dir() and _tail(d.name) == needle]
+        if not out:
+            # 兜底：目录布局不是 ccs-workspaces 形态时退回子串匹配（真实的
+            # 前缀撞车已由精确匹配挡住：curator 曾把 knowledge-curator 的 19 份
+            # 转录一起算进来，同一条 finding 记给两个角色）。
+            out = [d for d in _TRANSCRIPTS_DIR.iterdir()
+                   if d.is_dir() and needle in d.name.lower().replace("_", "-")]
         return out
 
     def _load_tool_calls(self, sessions: list[Path]) -> list[dict]:
@@ -933,6 +942,13 @@ class TrajectoryQualityChecker:
         calls = self._load_tool_calls(sessions)
         findings: list[dict] = []
 
+        # 工具在该 session 里根本不存在时（"No such tool available"），这次调用从未执行，
+        # 缺键判的是"会不会用该工具"——maintainer 的 Grep 就是这样被误报缺 pattern。
+        _no_tool_ids = {c["id"] for c in calls
+                        if c["kind"] == "result" and c["id"]
+                        and "<tool_use_error>" in (c.get("text") or "")
+                        and "No such tool available" in (c.get("text") or "")}
+
         # ── 1. schema 校验 ──
         for c in calls:
             if c["kind"] != "use":
@@ -945,6 +961,8 @@ class TrajectoryQualityChecker:
             # Claude Code 有时打包 __unparsedToolInput，此时 input 非标准 shape → 跳过严格校验
             # （这些调用仍可被其它维度评估，避免 schema 维度产生噪声虚报）
             if "__unparsedToolInput" in inp:
+                continue
+            if c["id"] in _no_tool_ids:
                 continue
             missing = [k for k in req if k not in inp]
             if missing:
@@ -979,6 +997,7 @@ class TrajectoryQualityChecker:
         last_cmd: str | None = None
         repeat_run: int = 0
         repeat_window_start: int | None = None
+        repeat_src: str = ""
 
         # 会话边界：每个 transcript **末尾连续未配对**的 tool_use 段。
         # 同一轮里 Claude 会并行发多个 tool_use（实测 dfd563da 末尾连发 2 条），
@@ -1033,13 +1052,37 @@ class TrajectoryQualityChecker:
         failed_ids = {(c["src"], c["id"]) for c in calls
                       if c["kind"] == "result" and c["id"] and c["error"]} - _ok_ids
 
+        # 自己写过的文件不算盲改：内容本来就在自己上下文里（Claude Code 也明说
+        # "no need to Read it back"）。只豁免**写之后**的编辑；跨 transcript 不豁免
+        # ——那份内容可能已被别人改过。实测 pg 5 条误报里 4 条是这一类。
+        # 只豁免 Edit：它必须带 old_string 且成功，说明角色手上的内容与磁盘一致
+        # （对不上就失败，失败的调用已按 failed_ids 跳过）。Write 是整文件覆盖，
+        # 命中 old_string 这层证据不存在，故不豁免——否则 compact 后盲覆盖会被放过。
+        own_written: dict[tuple[str, str], int] = {}
+        for c in calls:
+            _n = c["name"] or ""
+            if (c["kind"] == "use" and (_n == "Write" or _n.endswith("__write_file"))
+                    and c["id"] and (c["src"], c["id"]) in _ok_ids):
+                fp = (c["input"] or {}).get("file_path")
+                if fp:
+                    _k = (c["src"], fp)
+                    own_written[_k] = min(own_written.get(_k, c["order"]), c["order"])
+
+        # thrash 按 transcript 归并：同一次爆发被「差一两个字符」的变体命令切段时
+        # 会重复报（closer 实测 1 次 298 连发被切成 4 条），白占 bus 报告的名额。
+        _thrash: dict[str, dict] = {}
+
         def _close_thrash():
-            nonlocal repeat_run, repeat_window_start, last_cmd
+            nonlocal repeat_run, repeat_window_start, last_cmd, repeat_src
             if repeat_run >= _THRASH_REPEAT_MIN and repeat_window_start is not None:
-                findings.append({
-                    "issue": "thrash_loop", "tool": "Bash",
-                    "command": last_cmd, "count": repeat_run,
-                })
+                _cur = _thrash.get(repeat_src)
+                if _cur is None:
+                    _thrash[repeat_src] = {
+                        "issue": "thrash_loop", "tool": "Bash",
+                        "command": last_cmd, "count": repeat_run,
+                    }
+                else:      # 变体命令切段：同一次爆发的次数应累加（298 = 89+117+64+28）
+                    _cur["count"] += repeat_run
             repeat_run, repeat_window_start, last_cmd = 0, None, None
 
         for c in calls:
@@ -1084,6 +1127,9 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
                     continue
+                if (name == "Edit" and fp
+                        and own_written.get((c["src"], fp), c["order"]) < c["order"]):
+                    continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
                         "issue": "blind_edit", "tool": name,
@@ -1100,11 +1146,13 @@ class TrajectoryQualityChecker:
                         _close_thrash()
                         last_cmd = cmd
                         repeat_run = 1
+                        repeat_src = c["src"]
                     if repeat_window_start is None:
                         repeat_window_start = c["order"]
                 else:
                     _close_thrash()
         _close_thrash()
+        findings.extend(_thrash.values())
 
         # 孤儿调用：发出但无返回。
         # WHY 要排除每个 transcript 的**末条** tool_use：会话在工具执行中结束

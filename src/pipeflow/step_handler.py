@@ -54,6 +54,11 @@ _QUEUE_DEGRADE_AT = 3
 _QUEUE_BUDGET_FLOOR = 1800
 
 
+# 闸门连续未通过多少次后升级给模板所有者（10s/tick ≈ 5 分钟）。
+# 只升级一次：判据不修时每 tick 再喊一遍不带来新信息。
+_GATE_ESCALATE_AT = 30
+
+
 def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> float:
     """排队上限 = 该步声明的 timeout_minutes × 可重试次数，不低于下限。
 
@@ -382,6 +387,26 @@ class StepHandlerMixin:
             # 产出落盘。此前直接 complete → 文件契约缺失的步骤照样推进（与宽松推进
             # 同一类假完成，R119 已在宽松推进处堵住，这里漏了同一扇门）。
             if self._quality_gate_blocks(step, run):
+                # 闸门反复不过 = 判据可能本身不可满足：实测 WL-full_dev_pipeline/s4
+                # 的 "P0" not in 判据对任何合格报告恒假，实例空转 18.3h 直到 24h 全局
+                # 回收，期间角色被反复催一条永远做不到的指令。计数并在第
+                # _GATE_ESCALATE_AT 次升级一次给模板所有者：角色侧已交付，再催它
+                # 没有意义，要改的是判据本身。
+                _n = int(_sdata.get("gate_block_count") or 0) + 1
+                _sdata["gate_block_count"] = _n
+                if _n >= _GATE_ESCALATE_AT and not _sdata.get("gate_escalated_at"):
+                    _sdata["gate_escalated_at"] = time.time()
+                    self._bb.write(
+                        "blocker",
+                        f"[workflow] {run.workflow_name}/{step.id} 闸门连续 {_n} 次未通过"
+                        f" —— 判据可能不可满足，待模板所有者改判据",
+                        evidence=(f"实例 {run.id}：角色已交付"
+                                  f"（exit_messages={len(_sdata.get('exit_messages') or [])}），"
+                                  f"但 schema/verify 每 tick 仍拦下。"
+                                  f"先验模板 verify 是否对合格产出恒假（本次现场形态），"
+                                  f"再考虑催角色。"),
+                        src="workflow_engine")
+                self._sync_step_results(run.id, run.step_results)
                 return
             # bypass 补发完整性提醒（tick rescue 直接 complete，跳过双节点审查）
             # 两个问题分开发送（用户约束：每个步骤分开提示词）

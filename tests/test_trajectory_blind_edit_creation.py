@@ -236,6 +236,101 @@ def test_one_success_result_keeps_blind_edit() -> None:
             pass
 
 
+def test_edit_of_own_written_file_not_flagged() -> None:
+    """自己刚写过的文件，随后 Edit 不算盲改（内容就在上下文里）。
+
+    只豁免「写之后」的编辑：写之前的 Edit 仍要判——否则盲改判据被自己未来的写洗白。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-ownwrite-role"
+    path = "/tmp/probe_own.py"
+    lines = _write_seq(0, "cw1", path,
+                       f"File created successfully at: {path} (file state is current)")
+    lines += [
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "ce1", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "ce1", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("ownwrite", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"自建文件的后续 Edit 被误判: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_edit_before_own_write_still_flagged() -> None:
+    """顺序不能反：先 Edit 后 Write 时，那次 Edit 仍算盲改。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-ownwrite-order-role"
+    path = "/tmp/probe_own_order.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "ce2", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "ce2", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    lines += _write_seq(2, "cw2", path,
+                        f"File created successfully at: {path} (file state is current)")
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("ownwrite-order", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"写之前的 Edit 不该被豁免: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_mcp_write_then_edit_own_file_not_flagged() -> None:
+    """mcp__*__write_file 也是一次写：随后 Edit 不算盲改。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-mcpown-role"
+    path = "/tmp/probe_mcp.py"
+    lines = [
+        json.dumps({"type": "assistant", "message": {"id": "mm1", "type": "message", "role": "assistant",
+            "content": [{"type": "tool_use", "id": "mw1", "name": "mcp__hex-line__write_file",
+                         "input": {"file_path": path, "content": "x=1\n"}}]}}),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "mw1", "is_error": False,
+             "content": "wrote /tmp/probe_mcp.py (1 line)"},
+        ]),
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "me1", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "me1", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("mcpown", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"MCP 自建文件的后续 Edit 被误判: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     for _t in (test_created_file_not_flagged,
                test_list_shaped_result_content,
@@ -243,6 +338,9 @@ if __name__ == "__main__":
                test_non_creation_write_still_flagged,
                test_unparsed_retry_duplicate_not_blind_edit,
                test_failed_write_is_not_blind_edit,
-               test_one_success_result_keeps_blind_edit):
+               test_one_success_result_keeps_blind_edit,
+               test_edit_of_own_written_file_not_flagged,
+               test_edit_before_own_write_still_flagged,
+               test_mcp_write_then_edit_own_file_not_flagged):
         _t()
-    print("PASS: 7 tests")
+    print("PASS: 10 tests")

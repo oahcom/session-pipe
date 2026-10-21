@@ -50,7 +50,7 @@ print(format_pipeline())
 # 路由表加载正常
 PYTHONPATH=src python3 -c "
 from routing.router import get_router; r = get_router()
-assert len(r._routing) >= 25, f'路由表不完整: {len(r._routing)}'
+assert len(r._routing) >= 19, f'路由表不完整: {len(r._routing)}'   # roles_export 现为 19
 print(f'OK: {len(r._routing)} roles')
 "
 
@@ -107,7 +107,7 @@ python3 src/ccs.py health
 
 ### 模板必填元数据
 ```bash
-# 每个 ~/.hermes/workflows/*.json 必须包含以下 6 个字段：
+# 每个 ~/.hermes/workflows/*.json 必须含 schema 的 8 个 required 字段（下面 5 个之外还有 name/description/steps）：
 trigger_scene=["编码实现", "bug修复"]   # 至少 1 条触发场景
 allowed_initiators=["coordinator","pm"] # 至少 1 个允许发起角色
 allowed_executors=["engineer"]          # 至少 1 个允许执行角色

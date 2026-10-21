@@ -286,6 +286,40 @@ def test_mid_stream_orphan_still_flagged() -> None:
             pass
 
 
+def test_thrash_merged_per_transcript() -> None:
+    """同一次爆发被变体命令切段时只报 1 条，次数累加。
+
+    实测 closer：一条 assistant 消息里 298 次完全相同的 sqlite3 查询，
+    被 3 条 "locallocal" 变体切成 4 段，原实现报 4 条 finding（白占报告名额）。
+    """
+    sess = _TRANSCRIPTS_DIR / "-home-administrator-ccs-workspaces-thrashmerge-role"
+    sess.mkdir(parents=True, exist_ok=True)
+    jf = sess / "fixture_thrash.jsonl"
+    cmd = "sqlite3 ~/.hermes/sister_bus/blackboard.db 'select 1'"
+    lines, n = [], 0
+    for batch in ([cmd] * 5, ["locallocal"], [cmd] * 6):
+        for c_ in batch:
+            lines.append(json.dumps({
+                "type": "assistant",
+                "message": {"id": f"t{n}", "type": "message", "role": "assistant", "content": [
+                    {"type": "tool_use", "id": f"th{n}", "name": "Bash", "input": {"command": c_}},
+                ]},
+            }))
+            n += 1
+    jf.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        result = TrajectoryQualityChecker().check("thrashmerge", "eval_thrashmerge")
+        thrash = [f for f in result["findings"] if f["issue"] == "thrash_loop"]
+        assert len(thrash) == 1, f"同一次爆发应只报 1 条，实际 {len(thrash)}: {thrash}"
+        assert thrash[0]["count"] == 11, f"次数应累加为 11，实际 {thrash[0]['count']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     test_blind_edit_only_flagged()
     print("PASS: TrajectoryQualityChecker flags only blind edit")
@@ -293,5 +327,7 @@ if __name__ == "__main__":
     print("PASS: Bash-read file not flagged as blind edit")
     test_tail_orphans_not_flagged()
     print("PASS: tail orphans (session boundary) not flagged")
+    test_thrash_merged_per_transcript()
+    print("PASS: thrash merged per transcript")
     test_mid_stream_orphan_still_flagged()
     print("PASS: mid-stream orphan still flagged")

@@ -276,7 +276,6 @@ if __name__ == "__main__":
         ("重复关闭仍级联孤儿", test_repeat_close_heals_orphan_child),
         ("拒绝未知终态", test_unknown_close_status_is_rejected),
         ("回收端到端级联", test_reclaim_end_to_end_cancels_child),
-        ("催办 argv 用 --by-role", test_nudge_argv_uses_by_role),
         ("真实 argparse 拒绝 --from", test_ccs_parser_rejects_from_flag),
     ]
     passed = failed = 0

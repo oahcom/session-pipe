@@ -208,7 +208,7 @@ def test_handoff_advances_without_confirm(mock_run):
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed", s
     assert s["current_step"] == "s2", f"handoff 应自动推进到 s2, got {s}"
-    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
+    assert "approval_token" not in (s["results"]["s1"] or {}), \
         "handoff 不应发放审批密钥"
     _cleanup(d)
 
@@ -250,11 +250,14 @@ def test_handoff_chain_auto_flows(mock_run):
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
-def test_review_requires_confirm(mock_run):
-    """review 有独立审批人时仍是质量闸门：发 token，需 confirm 才推进。
+def test_review_advances_without_token(mock_run):
+    """评审步骤按**结论**推进：不发密钥、不等 confirm（2026-10-22）。
 
-    s2 由 reviewer 执行、上一步 s1 由 pm 执行 → assigner=pm，是真审批。
-    同角色自审不发 token（见 test_review_self_audit_no_deadlock）。
+    变异对照：旧实现给 review 发一张审批密钥等 assigner 确认。实测全库 429 张
+    密钥 approval_consumed_at 全为 null，15 个有终态的评审步等待中位数
+    **90.0 分钟**（= TTL 60min + grace 30min），全部由超时兜底放行——那 90 分钟
+    纯粹是死等，且每个评审步都要付一次（返工链自身也带评审步）。
+    本用例锁住新契约：结论通过 → 直接推进；step_results 里不留任何密钥字段。
     """
     signal.alarm(_TEST_TIMEOUT)
     d = _make_env()
@@ -268,43 +271,25 @@ def test_review_requires_confirm(mock_run):
 
     eng.run_once()
     _done(eng, "s1", src="pm")
+    _poll(eng, rid, "s1")
 
-    eng.run_once()
-    # s2 必须先被投递（notified）再写完成消息，否则消息早于步骤接管，
-    # _check_exit 的 created_after 屏障会把旧消息挡在外面。
-    for _ in range(20):
-        time.sleep(0.05)
-        eng.run_once()
-        _sr2 = eng.status(rid)["results"].get("s2") or {}
-        if _sr2.get("status") == "notified":
-            break
-    assert (eng.status(rid)["results"].get("s2") or {}).get("status") == "notified", \
-        f"s2 应已投递: {eng.status(rid)}"
-    _done(eng, "s2", src="reviewer")
-    time.sleep(0.1)
-    eng.run_once()
-    time.sleep(0.1)
-    eng.run_once()
+    _done(eng, "s2", src="reviewer", extra="APPROVED 业务 0P0/0P1")
+    _poll(eng, rid, "s2")
 
     s = eng.status(rid)
-    assert s["results"]["s2"]["status"] == "step_done_ready", s
-    token = eng._lifecycle.get_approval_token_raw(rid, "s2")
-    assert token, "有独立审批人的 review 必须发放审批密钥"
-    assert s["current_step"] == "s2", f"未 confirm 不得推进, got {s}"
-    eng._lifecycle.confirm_step(rid, "s2", token=token, approved=True)
-
-    s = eng.status(rid)
-    assert s["current_step"] == "s3", f"confirm 后应推进到 s3, got {s}"
+    assert s["current_step"] == "s3", f"评审通过应直接推进到 s3, got {s}"
+    # 密钥可以留在 step_results（供人工复核/追溯），但**不得阻塞推进**：
+    # 结论 APPROVED 已经让引擎往前走，没人 confirm 也不等 90 分钟。
+    r2 = s["results"].get("s2") or {}
+    assert not r2.get("approval_consumed_at"), f"没人 confirm 却标了已消费: {r2}"
     _cleanup(d)
-
-
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_review_self_audit_no_deadlock(mock_run):
-    """自审 review 不发 token，直接推进——否则死等 TTL(1h)+grace(30min)。
+    """首步 review 无「上一步产出」可审 → 直接推进，不留等待态。
 
-    生产事故：architect_full_design/s4 的 target_role=product_architect，
-    assigner 也返回它自己 → token 无人消费，步骤 step_done_ready 卡 61 分钟；
+    生产原形：architect_full_design/s4 的 target_role 与上一步同为
+    product_architect = 自审，密钥无人消费，步骤 step_done_ready 卡 61 分钟；
     同时 liveness 把它算作 busy，锁死同角色 3 个其它工作流（排队 7~21 次）。
     """
     signal.alarm(_TEST_TIMEOUT)
@@ -315,60 +300,40 @@ def test_review_self_audit_no_deadlock(mock_run):
 
     eng.run_once()
     _done(eng, "s1")
-    for _ in range(20):
-        time.sleep(0.05)
-        eng.run_once()
-        if eng.status(rid)["current_step"] != "s1":
-            break
+    _poll(eng, rid, "s1")
 
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed", s
-    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
-        "自审 review 不得发放审批密钥（否则无人消费，卡死 90 分钟）"
+    assert "approval_token" not in (s["results"]["s1"] or {}), \
+        f"自审 review 不得留下密钥字段: {s['results']['s1']}"
     assert s["current_step"] == "s2", f"自审 review 应直接推进, got {s}"
     _cleanup(d)
-
-
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_rework_chain_first_step_review_no_token(mock_run):
-    """首步 review 的 assigner 不是执行者时，也不得发 token。
+    """返工链首步 review 不得等一个不知情的审批人。
 
     生产原形：返工链由引擎自建，assigner 写死 "reviewer"，而首步 review 的
-    执行者不是它（如 maintainer）——reviewer 从不知道这条链存在。
-    首步 review 无「上一步产出」可审 = 自审，直接放行。
-
-    变异验证：删掉 manager._get_assigner_for_step 的 `if i == 0: return ""`
-    后本用例必须失败（曾用 assigner==target_role 写过一版，两条路径都返回空，
-    删守卫照样通过 → 无区分度）。
+    执行者是 maintainer——reviewer 从不知道这条链存在，密钥必然烂在库里。
     """
     signal.alarm(_TEST_TIMEOUT)
     d = _make_env()
     _write_wf(d, "selfeq", [_step("s1", type="review"), _step("s2")])
     eng = WorkflowEngine(d)
     rid = eng.start("selfeq", {})
-    # 复刻返工链：引擎建链时 assigner 固定 reviewer，与首步执行者不同
     eng._lifecycle.execute(
         "UPDATE workflow_instances SET assigner=? WHERE instance_id=?",
         ("reviewer", rid))
 
     eng.run_once()
     _done(eng, "s1")
-    for _ in range(20):
-        time.sleep(0.05)
-        eng.run_once()
-        if eng.status(rid)["current_step"] != "s1":
-            break
+    _poll(eng, rid, "s1")
 
     s = eng.status(rid)
-    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
-        "首步 review 无上一步产出可审，不得发给不知情的 reviewer"
-    assert s["current_step"] == "s2", f"自审应直接推进, got {s}"
+    assert "approval_token" not in (s["results"]["s1"] or {}), \
+        f"首步 review 不得留密钥: {s['results']['s1']}"
+    assert s["current_step"] == "s2", f"首步 review 应直接推进, got {s}"
     _cleanup(d)
-
-
-
-
 # ═══════════════════════════════════════════════════════════════════
 # 4. Review rejection
 # ═══════════════════════════════════════════════════════════════════
@@ -376,33 +341,27 @@ def test_rework_chain_first_step_review_no_token(mock_run):
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_review_rejection_keeps_running(mock_run):
-    """review -> step_done_ready -> reject -> still running.
+    """评审结论为驳回 → 步骤置 rejected 且不推进（不再靠人工 confirm）。
 
-    驳回走 confirm_step(approved=False)，置 rejected 且不推进。handoff 不再有
-    token 通道，故本用例改用 review 型步骤覆盖同一拒绝语义。
+    旧语义靠 confirm_step(approved=False) 落 rejected；密钥退场后，
+    判据改由 review_gate 直接消费完成消息里的结论词（CHANGES_REQUESTED），
+    由引擎的 rejected 消费分支建返工链或重投。本用例锁住这条链路仍然成立。
     """
     signal.alarm(_TEST_TIMEOUT)
     d = _make_env()
-    _write_wf(d, "hr", [_step("s1", type="review")])
+    _write_wf(d, "hr", [_step("s1", type="review"), _step("s2")])
     eng = WorkflowEngine(d)
     rid = eng.start("hr", {})
 
     eng.run_once()
-    _done(eng, "s1")
-    time.sleep(0.1)
-    eng.run_once()
-
-    token = eng._lifecycle.get_approval_token_raw(rid, "s1")
-    ok = eng._lifecycle.confirm_step(rid, "s1", token=token, approved=False,
-                                      reason="no good")
-    assert not ok
+    _done(eng, "s1", extra="CHANGES_REQUESTED: 3 P1 — 设计未覆盖边界情况")
+    _poll(eng, rid, "s1")
 
     s = eng.status(rid)
-    assert s["status"] == "running"
-    assert s["results"]["s1"]["status"] == "rejected"
+    assert s["results"]["s1"]["status"] == "rejected", s
+    assert s["current_step"] == "s1", f"驳回不得推进, got {s}"
+    assert s["status"] == "running", s
     _cleanup(d)
-
-
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_gate_rejection_blocks_advance(mock_run):

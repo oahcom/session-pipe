@@ -13,17 +13,17 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
          └──→ launcher/ccs.py send ← 唯一跨项目调用（subprocess）
 ```
 
-**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`/tmp/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
+**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`~/.hermes/run/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
 
 ## Module inventory
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 895 | Data-driven workflow execution engine (core, imports mixins below) |
-| **pipeflow/step_handler.py** | 977 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 443 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
-| **pipeflow/task_generator.py** | 406 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 903 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **pipeflow/engine.py** | 1771 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/step_handler.py** | 1634 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1153 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/task_generator.py** | 851 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 1958 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
 | **lifecycle/manager.py** | 1200 | Workflow state machine (5 step types, approval/rollback/escalation) |
 | **template_registry.py** | 837 | 模板注册中心 |
 | **eval_checker.py** | 602 | 安全白名单命令执行检查 |
@@ -41,14 +41,12 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **conversation_monitor.py** | 228 | 对话监控 |
 | **config_loader.py** | 184 | YAML config loading with env override and hot-reload |
 | **workflow/gateway.py** | 193 | 工作流网关门禁 |
-| **dispatch_tasks.py** | 145 | 任务分发 |
 | **drift_detector.py** | 143 | 架构漂移检测 |
 | **cron_scheduler.py** | 139 | cron 调度器 |
 | **eval_consistency.py** | 137 | 评估一致性 |
 | **routing/consistency.py** | 120 | 路由一致性 |
 | **pipeflow/daemon.py** | 108 | Main loop: `while True: engine.run_once(); sleep(10)` |
 | **workflow_metrics.py** | 103 | 工作流指标 |
-| **role_validator.py** | 92 | 角色校验 |
 | **workflow/db.py** | 92 | 工作流数据访问 |
 | **output_validator.py** | 90 | 输出格式验证 |
 | **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
@@ -58,7 +56,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **pipeflow/db.py** | 328 | Three-layer SQLite: Template → Instance → Task |
 | **p0_exemption.py** | 486 | P0 豁免通道 |
 
-**Total: 38 modules（不含 `__init__.py`），合计 ~10700 行 Python**
+**Total: 39 modules（不含 `__init__.py`），合计 ~20064 行 Python**（其余行数已过期；机器校验只看 CLAUDE.md，见 `scripts/doccheck.py`）
 
 ## Data flow
 
@@ -90,7 +88,7 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **roles_export.json** (`~/.hermes/data/roles_export.json`) -- route table source from shared_loader.py
 - **Sister Bus** (`~/.hermes/scripts/bus_protocol.py`) -- Blackboard read/write
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
-- **Sentinel files** (`/tmp/ccs-sentinels/`) -- CCS alive check
+- **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
 - **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `pipeline_cursor.db`, `ack_tracker.db`)
 
@@ -122,12 +120,6 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 - `_scan_tasks()` -- sub-workflow completion pushes parent workflow
 
 These bypasses lose RLock protection and approval workflow.
-
-### `/loop` injection is a no-op
-
-`_ensure_role_alive()` injects `/loop` into the CCS, but `/loop` is NOT available in tmux environments. The CCS will not error, but it will also not enter a work loop -- it idles after processing each message.
-
-Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` in `engine.py:582`.
 
 ### Cross-project call boundary
 
