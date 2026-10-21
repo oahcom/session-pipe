@@ -113,6 +113,14 @@ _MAX_REJECTED_RETRY = 3
 # 丢产物好。
 _REJECTED_WAIT_MAX = 3600
 
+# 升级后的终结期限：升级只是通知，没人处置时 step 会永远停在 rejected——
+# 实测 wf_a4da845a61 卡 16.3h、wf_83a7b58c4a 卡 11.6h（返工链 s2 timeout_count=3
+# 仍在跑），两者都只能等 24h 全局 cancel，届时已推进的步骤产物全部陪葬。
+# 升级送达后再给 2h：仍无进展则按 failed 收口，理由落在 wf_logs 里可归因。
+# ponytail: 固定期限，不区分返工链是否还活着——2h 后仍在跑的返工链会随父链
+# 级联取消。升级路径：改判「子链最后一次进展距今」，需先给子链记账进展时间戳。
+_REJECTED_ESCALATED_MAX = 7200
+
 _REWORK_TERMINAL = ("completed", "failed", "cancelled")
 
 # 回退重投须清掉的 step_result 键：exit_messages 残留会让 tick-rescue 立即二次
@@ -1242,6 +1250,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 但证据仍空时重复建链（rework 防重靠模板匹配，两次解析结果可能不同）。
                 if step_status == "rejected":
                     _rej_sr = results.get(step_id, {}) or {}
+                    # 升级后的终结期限：三个升级入口（等待超时/返工未交付/重投封顶）
+                    # 都只在 rework_escalated_at 上落锚、然后 continue——没人处置就一直
+                    # 停在这里等 24h 全局 cancel。放在分支入口一次判齐，不必三处各写。
+                    _esc_at = _rej_sr.get("rework_escalated_at")
+                    if _esc_at and time.time() - _esc_at > _REJECTED_ESCALATED_MAX:
+                        self._bb.write("blocker",
+                            f"[workflow] {inst['instance_id'][:12]}/{step_id} 升级后"
+                            f" {_REJECTED_ESCALATED_MAX // 3600}h 无人处置，按 failed 收口",
+                            evidence=(f"升级时间: {time.strftime('%F %T', time.localtime(_esc_at))}\n"
+                                      f"驳回理由: {(_rej_sr.get('rejection_reason') or '')[:200]}"),
+                            src="workflow_engine")
+                        self._lifecycle.close_wf(
+                            inst["instance_id"], status="failed",
+                            reason=f"rejected step {step_id} unhandled "
+                                   f"{int((time.time() - _esc_at) / 60)}min after escalation")
+                        continue
                     _rework_ids = _rej_sr.get("rework_ids") or []
                     _idx = next((i for i, s in enumerate(wf.steps) if s.id == step_id), -1)
                     _has_next = 0 <= _idx < len(wf.steps) - 1
