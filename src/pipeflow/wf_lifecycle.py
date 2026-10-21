@@ -678,11 +678,27 @@ class WorkflowLifecycleMixin:
                     # 主循环看到旧 step_done_ready 再次触发 advance
                     conn.execute("UPDATE workflow_instances SET status='running' WHERE instance_id=?",
                                 (wf_id,))
-                    new_results = dict(results or {})
+                    # 用 DB 实时副本封旧步骤，不用 tick 快照：快照里这一步可能只有
+                    # status 没有 completed_at/completed_by（生产实测 124 步如此，
+                    # 10-17 cron 巡检链 71 步一批）。末步分支（:553）早已实时读取，
+                    # 推进分支是遗漏的另一半 → 证据链在推进瞬间丢失。
+                    _db_sr = conn.execute(
+                        "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                        (wf_id,)).fetchone()
+                    try:
+                        _db_res = json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        _db_res = {}
+                    # 快照在前、DB 在后：快照里的步骤（DB 还是空表时）不能丢，
+                    # DB 里更新的字段（confirmed_at / 盖戳）必须盖过来
+                    new_results = {**dict(results or {}), **_db_res}
                     # 旧步骤强制 completed：残留 notified/step_done_ready 会让
                     # _is_role_busy 误判角色忙 → 下棒角色被堵（与 _advance_unsafe 同源修复）
                     if isinstance(new_results.get(step_id), dict):
-                        new_results[step_id]["status"] = "completed"
+                        _cur = new_results[step_id]
+                        _cur["status"] = "completed"
+                        _cur.setdefault("completed_at", time.time())
+                        _cur.setdefault("completed_by", "workflow_engine")
                     new_results[next_step.id] = {"status": "notified", "ts": time.time(), "notified_at": time.time(),
                                                   "poll_since": time.time(), "bus_anchor": time.time()}
                     conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
