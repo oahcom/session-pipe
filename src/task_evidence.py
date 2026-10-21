@@ -234,7 +234,11 @@ def _evaluate_with(db):
             try:
                 _r = subprocess.run(
                     [str(_bus), "write", "feedback",
-                     f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
+                     # 标题必须带实例与时刻：bus 按标题 UPSERT 且不更新 ts，
+                     # 同一 detail 的第 2..N 次评估会覆盖成第一行（#406143 写 1091 次，
+                     # ts 冻在 10-18 → 今天转负面的任务读出来是 3 天前的结论）。
+                     f"[task_evidence] {a['detail']} — 质量: {a['quality']}"
+                     f" [{a['task_id'][:12]} {time.strftime('%m-%d %H:%M')}]",
                      "--evidence", json.dumps(a),
                      "--src", "task_evidence"],
                     capture_output=True, timeout=10)

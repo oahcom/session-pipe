@@ -8,6 +8,7 @@
 
 Run: cd ~/session-pipeline && python3 -m pytest tests/test_rate_recovery.py -q
 """
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,9 +23,9 @@ def _engine():
     eng._lm = MagicMock()
     eng._lm.query.return_value = []          # DB 里没有活跃工作流
     eng._last_rate_recover = {}
-    # 真 Blackboard：这些用例会走到 _bb.write，实测把
-    # "[rate_limit] knowledge_curator 被额度拒绝" 写进生产 bus（21 日 19:01 起
-    # 每半小时一条、attempt 编号还倒着重置）。测试不许写生产通道。
+    # conftest 已把 Blackboard 重定向到临时 DB；这里再 mock 是为了让断言面
+    # 只落在 tmux 调用上，不依赖 bus 是否可用（本轮曾把 daemon 写的
+    # "[rate_limit] knowledge_curator" 误归因给测试，记录在此避免重犯）。
     eng._bb = MagicMock()
     return eng
 
@@ -272,9 +273,8 @@ def test_audit_title_carries_time_so_rows_dont_merge():
         eng._recover_rate_limited_roles()
 
     assert titles, "注入后必须有审计行"
-    import re
-    assert re.search(r"已发继续（第 1 次 \d{2}:\d{2}:\d{2}）", titles[0]), \
-        f"标题缺时刻 → 跨天 UPSERT 会合并, got {titles[0]}"
+    assert re.search(r"已发继续（第 1 次 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}）",
+                     titles[0]), f"标题缺完整日期 → 跨天 UPSERT 会合并, got {titles[0]}"
 
 
 def test_send_failure_writes_no_audit_and_does_not_raise():
@@ -296,9 +296,60 @@ def test_send_failure_writes_no_audit_and_does_not_raise():
     assert not eng._bb.write.called, "注入失败却写了审计"
 
 
+def test_send_nonzero_rc_writes_no_audit():
+    """tmux 返回 rc≠0（会话已死）也必须算发送失败。
+
+    subprocess.run 不会因 rc≠0 抛异常；只看异常会把"没发出去"记成"已发继续"。
+    """
+    eng = _engine()
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="API Error: 403 FreeTierError")
+        if "send-keys" in cmd:
+            return MagicMock(returncode=1, stdout="", stderr="no such session")
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert not eng._bb.write.called, "tmux rc=1 却写了「已发继续」"
+
+
+def test_request_rejected_429_is_recovered():
+    """9router 现行 429 文案 `Request rejected (429)` 必须命中恢复词表。
+
+    2026-10-21 实测 closer/maintainer 的 pane 停在这一行，旧词表
+    ("API Error: 429" / "Rate limit exceeded") 一条不中 → 恢复分支整条不可达，
+    两角色各空等 16min，当日 [rate_limit] 审计 0 条（#432582）。
+    """
+    eng = _engine()
+    sent = []
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-closer\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout=(
+                "● API Error: Request rejected (429) · [ollama/gpt-oss:120b] [429]:\n"
+                '{"error":"You reached the Free usage limit."} (reset after 4m 45s)\n'
+                "✻ Cogitated for 16m 23s\n❯ "))
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run):
+        eng._recover_rate_limited_roles()
+
+    assert any("继续" in c for c in sent), f"Request rejected (429) 应发继续, got {sent}"
+
+
 if __name__ == "__main__":
     for fn in (test_no_workflow_role_recovered_via_tmux,
                test_healthy_role_not_touched,
-               test_backoff_blocks_immediate_retry):
+               test_backoff_blocks_immediate_retry,
+               test_request_rejected_429_is_recovered):
         fn()
         print(f"OK {fn.__name__}")

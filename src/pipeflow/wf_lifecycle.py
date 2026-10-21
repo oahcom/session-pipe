@@ -732,8 +732,10 @@ class WorkflowLifecycleMixin:
             # 部署自动闭环：把产出 cli/*.py 安装到 ~/.hermes/bin/，让工具可被
             # cron/daemon/角色直接调用（"有实际收益"的最后一环——部署）。
             self._deploy_production_outputs(wf_id)
+            # 标题带 wf_id：同一模板每完成一次都写同一行，ts 冻在首次 →
+            # 看板据此判"模板卡死"（#376577 写 47 次，ts 停在 10-17）。
             self._bb.write("workflow",
-                f"[workflow] {wf_name} 完成: {len(steps)} 步",
+                f"[workflow] {wf_name} 完成: {len(steps)} 步 ({wf_id[:12]})",
                 src="workflow_engine")
             # 食物链循环：loop 配置存在 → 检查是否继续下一轮
             # 子 agent 价值审计文件存在且标记 FAIL → 停止循环（收益不足）
@@ -858,6 +860,20 @@ class WorkflowLifecycleMixin:
                             (json.dumps(results, ensure_ascii=False), wf_id))
                         conn2.commit()
                     return True
+                # 同一父步已有"跑完却没通过"的旧子链 → 不再重建：重建只是把同样的
+                # 空需求再跑一遍。实测 wf_0c5e3d807ede/s1（[auto] 产品交付全流程，
+                # 任务描述只有模板简介、没有用户需求）的子链三步全零产出并自判
+                # REJECTED，父链每次重投都清 subflow_id → 本函数再造一条，19:28:45
+                # 旧子链完成、19:29:08 新子链已建，23 秒一轮，纯烧 pm 队列。
+                # 交还父步自投，让 _MAX_REJECTED_RETRY 正常收敛。
+                if isinstance(_db_sdata, dict) and _db_sdata.get("rejected_retry"):
+                    _old_sub = conn2.execute(
+                        "SELECT instance_id FROM workflow_instances WHERE parent_wf_id=? "
+                        "AND subflow_source_step_id=? AND status='completed' "
+                        "AND instance_id NOT LIKE 'wf_rw_%' LIMIT 1",
+                        (wf_id, tgt_step.id)).fetchone()
+                    if _old_sub:
+                        return False
                 # 不再按"角色忙"跳过建子链：父步的完成判据就是整条子链，跳过建链
                 # 等于让父步空等角色空闲（实测 wf_b808ff2f3611 17:54 建链、18:08
                 # 才建出子链，14 分钟全耗在 17 次 "subflow skip: pm 忙于其他工作流"）。

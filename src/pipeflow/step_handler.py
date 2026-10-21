@@ -1452,10 +1452,15 @@ class StepHandlerMixin:
         ws_real = os.path.realpath(ws)
         errs: list[str] = []
 
+        def _inside(real: str) -> bool:
+            # 必须带分隔符边界：startswith("/ws/dev") 会放行兄弟目录 /ws/devops
+            # （本机存在 dev/devops、architect/architecture、research/researcher）。
+            return real == ws_real or real.startswith(ws_real + os.sep)
+
         for req in schema.get("required", []):
             fpath = ws / req
             fpath_real = os.path.realpath(fpath)
-            if not fpath_real.startswith(ws_real):
+            if not _inside(fpath_real):
                 errs.append(f"路径越权: {req}")
                 continue
             # 支持通配符: mc_*/ * → 检查 glob 匹配
@@ -1468,6 +1473,13 @@ class StepHandlerMixin:
 
         for fname, props in schema.get("properties", {}).items():
             fpath = ws / fname
+            # 旧实现只在 required 分支做了越界检查，properties 分支直接按
+            # `ws / fname` 读内容：schema 写 `../devops/X.md` 或
+            # `../../../../tmp/X.md` 即可让引擎把兄弟 workspace / 工作区外文件
+            # 当本步产出校验（2026-10-21 实测 required 越界 + properties 无检查）。
+            if not _inside(os.path.realpath(fpath)):
+                errs.append(f"路径越权: {fname}")
+                continue
             # 通配符一次解析：所有检查器共享匹配列表
             # 2s 容差：fs 时间戳精度与 time.time() 不保证有序，同一瞬间写出的
             # 文件 mtime 可能早于 run.created_at 数微秒（实测约 100µs 量级）。

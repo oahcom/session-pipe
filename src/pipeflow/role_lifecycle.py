@@ -207,6 +207,10 @@ class RoleLifecycleMixin:
     _last_rate_recover: dict[str, tuple[float, int]] = {}   # role -> (last_ts, attempt)
     _RATE_LIMIT_PATTERNS = (
         "API Error: 403", "API Error: 429",
+        # 9router 当前 429 文案是 `API Error: Request rejected (429) · [ollama/...]`，
+        # 不含上面两条 → 恢复分支整条不可达。实测 close/maintainer 各空等 16min，
+        # 今日 [rate_limit] 审计 0 条（#432582）。
+        "Request rejected (429)",
         "Rate limit exceeded", "rate_limit_exceeded",
         "FreeTierError", "FreeUsageLimitError",
         "Please run /login",
@@ -348,25 +352,34 @@ class RoleLifecycleMixin:
 
             LOGGER.warning("额度拒绝: %s 命中 403/429，第 %d 次发「继续」重试", role, attempt + 1)
             try:
-                _engine_mod._sp.run(
+                _r1 = _engine_mod._sp.run(
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
                     capture_output=True, timeout=5,
                 )
-                _engine_mod._sp.run(
+                _r2 = _engine_mod._sp.run(
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "继续", "Enter"],
                     capture_output=True, timeout=5,
                 )
             except Exception as e:
                 LOGGER.warning("额度恢复发送失败 %s: %s", role, e)
                 continue
+            # subprocess.run 在 rc≠0 时不抛异常：会话在候选集之后死掉只会得到
+            # RC=1（实测 tmux send-keys -t ccs-nonexistent → rc=1），不判 rc 就会
+            # 写出「已发继续」假审计。
+            _rc = max(getattr(_r1, "returncode", 0) or 0,
+                      getattr(_r2, "returncode", 0) or 0)
+            if _rc != 0:
+                LOGGER.warning("额度恢复发送失败 %s: tmux rc=%d", role, _rc)
+                continue
             # 审计与发送分家：发送异常不再吞掉审计，写入失败单独可见。
-            # 标题必须带时刻——bus 按标题 UPSERT 且保留首次 ts，而 attempt 随
-            # 退避重置反复从 1 起算，同一标题把新一轮注入覆盖到昨天那行上：
-            # 实测今日 8 次注入在 facts 里查不到，最后可见行还是 2026-10-20 23:46。
+            # 标题必须带完整日期时刻——bus 的 facts.t 是 UNIQUE 且 ON CONFLICT
+            # 保留首次 ts，而 attempt 随退避重置反复从 1 起算：不带日期时新一天
+            # 的注入会覆盖昨天那行（实测今日 8 次注入在 facts 里查不到，最后可见
+            # 行停在 2026-10-20 23:46；24h 902 次写只落到 91 行 ≈10:1 合并）。
             try:
                 self._bb.write("monitor_audit",
                     f"[rate_limit] {role} 被额度拒绝 → 已发继续"
-                    f"（第 {attempt + 1} 次 {time.strftime('%H:%M:%S')}）",
+                    f"（第 {attempt + 1} 次 {time.strftime('%Y-%m-%d %H:%M:%S')}）",
                     evidence=output[-300:], src="workflow_engine")
             except Exception as e:
                 LOGGER.warning("额度拒绝审计写入失败 %s: %s", role, e)
@@ -467,8 +480,9 @@ class RoleLifecycleMixin:
                 )
                 with self._COMPACT_LOCK:
                     self._last_compact[role] = now
+                # 带时刻：压缩频率是上下文压力的唯一时间线，UPSERT 会把它压成一行。
                 self._bb.write("architecture",
-                    f"[context_overflow] {role} → /compact",
+                    f"[context_overflow] {role} → /compact {time.strftime('%m-%d %H:%M')}",
                     src="workflow_engine")
             except Exception as e:
                 LOGGER.warning("compact send failed for %s: %s", role, e)
@@ -648,8 +662,11 @@ class RoleLifecycleMixin:
                         # 审计信号：记录角色被 workflow 引擎拉起（供 monitor_audit 查看）
                         # 写失败不阻断拉起（审计是旁路，DB 锁/连接异常不应让角色拉起中断）
                         try:
+                            # 带时刻：固定标题会把每次重启压成一行（#288618 写 21 次
+                            # 仍只显示"重启 1 次"），崩溃循环在审计里不可见。
                             self._bb.write("monitor_audit",
-                                f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)",
+                                f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)"
+                                f" {time.strftime('%m-%d %H:%M:%S')}",
                                 src="workflow_engine")
                         except Exception:
                             LOGGER.debug("monitor_audit write failed for %s", role)
