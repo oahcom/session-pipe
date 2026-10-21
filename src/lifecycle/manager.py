@@ -894,6 +894,11 @@ class LifecycleManager:
         # engine 的审批门控只看"token 存在"（engine.py 审批门控段）→ 照样拦住
         # 推进，等 TTL+grace 90 分钟。实测 architect_full_design/s4 因此卡死。
         wf = self._get_wf_unsafe(wf_id)
+        # 步骤/实例已终态就别再上闸：超时兜底放行后再签发，会把
+        # approval_consumed_at 写回 None，已完成的步骤重新变成待审批（复活）。
+        _cur = self._parse_results(wf).get(step_id, {})
+        if _cur.get("status") == "completed" or wf.get("status") in ("completed", "cancelled"):
+            return
         assigner = self._get_assigner_for_step(wf, step, step_id)
         if not assigner:
             return  # 无审批人（系统发起/自审/首步）→ 不落 token，engine 直接放行
