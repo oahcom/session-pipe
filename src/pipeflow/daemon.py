@@ -232,16 +232,28 @@ def _tmux_wedged(timeout: float = 6.0) -> bool:
         return False  # 没有 tmux 不算卡死，可能是别的 tmux 实例/权限问题
 
 
-def _tmux_stuck_utempter() -> list:
+def _tmux_ok(timeout: float = 6.0) -> bool:
+    """服务端能应答且 rc==0 = 真的活。超时/无二进制/rc!=0 一律算否。"""
+    try:
+        return subprocess.run(["tmux", "display-message", "-p", "ok"],
+                              capture_output=True, timeout=timeout).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _tmux_stuck_utempter(min_age: int = 30) -> list:
     """卡住的 utempter 进程（tmux 借 libutempter 写 /var/run/utmp 的 setuid 助手）。
 
     tmux 链接 libutempter，新 pane 建会话时它 fork 出 utempter 写 utmp 记录；
     助手卡住时单线程 server 停在 waitpid，整个事件循环停摆——所有 tmux 命令
     排队 12~50s（实测 2026-10-22 03:44~04:05：助手存活 273s 未退出，
     server /proc/<pid>/wchan = do_wait）。
+
+    min_age 是安全阀：正常助手活不过几十毫秒，只杀「活了 30s 还在」的，
+    避免误杀并发登录/另一个 tmux server 的健康助手（codex review P2）。
     """
     try:
-        r = subprocess.run(["pgrep", "-x", "utempter"],
+        r = subprocess.run(["pgrep", "-x", "utempter", "--older", str(min_age)],
                            capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -253,6 +265,10 @@ def _tmux_recover() -> bool:
 
     只损失一条 utmp 记账，pane 与会话毫发无损——比重启 server（丢 17 个
     角色会话上下文）代价低两个数量级。
+
+    恢复必须由**正向应答**证明（rc==0）：not _tmux_wedged() 会把「没有 tmux
+    二进制/服务端已死（rc!=0）」也算成恢复，从而吞掉该升级的 blocker
+    （codex review P1）。
     """
     for _pid in _tmux_stuck_utempter():
         try:
@@ -260,7 +276,7 @@ def _tmux_recover() -> bool:
             LOGGER.warning("tmux 服务端阻塞：杀掉卡住的 utempter pid=%d", _pid)
         except OSError:
             pass
-    return not _tmux_wedged()
+    return _tmux_ok()
 
 
 def _tmux_wedge_alarm() -> None:
