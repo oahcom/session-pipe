@@ -1000,19 +1000,39 @@ class TrajectoryQualityChecker:
             return os.path.realpath(os.path.expanduser(fp)) if fp else ""
 
         def _bash_read(fp: str) -> bool:
-            """命令里出现过同名文件即算读过（roles 实测 basename 100% 命中）。
+            """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
 
-            basename 必须是完整路径分量：`x.md` 不命中 `my_x.md`/`x.md.bak`
-            （子串匹配会把别的文件当成读过）。也**不**要求命令"读成功"——grep
-            无匹配退出 1 在 Claude Code 里就是 is_error，按成功过滤会丢掉全部
-            grep 读（角色规范要求的正是先 grep 定位）。
+            只比 basename 会白拿豁免：`cat /tmp/decoy/config.py` 就算读过
+            `/repo/config.py`（同名异目录）。规则分两档——token 是绝对路径 →
+            realpath 必须相等；裸 basename / 相对路径 → 认（角色在自己 cwd 里
+            `cat notes.md`，cwd 不可知，判不了）。
+            basename 还必须是完整路径分量：`x.md` 不命中 `my_x.md`/`x.md.bak`。
+            不要求命令"读成功"：grep 无匹配退出 1 就是 is_error，按成功过滤会
+            丢掉全部 grep 读（角色规范要求的正是先 grep 定位）。
+            ponytail: 只建模 Write/Edit 两个改文件的工具，`sed -i`/`mv`/MultiEdit
+            改文件不进判据——给每种改文件方式配读取证据只会更假。
             """
             base = os.path.basename(fp)
             if not base:
                 return False
             pat = r"(?<![\w.-])" + re.escape(base) + r"(?![\w.-])"
-            return any(re.search(pat, b, re.ASCII) for b in bash_blob)
+            target = _key(fp)
+            for b in bash_blob:
+                for m in re.finditer(pat, b, re.ASCII):
+                    i = m.start()
+                    while i > 0 and b[i - 1] not in " \t\n\"'`;|&()":
+                        i -= 1
+                    token = b[i:m.end()]
+                    if not token.startswith(("/", "~")):
+                        return True
+                    if _key(token) == target:
+                        return True
+            return False
 
+        # 语义边界（判据能回答什么）：盲改问的是"角色有没有看过这个文件"，不是
+        # "看的是不是最新版本"。读过之后别人又改了文件、角色拿着旧内容去 Edit，
+        # 不建模——跨角色交错改动要扫全部 transcript 的时间线，且那是"内容陈旧"
+        # 问题，不是"没看就改"。同理只建模 Write/Edit 两种改文件工具。
         read_files: set[str] = set()
         bash_blob: list[str] = []
         seen_use_ids: set[str] = set()

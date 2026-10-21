@@ -406,6 +406,78 @@ def test_bash_basename_must_be_path_component() -> None:
             pass
 
 
+def test_bash_absolute_path_must_point_at_same_file() -> None:
+    """带绝对路径的 bash 读取必须指向同一文件：同名异目录的 decoy 不豁免。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-bashpath-role"
+    decoy, target = "/tmp/decoy/x_path.md", "/tmp/other/x_path.md"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "b3", "name": "Bash",
+             "input": {"command": f"cat {decoy}"}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "b3", "is_error": False,
+             "content": "DECOY CONTENT"},
+        ]),
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "e3", "name": "Edit",
+             "input": {"file_path": target, "old_string": "a", "new_string": "b"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "e3", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("bashpath", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == target]
+        assert len(blind) == 1, f"读同名异目录文件不该豁免: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_bash_same_absolute_path_still_exempts() -> None:
+    """对照：bash 读同一个绝对路径的文件仍豁免（别把 grep 大文件的合规行为判成盲改）。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-bashsame-role"
+    path = "/tmp/x_same.md"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "b4", "name": "Bash",
+             "input": {"command": f"grep -n TODO {path} | head -20"}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "b4", "is_error": False,
+             "content": "3:TODO x"},
+        ]),
+        _turn(2, "assistant", [
+            {"type": "tool_use", "id": "e4", "name": "Edit",
+             "input": {"file_path": path, "old_string": "a", "new_string": "b"}},
+        ]),
+        _turn(3, "user", [
+            {"type": "tool_result", "tool_use_id": "e4", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("bashsame", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert not blind, f"grep 过同一文件的 Edit 被误判: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     for _t in (test_created_file_not_flagged,
                test_list_shaped_result_content,
@@ -418,6 +490,8 @@ if __name__ == "__main__":
                test_edit_before_own_write_still_flagged,
                test_mcp_write_then_edit_own_file_not_flagged,
                test_same_file_different_path_form_not_flagged,
-               test_bash_basename_must_be_path_component):
+               test_bash_basename_must_be_path_component,
+               test_bash_absolute_path_must_point_at_same_file,
+               test_bash_same_absolute_path_still_exempts):
         _t()
     print(f"PASS: {len(_t.__globals__['__name__'] and tuple()) or 12} tests")
