@@ -647,8 +647,8 @@ class OutputSemanticChecker:
 class RequirementConfirmationChecker:
     """需求确认检查器：判断需求是否被真实消费/确认。
 
-    读 bus 消费记录，判断需求 (task_spec/user_story/prd/approval/product_design)
-    是否被真实消费或有下游确认 (code_fix/deployment_report/delivery)。
+    读 bus 的 consume 记录，判断需求 (task_spec/user_story/prd/approval/product_design)
+    是否被任何消费者真实消费过。全局一次，不按角色重算。
     """
 
     REQUIREMENT_CATS = {"task_spec", "user_story", "prd", "approval", "product_design"}
@@ -657,24 +657,25 @@ class RequirementConfirmationChecker:
         from hermes_bus.blackboard_legacy import Blackboard
         self._bb = Blackboard()
 
-    def check(self) -> dict:
-        """未被任何消费者 consume 掉的需求 = 未确认需求。
+    TTL_DAYS = 90  # 与 bus prune 保留期对齐：更老的窗口会静默漏掉未确认需求
 
-        ponytail: 判据只保留「有没有人消费过」这一条。原实现用
-        `search("role:<role> cat:<cat>")` 找需求、`search("fid:<id>")` 找下游确认，
-        但 bus 的 search 是 FTS5 全文，`role:`/`cat:`/`fid:` 限定符一个都不支持
-        （2026-10-22 实测三者全返回 0 条）→ 该检查自诞生起恒 vacuous pass；
+    def check(self) -> dict:
+        """需求有没有人 consume 过 —— 全局口径，不按角色。
+
+        原实现用 `search("role:<role> cat:<cat>")` 找需求、`search("fid:<id>")`
+        找下游确认，但 bus 的 search 是 FTS5 全文，`role:`/`cat:`/`fid:` 限定符
+        一个都不支持（2026-10-22 实测三者全返回 0 条）→ 自诞生起恒 vacuous pass；
         它还传了不存在的 `unconsumed(limit=1)`，每轮 eval 抛 TypeError 被 except
-        吞成一条 finding。消费本就是全局事实，不必按角色重算一遍。
-        天花板：只认 consume 记录，不追下游 code_fix 等确认事实（那需要按 fid 反查，
-        bus 现在没有这个接口）。
+        吞成一条 finding。判据现在只认 consume 记录：没人消费过 = 未确认。
+        查询异常按失败处理（fail-closed）——「出错即通过」正是这次要消灭的东西。
+        天花板：不追下游 code_fix/deployment_report 等确认事实（按 fid 反查 bus
+        没有接口），升级路径 = 给 log 建 fid 索引后反查。
         """
-        findings, checked, unconfirmed = [], 0, 0
+        findings = []
         for cat in self.REQUIREMENT_CATS:
             try:
-                for fact in self._bb.unconsumed(consumer=None, cat=cat)[:20]:
-                    checked += 1
-                    unconfirmed += 1
+                for fact in self._bb.unconsumed(consumer=None, cat=cat,
+                                                ttl_days=self.TTL_DAYS):
                     findings.append({
                         "fact_id": fact.id, "cat": cat,
                         "issue": ("expired_unconfirmed_requirement"
@@ -683,8 +684,9 @@ class RequirementConfirmationChecker:
                     })
             except Exception as e:
                 LOGGER.warning("requirement check error cat=%s: %s", cat, e)
-        return {"passed": unconfirmed == 0, "findings": findings,
-                "checked_requirements": checked}
+                findings.append({"cat": cat, "issue": f"check error: {e}"})
+        return {"passed": not findings, "findings": findings,
+                "checked_requirements": len(findings)}
 
 
 def _ts_recent(ts: str, cutoff: float) -> bool:
@@ -1052,8 +1054,8 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
                     continue
-                if (fp and own_written.get(
-                        (c["src"], _key(fp)), c["order"]) < c["order"]):
+                if (name == "Edit" and fp
+                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
@@ -1234,26 +1236,6 @@ def run_eval_check(role_filter: str | None = None) -> dict:
         except Exception as e:
             LOGGER.warning("OutputSemanticChecker failed: %s", e)
 
-        # RequirementConfirmationChecker: 需求有没有人消费（全局一次；消费本就是全局事实）
-        try:
-            reqc_result = RequirementConfirmationChecker().check()
-            if not reqc_result["passed"]:
-                summary["failed"] += 1
-                summary["checked"] += 1
-                _n = len(reqc_result["findings"])
-                _write_bus(
-                    "verification",
-                    f"[eval_checker] RequirementConfirm FAIL: {_n} 条需求无人消费 — {reqc_result['findings'][:3]}",
-                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
-                )
-                _write_bus(
-                    "notice",
-                    f"@ccs-monitor [eval_checker] 未确认需求 {_n} 条",
-                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
-                )
-                summary["notices"] += 1
-        except Exception as e:
-            LOGGER.warning("RequirementConfirmationChecker failed: %s", e)
 
         # TrajectoryQualityChecker: 从角色对话 transcri 评估工具调用质量
         try:
@@ -1299,6 +1281,30 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                     summary["notices"] += 1
         except Exception as e:
             LOGGER.warning("TrajectoryQualityChecker failed: %s", e)
+
+    # RequirementConfirmationChecker：需求有没有人消费。判的是 bus 的 consume 记录，
+    # 与被抽到的角色无关 → 放在角色循环之外跑一次（在循环里会重复计数、重复发告警）。
+    # role_filter 是「只看某角色」的口径，全局扫描与之冲突，此时不跑。
+    if role_filter is None:
+        try:
+            reqc_result = RequirementConfirmationChecker().check()
+            if not reqc_result["passed"]:
+                summary["failed"] += 1
+                summary["checked"] += 1
+                _n = len(reqc_result["findings"])
+                _write_bus(
+                    "verification",
+                    f"[eval_checker] RequirementConfirm FAIL: {_n} 条需求无人消费 — {reqc_result['findings'][:3]}",
+                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
+                )
+                _write_bus(
+                    "notice",
+                    f"@ccs-monitor [eval_checker] 未确认需求 {_n} 条",
+                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
+                )
+                summary["notices"] += 1
+        except Exception as e:
+            LOGGER.warning("RequirementConfirmationChecker failed: %s", e)
 
     LOGGER.info(
         "eval_check done: checked=%d passed=%d failed=%d skipped=%d notices=%d blockers=%d",
