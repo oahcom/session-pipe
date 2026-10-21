@@ -1570,7 +1570,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # v.get 抛 AttributeError，被外层 except 吞掉 → 本函数当轮完全跳过
                 # （不是跳过该行，是整批 delivery_blocked 实例都得不到恢复），
                 # 连带让 recover_count>=3 → failed 的护栏失效。同文件 1009 与
-                # wf_lifecycle.py:101、health_check.py:39 都已有此守卫。
+                # wf_lifecycle.py:101 已有此守卫。
                 _cand = {_cur: sr[_cur]} if _cur in sr else {
                     k: v for k, v in sr.items()
                     if isinstance(v, dict) and v.get("status") == "delivery_blocked"}

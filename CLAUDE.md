@@ -42,8 +42,8 @@ python3 tests/test_router.py -x -q
 # 列出路由表（router CLI）
 PYTHONPATH=src python3 -m routing.router list
 
-# 健康检查
-python3 src/pipeflow/health_check.py
+# 健康检查（工作流统计与 completion_rate）
+python3 src/wf.py -r maintainer stats
 ```
 
 ### 禁止操作
@@ -76,7 +76,6 @@ src/
     wf_lifecycle.py   ── 工作流生命周期（1059 行）
     daemon.py         ── 工作流守护 while 循环（256 行）
     pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
-    health_check.py   ── 健康检查（65 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/

@@ -53,7 +53,6 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **output_validator.py** | 90 | 输出格式验证 |
 | **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
 | **paths.py** | 84 | 路径常量 |
-| **pipeflow/health_check.py** | 67 | 健康检查 |
 | **workflow/sync.py** | 55 | 工作流同步 |
 
 | **pipeflow/db.py** | 328 | Three-layer SQLite: Template → Instance → Task |
