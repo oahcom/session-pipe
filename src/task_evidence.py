@@ -10,7 +10,7 @@
 
 子 agent 拿到这些数据后自行判断哪些 task 有实际收益。
 """
-import os, sqlite3, json, subprocess, time
+import os, sqlite3, json, subprocess, sys, time
 from pathlib import Path
 
 # env 覆盖: 与 paths.py 同源的两个变量。不隔离时 engine.run_once 会往生产库
@@ -319,8 +319,11 @@ def _evaluate_with(db):
                 # WHY: evaluate_and_feedback 原仅写 bus，role 无法从 negative 教训学习。
                 # CLAUDE.md 禁止回写 CLAUDE.md，仅 TASKS.md 足矣。
                 _append_role_feedback(a["role"], a["title"][:60], a["task_id"])
-            except Exception:
-                pass
+            except Exception as _e:
+                # 不能静默：这条路径是「评分 → 角色 prompt 学习」的唯一闭环，
+                # 吞掉异常 = 角色永远学不到 negative 教训，而日志里看不出没学。
+                print(f"[task_evidence] 负面反馈回写失败 task={a.get('task_id')}: {_e}",
+                      file=sys.stderr)
 
     # 修剪只按 1h 窗口，不按本轮 LIMIT 结果集：窗口内实测 13 个 completed 任务
     # 竞争 LIMIT 10 槽位，排序翻转时被挤出的任务签名会被删，下一轮回到窗口
