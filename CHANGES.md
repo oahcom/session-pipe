@@ -1,24 +1,66 @@
 # CHANGES.md
 
-## 2026-10-22 — 闸门提示标题改为稳定去重键（747fefa）
+## 2026-10-22 — 审批密钥通道全链路退场（841e545 + 2a8a016）
 
 ### 问题
-`_gate_prompt` 把失败详情（缺失文件名 / verify 报错原文）拼进标题，而 `_notify_role` 的
-30min 冷却按 `(role, title)` 命中 → 每次文本都不同 → 冷却永不命中 → 每 tick 叫醒执行角色一次。
-现场（747fefa 提交信息记载的 24h 实测，本条未复算）：qa 目录 11:30–12:05 收到 68 条 user 消息；
-qa 只能回同一句 9 字正文「已完成，无新动作。」18 次（11:38–11:51，每 1–2 分钟一条）；qa 整轮零工具 45/84 = 53.6%（全角色 2.5%）。
+评审步按**结论**推进，密钥没有消费者：引擎侧早已不再等审批，但 `manager` 仍签发 token，
+并向审批人投递一条「[workflow] 步骤审批请求」——密钥在 bus 里被脱敏成 `***`，
+角色既拿不到也 `confirm` 不了。驳回语义改由 bus 文本承担
+（`CHANGES_REQUESTED` / `rejected`，由 `src/review_gate.py` 判据消费）。
 
 ### 修复
-`src/pipeflow/step_handler.py` `_gate_prompt`（:1291-1319）：标题固定为
-`[workflow] {run.workflow_name} {step.id} 闸门未通过`（例：`[workflow] engineer_feature s1 闸门未通过`）；缺失文件名与模板要求的 `text_contains`
-标题契约移入 evidence 正文，详情仍随消息送达。
-`tests/test_r119_gate_prompt.py` 同步断言稳定标题 + 详情在 evidence。
+1. `841e545`：删签发侧（`_issue_approval_token` + `_bb_write_fallback` 120 行 + 2 处调用）；
+   删 `tests/test_approval_pull_lane.py`，新增 `tests/test_approval_channel_retired.py`（反向验证）。
+2. `2a8a016`：删消费侧 3 个读取器（`get_approval_token` / `get_approval_token_raw` /
+   `approval_ttl_remaining`）+ `confirm_step` 里的密钥分支，实测 `git show --numstat` 合计 23 增/117 删 = **净删 94 行**（src 子集 17/114 = −97）。
+   ⚠️ 提交标题自称「−110 行」，实测 −94，不一致——引用时以 numstat 为准。
 
 ### 验证
-- `python3 -m pytest tests/test_r119_gate_prompt.py -q` → `2 passed`（exit=0，本文档写作时实跑）
-- ⚠️ 上游数字一处自相矛盾：747fefa 原文「11:30–12:05 收到 68 条 user 消息，其中 79 条提醒在 24h 内注入」——子集大于全集，不可同时成立；本条只引用 68 / 18 / 45-84 三项，未引用 79。
-- 冷却口径核对：`grep -n _ALERT_COOLDOWN_S src/pipeflow/role_lifecycle.py` → :217 `_ALERT_COOLDOWN_S = 1800`，与「30min 冷却」一致
-- 天花板：冷却表是进程级内存（role_lifecycle.py:215 `ponytail:` 注释），CLI 每 tick 起新进程时最坏退化为每 tick 一条
+- `python3 -m pytest tests/test_approval_channel_retired.py tests/test_launcher_delegation_contract.py tests/test_workcycle_e2e.py -q`
+  → `20 passed in 62.90s`（exit=0，本文档写作时实跑；单跑分别为 2 passed / 18 passed）
+- 读取器确已删除：`grep -rn "def get_approval_token\|def get_approval_token_raw\|def approval_ttl_remaining" src/` → 无命中（exit=1）
+- 存量密钥复算（`~/.hermes/state/workflows.db` 只读，本条实测）：
+  1897 个 dict 步骤中 **430 个仍带 `approval_token`**（`completed` 345 / `step_done_ready` 85）；
+  `approval_consumed_at` 非空者 **0** → 全部是死密钥，只能留着，不能再被拉回。
+- 上游 bus #438765 记「24h 107 条审批请求」与「14 张消费延迟实测」；本次只复算上表，
+  107 条无法从生产库重算（投递记录未落库），按原文转载未独立验证。
+
+### 影响面
+所有走评审步的角色的工作流契约都变了：不再等密钥、不再收「步骤审批请求」，
+驳回写 bus 消息（正文含 `CHANGES_REQUESTED` + 业务/系统问题分类 + 返工对象），
+`wf confirm <wf_id> <step_id> --reject -r "<理由>"` 也不再需要密钥。
+
+
+## 2026-10-22 — 闸门提示标题稳定化（747fefa）已撤回（fdf4bde）
+
+### 结论
+747fefa 把标题换成稳定键，随后被 fdf4bde 撤回；现在 `_gate_prompt` 的标题重新携带失败详情。
+本节保留，因为「为什么要撤回」比「当时为什么改」更值得记。
+
+### 为什么改（747fefa）
+`_gate_prompt` 把失败详情（缺失文件名 / verify 报错原文）拼进标题，而 `_notify_role` 的
+30min 冷却按 `(role, title)` 命中，于是每次文本都不同，冷却永不命中，每 tick 叫醒执行角色一次。
+
+### 为什么撤回（fdf4bde）
+冷却键就是 `(role, title)`，而命中后的 `return` 发生在**写 bus 之前**（role_lifecycle.py:844-852），
+同一 `(role, wf, step)` 的**另一种失败原因**在 30min 内整条被吞：既不落 bus 也不发角色。
+实测复现：`tests/test_tick_paths.py::test_tick_verify_failure` 单跑过、整文件跑红
+（同进程内 schema 用例先占了稳定标题）。频率控制改由 `_gate_alert` 的退避承担
+（5/10/20/40/80min，见下一节），不再靠吞消息。
+
+### 因果陈述被证伪
+747fefa 称 qa 空转源于「闸门标题不稳定叫醒 qa」。fdf4bde 实测：qa 那 18 条
+「已完成，无新动作。」发生在 **10-21 19:38–19:51**，驱动它的是意图提醒通道（79 条/24h）；
+**7 天内 target=qa 的闸门告警为 0 条**，这条链从未对 qa 成立
+（对 reviewer 成立：01:33–02:27 每 5–7 分钟一条）。
+因此 747fefa 正文里的 68 条 / 18 次 / 45-84=53.6% 不能归因到闸门告警，本条不再引用它们作依据；
+原文另有一处自相矛盾（子集 79 > 全集 68）。
+
+### 当前行为（可核对）
+- `step_handler.py:1308-1310`：`_notify_role(self._eff_role(...), msg, ...)`，标题即 `msg`，带失败详情
+- `role_lifecycle.py:217`：`_ALERT_COOLDOWN_S = 1800`
+- 验证：`python3 -m pytest tests/test_r119_gate_prompt.py tests/test_tick_paths.py tests/test_gate_escalation.py -q`
+  → `32 passed in 1.55s`（exit=0，本文档写作时实跑）
 
 ## 2026-10-22 — 投递前 CLI 忙预检
 
