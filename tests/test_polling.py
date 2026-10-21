@@ -34,7 +34,10 @@ def _poll_ctx(facts, *, config_getter=None, circuit_side_effect=None):
         cb_mock.call.side_effect = lambda fn: fn()
 
     bb_mock = mock.MagicMock()
-    bb_mock.unconsumed.return_value = facts
+    # 真 API 把 limit 下推到 SQL（Blackboard.unconsumed(limit=…)）；
+    # 桩也必须裁剪，否则用例测的是"桩返回 30 条"，不是 limit 生效。
+    bb_mock.unconsumed.side_effect = (
+        lambda **kw: facts[:kw['limit']] if kw.get('limit') else facts)
 
     config_mock = mock.MagicMock()
     if config_getter is None:
