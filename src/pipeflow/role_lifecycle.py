@@ -140,6 +140,7 @@ def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AG
         return (time.time() - _dt.timestamp()) < max_age
     return False
 
+
 # 生成中但 transcript 多久没落事件即判卡死（秒）。
 # 实测 2026-10-21 coordinator：末事件是 05:22:13Z 的 tool_use，之后 31 分钟
 # 无任何行（含 tool_result），pane 一直挂 `Compacting… 55% · esc to interrupt`。
@@ -438,10 +439,6 @@ class RoleLifecycleMixin:
             # `-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，故溢出报错一旦滚出
             # 视口就再也抓不到。transcript 是落盘事实，不受视口与进程存活影响。
             #
-            # 阈值告警（与溢出检测独立，先于它执行）：从状态栏 `↓ 117.1k tokens`
-            # 提取当前用量，超阈值就写 blocker —— 溢出信号要等真正撞墙才出现，
-            # 那时 /compact 已排在长任务队列尾（实测 engineer 117k 时正在跑 21 分钟
-            # 的 pytest，compact 要等它结束）。提前告警让 coordinator 能安排任务间隙。
 
             # 而本函数从未触发过一次 /compact——只有 pane 单路时角色溢出后永久卡死
             # （product-architect 90 次 / consumer 35 次）。CLAUDE.md 早已声明本路存在，
