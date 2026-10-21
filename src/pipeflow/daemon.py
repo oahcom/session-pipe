@@ -60,6 +60,15 @@ def _parse_tick_sec(name, default):
     return max(_v, -1)
 
 
+# 源码热加载最小间隔（秒）：实测 2026-10-22 03:46-04:26 的 40 分钟内 execv 8 次
+# （多 session 同时改 src/**），每次重执行都丢掉当前 tick 并重跑启动流程。
+# 不是禁用热加载（分支上的修复就永远不生效），而是限速：最多 1 次 / 5 分钟。
+_RELOAD_MIN_INTERVAL_SEC = 300
+
+
+def _reload_allowed(now_ts, last_reload_ts, interval=_RELOAD_MIN_INTERVAL_SEC):
+    """距上次重执行 ≥ interval 才允许 execv（跨进程用墙钟，monotonic 不可比）。"""
+    return (now_ts - last_reload_ts) >= interval
 _TICK_STACK_DUMP_SEC = _parse_tick_sec("TICK_STACK_DUMP_SEC", 180)
 _TICK_SLOW_SEC = _parse_tick_sec("TICK_SLOW_SEC", 60)
 
@@ -194,6 +203,55 @@ def _starve_signal(eng: WorkflowEngine) -> None:
     _safe_write_state(state)
 
 
+_TMUX_ALARM_AT = 0.0
+
+
+def _tmux_wedged(timeout: float = 6.0) -> bool:
+    """tmux 服务端是否失去响应。健康态实测 2~60ms，卡死态单命令 12~50s。
+
+    WHY 只认超时、不认返回码：会话/目标不存在同样 rc!=0，与卡死无关。
+    """
+    try:
+        subprocess.run(["tmux", "display-message", "-p", "ok"],
+                       capture_output=True, timeout=timeout)
+        return False
+    except subprocess.TimeoutExpired:
+        return True
+    except (FileNotFoundError, OSError):
+        return False  # 没有 tmux 不算卡死，可能是别的 tmux 实例/权限问题
+
+
+def _tmux_wedge_alarm() -> None:
+    """tick 变慢时探一次 tmux 服务端；卡死则升级（10 分钟最多一条）。
+
+    WHY 单独探：tick 变慢不指向 tmux，日志里只有"tick 耗时 399s"看不出原因。
+    2026-10-22 实测：has-session 13~15s、list-sessions 18s、单 tick 399s，
+    5 条链卡在 step_done_ready 1.5~2.4h，2 条链被僵尸回收误杀。根因是 tmux
+    服务端单线程卡在一次写（17 个 pane 的 pty 全满，pane 进程也堵在写）。
+    只能重启服务端解开，故这里报警而不是自动重启——重启会丢 17 个角色会话。
+    """
+    global _TMUX_ALARM_AT
+    _now = time.time()
+    if _now - _TMUX_ALARM_AT < 600:
+        return
+    _TMUX_ALARM_AT = _now  # 探过就记时，避免慢 tick 期每轮付一次探测超时
+    if not _tmux_wedged():
+        return
+    LOGGER.error("tmux 服务端失去响应：角色投递全部阻塞，工作流全链停摆")
+    try:
+        subprocess.run(
+            [sys.executable, str(_BUS_SCRIPT), "write", "blocker",
+             "tmux 服务端卡死：所有角色投递阻塞，工作流全链停摆",
+             "--src", "workflow_engine",
+             "--evidence",
+             "tmux display-message 超时 6s（健康态 2~60ms），角色 pane 读写全堵。"
+             "恢复：pkill -9 -f 'tmux: server'，再对每个角色执行 "
+             "python3 ~/session-launcher/src/ccs.py start <role> --no-attach"],
+            capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 _LOCK_FILE = Path.home() / ".hermes" / "run" / "workflow-daemon.lock"
 _LOCK_FD = None
 
@@ -264,6 +322,11 @@ def daemon_loop(interval: int):
         return max((_mt(_p) for _p in _src_files), default=0.0)
 
     _seen_mtime = _src_mtime()
+    try:
+        _last_reload = float(os.environ.get("_WF_LAST_RELOAD", "0") or 0)
+    except ValueError:
+        _last_reload = 0.0
+
 
     try:
         while not shutdown:
@@ -306,10 +369,19 @@ def daemon_loop(interval: int):
                             # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
                             # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
                             # 锁随新进程重新获取，任何监管方式下都能生效。
-                            LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
-                                        _now_mtime)
-                            logging.shutdown()
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                            _now_ts = time.time()
+                            if not _reload_allowed(_now_ts, _last_reload):
+                                # 收下新 mtime，否则每轮都重走这条路径再 sleep 2s
+                                _seen_mtime = _now_mtime
+                                LOGGER.info(
+                                    "源码已更新，但距上次重执行 %.0fs < %ds，本轮不重启",
+                                    _now_ts - _last_reload, _RELOAD_MIN_INTERVAL_SEC)
+                            else:
+                                LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
+                                            _now_mtime)
+                                os.environ["_WF_LAST_RELOAD"] = str(_now_ts)
+                                logging.shutdown()
+                                os.execv(sys.executable, [sys.executable] + sys.argv)
                 except OSError as _e:
                     LOGGER.debug("源码 mtime 探测失败: %s", _e)
             finally:
@@ -320,6 +392,7 @@ def daemon_loop(interval: int):
                 # 强制每次 tick 都记一条（自检测试与排查用）。
                 if 0 <= _TICK_SLOW_SEC < _tick_dt:
                     LOGGER.warning("tick 耗时 %.0fs（阈值 %ds）", _tick_dt, _TICK_SLOW_SEC)
+                    _tmux_wedge_alarm()
             time.sleep(interval)
     except KeyboardInterrupt:
         LOGGER.info("收到 KeyboardInterrupt，正在关闭...")
