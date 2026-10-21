@@ -1054,9 +1054,9 @@ class TrajectoryQualityChecker:
         # 自己写过的文件不算盲改：内容本来就在自己上下文里（Claude Code 也明说
         # "no need to Read it back"）。只豁免**写之后**的编辑；跨 transcript 不豁免
         # ——那份内容可能已被别人改过。实测 pg 5 条误报里 4 条是这一类。
-        # compact 后仍豁免：Edit 要带 old_string 且成功，说明角色手上的内容与磁盘一致
-        # （对不上会失败，而失败的写已按 failed_ids 跳过），这正是"没盲改"的证据。
-        # 写工具算两种：内置 Write 与 mcp__*__write_file（实测 573 次，input 同 file_path）。
+        # 只豁免 Edit：它必须带 old_string 且成功，说明角色手上的内容与磁盘一致
+        # （对不上就失败，失败的调用已按 failed_ids 跳过）。Write 是整文件覆盖，
+        # 命中 old_string 这层证据不存在，故不豁免——否则 compact 后盲覆盖会被放过。
         own_written: dict[tuple[str, str], int] = {}
         for c in calls:
             _n = c["name"] or ""
@@ -1118,7 +1118,8 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == fp:
                     continue
-                if fp and own_written.get((c["src"], fp), c["order"]) < c["order"]:
+                if (name == "Edit" and fp
+                        and own_written.get((c["src"], fp), c["order"]) < c["order"]):
                     continue
                 if fp and fp not in read_files and not bash_read:
                     findings.append({
