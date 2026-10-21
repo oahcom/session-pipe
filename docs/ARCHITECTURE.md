@@ -13,13 +13,13 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
          └──→ launcher/ccs.py send ← 唯一跨项目调用（subprocess）
 ```
 
-**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`/tmp/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
+**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`~/.hermes/run/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
 
 ## Module inventory
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 1922 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/engine.py** | 1929 | Data-driven workflow execution engine (core, imports mixins below) |
 | **pipeflow/step_handler.py** | 1696 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
 | **pipeflow/role_lifecycle.py** | 1199 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
 | **pipeflow/task_generator.py** | 887 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
@@ -30,7 +30,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **workflow/client.py** | 495 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 385 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
 | **reliability.py** | 432 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 608 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/routes.py** | 616 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
 | **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
 | **routing/survival_monitor.py** | 640 | 存活监测 |
 | **routing/rdb.py** | 293 | Route table SQLite persistence + audit log |
@@ -45,13 +45,13 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **cron_scheduler.py** | 128 | cron 调度器 |
 | **eval_consistency.py** | 70 | 评估一致性 |
 | **routing/consistency.py** | 105 | 路由一致性 |
-| **pipeflow/daemon.py** | 481 | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **pipeflow/daemon.py** | 478 | Main loop: `while True: engine.run_once(); sleep(10)` |
 | **workflow_metrics.py** | 109 | 工作流指标 |
 | **workflow/db.py** | 96 | 工作流数据访问 |
 | **output_validator.py** | 93 | 输出格式验证 |
 | **routing/polling.py** | 87 | Message polling with cursor (dedup across restarts) |
 | **paths.py** | 105 | 路径常量 |
-| **workflow/sync.py** | 65 | 工作流同步 |
+| **workflow/sync.py** | 63 | 工作流同步 |
 
 | **pipeflow/db.py** | 96 | Three-layer SQLite: Template → Instance → Task |
 | **p0_exemption.py** | 496 | P0 豁免通道 |
@@ -88,7 +88,7 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **roles_export.json** (`~/.hermes/data/roles_export.json`) -- route table source from shared_loader.py
 - **Sister Bus** (`~/.hermes/scripts/bus_protocol.py`) -- Blackboard read/write
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
-- **Sentinel files** (`/tmp/ccs-sentinels/`) -- CCS alive check
+- **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
 - **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `pipeline_cursor.db`, `ack_tracker.db`)
 
@@ -121,12 +121,7 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 
 These bypasses lose RLock protection and approval workflow.
 
-### `/loop` injection is a no-op
-
-`_ensure_role_alive()` injects `/loop` into the CCS, but `/loop` is NOT available in tmux environments. The CCS will not error, but it will also not enter a work loop -- it idles after processing each message.
-
-Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` in `engine.py:582`.
-
+### Cross-project call boundary
 ### Cross-project call boundary
 
 `route_to_ccs()` calls `ccs.py send` via subprocess. There is no documented API contract or version check between pipeline → launcher. If launcher changes CLI flags, pipeline silently fails.
@@ -137,7 +132,7 @@ Fix per ARCHITECTURE.md: change `"--drive", "loop"` to `"--drive", "ondemand"` i
 
 ## Tests
 
-- Full suite: `python3 -m pytest tests/ -q` → 1249 passed in 90s (2026-10-22 04:41)；并发 session 抢锁时全量会挂，以定向回归为准。
+- Full suite: `python3 -m pytest tests/ -q`。当前分支**不绿**（未提交改动导致 4 个文件收集失败 + 7 个用例失败），实测基线见 [TEST_WORKFLOW.md](TEST_WORKFLOW.md)；判定回归用定向文件跑。
 - Per-file counts are not maintained; run the suite for current numbers.
 - `python3 scripts/doccheck.py` 校验本文件与 CLAUDE.md 声明的行数；无自动钩子，代码增删后跑一次 `--fix` 刷新。
 
