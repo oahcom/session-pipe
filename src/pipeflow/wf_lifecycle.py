@@ -1013,6 +1013,11 @@ class WorkflowLifecycleMixin:
                     # 消失（步骤行无 s2 键），下一 tick 走"未投递"分支重新派单，
                     # 于是子链与父步同时投给同一角色，subflow_id 也再也接不回来
                     # （生产 wf_413e05355b/s4：notified 但无 subflow_id）。
+                    _psr = dict(results.get(tgt_step.id) or {})
+                    _psr["subflow_id"] = _wf_id
+                    _psr["queued"] = 0
+                    _psr.pop("queued_since", None)
+                    results[tgt_step.id] = _psr
                     conn2.execute(
                         "UPDATE workflow_instances SET step_results="
                         "json_remove(json_set(COALESCE(step_results,'{}'), ?, ?, ?, 0), ?) "
@@ -1031,7 +1036,14 @@ class WorkflowLifecycleMixin:
                         try:
                             _frs = json.loads(_fresh["step_results"])
                             if isinstance(_frs.get(tgt_step.id), dict):
-                                results[tgt_step.id] = _frs[tgt_step.id]
+                                # 取落库现状，再覆回接管键（本地胜）：fallback-读取
+                                # 可能返回旧副本（tests 的假连接），此时本地这三个键
+                                # 保证最终状态正确。
+                                _merged = dict(_frs[tgt_step.id])
+                                _merged["subflow_id"] = _wf_id
+                                _merged["queued"] = 0
+                                _merged.pop("queued_since", None)
+                                results[tgt_step.id] = _merged
                         except (json.JSONDecodeError, TypeError):
                             pass
                     return True   # 子链已接管
