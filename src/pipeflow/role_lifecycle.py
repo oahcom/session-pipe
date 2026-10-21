@@ -4,6 +4,7 @@
 从 engine.py 拆出，方法签名和 self 访问完全不变。
 """
 
+import fcntl
 import json
 import re
 import sys
@@ -227,7 +228,9 @@ _ALERT_LOCK = threading.Lock()
 # 告警冷却落盘：daemon 重启、CLI 每 tick 起新进程都会清空进程内表。实测同一条
 # verify traceback 33 分钟内注入 4 次（reviewer f706ce80 的 1114/1482/1561/1606），
 # 每次都要角色花一整个回合重读同一段话。
-_ALERT_STATE = Path.home() / ".hermes" / "run" / "alert_cooldowns.json"
+_ALERT_STATE = Path(_os.environ.get("HERMES_RUN_DIR")
+                    or Path.home() / ".hermes" / "run") / "alert_cooldowns.json"
+_ALERT_MAX_ENTRIES = 200      # 表的上限：超出按时间留最新的，别让文件无限长
 
 
 def _load_alert_ts(path: Path, now: float, ttl: float) -> dict:
@@ -240,21 +243,37 @@ def _load_alert_ts(path: Path, now: float, ttl: float) -> dict:
     for row in rows:
         try:
             role, title, ts = row
-            if now - float(ts) < ttl:      # 过期条目直接丢，别让文件无限长
+            if now - float(ts) < ttl:      # 过期条目直接丢
                 out[(role, title)] = float(ts)
         except (TypeError, ValueError):
             continue
     return out
 
 
-def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float) -> None:
-    """原子替换写：读方要么看到旧表要么看到新表，不会读到半行。"""
-    rows = [[r, t, v] for (r, t), v in ts.items() if now - v < ttl]
+def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float, override=()) -> None:
+    """读盘→合并→裁剪→原子写，全程持跨进程文件锁。
+
+    合并而不是整表覆盖：两个进程（workflow-engine / routing_daemon）各持一份内存快照，
+    谁后写就把对方刚占的位抹掉 → 同一条告警再投一次（codex 20 维 P1）。
+    锁文件独立于数据文件：replace 会换 inode，锁在数据文件上等于没锁。
+    临时文件名带 pid：两进程同名 .tmp 互相 replace 会丢更新。
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(rows))
-        tmp.replace(path)
+        with open(path.with_suffix(".lock"), "a+") as _fh:
+            fcntl.flock(_fh, fcntl.LOCK_EX)
+            merged = dict(_load_alert_ts(path, now, ttl))
+            for key, val in ts.items():
+                # override：投递失败要**提前**时间戳（600s 后重试），合并取 max 会把它顶回去
+                if key in override or val > merged.get(key, 0.0):
+                    merged[key] = val
+            # 内存表跟着裁剪：长驻 daemon 的 _ts 否则只增不减（codex 20 维 P1）
+            ts.clear()
+            ts.update({k: v for k, v in merged.items() if now - v < ttl})
+            rows = sorted(ts.items(), key=lambda kv: kv[1], reverse=True)[:_ALERT_MAX_ENTRIES]
+            tmp = path.with_name(f"{path.name}.{_os.getpid()}.tmp")
+            tmp.write_text(json.dumps([[r, t, v] for (r, t), v in rows]))
+            tmp.replace(path)
     except OSError as e:      # 落盘失败只退化成进程内冷却，不该影响告警投递
         LOGGER.debug("alert cooldown 落盘失败: %s", e)
 
@@ -268,10 +287,9 @@ class RoleLifecycleMixin:
     # 状态放类属性（进程级）而非实例：与 _BACKLOG_ALERT_TS 同口径——限流是进程级
     # 事实，一个进程里多个 engine 实例各存一份等于没限流。
     # 落盘（2026-10-22）：原来只在进程内生效，daemon 重启或 CLI 每 tick 新进程都会清空
-    # 内存表 → 实测同一条 verify traceback 33 分钟注入 4 次。现在首用即从
-    # ~/.hermes/run/alert_cooldowns.json 加载，每次占位后原子回写。
+    # 内存表 → 实测同一条 verify traceback 33 分钟注入 4 次。现在每次判定前都从
+    # $HERMES_RUN_DIR/alert_cooldowns.json（默认 ~/.hermes/run）合并一次，占位后持锁回写。
     _ALERT_TS: dict[tuple, float] = {}
-    _ALERT_STATE_LOADED = False
     _ALERT_COOLDOWN_S = 1800
     _ALERT_TTL_S = 3600    # 落盘条目保留 2 倍冷却窗口：够覆盖重启间隔，又不会无限增长
     # 投递失败后的重试间隔（秒）。必须 < _ALERT_COOLDOWN_S：下面写的是
@@ -900,9 +918,8 @@ class RoleLifecycleMixin:
         # 锁只包 check+占位，不包 subprocess：8 线程池会同时看到同一条告警
         # （Barrier 20 线程实测放行 20 次）。先占位 30min，投递失败改占 600s。
         with _ALERT_LOCK:
-            if not self._ALERT_STATE_LOADED:   # 首用读盘，避免 import 期 IO
-                _ts.update(_load_alert_ts(_ALERT_STATE, _now, self._ALERT_TTL_S))
-                self._ALERT_STATE_LOADED = True
+            # 每次都合并一次盘上最新表：别的进程刚占的位、或本进程重启前写的位都要生效
+            _ts.update(_load_alert_ts(_ALERT_STATE, _now, self._ALERT_TTL_S))
             _gap = _now - _ts.get(_key, 0.0)
             # 时间回拨时 _gap 为负，旧写法同样 < 窗口 → 最长静默 1.5h。
             if 0 <= _gap < self._ALERT_COOLDOWN_S:
@@ -936,7 +953,7 @@ class RoleLifecycleMixin:
                            role, title, self._ALERT_RETRY_S)
             with _ALERT_LOCK:
                 _ts[_key] = _now - self._ALERT_COOLDOWN_S + self._ALERT_RETRY_S
-                _save_alert_ts(_ALERT_STATE, _ts, _now, self._ALERT_TTL_S)
+                _save_alert_ts(_ALERT_STATE, _ts, _now, self._ALERT_TTL_S, override=(_key,))
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
