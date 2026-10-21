@@ -652,60 +652,39 @@ class RequirementConfirmationChecker:
     """
 
     REQUIREMENT_CATS = {"task_spec", "user_story", "prd", "approval", "product_design"}
-    CONFIRM_CATS = {"code_fix", "deployment_report", "delivery", "verification"}
 
     def __init__(self):
         from hermes_bus.blackboard_legacy import Blackboard
         self._bb = Blackboard()
 
-    def check(self, role: str, task_id: str) -> dict:
-        """检查角色在任务窗口内的需求是否被确认。
+    def check(self) -> dict:
+        """未被任何消费者 consume 掉的需求 = 未确认需求。
 
-        返回 {passed: bool, findings: list[dict], checked_requirements: int}
+        ponytail: 判据只保留「有没有人消费过」这一条。原实现用
+        `search("role:<role> cat:<cat>")` 找需求、`search("fid:<id>")` 找下游确认，
+        但 bus 的 search 是 FTS5 全文，`role:`/`cat:`/`fid:` 限定符一个都不支持
+        （2026-10-22 实测三者全返回 0 条）→ 该检查自诞生起恒 vacuous pass；
+        它还传了不存在的 `unconsumed(limit=1)`，每轮 eval 抛 TypeError 被 except
+        吞成一条 finding。消费本就是全局事实，不必按角色重算一遍。
+        天花板：只认 consume 记录，不追下游 code_fix 等确认事实（那需要按 fid 反查，
+        bus 现在没有这个接口）。
         """
-        # 找到该任务关联的需求事实 (简化：搜索 role 的 output_targets 包含的 cat)
-        # 简化：搜索 requirement_cats 中未被消费/无下游确认的 fact
-        findings = []
-        checked = 0
-        unconfirmed = 0
-
+        findings, checked, unconfirmed = [], 0, 0
         for cat in self.REQUIREMENT_CATS:
-            # 搜索该角色的需求 fact
             try:
-                facts = self._bb.search(f"role:{role} cat:{cat}", limit=20)
-                for fact in facts:
+                for fact in self._bb.unconsumed(consumer=None, cat=cat)[:20]:
                     checked += 1
-                    fid = fact.id
-
-                    # 检查是否有消费记录
-                    consumed = self._bb.unconsumed(consumer=None, cat=cat, limit=1)
-                    has_consumption = any(f.id == fid for f in consumed)
-
-                    # 检查是否有下游确认
-                    has_downstream = False
-                    for dc in self.CONFIRM_CATS:
-                        downstream = self._bb.search(f"fid:{fid}", cat=dc, limit=5)
-                        if downstream:
-                            has_downstream = True
-                            break
-
-                    if not has_consumption and not has_downstream:
-                        # 检查年龄
-                        if fact.ts < time.time() - 7 * 86400:  # 7天过期
-                            findings.append({"fact_id": fid, "cat": cat, "issue": "expired_unconfirmed_requirement"})
-                            unconfirmed += 1
-                        else:
-                            findings.append({"fact_id": fid, "cat": cat, "issue": "unconfirmed_requirement"})
-                            unconfirmed += 1
+                    unconfirmed += 1
+                    findings.append({
+                        "fact_id": fact.id, "cat": cat,
+                        "issue": ("expired_unconfirmed_requirement"
+                                  if time.time() - fact.ts > 7 * 86400
+                                  else "unconfirmed_requirement"),
+                    })
             except Exception as e:
-                findings.append({"cat": cat, "issue": f"check error: {e}"})
-
-        passed = unconfirmed == 0
-        return {
-            "passed": passed,
-            "findings": findings,
-            "checked_requirements": checked
-        }
+                LOGGER.warning("requirement check error cat=%s: %s", cat, e)
+        return {"passed": unconfirmed == 0, "findings": findings,
+                "checked_requirements": checked}
 
 
 def _ts_recent(ts: str, cutoff: float) -> bool:
@@ -1255,25 +1234,24 @@ def run_eval_check(role_filter: str | None = None) -> dict:
         except Exception as e:
             LOGGER.warning("OutputSemanticChecker failed: %s", e)
 
-        # RequirementConfirmationChecker: 检查需求是否被真实消费/确认
+        # RequirementConfirmationChecker: 需求有没有人消费（全局一次；消费本就是全局事实）
         try:
-            reqc = RequirementConfirmationChecker()
-            for role in sampled:
-                reqc_result = reqc.check(role["name"], f"eval_{role['name']}")
-                if not reqc_result["passed"] and reqc_result.get("checked_requirements", 0) > 0:
-                    summary["failed"] += 1
-                    summary["checked"] += 1
-                    _write_bus(
-                        "verification",
-                        f"[eval_checker] RequirementConfirm FAIL: {role['name']} — {reqc_result['findings'][:3]}",
-                        evidence=f"role={role['name']} findings={reqc_result['findings'][:3]}",
-                    )
-                    _write_bus(
-                        "notice",
-                        f"@ccs-monitor [eval_checker] 需求未确认: {role['name']}",
-                        evidence=f"role={role['name']} findings={reqc_result['findings'][:3]}",
-                    )
-                    summary["notices"] += 1
+            reqc_result = RequirementConfirmationChecker().check()
+            if not reqc_result["passed"]:
+                summary["failed"] += 1
+                summary["checked"] += 1
+                _n = len(reqc_result["findings"])
+                _write_bus(
+                    "verification",
+                    f"[eval_checker] RequirementConfirm FAIL: {_n} 条需求无人消费 — {reqc_result['findings'][:3]}",
+                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
+                )
+                _write_bus(
+                    "notice",
+                    f"@ccs-monitor [eval_checker] 未确认需求 {_n} 条",
+                    evidence=f"checked={reqc_result['checked_requirements']} findings={reqc_result['findings'][:3]}",
+                )
+                summary["notices"] += 1
         except Exception as e:
             LOGGER.warning("RequirementConfirmationChecker failed: %s", e)
 
