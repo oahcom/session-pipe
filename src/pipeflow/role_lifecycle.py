@@ -6,6 +6,7 @@
 
 import json
 import re
+import sqlite3
 import sys
 import time
 import logging
@@ -908,16 +909,15 @@ class RoleLifecycleMixin:
 
         原实现只在发消息之前写，判到文件里是别的任务就只追加一行 [排队] 然后
         照样发 —— 角色手里出现两份互相矛盾的任务书（实测 pm 2026-10-22 05:33：
-        TASKS.md 主块是旧任务 + [排队] 行，而 prompt 已经是新任务）。读到哪份
-        就干哪件事，模板要求"先读 TASKS.md"的角色会干错活。
+        TASKS.md 主块是旧任务 + [排队] 行，而 prompt 已经是新任务）。角色按 prompt
+        干活，读这份文件的人和 launcher 的教训注入（roles.py:442）却看到旧任务。
         """
-        if getattr(self, "_lm", None) is None:  # 无 DB 的纯投递场景（测试/延迟发送）
-            return
         try:
             rows = self._lifecycle.query(
                 "SELECT title, description FROM tasks WHERE task_id="
                 "(SELECT task_id FROM workflow_instances WHERE instance_id=?)", (wf_id,))
-            if not rows:
+            if not rows:  # 孤儿实例（生产 1103 条里 1 条）：没有任务行就写不出任务书
+                LOGGER.warning("TASKS.md 未同步 %s/%s：库里没有任务行", role, wf_id[:12])
                 return
             t = rows[0]
             body = (f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
@@ -935,7 +935,11 @@ class RoleLifecycleMixin:
             if old == body:
                 return  # 同内容不重写：避免每 tick 刷新 mtime
             path.write_text(body, encoding="utf-8")
-        except (ValueError, KeyError, TypeError, OSError) as _e:
+        # 这一步发生在 ccs send 成功之后：抛出去会让 engine.run_once 的整个
+        # for row 循环中断（同一类"单点异常停整轮"）。sqlite3.Error = 并发写 WAL
+        # 撞 locked；AttributeError = 脚手架没挂 _lm。
+        except (ValueError, KeyError, TypeError, OSError, AttributeError,
+                sqlite3.Error) as _e:
             LOGGER.debug("TASKS.md 同步失败 %s/%s: %s", role, wf_id[:12], _e)
 
     def _send_to_role(self, role: str, prompt: str,
