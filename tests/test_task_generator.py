@@ -97,25 +97,29 @@ def test_notify_role_cooldown_suppresses_repeat_in_same_window():
     print("✅ 告警 (role,title) 冷却（进程级）✓")
 
 
-def test_notify_role_does_not_burn_cooldown_when_send_fails():
-    """叫不醒就不许记账：rc≠0 或抛错时，下一次必须仍能重试。
+def test_notify_role_backs_off_after_failed_send():
+    """rc≠0/抛错不还回整窗，只退避 600s：既不每 tick 重投，也不静默 30min。
 
-    冷却写在投递之前时，角色没收到告警也会被静默 30min（bus 有 blocker、
-    角色 pane 什么都没有），状态没变就永远补不上。
+    旧实现 pop 掉键 → 下一个 10s tick 立刻重投；实测错误态角色 30h 收 261 条
+    同一告警（中位间隔 20s）。两条不变式：窗口内不重投、退避到期必须重投。
     """
     from pipeflow.role_lifecycle import RoleLifecycleMixin
+    key = ("maintainer", "工作流多步骤超时: wf_y")
     RoleLifecycleMixin._ALERT_TS.clear()
     eng = _get_test_eng()
     eng._bb = MagicMock()
     with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=1)):
         eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
-    assert RoleLifecycleMixin._ALERT_TS == {}, "rc≠0 仍记了冷却"
-    with patch("pipeflow.engine._sp.run", side_effect=RuntimeError("boom")):
+    ts = RoleLifecycleMixin._ALERT_TS.get(key)
+    assert ts is not None, "rc≠0 也要记账，否则每 tick 重投"
+    assert 1190 < time.time() - ts < 1210, f"应退避 600s，实际 {time.time() - ts:.0f}s"
+    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)) as _run:
         eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
-    assert RoleLifecycleMixin._ALERT_TS == {}, "send 抛错仍记了冷却"
-    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)):
+    assert _run.call_count == 0, "退避窗口内不得重投"
+    RoleLifecycleMixin._ALERT_TS[key] = time.time() - RoleLifecycleMixin._ALERT_COOLDOWN_S
+    with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)) as _run2:
         eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
-    assert len(RoleLifecycleMixin._ALERT_TS) == 1, "投递成功后应记账"
+    assert _run2.call_count == 1, "退避到期后必须重投"
     RoleLifecycleMixin._ALERT_TS.clear()
 
 

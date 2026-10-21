@@ -212,6 +212,9 @@ class RoleLifecycleMixin:
     # 需要跨进程时改成写 ~/.hermes/run/alert_cooldown.json，先有证据再加。
     _ALERT_TS: dict[tuple, float] = {}
     _ALERT_COOLDOWN_S = 1800
+    # 投递失败后的重试间隔（秒）。必须 < _ALERT_COOLDOWN_S：下面写的是
+    # now - COOLDOWN + RETRY，RETRY >= COOLDOWN 就写成未来时间戳 → 每 tick 重投。
+    _ALERT_RETRY_S = 600
     # 同一 (role, wf, step) 的**相同 prompt** 在窗口内不重发。
     # 实测 24h cross_role_send 24,284 条里 20,499 条（84%）是同 target 同文案重复，
     # 最重一条 product_architect 收 7,290 次、间隔恒 11s（= 每 tick 一次）：每次重发
@@ -806,7 +809,7 @@ class RoleLifecycleMixin:
         _key = (role, title)
         _now = time.time()
         # 锁只包 check+占位，不包 subprocess：8 线程池会同时看到同一条告警
-        # （Barrier 20 线程实测放行 20 次）。先占位再投递，失败再还回窗口。
+        # （Barrier 20 线程实测放行 20 次）。先占位 30min，投递失败改占 600s。
         with _ALERT_LOCK:
             _gap = _now - _ts.get(_key, 0.0)
             # 时间回拨时 _gap 为负，旧写法同样 < 窗口 → 最长静默 1.5h。
@@ -828,13 +831,18 @@ class RoleLifecycleMixin:
             # "没叫醒"记成"已叫醒"，角色收不到而 30min 内不再重试。
             _delivered = getattr(_r, "returncode", 0) == 0
         except Exception as _e:
-            LOGGER.warning("notify send 异常（窗口已还回，下轮重试）%s / %s: %s",
+            LOGGER.warning("notify send 异常（%ds 后重试）%s / %s: %s", self._ALERT_RETRY_S,
                            role, title, _e)
-        # 冷却只在**真的叫醒之后**保留：bus 写失败 / send 抛错 / rc≠0 都不该吃掉
-        # 30min 窗口（告警静默丢失而状态还在，wf_lifecycle 每轮都会再判到它）。
+        # 冷却只在**真的叫醒之后**满额保留；投递失败退避 600s，不还回整窗。
+        # 还回整窗的旧写法让每个 tick（10s）重投一次，而 API 报错/未登录的角色
+        # 不会因为被多敲几次就恢复：实测 maintainer 30h 收 272 条同一告警、196 条
+        # 落在错误态，同文案 20s 间隔重复 95 次。bus 记录已在上方落盘，不丢事。
+        # WARNING 不能省：抑制路径只有 DEBUG、daemon 级别 INFO，否则失败期零可见信号。
         if not _delivered:
+            LOGGER.warning("notify 未送达 %s / %s，%ds 后重试",
+                           role, title, self._ALERT_RETRY_S)
             with _ALERT_LOCK:
-                _ts.pop(_key, None)
+                _ts[_key] = _now - self._ALERT_COOLDOWN_S + self._ALERT_RETRY_S
 
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
@@ -1062,10 +1070,13 @@ class RoleLifecycleMixin:
             _result = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "send", role, prompt,
                  "--from", "workflow_engine"],
-                # 窗口必须覆盖子进程真实最坏路径：长 prompt 分块写入（每块
-                # 500 字符）+ tmux 自适应超时（负载 ≥12 时单次 20s，3 次重试）
-                # 可超 60s。30s 会在投递途中杀掉子进程，留下半截输入。
-                capture_output=True, timeout=120,
+                # 30s（原 120s）。run_once 是单线程顺序循环：一次卡住的投递会拖住
+                # 整轮，16 个活跃实例时实测 tick 间隔 >10 分钟（2026-10-22 03:00
+                # journal 三次 product_architect 超时, 中间 11 分钟无任何日志），
+                # 于是所有链都停在原地——单点投递延迟被放大成全局停摆。
+                # 杀在半途不会留下叠字：下一次投递第一步就是 C-u 清行
+                # （tmux_ops._deliver_once），旧内容先被清掉再写。
+                capture_output=True, timeout=30,
             )
         except _engine_mod._sp.TimeoutExpired as _te:
             # ccs send 超时（实测长 prompt 2299 字符 > 30s，19:53/19:57/20:54/21:19 共 8 次）：
