@@ -322,11 +322,17 @@ def test_tick_integrity_reply后complete_step被调用():
 
 
 def test_fail_open后步骤能推进():
-    """fail-open后步骤不悬死，完整性状态被清除。"""
+    """fail-open后步骤不悬死，完整性状态被清除。
+
+    步骤本身必须是**新鲜**的（notified_at 刚写）：_tick 先判步骤超时再进完整性块，
+    旧的 6000s + timeout_minutes=1 会让它先撞超时分支直接 return，
+    根本到不了 fail-open（实测：age=6000s → complete 保持测试设的 True；
+    age=30s → pending=False complete=False）。原夹具因此长期假红。
+    """
     eng = _build_eng()
     run = _make_run(step_results={
-        "s1": {"status": "notified", "ts": time.time() - 6000,
-               "notified_at": time.time() - 6000}
+        "s1": {"status": "notified", "ts": time.time() - 5,
+               "notified_at": time.time() - 5}
     })
     step = _make_step(exit_condition={"bus_category": "notice", "text_contains": "DONE",
                                        "timeout_minutes": 1})
