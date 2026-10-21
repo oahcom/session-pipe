@@ -271,11 +271,11 @@ def _evaluate_with(db):
             try:
                 _r = subprocess.run(
                     [str(_bus), "write", "feedback",
-                     # 标题必须带实例与时刻：bus 按标题 UPSERT 且不更新 ts，
-                     # 同一 detail 的第 2..N 次评估会覆盖成第一行（#406143 写 1091 次，
-                     # ts 冻在 10-18 → 今天转负面的任务读出来是 3 天前的结论）。
-                     f"[task_evidence] {a['detail']} — 质量: {a['quality']}"
-                     f" [{a['task_id'][:12]} {time.strftime('%m-%d %H:%M')}]",
+                     # bus 按标题 UPSERT：同一 task+quality 只保留一条，后续评估覆盖
+                     # 第一条（ts 冻在初次评估时刻）。标题里不要带时刻/文件数：它们每
+                     # 分钟都会变，导致每次插新行而不是覆盖（实测 6h 内 90 条里 75 条重复，
+                     # 同一任务同一结论最多写 18 次，21 个角色各自读一遍）。
+                     f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
                      "--evidence", json.dumps(a),
                      "--src", "task_evidence"],
                     capture_output=True, timeout=10)

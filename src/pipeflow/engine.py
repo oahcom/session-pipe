@@ -159,16 +159,6 @@ def _rework_exit(sts: list) -> str:
     return "requeue"                 # 已交付（或链已删）→ 重审原步
 
 
-def _blocking_rework_sts(rows) -> list:
-    """返工链状态里真正砍住重审的那部分：系统问题链不阻断。
-
-    maintainer_health_monitor 修的是引擎/模板债，与产品产出能否交付无关；
-    让它阻断会让产品链被维护队列扣死（实测维护者队列 91 深，3 条主链被一条
-    从未投递的维护链扣 8h+，升级后按"链仍活"无限续期到 24h 全局回收）。
-    """
-    return [r["status"] for r in rows if "maintainer" not in (r["template_id"] or "")]
-
-
 def _rejected_wait_anchor(sr: dict, inst: dict):
     """等返工链的计时锚 → 时间戳，无可用锚则 None。
 
@@ -1179,10 +1169,86 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     )
                     step_status = "notified"  # 更新状态，让后续 exit_condition/超时检查能执行
 
-                # 审批密钥门控已删除（2026-10-22）：全库 429 张密钥 0 消费，
-                # 15 个有终态的评审步等待中位数 90.0 分钟（= TTL+grace）后靠超时
-                # 兜底放行。step_done_ready 直接进推进分支，评审结论由
-                # wf_lifecycle 的 review_gate 判据消费（驳回→rejected→返工链）。
+                # ── 审批门控 ──
+                # 曾经这里对 step_done_ready 无条件推进（全文件零处引用 approval），
+                # 于是审批密钥机制形同虚设：全库 413 个步骤发放过 token，消费 0 次，
+                # 335 个"需审批"步骤全部无审批完成。handoff/review/subflow 步骤的
+                # 设计意图是"等 assigner 用 token 确认"（见 step_handler._tick 注释），
+                # 判据只看"token 已发放且未被消费"这一条：confirm_step 通过时会把
+                # approval_token 置 None 并写 approval_consumed_at（manager.py:396-397），
+                # 故 token 存在 ⟺ 尚未审批。无 token 的步骤（无审批人/系统发起/
+                # 角色 wf complete 主动声明）不受影响，保持原有放行语义。
+                #
+                _awaiting_approval = False
+                if step_status == "step_done_ready":
+                    _sr_now = results.get(step_id)
+                    # 非 dict 值实测 599 个（'summary'/'files' 等键）——不加守卫
+                    # 会 AttributeError 冒泡到 run_once 的 except，整轮 for 中止
+                    # （与 step_handler.py:206-212 记录的历史缺陷同型）。
+                    if not isinstance(_sr_now, dict):
+                        _sr_now = {}
+                    if _sr_now.get("approval_token"):
+                        _ttl = _sr_now.get("approval_token_ttl", 0)
+                        # 无 ttl（旧数据/手写 token）不能当作"永远等"：
+                        # 原实现 `_ttl>0 and ...` 为假 → else → 永久卡死。
+                        # 视为已过期，走同一条兜底放行。
+                        _expired = _ttl <= 0 or time.time() > _ttl + 1800
+                        if _expired:
+                            try:
+                                lm.confirm_step(inst["instance_id"], step_id,
+                                                token=_sr_now["approval_token"],
+                                                approved=True,
+                                                reason="daemon approval_timeout_fallback",
+                                                allow_expired=True)
+                                LOGGER.warning(
+                                    "approval_timeout_fallback %s/%s: token 超时未消费（ttl=%s），自动 approve",
+                                    wf_name, step_id, _ttl)
+                                # confirm_step 改的是它自己 load 的 results；本 tick 的
+                                # results 仍是 762 行读的旧快照。落到 1054 后 _persist_step_done
+                                # 会把它**整份**写回 → 刚落的 completed 被打回 step_done_ready、
+                                # approval_token 复活，而 current_step_id 已推进 → 步骤 JSON 与
+                                # 行级彻底脱节。实测 wf_rw_46e42f725e74/s1: 19:33:36 confirm
+                                # 落库 completed, 19:33:58 旧快照覆写回 step_done_ready, 父链
+                                # _rework_exit 永久判 wait 卡 7h。重读 DB 消除快照分歧。
+                                _fresh_rows = lm.query(
+                                    "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                                    (inst["instance_id"],))
+                                if _fresh_rows:
+                                    results = json.loads(_fresh_rows[0]["step_results"] or "{}")
+                                    step_status = "completed"
+                            except Exception as _af:
+                                # confirm 失败（如角色 wf complete 改写了 status）
+                                # 若仍等，就是永久 step_done_ready 死锁。累计 3 次
+                                # 失败后清 token 放行，让步骤能推进而不是烂在库里。
+                                _n = (_sr_now.get("approval_fallback_fail", 0) or 0) + 1
+                                _sr_now["approval_fallback_fail"] = _n
+                                results[step_id] = _sr_now
+                                try:
+                                    lm.execute(
+                                        "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                        (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                                except Exception:
+                                    pass
+                                LOGGER.warning("approval fallback failed %s/%s (%d/3): %s",
+                                               inst["instance_id"][:12], step_id, _n, _af)
+                                if _n >= 3:
+                                    _sr_now.pop("approval_token", None)
+                                    results[step_id] = _sr_now
+                                    try:
+                                        lm.execute(
+                                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                                            (json.dumps(results, ensure_ascii=False), inst["instance_id"]))
+                                    except Exception:
+                                        pass
+                                    LOGGER.warning(
+                                        "approval fallback 连续失败 %d 次 → 清 token 放行 %s/%s",
+                                        _n, wf_name, step_id)
+                                else:
+                                    _awaiting_approval = True
+                        else:
+                            _awaiting_approval = True
+                    if _awaiting_approval:
+                        continue  # 等 assigner 确认；超时由上面的 grace 分支放行
 
                 # 步骤已完成 → 自动推进到下一步
                 # step_done_ready/completed 由角色或外部系统标记，无需额外的 completion_check
@@ -1301,11 +1367,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 返工链当子链重复推进（实测 wf_rw_* 全库 0 台，从未回流过）。
                         try:
                             _ph = ",".join("?" * len(_rework_ids))
-                            _rework_rows = lm.query(
-                                f"SELECT status, template_id FROM workflow_instances "
-                                f"WHERE instance_id IN ({_ph})", tuple(_rework_ids))
-                            _sts = [r["status"] for r in _rework_rows]
-                            _gate_sts = _blocking_rework_sts(_rework_rows)
+                            _sts = [r["status"] for r in lm.query(
+                                f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
+                                tuple(_rework_ids))]
                         except Exception as _q:
                             # 查询失败 ≠ 链不存在：置空会落进下面的「无返工链→重投
                             # 原步」，与仍在跑的返工链并发推进同一个 step。
@@ -1318,7 +1382,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # → 被再驳回 → 再建链，形成自旋。实测 wf_3f71a2a78：3 条返工链
                         # 同时压单线程 maintainer，2 条排队 10 tick 后被回收，我的回流把
                         # cancelled 当「已处理」→ 8 分钟内 retry 从 3 涨到 6 仍在涨。
-                        _exit = _rework_exit(_gate_sts)
+                        _exit = _rework_exit(_sts)
                         if _exit == "wait":
                             # 返工链仍在跑：等它，但有上限（返工链自身无 timeout，
                             # 链内卡一步父链就永远等）。超限只喊一次、不停止等。
