@@ -763,10 +763,13 @@ class StepHandlerMixin:
                 self._notify_role("maintainer",
                     f"工作流超时自动回收: {run.workflow_name}/{run.id}",
                     f"step={run.current_step} timeout_count={timeout_count} >= {_auto_cancel_at}\n请排查该步骤为何持续超时。")
-            # 重推任务（最多重推 1 次，不自动完成）
+            # 重推任务（本路只在第 1 次超时重推，避免每窗口刷屏）
             # 角色忙（有其他任务在跑）→ 不强制重推，通知 coordinator 排队
             # 架构 P1-2：完整性阶段进行中时跳过重推（避免 /goal 覆盖完整性提醒）
             # 注意：此处在完整性阶段的 if not cat: return 之后，_integ_state 需重新读取
+            # count>=2 的补位交给 _kick_stalled_roles（600s 冷却 + 产出/忙检测）：
+            # 此前它带 `_tc > 0: continue` 跳过一切已计数步骤，与这里的 `== 1`
+            # 合起来制造无派发空窗（实测 closer 30min21s 零派发，#431798）。
             _integ_retry_guard = _integ_load({step.id: self._step_sd(run, step)}, step.id)
             if timeout_count == 1 and not _integ_retry_guard.pending and not _integ_retry_guard.complete:
                 if self._is_role_busy(_eff, exclude_wf_id=run.id):
