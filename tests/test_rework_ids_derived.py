@@ -13,6 +13,7 @@ Run: cd ~/session-pipeline && python3 -m pytest tests/test_rework_ids_derived.py
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -117,3 +118,21 @@ def test_queue_tick_preserves_sibling_keys(tmp_path):
     assert sd["queued"] == 6, sd
     assert sd["rework_ids"] == ["wf_rw_x"], f"rework_ids 被抹掉: {sd}"
     assert sd["subflow_id"] == "wf_sub_y", f"subflow_id 被抹掉: {sd}"
+
+def test_queue_tick_on_bad_json_does_not_raise(tmp_path):
+    """列被写坏（非合法 JSON）时不抛，不打断本轮剩余实例。
+
+    生产 0 例，但整份回写的旧实现顺手修了这种坏行；单键写修不了，
+    只能记账。测试点：不抛异常，且之后对同一行的正常写还能跑。
+    """
+    db = _db(tmp_path)
+    _insert(db, "wf_bad", "running")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                ("{broken", "wf_bad"))
+    con.commit()
+    con.close()
+    # 第一次：坏列，只记 warning，不抛。
+    _persist_queue_tick(_Lm(db), "wf_bad", "s1", 1, time.time())
+    # 第二次：此时列还是坏的（helper 不修写旧列），再次不抛。
+    _persist_queue_tick(_Lm(db), "wf_bad", "s1", 2, time.time())

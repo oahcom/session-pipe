@@ -167,11 +167,18 @@ def _persist_queue_tick(lm, wf_id: str, step_id: str, queued: int, q_since: floa
     rework_ids 一起抹掉（实测 40 条子链里 20 条父步丢了指针，同一步因此连建
     多条返工链）。单键 json_set 只动这两个键，其余原样留在库里。
     """
-    lm.execute(
-        "UPDATE workflow_instances SET step_results="
-        "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) WHERE instance_id=?",
-        (f'$."{step_id}".queued', queued,
-         f'$."{step_id}".queued_since', q_since, wf_id))
+    try:
+        lm.execute(
+            "UPDATE workflow_instances SET step_results="
+            "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) WHERE instance_id=?",
+            (f'$."{step_id}".queued', queued,
+             f'$."{step_id}".queued_since', q_since, wf_id))
+    except Exception as _e:
+        # 列被写坏（非合法 JSON）时 json_set 会抛，而调用点在 tick 的大 try 里——
+        # 抛出去会打断**本轮剩余所有实例**。旧实现整份回写顺手修好了这种行，
+        # 单键写修不了，所以这里只记账不抛。ponytail: 生产 0 例（1097 行全可解析），
+        # 升级路径是给坏行加一次 json_valid 修复写。
+        LOGGER.warning("排队账本写入失败 %s/%s: %s", wf_id[:12], step_id, _e)
 
 def _derive_rework_ids(lm, wf_id: str, step_id: str) -> list:
     """从行上反查该步仍在跑的返工链（rework_ids 丢了也能认回来）。
