@@ -231,8 +231,8 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 METRICS.inc("route_orphan_count")
                 details.append({"id": msg["id"], "category": msg["category"], "assigned": [], "reason": "no_consumer"})
                 # 这条已由路由判定"无人可派"（@tag 过滤后为空 / 全是自回声）。
-                # 不记 claim → 它永远留在 pipeline 视图里被每 60s 重扫一次
-                # （实测 24h 416/1813=22.9% 无主事实，领取年龄中位 136min ≈ 136 轮）。
+                # 仍要标记已消费：不标就永久留在视图里被每 60s 重扫（实测 24h
+                # 416/1813=22.9%，领取年龄中位 136min），并挤掉最新 100 条窗口。
                 try:
                     if not dry_run:
                         bb.mark_consumed(msg["id"], consumer)

@@ -53,7 +53,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **workflow/sync.py** | 63 | 工作流同步 |
 | **p0_exemption.py** | 496 | P0 豁免通道 |
 
-**Total: 34 modules（不含 `__init__.py`），合计约 20k 行 Python**（`pipeflow/db.py` 已删，持久化在 `workflow/db.py`）
+**本表只列主要模块，不是全集**：模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`（2026-10-22 为 37，合计约 20k 行；表里没列 `liveness.py`/`review_gate.py`/`pipeflow/integrity.py`/`eval_shared_loader.py`）。`pipeflow/db.py` 已删，持久化在 `workflow/db.py`。
 
 ## Data flow
 
@@ -111,7 +111,7 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 
 ### Engine bypasses LifecycleManager
 
-`engine.py` has 3 sites that bypass `lifecycle/manager.py` and write SQL directly:
+`engine.py` 至少 3 个函数绕过 `lifecycle/manager.py` 直接写 SQL（`wf_lifecycle.py` 内 `conn.execute` 共 12+ 处，不止这三处）：
 
 - `_advance_production_wf()` -- updates step_results via raw conn.execute
 - `_tick()` -- timeout detection writes directly via `_sync_step_results()`

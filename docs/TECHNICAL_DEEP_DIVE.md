@@ -96,7 +96,7 @@ src/
 
 ## 6. 配置热重载
 
-`config_loader.py`：`get_config()`（缓存读）/ `reload_config()`（强制重读）/ `reconfigure()`（重建 CIRCUIT_BREAKER、HEARTBEAT、TTL_PRUNER、DEFAULT_RETRY、GRACEFUL_SHUTDOWN 单例），按 `config.yaml` mtime 自动触发。
+`config_loader.py` 只有 `get_config()`（懒加载缓存读，:158）——**没有** `reload_config`，也没有 mtime 热重载；`reconfigure()` 在 `src/reliability.py:40`（重建 CIRCUIT_BREAKER/HEARTBEAT/TTL_PRUNER/DEFAULT_RETRY/GRACEFUL_SHUTDOWN 单例）。改 `config.yaml` 需重启进程。
 
 ## 7. 与 Sister Bus 的集成
 

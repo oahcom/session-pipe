@@ -17,8 +17,8 @@ python3 -m pytest tests/test_engine_e2e.py -q
 
 | 命令 | 结果 |
 |------|------|
-| `--collect-only` | 1218 tests collected, 0 error |
-| `pytest tests/ -q` | **1215 passed, 3 skipped** in 117s |
+| `--collect-only` | `collected` 数 + `0 error`（条数不写死：并发改动每天在变） |
+| `pytest tests/ -q` | **全 passed**（条数不写死，判据见下） |
 
 > 这两个数字只是某个时刻的快照，别当门禁。判定"我的改动有没有引入回归"先跑
 > `--collect-only`（秒级，能抓到导入断裂），再跑全量并只对齐失败集合。
