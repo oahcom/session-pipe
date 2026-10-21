@@ -1389,8 +1389,8 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                 # 一条，升级路径 = 落 DB 去重表（当前不值得）。
                 _sub = traj_result.get("subagent") or {}
                 _cur = (_sub.get("followed", 0), _sub.get("rounds", 0))
-                # 只在数字变化时写。抽样每 300s 一轮，无条件写会让同一组数字
-                # 反复落到 bus：facts.t 是 UNIQUE + UPSERT，同文本会抬高 ts，
+                # 只在数字变化时写。daemon 每 600s 抽样一轮，无条件写会让同一组
+                # 数字反复落到 bus：facts.t 是 UNIQUE + UPSERT，同文本会抬高 ts，
                 # 而 created_after 屏障读的正是这个可变列（旧消息因此复活）。
                 if _cur[1] > 0 and _LAST_SUBAGENT.get(role["name"]) != _cur:
                     _LAST_SUBAGENT[role["name"]] = _cur
