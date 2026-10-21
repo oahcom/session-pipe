@@ -118,13 +118,17 @@ def test_blackboard_import_is_packaged():
     背景：真身是 ~/.hermes/scripts/hermes_bus/blackboard.py，裸 `from blackboard
     import` 恒失败 → 审批告警全部丢失（journal 每 20s 报一次 No module named）。
     """
-    src = open(os.path.join(os.path.dirname(__file__), "..",
-                            "src/lifecycle/manager.py"),
-               encoding="utf-8").read()
-    assert "from hermes_bus.blackboard import Blackboard" in src, \
-        "应使用 hermes_bus.blackboard 包路径"
-    assert not re.search(r"^\s+from blackboard import", src, re.M), \
-        "不应残留裸 blackboard 导入"
+    root = os.path.join(os.path.dirname(__file__), "..", "src")
+    bare = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            f = os.path.join(dirpath, name)
+            text = open(f, encoding="utf-8", errors="replace").read()
+            if re.search(r"^\s*from blackboard import", text, re.M):
+                bare.append(os.path.relpath(f, root))
+    assert not bare, f"不应残留裸 blackboard 导入（恒 ModuleNotFound）: {bare}"
     print("✓ test_blackboard_import_is_packaged PASS")
 
 
