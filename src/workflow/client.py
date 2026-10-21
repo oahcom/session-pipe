@@ -387,21 +387,12 @@ class WorkflowClient:
         self.notify("workflow", f"已接单 {wf_id}", evidence=evidence)
         self._log(wf_id=wf_id, action="started", detail=f"step={step_id}")
 
-    def complete(self, wf_id: str, summary: str, files: list = None):
-        files_str = ", ".join(files) if files else ""
-        self._conn.execute(
-            "UPDATE workflow_instances SET status='completed', completed_at=?, "
-            "step_results=? WHERE instance_id=?",
-            (time.time(), json.dumps({"summary": summary, "files": files_str}), wf_id)
-        )
-        self._conn.commit()
-        wf = self.get(wf_id)
-        if wf and wf.get('task_id'):
-            try:
-                self._sync_task_from_workflows(wf['task_id'])
-            except Exception:
-                self._conn.rollback()  # 同步失败不阻断主流程，日志必须落库
-        self._log(wf_id=wf_id, action="completed", detail=f"summary={summary}")
+    # 未实现 complete()：整链终结走 engine 的 close_wf（保留步骤状态 + 证据门）。
+    # 曾有版本无条件写 status='completed' 并把 step_results 整体覆写成
+    # {"summary","files"}：既抹掉全部步骤与 subflow_id（父链回流静默断链），
+    # 又无终态守卫（可把 cancelled 复活）。实测零调用点 —— 角色侧的 `wf complete`
+    # 走 session-launcher 的同名类（终态守卫 + 合并语义 + 审批 token），
+    # 两份实现语义相反，留着只会被误用。
 
     def confirm(self, wf_id: str, step_id: str, token: str, approved: bool, reason: str = ""):
         """角色侧审批入口：把 token 回传给 LifecycleManager 完成/驳回步骤。
