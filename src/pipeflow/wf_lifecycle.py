@@ -1440,10 +1440,86 @@ class WorkflowLifecycleMixin:
         if not _ids:
             return _text
         try:
-            return _text + "\n" + "\n".join(self._bb_evidence(_ids))
+            _full = _text + "\n" + "\n".join(self._bb_evidence(_ids))
         except Exception as _ev_e:
             LOGGER.debug("rework: 子链 evidence 回查失败 %s: %s", _sf[:12], _ev_e)
-            return _text
+            _full = _text
+        if self._has_issue_classification(_full):
+            return _full
+        # 第五来源：审查报告文件。完成消息普遍只写「0P0/3P1/…」统计，
+        # 逐条明细在 REVIEW*.md；不读文件 → 返工角色只能盲改（见 _review_artifact_text）。
+        _art = self._review_issues_block(_sf)
+        if _art:
+            LOGGER.info("rework: 问题清单补入审查报告 %s（%d 条明细）", _sf[:12], _art.count(chr(10)))
+            return _full + "\n" + _art
+        return _full
+
+    def _review_issues_block(self, instance_id: str) -> str:
+        """把审查报告文件里的逐条问题转成引擎认的分类段（【业务问题】/【系统问题】）。
+
+        实测 2026-10-22：返工任务的问题清单只有「子链 wf_sub_xxx 末步驳回: …
+        0P0/3P1/5P2/4P3」一行统计，返工角色拿不到可执行信息 → 整篇重做 →
+        复查按同样数量再驳回（reject→rework→reject 死循环）。逐条明细在
+        ~/ccs-workspaces/<role>/REVIEW-wf_sub_xxx.md 的
+        「### 【业务问题】」/「### 【系统问题】」两段里，形如 **P1-1 | 问题 | 文件 | 行号**。
+
+        只取这两段的 P0-P3 行（不整篇塞进去：报告里的表格行会被解析成噪声问题，
+        实测一份 16KB 报告整篇喂进去解析出 40 条「维度 | 结论 | 关键实测 |」）。
+        只认文件名或正文提到该实例 id 的文件，避免把别的链的意见派下去。
+        """
+        if not instance_id:
+            return ""
+        try:
+            _dirs = [d for d in _CCS_WORKSPACES.iterdir() if d.is_dir()]
+        except OSError:
+            return ""
+        _text = ""
+        for _d in _dirs:
+            try:
+                _cands = sorted(_d.glob("REVIEW*.md"),
+                                key=lambda f: f.stat().st_mtime, reverse=True)
+            except OSError:
+                continue
+            for _f in _cands:
+                try:
+                    _t = _f.read_text(errors="ignore")
+                except OSError:
+                    continue
+                # 只认文件名带实例 id 的权威副本：REVIEW.md 是共享的“最新一份”，
+                # 正文里可能只是提到本实例，整份拿来会把别的链的意见派下去。
+                if instance_id in _f.name:
+                    _text = _t
+                    break
+            if _text:
+                break
+        if not _text:
+            return ""
+        _sections = {"biz": [], "sys": []}
+        _cur = ""
+        for _line in _text.splitlines():
+            if "【业务问题" in _line:
+                _cur = "biz"
+                continue
+            if "【系统问题" in _line:
+                _cur = "sys"
+                continue
+            if _line.startswith("#") and _cur:
+                _cur = ""  # 出了该段
+                continue
+            # 条目形态：**P1-1 | …**、- P2 …、**S-P1-1 | …**（系统段用 S- 前缀）
+            if not _cur or not re.match(r"\s*[-*]*\s*\*{0,2}(S-)?P[0-3]", _line):
+                continue
+            _clean = _line.strip().strip("*").lstrip("- ").strip()
+            if len(_clean) >= 10:
+                _sections[_cur].append(_clean[:300])
+        if not (_sections["biz"] or _sections["sys"]):
+            return ""
+        _out = []
+        for _kind, _label in (("biz", "业务问题"), ("sys", "系统问题")):
+            _items = _sections[_kind][:12]
+            _out.append(f"【{_label}】")
+            _out.extend(f"- {i}" for i in _items) if _items else _out.append("无")
+        return "\n".join(_out)
 
     def _rework_tpl_for(self, rework_id: str) -> str:
 
