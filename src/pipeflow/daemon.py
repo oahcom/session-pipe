@@ -51,9 +51,17 @@ from pipeflow.engine import WorkflowEngine
 INTERVAL = 10  # 秒
 
 # tick 卡死取证：超过 _TICK_STACK_DUMP_SEC 自动打印全部线程栈，超过 _TICK_SLOW_SEC 记一条耗时日志。
-# 用环境变量可调，默认值按「正常 tick < 60s」定（实测健康 tick 数秒级）。
-_TICK_STACK_DUMP_SEC = int(os.environ.get("TICK_STACK_DUMP_SEC", "180"))
-_TICK_SLOW_SEC = int(os.environ.get("TICK_SLOW_SEC", "60"))
+# 用环境变量可调。非正数或非法值 → 禁用（daemon 绝不因配置值自身而无法启动）。
+def _parse_tick_sec(name, default):
+    try:
+        _v = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return -1
+    return max(_v, -1)
+
+
+_TICK_STACK_DUMP_SEC = _parse_tick_sec("TICK_STACK_DUMP_SEC", 180)
+_TICK_SLOW_SEC = _parse_tick_sec("TICK_SLOW_SEC", 60)
 
 # ── 饥饿检测：工作流长期空转 → 触发食物链重启生产 ──
 # 设计背景：引擎只推进已有工作流，不主动创建；当所有工作流终态且超时未重启，
@@ -259,52 +267,57 @@ def daemon_loop(interval: int):
 
     try:
         while not shutdown:
-            # 一次 tick 卡住时进程无日志、无子进程、CPU 近零，外部只能看到"引擎活着但不干活"。
-            # 实测 2026-10-22 02:45→03:03 单 tick 静默 18 分钟，四种归因都无法证伪（无 root 拿不到栈）。
-            # 到点让 Python 自己把当前栈打到 stderr(journal)，换取下一次卡顿的确定根因。
-            _tick_t0 = time.time()
-            faulthandler.dump_traceback_later(_TICK_STACK_DUMP_SEC, repeat=False)
+            # 整轮看门狗：覆盖 run_once + 饥饿检测 + 源码扫描，不含 time.sleep。
+            # 一次 tick 卡住时进程无日志、无子进程、CPU 近零（实测 2026-10-22 02:45→03:03
+            # 单 tick 静默 18 分钟，无 root 拿不到栈）→ 到点让 Python 自己把栈打到 stderr。
+            _tick_t0 = time.monotonic()
+            if _TICK_STACK_DUMP_SEC > 0:
+                faulthandler.dump_traceback_later(_TICK_STACK_DUMP_SEC, repeat=False)
+            # 两层 try 是刻意的：内层各自兜异常（一处失败不耽误同轮其它分支），
+            # 外层 finally 只管看门狗收尾与整轮计时，不重复处理异常。
             try:
-                eng.run_once()
-                idled = 0
-            except Exception as e:
-                LOGGER.error("run_once 异常: %s", e, exc_info=True)
-                idled += 1
-                if idled % 10 == 0:
-                    LOGGER.error("连续失败 %d 轮，最后异常: %s", idled, e)
+                try:
+                    eng.run_once()
+                    idled = 0
+                except Exception as e:
+                    LOGGER.error("run_once 异常: %s", e, exc_info=True)
+                    idled += 1
+                    if idled % 10 == 0:
+                        LOGGER.error("连续失败 %d 轮，最后异常: %s", idled, e)
+                # 饥饿检测：连续空转无活跃工作流 → 写 bus 请求生产者重启食物链
+                try:
+                    if _active_count(eng) > 0:
+                        starve_rounds = 0
+                    else:
+                        starve_rounds += 1
+                        if starve_rounds >= _STARVE_ROUNDS:
+                            _starve_signal(eng)
+                            starve_rounds = 0
+                except Exception as e:
+                    LOGGER.warning("饥饿检测异常: %s", e)
+                # 每轮都探。旧写法按"轮次"计数（6 轮一探），而忙机上 run_once 一轮要
+                # 几分钟 → 实测 18:18:43 改 daemon.py、18:26 仍不重启，源码修复不生效。
+                try:
+                    _now_mtime = _src_mtime()
+                    if _now_mtime > _seen_mtime:
+                        time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
+                        if _src_mtime() == _now_mtime:
+                            # 就地重执行，不退出：退出依赖外部拉起（systemd Restart /
+                            # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
+                            # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
+                            # 锁随新进程重新获取，任何监管方式下都能生效。
+                            LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
+                                        _now_mtime)
+                            logging.shutdown()
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                except OSError as _e:
+                    LOGGER.debug("源码 mtime 探测失败: %s", _e)
             finally:
-                faulthandler.cancel_dump_traceback_later()
-                _tick_dt = time.time() - _tick_t0
+                if _TICK_STACK_DUMP_SEC > 0:
+                    faulthandler.cancel_dump_traceback_later()
+                _tick_dt = time.monotonic() - _tick_t0
                 if _tick_dt > _TICK_SLOW_SEC:
                     LOGGER.warning("tick 耗时 %.0fs（阈值 %ds）", _tick_dt, _TICK_SLOW_SEC)
-            # 饥饿检测：连续空转无活跃工作流 → 写 bus 请求生产者重启食物链
-            try:
-                if _active_count(eng) > 0:
-                    starve_rounds = 0
-                else:
-                    starve_rounds += 1
-                    if starve_rounds >= _STARVE_ROUNDS:
-                        _starve_signal(eng)
-                        starve_rounds = 0
-            except Exception as e:
-                LOGGER.warning("饥饿检测异常: %s", e)
-            # 每轮都探。旧写法按"轮次"计数（6 轮一探），而忙机上 run_once 一轮要
-            # 几分钟 → 实测 18:18:43 改 daemon.py、18:26 仍不重启，源码修复不生效。
-            try:
-                _now_mtime = _src_mtime()
-                if _now_mtime > _seen_mtime:
-                    time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
-                    if _src_mtime() == _now_mtime:
-                        # 就地重执行，不退出：退出依赖外部拉起（systemd Restart /
-                        # 角色自愈脚本），而这两者会互相抢锁——实测手工实例占住锁后
-                        # systemd 永远 activating，引擎反而没人管。execv 只换内存镜像，
-                        # 锁随新进程重新获取，任何监管方式下都能生效。
-                        LOGGER.info("源码已更新 (mtime=%.0f)，就地重执行以加载新代码",
-                                    _now_mtime)
-                        logging.shutdown()
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
-            except OSError as _e:
-                LOGGER.debug("源码 mtime 探测失败: %s", _e)
             time.sleep(interval)
     except KeyboardInterrupt:
         LOGGER.info("收到 KeyboardInterrupt，正在关闭...")

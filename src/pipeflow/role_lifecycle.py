@@ -33,6 +33,9 @@ _KICK_COOLDOWN_SEC = 600
 # on_advance 回调，每个步骤推进都触发），且是 check-then-act 无锁 → 并发 tick
 # 各自判定"不存活"后同时拉起同一角色（实测 scout 建 116 个会话）。
 # 同一角色在冷却窗内不重复拉起。
+# 存活正向缓存（秒）：单次探测 4-5.6s（tmux has-session 2.4s + _is_agent_alive 2.4s）
+_ALIVE_CACHE_SEC = 120.0
+
 _RESTART_COOLDOWN_SEC = 300
 
 # 上下文溢出措辞。pane 与 transcript 两条检测路径共用一份，避免措辞漂移：
@@ -591,11 +594,38 @@ class RoleLifecycleMixin:
             return None  # 探测失败 ≠ 判死
 
     def _ensure_role_alive(self, role: str) -> bool:
+        """存活探测 + 拉起；正向结果缓存 _ALIVE_CACHE_SEC（实测单次探测 4-5.6s）。
+
+        实测 2026-10-22 03:3x：一次 tmux has-session 2.4s、_is_agent_alive 再 2.4s。
+        _ensure_guard_roles 每 tick 对活跃链的全部 guard/wait 角色各探一次，
+        十几个角色就是 40-95s 的纯探测开销，与投递/推进争同一个 tick。
+        角色死后最迟 120s 被发现；投递前 _wait_for_role_ready 仍独立复核，不靠这份缓存。
+        """
+        _now = time.time()
+        _cache = getattr(self, "_alive_until", None)
+        if _cache is None:
+            _cache = self._alive_until = {}
+        if _cache.get(role, 0.0) > _now:
+            return True
+        if self._check_and_start_role(role):
+            _cache[role] = time.time() + _ALIVE_CACHE_SEC
+            return True
+        return False
+
+    def _check_and_start_role(self, role: str) -> bool:
         """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。"""
-        alive = _engine_mod._sp.run(
-            ["tmux", "has-session", "-t", f"ccs-{role}"],
-            capture_output=True, timeout=5,
-        ).returncode == 0
+        try:
+            alive = _engine_mod._sp.run(
+                ["tmux", "has-session", "-t", f"ccs-{role}"],
+                capture_output=True, timeout=5,
+            ).returncode == 0
+        except (_engine_mod._sp.TimeoutExpired, OSError) as _pe:
+            # 探针本身卡住 ≠ 角色死亡：实测 has-session 常态 2.4s，内存高压下 >5s。
+            # 原实现让异常穿出去，调用方按"探测失败"记一条 warning 后什么都不做，
+            # 但每个角色每 tick 仍要再付 5s —— 十几个角色就是一整轮 tick。
+            # 按未知处理（返回 True）让上层缓存，避免在 tmux 卡顿时反复重探。
+            LOGGER.warning("存活探测异常 %s: %s（按未知处理，不重启）", role, _pe)
+            return True
         if alive:
             agent = self._is_agent_alive(role)
             if agent is None or agent:
