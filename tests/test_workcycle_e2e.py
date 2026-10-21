@@ -208,7 +208,7 @@ def test_handoff_advances_without_confirm(mock_run):
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed", s
     assert s["current_step"] == "s2", f"handoff 应自动推进到 s2, got {s}"
-    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
+    assert not s["results"]["s1"].get("approval_token"), \
         "handoff 不应发放审批密钥"
     _cleanup(d)
 
@@ -273,7 +273,7 @@ def test_review_self_audit_no_deadlock(mock_run):
 
     s = eng.status(rid)
     assert s["results"]["s1"]["status"] == "completed", s
-    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
+    assert not s["results"]["s1"].get("approval_token"), \
         "自审 review 不得发放审批密钥（否则无人消费，卡死 90 分钟）"
     assert s["current_step"] == "s2", f"自审 review 应直接推进, got {s}"
     _cleanup(d)
@@ -311,7 +311,7 @@ def test_rework_chain_first_step_review_no_token(mock_run):
             break
 
     s = eng.status(rid)
-    assert not eng._lifecycle.get_approval_token_raw(rid, "s1"), \
+    assert not s["results"]["s1"].get("approval_token"), \
         "首步 review 无上一步产出可审，不得发给不知情的 reviewer"
     assert s["current_step"] == "s2", f"自审应直接推进, got {s}"
     _cleanup(d)
@@ -342,9 +342,7 @@ def test_review_rejection_keeps_running(mock_run):
     time.sleep(0.1)
     eng.run_once()
 
-    token = eng._lifecycle.get_approval_token_raw(rid, "s1")
-    ok = eng._lifecycle.confirm_step(rid, "s1", token=token, approved=False,
-                                      reason="no good")
+    ok = eng._lifecycle.confirm_step(rid, "s1", approved=False, reason="no good")
     assert not ok
 
     s = eng.status(rid)

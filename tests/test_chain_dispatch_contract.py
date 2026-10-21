@@ -112,8 +112,12 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
 
     assert eng.status(rid)["status"] == "completed", eng.status(rid)
     # s1 由 start 投递一次；s2/s3 由推进投递一次。少一次 = 那一跳没人干活。
+    # 开发者步允许换棒：engine._resolve_effective_role 在 engineer 不忙时把 dev 步
+    # 派给池里的 pg（负载均衡），故判据是"池内任一角色收到"，不是硬编码 engineer。
+    _dev_pool = ("engineer", "pg")
     for i, role in enumerate(roles[1:], start=2):
-        assert (role, f"s{i}") in sent, \
+        allowed = _dev_pool if role in _dev_pool else (role,)
+        assert any((_r, f"s{i}") in sent for _r in allowed), \
             f"s{i} 没有派给 {role}，实投={sent}"
 
 
