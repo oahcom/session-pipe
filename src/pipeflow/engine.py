@@ -760,9 +760,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                            lm, reason: str) -> None:
         """驳回步骤停重投 → 升级 coordinator。reason 说明为何放弃继续等/重投。
 
-        幂等锚 rework_escalated_at：无它则每 tick 重发一条。锚只在投递确实成功
-        （True）时落——busy 是排队、False 是守卫拦下，都非送达，下轮重试；否则
-        coordinator 没收到消息锚却已置位，升级永久丢失。
+        幂等锚 rework_escalated_at：升级一经发起（pane True 或改落持久 bus
+        通道）即落库，防每 tick 重发一条。pane 未送达（busy=排队 / False=守卫拦
+        下）非送达，但 bus 是持久通道：落库即算已升级，随后正常路径落锚停重投。
+        不落库会让每 tick 重起一次 ccs send，永不收敛（实测 wf_175751a92033/s2：
+        48min 111 次告警，锚未置位）。
 
         锚用单键 json_set 写，**不**擕整份 results——results 是本 tick 起始快照。
         wait 分支紧跟在 _create_rework_subflow 之后（同一 tick 内可达），建链走
