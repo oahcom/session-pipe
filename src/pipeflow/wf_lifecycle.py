@@ -685,20 +685,40 @@ class WorkflowLifecycleMixin:
                     _db_sr = conn.execute(
                         "SELECT step_results FROM workflow_instances WHERE instance_id=?",
                         (wf_id,)).fetchone()
-                    try:
-                        _db_res = json.loads(_db_sr["step_results"]) if _db_sr and _db_sr["step_results"] else {}
-                    except (json.JSONDecodeError, TypeError):
-                        _db_res = {}
-                    # 快照在前、DB 在后：快照里的步骤（DB 还是空表时）不能丢，
-                    # DB 里更新的字段（confirmed_at / 盖戳）必须盖过来
-                    new_results = {**dict(results or {}), **_db_res}
+                    _db_res = {}
+                    if _db_sr and _db_sr["step_results"]:
+                        try:
+                            _parsed = json.loads(_db_sr["step_results"])
+                            if isinstance(_parsed, dict):
+                                _db_res = _parsed
+                        except (json.JSONDecodeError, TypeError):
+                            _db_res = {}
+                    # 逐步合并（不是整份替换）：快照里仅存内存的字段要留住，
+                    # DB 里更新的字段（confirmed_at / 盖戳）必须盖过来；
+                    # 非 object 的 JSON 或解析失败一律退回快照，不让异常冒到
+                    # 外层 except —— 那时两条 UPDATE 已执行、事务未回滚（半推进）。
+                    _snap_res = dict(results) if isinstance(results, dict) else {}
+                    new_results = {}
+                    for _sid in set(_snap_res) | set(_db_res):
+                        _snap_v = _snap_res.get(_sid)
+                        _db_v = _db_res.get(_sid)
+                        if isinstance(_snap_v, dict) and isinstance(_db_v, dict):
+                            new_results[_sid] = {**_snap_v, **_db_v}
+                        elif _db_v is not None:
+                            new_results[_sid] = _db_v
+                        else:
+                            new_results[_sid] = _snap_v
                     # 旧步骤强制 completed：残留 notified/step_done_ready 会让
                     # _is_role_busy 误判角色忙 → 下棒角色被堵（与 _advance_unsafe 同源修复）
                     if isinstance(new_results.get(step_id), dict):
                         _cur = new_results[step_id]
                         _cur["status"] = "completed"
-                        _cur.setdefault("completed_at", time.time())
-                        _cur.setdefault("completed_by", "workflow_engine")
+                        # setdefault 对"键存在但值为 None"无效（生产 0 例，但一旦
+                        # 出现就会带着 None 走到下游时间戳比较），显式补空值
+                        if not _cur.get("completed_at"):
+                            _cur["completed_at"] = time.time()
+                        if not _cur.get("completed_by"):
+                            _cur["completed_by"] = "workflow_engine"
                     new_results[next_step.id] = {"status": "notified", "ts": time.time(), "notified_at": time.time(),
                                                   "poll_since": time.time(), "bus_anchor": time.time()}
                     conn.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",

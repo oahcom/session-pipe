@@ -97,21 +97,36 @@ def test_escalated_deadline_constant_exists():
         "终结期限必须晚于升级启动阈值，否则升级刚发出就被判死"
 
 
-def test_rejected_branch_closes_after_escalation_deadline():
-    """源码契约：rejected 分支入口处必须判升级锚是否超期并 close failed。
+def test_escalation_expired_only_after_deadline():
+    """行为断言（非源码 grep）：锚 + 期限才判超期，边界两侧都验。"""
+    from pipeflow import engine
 
-    短路在 branch 入口而非三处升级分支各写一份——漏一处就是一个永久出口缺失。
+    MAX = engine._REJECTED_ESCALATED_MAX
+    now = 1_000_000.0
+    assert engine._rejected_escalation_expired({"rework_escalated_at": now - MAX - 1}, now)
+    assert not engine._rejected_escalation_expired({"rework_escalated_at": now - MAX + 1}, now)
+    assert not engine._rejected_escalation_expired({"rework_escalated_at": now}, now)
+
+
+def test_escalation_expired_false_without_anchor():
+    """锚缺失（未升级的老数据）不得判超期——否则存量实例一上线就被批量判死。"""
+    from pipeflow import engine
+    now = 1_000_000.0
+    assert not engine._rejected_escalation_expired({}, now)
+    assert not engine._rejected_escalation_expired({"rework_escalated_at": None}, now)
+    assert not engine._rejected_escalation_expired({"rework_escalated_at": 0}, now)
+
+
+def test_rejected_branch_uses_the_deadline_guard():
+    """接线断言：分支必须调用上面那个纯函数，否则函数正确也白搭。
+
+    只验调用存在，不验窗口文本——窗口是弱断言（加行即漂移），行为由上面三条覆盖。
     """
     import inspect
     from pipeflow import engine
     src = inspect.getsource(engine.WorkflowEngine.run_once)
-    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
-    _i = code.find('if step_status == "rejected":')
-    assert _i >= 0
-    _blk = code[_i:_i + 1600]
-    assert "rework_escalated_at" in _blk, "缺升级锚读取 → 期限判不了"
-    assert "_REJECTED_ESCALATED_MAX" in _blk, "缺期限判据"
-    assert 'status="failed"' in _blk, "超期必须 close failed 收口，否则永远等 24h 兜底"
+    assert "_rejected_escalation_expired(" in src, "rejected 分支未接期限判据"
+    assert 'status="failed"' in src, "超期必须 close failed 收口，否则永远等 24h 兜底"
 
 
 if __name__ == "__main__":

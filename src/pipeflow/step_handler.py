@@ -1393,13 +1393,17 @@ class StepHandlerMixin:
         闸门判缺产出，原样挂到 20:12（77min）父链停在 s4 rejected；
         wf_rw_50eb6ec9d6fd 同样挂 3h20m 直到 timeout_count=3。
         """
-        self._bb.write("blocker", msg, src="workflow_engine")
+        # 走 _notify_role 而不是 _send_to_role：后者会 _wait_for_role_ready（最多
+        # 90s）并可能把运维停掉的角色拉起来，而 engine 单线程逐实例 tick
+        # （engine.py:1419）→ N 个卡步叠加成 90s×N/5min 的整轮阻塞。
+        # 闸门提示是旁路通知，不该拖住 tick；_notify_role 的 ccs send 有 15s 上限
+        # 且自带 (role,title) 30min 冷却与「先投递后记账」，异常也不会中断本轮。
         try:
-            self._send_to_role(
-                self._eff_role(run, step),
-                f"/goal\n## 闸门未通过（{run.workflow_name}/{step.id}）\n{msg}\n"
-                f"补齐上述产出后重新写 bus 完成声明（标题含 {step.id}-complete）。",
-                wf_id=run.id, step_id=step.id, force=True)
+            self._notify_role(
+                self._eff_role(run, step), msg,
+                f"{run.workflow_name}/{step.id}（实例 {run.id}）闸门未通过："
+                f"补齐上述产出后重新写 bus 完成声明（标题含 {step.id}-complete），"
+                f"否则本步无法推进。")
         except Exception as _e:
             LOGGER.debug("gate prompt to role failed: %s", _e)
 

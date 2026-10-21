@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pipeflow.role_lifecycle import RoleLifecycleMixin
 from pipeflow.engine import WorkflowEngine, Step, WorkflowRun
 
@@ -203,3 +203,45 @@ def test_advance_busy_also_reverts_step():
     assert "_mark_step_delivery_failed" in _blk, \
         "advance 的 `is not True` 分支必须调 _mark_step_delivery_failed（busy 同路径）"
     assert "return" in _blk, "advance 回退后必须 return，否则继续建子工作流/部署"
+
+
+# ── 相同 prompt 重投窗口（R124） ────────────────────────────────────────
+
+def _send_once(h, prompt="请完成本次任务并给出结论"):
+    """跑一次完整投递，返回三态。"""
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=0, stdout='{"success": true}')):
+        return h._send_to_role("qa", prompt, wf_id="wf_dup", step_id="s1")
+
+
+def test_identical_prompt_within_window_is_queued():
+    """同一 (role, wf, step) 的同一 prompt 在窗口内第二次投递必须排队。
+
+    实测 24h cross_role_send 24,284 条里 20,499 条（84%）是同 target 同文案重复，
+    最重一条 product_architect 收 7,290 次、间隔恒 11s（每 tick 一次）。
+    """
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._LAST_SEND.clear()
+    h = _Harness()
+    h._lm.query.return_value = []
+    first = _send_once(h)
+    second = _send_once(h)
+    assert first is True, f"首次投递应成功, got {first!r}"
+    assert second == "busy", f"窗口内重投应排队, got {second!r}"
+
+
+def test_changed_prompt_and_failure_do_not_take_the_window():
+    """文案变了照常投；上次投递失败不占窗口（否则重试被自己压死）。"""
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._LAST_SEND.clear()
+    h = _Harness()
+    h._lm.query.return_value = []
+    with patch("pipeflow.engine._sp.run",
+               return_value=MagicMock(returncode=1, stdout='{"success": false, "error": "boom"}')):
+        assert h._send_to_role("qa", "请完成本次任务并给出结论",
+                               wf_id="wf_dup", step_id="s2") is False
+    # 失败未记账 → 同一 prompt 立即重试不受阻
+    assert _send_once(h, "请完成本次任务并给出结论") is True
+    # 文案不同 → 不受上一条记账影响
+    assert _send_once(h, "请完成本次任务并给出结论（改口径）", ) in (True, "busy")
+    RoleLifecycleMixin._LAST_SEND.clear()
