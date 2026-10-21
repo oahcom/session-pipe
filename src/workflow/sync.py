@@ -1,11 +1,9 @@
 """
 workflow/sync.py — 工作流实例 → 任务状态同步
 
-4 处重复的 _sync_task_from_workflows 合并到此一处：
-  - pipeflow/db.py:351-375  (WorkflowDB._sync_task_from_workflows)
+重复的 _sync_task_from_workflows 合并到此一处：
   - workflow/client.py:282-304  (WorkflowClient._sync_task_from_workflows)
   - lifecycle/manager.py:738-758  (_sync_task_unsafe)
-  - pipeflow/db.py:351-375 (WorkflowDB._sync_task_from_workflows)
 """
 
 import logging
