@@ -1,5 +1,18 @@
 # CHANGES.md
 
+## 2026-10-22 — 归属更正（9042df0 / a5f7c45）
+
+- `9042df0` 的 commit message 写的是"文档与死码收敛"，实际 `--stat` 只有 3 个文档
+  + `reliability_core.py` −2 行，**没有 .py 逻辑改动**，并顺带带入了另一个 session 的
+  480+ 行文档改写（`SYSTEM_LANDSCAPE` 158 / `TECHNICAL_DEEP_DIVE` 329）。这些行的内容有效，
+  只是归属不在本提交作者名下；`git blame` 会指向 9042df0，以此条为准。
+- 另一仓 `hermes-session-roles` 的 `555c3ac` 数字当时报错：实际删 **14** 个零引用常量、
+  60→20 行、`pytest` 49 passed（报的是 13 个 / 24 行 / 43 passed）。
+  更正详情见 `~/hermes/workspace/R144-删除重复路径常量/验证与待办.md`（不在本仓文件）。
+- `a5f7c45` 删 6 行零引用常量（`HERMES_TEMPLATES` / `WORKFLOW_GUIDE` /
+  `CODEX_SENTINEL_DIR` / `_CONTROL_WORDS`），四仓 grep 零引用 + 12 passed + 463 passed。
+
+
 ## 2026-10-22 — 投递预检判据收口（底栏 6 行 + 测试锁真）
 
 ### 问题（5 个只读子代理审查 eda4a38/4f02450 后实证）
