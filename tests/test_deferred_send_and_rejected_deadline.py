@@ -136,7 +136,8 @@ def test_rework_alive_only_for_non_terminal_chain():
 
     def _lm(sts):
         _l = MagicMock()
-        _l.query.return_value = [{"status": s} for s in sts]
+        # template_id 必填：_rework_alive 用 system-rework 过滤，缺键会 TypeError → 走 except 分支按活处理
+        _l.query.return_value = [{"status": s, "template_id": "WF-product"} for s in sts]
         return _l
 
     assert engine._rework_alive(_lm(["running"]), ["wf_rw_a"]) is True
