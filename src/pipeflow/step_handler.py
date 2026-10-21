@@ -456,6 +456,11 @@ class StepHandlerMixin:
         # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
         _sdata = self._step_sd(run, step)
         if _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_sent")):
+            # 抢救路径同样过质量闸门：exit_messages 只证明"角色写了消息"，不证明
+            # 产出落盘。此前直接 complete → 文件契约缺失的步骤照样推进（与宽松推进
+            # 同一类假完成，R119 已在宽松推进处堵住，这里漏了同一扇门）。
+            if self._quality_gate_blocks(step, run):
+                return
             # bypass 补发完整性提醒（tick rescue 直接 complete，跳过双节点审查）
             # 两个问题分开发送（用户约束：每个步骤分开提示词）
             _integ_send_bypass(run, step, "tick rescue",
@@ -1378,20 +1383,37 @@ class StepHandlerMixin:
                 except (ValueError, KeyError, TypeError):
                     LOGGER.debug("bus write fail in _sync_step_results fallback")
 
+    def _gate_alert(self, key: str, text: str, write) -> None:
+        """闸门失败播报节流：同一步骤同一条失败 ≥5 分钟才再写一次 bus。
+
+        tick 抢救路径每 10s 复现同一条 schema/verify 失败，逐条写会把总线刷成
+        噪音（R119 实测路径）；失败原因变了（新文本）则立即播报，角色才拿得到新信息。
+        """
+        _now = time.time()
+        _last = getattr(self, "_gate_alert_at", None)
+        if _last is None:
+            _last = self._gate_alert_at = {}
+        if len(_last) > 1000:      # 常驻 daemon 防增长：丢的是 5 分钟节流记忆
+            _last.clear()          # （最坏影响 = 同一条失败再播一次）
+        if _last.get(key, (0.0, ""))[1] == text and _now - _last[key][0] < 300:
+            return
+        _last[key] = (_now, text)
+        write()
+
     def _quality_gate_blocks(self, step: Step, run: WorkflowRun) -> bool:
         """exit_schema + verify 闸门：不通过写 blocker 并返回 True（调用方不推进）。
 
-        两个调用点共用一把尺子：exit 匹配主路径与宽松推进（分类不匹配的兜底）。
-        此前宽松推进直接 complete_step，文件契约缺了也照样算完成——下游拿不到
-        产出才回头返工（7 天 6 次宽松推进实测）。verify 来自模板注册表（可信
-        内部源），context 值已 shlex.quote 保护。
+        三个调用点共用一把尺子：exit 匹配主路径、宽松推进（分类不匹配的兜底）、
+        tick 抢救（exit_messages 已落库）。后两处此前直接 complete_step，文件契约
+        缺了也照样算完成——下游拿不到产出才回头返工（7 天 6 次宽松推进实测）。
+        verify 来自模板注册表（可信内部源），context 值已 shlex.quote 保护。
         """
         if step.exit_schema:
             ok, errs = self._validate_exit_schema(step, run)
             if not ok:
-                self._bb.write("blocker",
-                    f"[workflow] {run.workflow_name} {step.id} schema: {'; '.join(errs)}",
-                    src="workflow_engine")
+                _msg = f"[workflow] {run.workflow_name} {step.id} schema: {'; '.join(errs)}"
+                self._gate_alert(f"{run.id}/{step.id}/schema", _msg,
+                                 lambda: self._bb.write("blocker", _msg, src="workflow_engine"))
                 self._sync_step_results(run.id, run.step_results)
                 return True
         if step.verify:
@@ -1405,16 +1427,16 @@ class StepHandlerMixin:
             try:
                 ver = _engine_mod._sp.run(vcmd, shell=True, capture_output=True, timeout=30)
             except Exception as _e:
-                # 闸门自身故障不等于通过也不等于失败：按失败留痕，交下一轮重试
-                self._bb.write("blocker",
-                    f"[workflow] {run.workflow_name} {step.id} verify 执行异常: {_e}",
-                    src="workflow_engine")
+                # 闸门自身故障不算通过：按失败留痕交下一轮重试（同 schema 节流）
+                _msg = f"[workflow] {run.workflow_name} {step.id} verify 执行异常: {_e}"
+                self._gate_alert(f"{run.id}/{step.id}/verify", _msg,
+                                 lambda: self._bb.write("blocker", _msg, src="workflow_engine"))
                 self._sync_step_results(run.id, run.step_results)
                 return True
             if ver.returncode != 0:
-                self._bb.write("blocker",
-                    f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}",
-                    src="workflow_engine")
+                _msg = f"[workflow] {run.workflow_name} {step.id} verify: {ver.stderr.decode()[:200] or 'failed'}"
+                self._gate_alert(f"{run.id}/{step.id}/verify", _msg,
+                                 lambda: self._bb.write("blocker", _msg, src="workflow_engine"))
                 self._sync_step_results(run.id, run.step_results)
                 return True
         return False

@@ -201,5 +201,28 @@ def test_evidence_blocks_queue_reclaim(mock_run):
     assert st["current_step"] == "s2", f"证据未消费: {st}"
 
 
+@_PATCH
+def test_tick_rescue_respects_exit_schema(mock_run):
+    """出口闸门：exit_messages 齐但产出文件缺失 → 不得被 tick 抢救成完成。"""
+    tag = _tag()
+    d = _env()
+    _write_wf(d, "evsc", [_step("s1", "S1", tag,
+                                exit_schema={"required": ["MISSING.md"]}),
+                          _step("s2", "S2", tag)])
+    eng = WorkflowEngine(d)
+    rid = eng.start("evsc", {})
+    eng.run_once()                                    # 首投
+    lm = eng._lifecycle
+    row = lm._get_wf_unsafe(rid)
+    results = json.loads(row["step_results"] or "{}")
+    results["s1"] = {**results.get("s1", {}), "status": "notified",
+                     "exit_messages": [{"id": 1, "text": f"{tag}_S1"}]}
+    lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+               (json.dumps(results, ensure_ascii=False), rid))
+    eng.run_once()
+    st = eng.status(rid)
+    assert st["current_step"] == "s1", f"schema 未过的 exit_messages 被抢救成完成: {st}"
+
+
 if __name__ == "__main__":
     raise SystemExit(__import__("pytest").main([__file__, "-q"]))
