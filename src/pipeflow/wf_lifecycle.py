@@ -247,6 +247,13 @@ class WorkflowLifecycleMixin:
                 # 当前行状态：step_done_ready 等待审批用更长阈值 72h
                 _st = d.get("status", "running")
                 _global_limit_h = 72 if _st == "step_done_ready" else 24
+                # 模板声明的预算此前只是元数据：回收器恒用硬编码 24h/72h。
+                # WF-architect_review 声明 4h，实测三条实例 4.3h 仍在 running。
+                _decl_h = getattr((self._workflows.get(tpl)
+                                   if hasattr(self, "_workflows") else None),
+                                  "max_duration_hours", 0) or 0
+                if _decl_h:
+                    _global_limit_h = min(_global_limit_h, int(_decl_h))
 
                 # 食链循环工作流豁免：loop.enabled 的长跑工作流跨轮次间隙可能静默 >24h，
                 # 用 72h 回收阈值（与 step_done_ready 一致）防误杀。loop 配置仅存内存
@@ -282,7 +289,14 @@ class WorkflowLifecycleMixin:
                 # 条件 0 例外：步骤自身已终态，子链本就该随之终止。缺这道门时
                 # 24h 兜底会连同活着的子链一起被级联杀掉（在途产出直接丢失）。
                 elif _live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {}):
-                    pass
+                    # 子链活着 = 父步无新产出属正常态，但豁免必须有上界：本 elif
+                    # 短路条件 1-4（含全局阈值）。子链卡审批（行级仍 running）时
+                    # 父链可等到 72h 且零记录 —— 16 个 live 实例里 2 条正是此态。
+                    if age_h > _global_limit_h:
+                        _cond = "5"
+                        reason = (f"等子链 {str(_cur_step.get('subflow_id') or '')[:12]} "
+                                  f"已 {age_h:.1f}h > 上限 {_global_limit_h}h"
+                                  f"（子链仍存活，父步状态={_cur_step.get('status')!r}）")
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
                 elif max_tc >= _auto_cancel_at:
@@ -993,17 +1007,33 @@ class WorkflowLifecycleMixin:
                     # 另一个作用域，方法内引用会 NameError 被 except 吞掉，
                     # 导致子链创建静默失败（实测生产 journal：
                     # "subflow creation failed: name 'new_results' is not defined"）。
-                    _psr = results.setdefault(tgt_step.id, {})
-                    _psr["subflow_id"] = _wf_id
-                    # 清排队账本（bus #425593 修法①）：子链接管后父步不再排队，
-                    # 冻结的 queued_since 会被条件4 当成"父步停滞至今"→ 子链一
-                    # 结束就整链判死（实测 8 例，138min 子链工时无接收方）。
-                    # 与投递成功路径（engine.py 清 queued+queued_since）同语义。
-                    _psr["queued"] = 0
-                    _psr.pop("queued_since", None)
-                    conn2.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                        (json.dumps(results, ensure_ascii=False), wf_id))
+                    # 只写本步那几个键，**不整份回写**：results 是本 tick 起始快照，
+                    # 而 :722 刚在本 tick 把 next_step 落成 notified、:711 又补了上一步
+                    # 的 completed_at。整份写回把这两处一起抹掉 —— 实测 next_step 整条
+                    # 消失（步骤行无 s2 键），下一 tick 走"未投递"分支重新派单，
+                    # 于是子链与父步同时投给同一角色，subflow_id 也再也接不回来
+                    # （生产 wf_413e05355b/s4：notified 但无 subflow_id）。
+                    conn2.execute(
+                        "UPDATE workflow_instances SET step_results="
+                        "json_remove(json_set(COALESCE(step_results,'{}'), ?, ?, ?, 0), ?) "
+                        "WHERE instance_id=?",
+                        (f'$."{tgt_step.id}".subflow_id', _wf_id,
+                         f'$."{tgt_step.id}".queued',
+                         f'$."{tgt_step.id}".queued_since', wf_id))
                     conn2.commit()
+                    # 内存副本同步成落库后的真值：调用方（engine.run_once 建子链后
+                    # 紧跟 _sync_step_results）会把 results 整份写回，不同步等于把
+                    # 刚做的单键写又抹一遍。
+                    _fresh = conn2.execute(
+                        "SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                        (wf_id,)).fetchone()
+                    if _fresh and _fresh["step_results"]:
+                        try:
+                            _frs = json.loads(_fresh["step_results"])
+                            if isinstance(_frs.get(tgt_step.id), dict):
+                                results[tgt_step.id] = _frs[tgt_step.id]
+                        except (json.JSONDecodeError, TypeError):
+                            pass
                     return True   # 子链已接管
         except Exception as _e:
             LOGGER.error("subflow creation failed for %s: %s", wf_id, _e)
@@ -1094,6 +1124,28 @@ class WorkflowLifecycleMixin:
         except Exception as e:
             LOGGER.debug("deploy_production_outputs failed: %s", e)
 
+    def _review_subject_role(self, wf_name: str, review_step) -> str:
+        """被审产物的产出角色（返工承接方）；不在返工映射表内返回空串。
+
+        门禁步（review/gate）的 target_role 是 reviewer 自己，真正的返工对象是
+        上一步产出者（生产 3/3 条真实驳回都是门禁步驳上一步产物），故向上回溯。
+        映射表只收真实出现过的角色，表外（pm/writer 等）返回空串，调用方维持
+        原语义，避免把文档缺陷盲目派给 engineer。
+        """
+        _tgt = str(getattr(review_step, "target_role", "") or "")
+        if _tgt in _REWORK_TPL_FOR_ROLE:
+            return _tgt
+        _wf = self._workflows.get(wf_name) or self._workflows.get(
+            re.sub(r"^(?:WL-|WF-)", "", str(wf_name)))
+        _steps = list(getattr(_wf, "steps", None) or [])
+        _i = next((_k for _k, _s in enumerate(_steps)
+                   if getattr(_s, "id", None) == getattr(review_step, "id", None)), 0)
+        for _s in reversed(_steps[:_i]):
+            _r = str(getattr(_s, "target_role", "") or "")
+            if _r in _REWORK_TPL_FOR_ROLE:
+                return _r
+        return ""
+
     def _create_rework_subflow(self, wf_id: str, lm, wf_name: str, review_step_id: str,
                                review_step, next_step, results: dict) -> bool:
         """review 被拒绝 → 解析【系统问题】/【业务问题】分类，分别创建修复子链。
@@ -1155,23 +1207,17 @@ class WorkflowLifecycleMixin:
             # 已知返工对象（映射表内角色）就用这句话建一条业务返工链；表外角色
             # 维持原语义（盲目重投），避免把 pm/reviewer 产物误派给 engineer。
             _rej_txt = str(_done_sr.get("rejection_reason") or "").strip()
-            _tgt_role = str(getattr(review_step, "target_role", "") or "")
-            if _rej_txt and _tgt_role not in _REWORK_TPL_FOR_ROLE:
-                # 门禁步的 target_role 是 reviewer 自己，返工对象是被审的上一步产出
-                # （生产 3/3 条真实驳回都是 s4 门禁驳 s3 产物，旧写法全被跳过）
-                _wf = self._workflows.get(wf_name) or self._workflows.get(
-                    re.sub(r"^(?:WL-|WF-)", "", str(wf_name)))
-                _steps = list(getattr(_wf, "steps", None) or [])
-                _i = next((_k for _k, _s in enumerate(_steps)
-                           if getattr(_s, "id", None) == getattr(review_step, "id", None)), 0)
-                for _s in reversed(_steps[:_i]):
-                    _r = str(getattr(_s, "target_role", "") or "")
-                    if _r in _REWORK_TPL_FOR_ROLE:
-                        _tgt_role = _r
-                        break
-            if _rej_txt and _tgt_role in _REWORK_TPL_FOR_ROLE:
+            _tgt_role = self._review_subject_role(wf_name, review_step)
+            if _rej_txt and _tgt_role:
                 _biz_issues = [_rej_txt[:300]]
                 _biz_role = _tgt_role
+        elif _biz_issues and not _biz_role:
+            # 有分类但没标流向：返工对象是**被审产物的人**，不是默认 engineer。
+            # 实测 wf_85faf589be90/s3（2026-10-22）：reviewer 的 4 条 P1 全是
+            # DESIGN.md 与仓库相反/统计无法回传等文档缺陷，却因未标箭头被派给
+            # engineer_feature —— 工程改不了 DESIGN，重审原样驳回，3 次封顶升级，
+            # 链条停摆。同批 8/10 条返工链全部错派（含 wf_b808ff2f3611 等 3 条主链）。
+            _biz_role = self._review_subject_role(wf_name, review_step)
         if not _sys_issues and not _biz_issues:
             LOGGER.info("rework: %s/%s review 无分类问题，跳过返工", wf_id[:8], review_step_id)
             return False
@@ -1216,6 +1262,17 @@ class WorkflowLifecycleMixin:
                     )
                     if _tpl_exists or _tpl in _created_tpls:
                         LOGGER.info("rework 已存在 %s/%s 类型=%s，不重复创建",
+                                    wf_id[:8], _type_label, _tpl)
+                        continue
+                    # 活跃同模板返工链在库里就不再建第二条：rework_ids 在重投时被
+                    # _REQUEUE_DROP 清空，只按它去重会让每轮驳回新开一条同型链
+                    # （实测 maintainer 队列积到 91 深仍在增长，而系统问题链已不再
+                    # 阻断父链，重复建只会继续堆队列）。
+                    if conn.execute(
+                            "SELECT 1 FROM workflow_instances WHERE parent_wf_id=? AND template_id=? "
+                            "AND status NOT IN ('completed','failed','cancelled') LIMIT 1",
+                            (wf_id, _tpl)).fetchone():
+                        LOGGER.info("rework 活跃链仍在 %s/%s 类型=%s，不重复创建",
                                     wf_id[:8], _type_label, _tpl)
                         continue
                     _sub_wf = self._workflows.get(_tpl)
@@ -1762,6 +1819,22 @@ class WorkflowLifecycleMixin:
 
         wf_id 非空时在头部注入实例 id：exit_condition 带 require_wf 的步骤
         只认含本 id 的完成消息，角色不知道 id 就永远写不出匹配消息。"""
+        # 验收判据渲染：角色收到的推进 prompt 此前只有「[实例]」，没有步骤号与实际
+        # 匹配串，{acceptance_criteria} 一律被 task_desc 顶替成「按模板要求完成」的空话
+        # —— 角色写出的标题差一个前缀（如只写 s2-complete 而契约是
+        # WF-product_delivery/s2-complete）就永远匹配不上，步骤熬到超时。判据全部
+        # 取自模板自身声明，不新增口径。
+        _ec = step.exit_condition or {}
+        _need = []
+        if _ec.get("text_contains"):
+            _need.append(
+                f"完成消息标题必须含 `{_ec['text_contains']}`"
+                f"（bus cat={_ec.get('bus_category') or '按模板'}，"
+                f"src={_ec.get('source_contains') or step.target_role}）")
+        _req = [f for f in ((step.exit_schema or {}).get("required") or [])
+                if isinstance(f, str)]
+        if _req:
+            _need.append("产出文件: " + ", ".join(_req))
         if wf_id:
             # 产物归属约定：模板里的上游路径是固定名（~/ccs-workspaces/pm/PRD.md），
             # 而同一角色常有 2+ 条链并发写同名文件 —— 实测 pm 的 PRD.md 被 scout 链
@@ -1771,7 +1844,9 @@ class WorkflowLifecycleMixin:
             # prompt 不知道去找它。此处把该约定说清，不改模板 JSON 与 exit_schema
             # （标准名仍须写，契约不变），只补读取侧与标注侧。
             prompt = (
-                f"[实例] {wf_id}（完成消息标题必须含此 id）\n"
+                f"[工作流] {wf_name} | 步骤: {step.id} — {step.title}\n"
+                + (f"[验收] {'；'.join(_need)}\n" if _need else "")
+                + f"[实例] {wf_id}（完成消息标题必须含此 id）\n"
                 f"[产物归属] 同一角色目录会被多条链并发写入固定名文件（如 PRD.md）。"
                 f"读上游产物时优先读带本实例 id 的副本（如 PRD-{wf_id}.md），"
                 f"并在完成消息里指明哪一份是本实例的权威副本；"
@@ -1783,7 +1858,9 @@ class WorkflowLifecycleMixin:
         prompt = prompt.replace("{description}", task_desc)
         prompt = prompt.replace("{assignee}", step.target_role)
         prompt = prompt.replace("{task_definition}", task_title or task_desc or wf_name)
-        prompt = prompt.replace("{acceptance_criteria}", task_desc or "按模板要求完成产出并写入对应bus分类")
+        prompt = prompt.replace("{acceptance_criteria}",
+                                "；".join(_need) if _need
+                                else (task_desc or "按模板要求完成产出并写入对应bus分类"))
         prompt = prompt.replace("{topic}", task_title)
         # workspace 摘要：给角色上下文（首步生产扫描在调用前已替换，这里统一兜底）
         try:
