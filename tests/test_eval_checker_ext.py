@@ -42,6 +42,20 @@ _VERIFIED_ROLE_2 = {
 _ALL_ROLES = [_UNVERIFIED_ROLE, _VERIFIED_ROLE, _VERIFIED_ROLE_2]
 
 
+class _BenignTrajectory:
+    """轨迹检查替身：不读真实转录。
+
+    真 TrajectoryQualityChecker 读 ~/.claude/projects/*-ccs-workspaces-<role>/
+    里**线上正在写**的转录，并把发现计进同一个 summary（checked+1 / failed+1）。
+    于是这些用例的红绿取决于"跑测试的那一刻角色转录里有没有 finding"——
+    实测 2026-10-22：同一份代码，单独跑 10 passed，全量跑 2 failed，
+    换 5 个不同的前置文件都能复现（其实是时间相关，不是文件顺序相关）。
+    """
+
+    def check(self, *args, **kwargs):
+        return dict(passed=True, findings=[], checked_traces=0)
+
+
 def test_role_filter():
     """run_eval_check(role_filter=...) 只检查指定角色。"""
     with (
@@ -49,6 +63,7 @@ def test_role_filter():
         patch.object(ec, "_run",
                      return_value={"ok": True, "stdout": "active", "stderr": "", "returncode": 0}),
         patch.object(ec, "_write_bus"),
+        patch.object(ec, "TrajectoryQualityChecker", _BenignTrajectory),
     ):
         s = ec.run_eval_check(role_filter="维护者")
 
@@ -108,6 +123,7 @@ def test_tool_error_skipped_not_failed():
             patch.object(ec, "_load_roles", return_value=_ALL_ROLES),
             patch.object(ec, "_run",
                          return_value={"ok": False, "stdout": "", "stderr": "grep: bad pattern", "returncode": 2}),
+            patch.object(ec, "TrajectoryQualityChecker", _BenignTrajectory),
         ):
             s = ec.run_eval_check()
     finally:
