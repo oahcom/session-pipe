@@ -27,11 +27,15 @@ DB 无其他活跃步时直接进入 ccs send；角色 CLI 仍在执行时，分
 实测单次 30s，整个 tick 的其他工作流全部停摆（R129 §8/§9.1）。
 
 ### 修复
-1. `src/pipeflow/role_lifecycle.py` `_send_to_role`：未替换变量校验之后、`_wait_for_role_ready` 之前，
+1. `src/pipeflow/role_lifecycle.py` `_send_to_role`：prompt 全部校验完（未替换变量 / 空 goal）之后，
    用 `liveness.pane_cli_busy` 只看 CLI 忙态（底栏 esc/retrying）；True 即返回 `"busy"`，下 tick 再试。
    不用 300s 活动窗——刚干完活的 pane 仍有输出，活动窗会把空闲角色判忙（bus #395128 同一根因）。
    探针异常不阻断投递（沿用原有的"探测不可用则放行"语义）。
+   `force=True` 不预检：timeout 重推 / dual-node / integrity 提醒是旁路，integrity 在发送前已落
+   bypass flag，预检返回 busy 会永久吞掉提醒。
+   首步派单 `_write_step_prompt` 补传 `wf_id/step_id`，否则新建链的第一跳绕过预检。
 2. `tests/test_pipeflow_error_paths.py`：新增 2 例，锁住"CLI 忙 → busy 且不启动 ccs 子进程"与"探针异常 → 放行"。
+3. `tests/test_exit_condition.py`：清空进程级 `_ALERT_TS`，避免稳定标题的 30min 冷却跨用例吞告警。
 
 ### 验证
 - `python3 -m py_compile src/pipeflow/role_lifecycle.py` 通过

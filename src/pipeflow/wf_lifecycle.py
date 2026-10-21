@@ -877,6 +877,9 @@ class WorkflowLifecycleMixin:
                         (_db_sdata["subflow_id"],)).fetchone()
                     if _sub_row and _sub_row["status"] in (
                             "pending", "running", "step_done_ready", "completed"):
+                        # 调用方会用本 tick 的 results 整份写回，不同步等于把 DB 里的
+                        # 指针又抹掉，下一轮继续走「指针不可信」兜底。
+                        results[tgt_step.id] = dict(_db_sdata)
                         return True
                 # 指针不可信时的回退：子链失败重试会主动 pop 掉 subflow_id
                 # （task_generator.py 的重建分支），此后上面那道防重失明，每轮
@@ -903,9 +906,15 @@ class WorkflowLifecycleMixin:
                         _psr["subflow_id"] = _link["instance_id"]
                         _psr["queued"] = 0
                         _psr.pop("queued_since", None)
+                        # 只写这一个键：results 是本 tick 起始快照，整份回写会抹掉本 tick
+                        # 刚落的 next_step.notified 与上一步 completed_at（同 :1021 的理由）。
                         conn2.execute(
-                            "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
-                            (json.dumps(results, ensure_ascii=False), wf_id))
+                            "UPDATE workflow_instances SET step_results="
+                            "json_remove(json_set(COALESCE(step_results,'{}'), ?, ?, ?, 0), ?) "
+                            "WHERE instance_id=?",
+                            (f'$."{tgt_step.id}".subflow_id', _link["instance_id"],
+                             f'$."{tgt_step.id}".queued',
+                             f'$."{tgt_step.id}".queued_since', wf_id))
                         conn2.commit()
                     return True
                 # 同一父步已有"跑完却没通过"的旧子链 → 不再重建：重建只是把同样的
@@ -1011,7 +1020,8 @@ class WorkflowLifecycleMixin:
                     # 消失（步骤行无 s2 键），下一 tick 走"未投递"分支重新派单，
                     # 于是子链与父步同时投给同一角色，subflow_id 也再也接不回来
                     # （生产 wf_413e05355b/s4：notified 但无 subflow_id）。
-                    _psr = dict(results.get(tgt_step.id) or {})
+                    _cur = results.get(tgt_step.id)
+                    _psr = dict(_cur) if isinstance(_cur, dict) else {}
                     _psr["subflow_id"] = _wf_id
                     _psr["queued"] = 0
                     _psr.pop("queued_since", None)
@@ -1955,7 +1965,9 @@ class WorkflowLifecycleMixin:
                     "{changes}", "{task_list}", "{assignments}"):
             if var in prompt:
                 prompt = prompt.replace(var, fallback)
-        self._send_to_role(step.target_role, prompt)
+        # 首步也要带实例/步骤号：否则 CLI 忙预检（_send_to_role 内）整段跳过，
+        # 新建链的第一跳仍可能用 30s ccs send 拖停整个 tick。
+        self._send_to_role(step.target_role, prompt, wf_id=run.id, step_id=step.id)
 
     def _collect_workspace_summary(self, ws_dir: Path) -> str:
         if not ws_dir.exists():
