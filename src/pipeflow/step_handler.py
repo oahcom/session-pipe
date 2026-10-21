@@ -480,7 +480,12 @@ class StepHandlerMixin:
         if sig and sig.idle_complaint:
             _idle_n = _sig_state.get("idle_count", 0) + 1
             _idle_cool = _sig_state.get("idle_cool_until", 0)
-            if _idle_n >= 5 and not self._has_live_subflow(run, step):
+            # 与排队分支（下方 _queued>=10 那处）同源的活体门：角色正在写转录 = 在推理，
+            # pane 静默是长思考的正常形态，不是卡死。不接这道门时实测两个实例的完成消息
+            # 分别在 cancel 后 +27.6s（wf_e688c4fafc/s4）与 +235s（wf_sub_c5620e70dd31/s1）
+            # 才落 bus —— 产出已写好却被丢弃，父链重建子链多花 35.6 分钟。
+            if (_idle_n >= 5 and not self._has_live_subflow(run, step)
+                    and not _role_producing_recently(_eff)):
                 try:
                     self._lifecycle.cancel_step(run.id, step.id)
                     LOGGER.info("tmux 信号取消: %s/%s 连续 %d 次空闲", run.workflow_name, step.id, _idle_n)

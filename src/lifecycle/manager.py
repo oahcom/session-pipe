@@ -529,6 +529,16 @@ class LifecycleManager:
                 wf = self._get_wf_unsafe(wf_id)
                 if not wf:
                     raise ValueError(f"workflow 不存在: {wf_id}")
+                # 幂等：已取消就返回。调用方（step_handler 的 idle 判死）每 tick 重算
+                # idle_count>=5 会再调一次，而本函数不判终态 → 同一次取消每 10s 落一行
+                # workflow_logs（实测 wf_ae31fd1c4c11 一条链 49 行 / 31 分钟），把
+                # "角色不响应"的日志统计放大 2.6 倍（109 行实为 41 个 (实例,步骤)）。
+                # 必须先 rollback 再返回：本函数在 BEGIN IMMEDIATE 内裸 return 会让
+                # 事务挂在连接上，下一个 BEGIN IMMEDIATE 直接报"transaction already
+                # open"，把 daemon 的整条调用链卡死（raise 路径走的是 except+rollback）。
+                if wf.get("status") == "cancelled":
+                    self._conn.rollback()
+                    return False
                 if wf.get("current_step_id") != step_id:
                     raise ValueError(
                         f"步骤不匹配: 当前={wf['current_step_id']}, 传入={step_id}")
