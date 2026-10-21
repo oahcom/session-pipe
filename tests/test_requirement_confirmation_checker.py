@@ -108,3 +108,30 @@ def test_skipped_when_role_filter_scopes_the_run(monkeypatch):
     _stub_pipeline(monkeypatch, counter)
     ec.run_eval_check(role_filter="engineer")
     assert counter == {"ctor": 0, "check": 0}
+
+
+def _checker_with_real_ctor(monkeypatch, bb, ttl_days):
+    """走真实构造器（stub 掉 Blackboard），验 ttl_days 的边界语义。"""
+    import types
+    fake = types.ModuleType("hermes_bus.blackboard_legacy")
+    fake.Blackboard = lambda *a, **k: bb
+    monkeypatch.setitem(sys.modules, "hermes_bus.blackboard_legacy", fake)
+    return RequirementConfirmationChecker(ttl_days=ttl_days)
+
+
+def test_non_positive_ttl_means_no_window(monkeypatch):
+    """ttl<=0 = 关掉年龄过滤，必须真的无窗口（inf）。
+
+    换成"很大的天数"只是近似；负数更糟：cutoff 被推到未来 → 一条都查不到，
+    而"一条都查不到"会被读成"全部已确认"——正是本轮要消灭的假绿。
+    """
+    bb = _FakeBB([])
+    _checker_with_real_ctor(monkeypatch, bb, 0).check()
+    assert bb.calls[0]["ttl_days"] == float("inf")
+
+
+def test_negative_ttl_also_means_no_window(monkeypatch):
+    bb = _FakeBB([])
+    _checker_with_real_ctor(monkeypatch, bb, -5).check()
+    assert bb.calls[0]["ttl_days"] == float("inf")
+

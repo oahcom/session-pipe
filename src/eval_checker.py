@@ -653,11 +653,12 @@ class RequirementConfirmationChecker:
 
     REQUIREMENT_CATS = {"task_spec", "user_story", "prd", "approval", "product_design"}
 
-    def __init__(self, ttl_days: int | None = None):
+    def __init__(self, ttl_days: float | None = None):
         from hermes_bus.blackboard_legacy import Blackboard
         self._bb = Blackboard()
         # 窗口必须与 TTL pruner 同源：保留期调大而检查窗口不动，就会静默漏判老需求。
-        # ttl_pruner.max_age_days=0 表示关掉年龄清理 → 此处等价于"不设窗口"。
+        # ttl_pruner.max_age_days<=0 表示关掉年龄清理 —— 用 inf 才是真"无窗口"；
+        # 换成一个很大的天数只是"很大"，负数更会把 cutoff 推到未来 → 全量漏查还假通过。
         if ttl_days is None:
             try:
                 from config_loader import get_config
@@ -665,7 +666,7 @@ class RequirementConfirmationChecker:
                     "ttl_pruner", default={}).get("max_age_days", 90))
             except Exception:
                 ttl_days = 90
-        self.ttl_days = ttl_days or 36500
+        self.ttl_days = float("inf") if (ttl_days or 0) <= 0 else ttl_days
 
     def check(self) -> dict:
         """需求有没有人 consume 过 —— 全局口径，不按角色。
