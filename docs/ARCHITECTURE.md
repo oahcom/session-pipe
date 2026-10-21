@@ -19,25 +19,25 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
-| **pipeflow/engine.py** | 1852 | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/engine.py** | 1878 | Data-driven workflow execution engine (core, imports mixins below) |
 | **pipeflow/step_handler.py** | 1681 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 1197 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 1199 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
 | **pipeflow/task_generator.py** | 874 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 1979 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 2021 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
 | **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
 | **template_registry.py** | 937 | 模板注册中心 |
 | **eval_checker.py** | 1459 | 安全白名单命令执行检查 |
 | **workflow/client.py** | 495 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 465 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
 | **reliability.py** | 434 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 612 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/routes.py** | 622 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
 | **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
 | **routing/survival_monitor.py** | 640 | 存活监测 |
 | **routing/rdb.py** | 293 | Route table SQLite persistence + audit log |
 | **routing/auto.py** | 260 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
 | **routing_daemon.py** | 591 | 路由守护进程 |
 | **task_evidence.py** | 448 | 任务证据链 |
-| **contract_updater.py** | 431 | 合约同步 |
+| **contract_updater.py** | 442 | 合约同步 |
 | **conversation_monitor.py** | 417 | 对话监控 |
 | **config_loader.py** | 167 | YAML config loading with env override and hot-reload |
 | **workflow/gateway.py** | 188 | 工作流网关门禁 |
@@ -45,7 +45,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **cron_scheduler.py** | 128 | cron 调度器 |
 | **eval_consistency.py** | 70 | 评估一致性 |
 | **routing/consistency.py** | 105 | 路由一致性 |
-| **pipeflow/daemon.py** | 420 | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **pipeflow/daemon.py** | 465 | Main loop: `while True: engine.run_once(); sleep(10)` |
 | **workflow_metrics.py** | 109 | 工作流指标 |
 | **workflow/db.py** | 96 | 工作流数据访问 |
 | **output_validator.py** | 93 | 输出格式验证 |
@@ -56,7 +56,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **pipeflow/db.py** | 327 | Three-layer SQLite: Template → Instance → Task |
 | **p0_exemption.py** | 496 | P0 豁免通道 |
 
-**Total: 38 modules（不含 `__init__.py`），合计 ~10700 行 Python**
+**Total: 35 modules（不含 `__init__.py`），合计约 19k 行 Python**
 
 ## Data flow
 
