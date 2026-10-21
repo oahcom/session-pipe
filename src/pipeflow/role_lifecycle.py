@@ -348,25 +348,34 @@ class RoleLifecycleMixin:
 
             LOGGER.warning("额度拒绝: %s 命中 403/429，第 %d 次发「继续」重试", role, attempt + 1)
             try:
-                _engine_mod._sp.run(
+                _r1 = _engine_mod._sp.run(
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
                     capture_output=True, timeout=5,
                 )
-                _engine_mod._sp.run(
+                _r2 = _engine_mod._sp.run(
                     ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "继续", "Enter"],
                     capture_output=True, timeout=5,
                 )
             except Exception as e:
                 LOGGER.warning("额度恢复发送失败 %s: %s", role, e)
                 continue
+            # subprocess.run 在 rc≠0 时不抛异常：会话在候选集之后死掉只会得到
+            # RC=1（实测 tmux send-keys -t ccs-nonexistent → rc=1），不判 rc 就会
+            # 写出「已发继续」假审计。
+            _rc = max(getattr(_r1, "returncode", 0) or 0,
+                      getattr(_r2, "returncode", 0) or 0)
+            if _rc != 0:
+                LOGGER.warning("额度恢复发送失败 %s: tmux rc=%d", role, _rc)
+                continue
             # 审计与发送分家：发送异常不再吞掉审计，写入失败单独可见。
-            # 标题必须带时刻——bus 按标题 UPSERT 且保留首次 ts，而 attempt 随
-            # 退避重置反复从 1 起算，同一标题把新一轮注入覆盖到昨天那行上：
-            # 实测今日 8 次注入在 facts 里查不到，最后可见行还是 2026-10-20 23:46。
+            # 标题必须带完整日期时刻——bus 的 facts.t 是 UNIQUE 且 ON CONFLICT
+            # 保留首次 ts，而 attempt 随退避重置反复从 1 起算：不带日期时新一天
+            # 的注入会覆盖昨天那行（实测今日 8 次注入在 facts 里查不到，最后可见
+            # 行停在 2026-10-20 23:46；24h 902 次写只落到 91 行 ≈10:1 合并）。
             try:
                 self._bb.write("monitor_audit",
                     f"[rate_limit] {role} 被额度拒绝 → 已发继续"
-                    f"（第 {attempt + 1} 次 {time.strftime('%H:%M:%S')}）",
+                    f"（第 {attempt + 1} 次 {time.strftime('%Y-%m-%d %H:%M:%S')}）",
                     evidence=output[-300:], src="workflow_engine")
             except Exception as e:
                 LOGGER.warning("额度拒绝审计写入失败 %s: %s", role, e)
