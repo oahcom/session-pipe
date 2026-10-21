@@ -134,3 +134,11 @@ def test_negative_ttl_also_means_no_window(monkeypatch):
     bb = _FakeBB([])
     _checker_with_real_ctor(monkeypatch, bb, -5).check()
     assert bb.calls[0]["ttl_days"] == float("inf")
+
+
+def test_nan_ttl_means_no_window(monkeypatch):
+    """NaN 会让 SQL 变成 f.ts >= NULL → 一条都查不到 → 假通过。必须映射成 inf。"""
+    bb = _FakeBB([])
+    _checker_with_real_ctor(monkeypatch, bb, float("nan")).check()
+    assert bb.calls[0]["ttl_days"] == float("inf")
+
