@@ -480,8 +480,9 @@ class RoleLifecycleMixin:
                 )
                 with self._COMPACT_LOCK:
                     self._last_compact[role] = now
+                # 带时刻：压缩频率是上下文压力的唯一时间线，UPSERT 会把它压成一行。
                 self._bb.write("architecture",
-                    f"[context_overflow] {role} → /compact",
+                    f"[context_overflow] {role} → /compact {time.strftime('%m-%d %H:%M')}",
                     src="workflow_engine")
             except Exception as e:
                 LOGGER.warning("compact send failed for %s: %s", role, e)
@@ -661,8 +662,11 @@ class RoleLifecycleMixin:
                         # 审计信号：记录角色被 workflow 引擎拉起（供 monitor_audit 查看）
                         # 写失败不阻断拉起（审计是旁路，DB 锁/连接异常不应让角色拉起中断）
                         try:
+                            # 带时刻：固定标题会把每次重启压成一行（#288618 写 21 次
+                            # 仍只显示"重启 1 次"），崩溃循环在审计里不可见。
                             self._bb.write("monitor_audit",
-                                f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)",
+                                f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)"
+                                f" {time.strftime('%m-%d %H:%M:%S')}",
                                 src="workflow_engine")
                         except Exception:
                             LOGGER.debug("monitor_audit write failed for %s", role)

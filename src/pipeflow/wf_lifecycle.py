@@ -732,8 +732,10 @@ class WorkflowLifecycleMixin:
             # 部署自动闭环：把产出 cli/*.py 安装到 ~/.hermes/bin/，让工具可被
             # cron/daemon/角色直接调用（"有实际收益"的最后一环——部署）。
             self._deploy_production_outputs(wf_id)
+            # 标题带 wf_id：同一模板每完成一次都写同一行，ts 冻在首次 →
+            # 看板据此判"模板卡死"（#376577 写 47 次，ts 停在 10-17）。
             self._bb.write("workflow",
-                f"[workflow] {wf_name} 完成: {len(steps)} 步",
+                f"[workflow] {wf_name} 完成: {len(steps)} 步 ({wf_id[:12]})",
                 src="workflow_engine")
             # 食物链循环：loop 配置存在 → 检查是否继续下一轮
             # 子 agent 价值审计文件存在且标记 FAIL → 停止循环（收益不足）
