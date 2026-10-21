@@ -140,72 +140,6 @@ def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AG
         return (time.time() - _dt.timestamp()) < max_age
     return False
 
-
-_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-
-
-def _last_assistant_usage_tokens(path: str) -> int | None:
-    """倒读 transcript，取最后一条带 usage 的 assistant 消息的上下文占用。
-
-    只读尾部：transcript 实测 7.8MB，全量解析 ×20 角色 ×每轮会把 daemon 拖死。
-    从后往前按 1MB 分块，跨块行用 carry 拼接，命中即返回。
-    """
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, 2)
-            pos = fh.tell()
-            carry = b""
-            while pos > 0:
-                step = min(1 << 20, pos)
-                pos -= step
-                fh.seek(pos)
-                buf = fh.read(step) + carry
-                lines = buf.split(b"\n")
-                carry = lines[0] if pos > 0 else b""
-                for raw in reversed(lines if pos == 0 else lines[1:]):
-                    if b'"usage"' not in raw:
-                        continue
-                    try:
-                        obj = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if obj.get("type") != "assistant":
-                        continue
-                    usage = (obj.get("message") or {}).get("usage") or {}
-                    total = sum(int(usage.get(k) or 0) for k in _USAGE_KEYS)
-                    if total:
-                        return total
-            return None
-    except (OSError, TypeError, ValueError):
-        return None
-
-
-def _transcript_context_k(role: str) -> float | None:
-    """角色真实上下文占用（k tokens）；取不到返回 None。
-
-    WHY 不用 pane 的 `↓ Nk tokens`（ccs-monitor #429090 实测）：那个计数器随
-    「本轮开始」归零，只统计当前轮增量 —— archivist pane 4.7k / 真实 163.2k
-    （偏小 158k），maintainer pane 203k / 真实 161.5k（偏大 41k）。两个方向都错，
-    对阈值比较没有意义。且 IDLE 角色不显示 spinner 行 → 真正的大上下文角色
-    （archivist/devops/reviewer/codex-dev/pm）从未进过告警分支。
-
-    transcript 的 last assistant usage 是「上一次调用时的占用」——对 IDLE 角色
-    正是需要判断的值。
-    """
-    import glob as _glob
-    try:
-        d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
-        files = sorted(_glob.glob(str(d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
-    except OSError:
-        return None
-    # 最多看两个文件：会话轮转后新文件可能还没写 assistant 行
-    for f in files[:2]:
-        tokens = _last_assistant_usage_tokens(f)
-        if tokens is not None:
-            return tokens / 1000.0
-    return None
-
-
 # 生成中但 transcript 多久没落事件即判卡死（秒）。
 # 实测 2026-10-21 coordinator：末事件是 05:22:13Z 的 tool_use，之后 31 分钟
 # 无任何行（含 tool_result），pane 一直挂 `Compacting… 55% · esc to interrupt`。
@@ -307,15 +241,6 @@ class RoleLifecycleMixin:
     )
 
     _last_compact: dict[str, float] = {}
-    # 上下文阈值告警：从 pane 状态栏 `↓ 117.1k tokens` 提取用量，超阈值写 blocker。
-    # 与溢出检测（_check_context_overflow 的 has_overflow）分两路：溢出信号要等
-    # 真正撞墙才出现，那时 /compact 已排在长任务队列尾（实测 engineer 117k 时
-    # 正在跑 21 分钟的 pytest）。提前告警让 coordinator 能安排任务间隙。
-    _CONTEXT_WARN_K = 100.0            # 触发告警的上下文用量（k tokens）
-    _CONTEXT_WARN_COOLDOWN = 1800      # 同角色两次告警最小间隔（秒）
-    # 冷却落盘：进程内 dict 在 daemon 重启时清零，实测 curator 两次告警间隔
-    # 仅 84s（#429027 05:27:00 → #429034 05:28:24），中间 05:28:03 重启。
-    _CONTEXT_WARN_STATE = Path.home() / ".hermes" / "run" / "context_warn.json"
     _RESTART_LOCK = threading.Lock()
     # check-then-act 竞态防护：cooldown 检查与写入之间加锁
     _COMPACT_LOCK = threading.Lock()
@@ -329,24 +254,6 @@ class RoleLifecycleMixin:
     _last_bus_write: dict[str, float] = {}
     _BUS_WRITE_LOCK = threading.Lock()
 
-
-    def _load_context_warns(self) -> dict[str, float]:
-        """读取落盘冷却表；损坏/缺失一律当空表（不能让坏文件卡住整轮巡检）。"""
-        try:
-            raw = json.loads(self._CONTEXT_WARN_STATE.read_text())
-            return {str(k): float(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
-        except (OSError, ValueError, TypeError, AttributeError):
-            return {}
-
-    def _save_context_warns(self, warns: dict[str, float]) -> None:
-        """原子写冷却表：tmp + replace，避免 daemon 半写导致下次读到坏 JSON。"""
-        try:
-            self._CONTEXT_WARN_STATE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._CONTEXT_WARN_STATE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(warns, ensure_ascii=False))
-            _os.replace(tmp, self._CONTEXT_WARN_STATE)
-        except OSError as e:
-            LOGGER.warning("context_warn 冷却表写入失败: %s", e)
 
     def _active_roles(self) -> set[str]:
         """活跃角色集合：DB 工作流 assignee ∪ 实际存在的 ccs-* tmux 会话。"""
@@ -517,29 +424,6 @@ class RoleLifecycleMixin:
             if r.returncode != 0:
                 continue
             output = r.stdout or ""
-
-            # 阈值告警独立于 pane 的溢出信号，且必须先于它：溢出要等真正撞墙才
-            # 出现，那时 /compact 已排在长任务队列尾（实测 engineer 117k 时正跑
-            # 21 分钟 pytest）。度量用 transcript 真实占用，不再用 pane 的
-            # `↓ Nk tokens`（ccs-monitor #429090：该计数器按轮归零，archivist
-            # pane 4.7k/真实 163k、maintainer pane 203k/真实 161k —— 两个方向都
-            # 错；IDLE 角色连该行都没有，恰是大上下文角色全成盲区）。
-            _used_k = _transcript_context_k(role)
-            if _used_k is not None and _used_k >= self._CONTEXT_WARN_K:
-                with self._COMPACT_LOCK:
-                    _warns = self._load_context_warns()
-                    if now - _warns.get(role, 0.0) >= self._CONTEXT_WARN_COOLDOWN:
-                        _warns[role] = now
-                        self._save_context_warns(_warns)
-                        LOGGER.warning("上下文预警: %s 已用 %.1fk tokens (阈值 %.0fk)",
-                                       role, _used_k, self._CONTEXT_WARN_K)
-                        # 标题带 @role 才会被该角色的 unread 命中；分类用 notice
-                        # 而非 blocker：这是提醒不是阻塞，blocker 会进全角色广播。
-                        self._bb.write("notice",
-                            f"@{role} [context_warn] 上下文已用 {_used_k:.0f}k"
-                            f"（阈值 {self._CONTEXT_WARN_K:.0f}k）"
-                            f" — 建议在任务间隙安排 /compact，避免溢出后排队",
-                            src="workflow_engine")
 
             # 信号匹配走共享清单 _OVERFLOW_PATTERNS（与 transcript 路径同源）。
             # 另加状态栏百分比形态（"Context (数字% remaining)"）。
