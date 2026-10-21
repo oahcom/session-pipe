@@ -1412,6 +1412,27 @@ class WorkflowLifecycleMixin:
         """
         _sf = (step_sdata or {}).get("subflow_id")
         if not _sf:
+            # 驳回文案里写着真正出结论的子链（task_generator 压状态时带过来的），
+            # 这条最可靠：子链驳回路径不写 subflow_id，而按父步反查会命中**最新**的
+            # 返工链（实测 s3 下有 7 条子链，最新的 wf_rw_* 不是产出评审的那条）。
+            _m = re.search(r"wf_(?:sub|rw)_[0-9a-f]{8,}",
+                           str((step_sdata or {}).get("rejection_reason") or ""))
+            _sf = _m.group(0) if _m else ""
+        if not _sf:
+            # 子链驳回路径（rejected_by=subflow_verdict）**不写** subflow_id，
+            # 只有子链自己的 parent_wf_id/subflow_source_step_id 反指父步。
+            # 不回查这里，取子链文案与下面读报告文件的第五来源全都走不到 ——
+            # 实测 3/3 子链驳回的返工提示只剩一行摘要。
+            try:
+                _rows = self._lifecycle.query(
+                    "SELECT instance_id FROM workflow_instances "
+                    "WHERE parent_wf_id=? AND subflow_source_step_id=? "
+                    "ORDER BY created_at DESC LIMIT 1", (wf_id, step_id))
+                _sf = _rows[0]["instance_id"] if _rows else ""
+            except Exception as _e:
+                LOGGER.debug("rework: 子链回查失败 %s/%s: %s", wf_id[:8], step_id, _e)
+                _sf = ""
+        if not _sf:
             return ""
         try:
             _rows = self._lifecycle.query(
@@ -1437,13 +1458,12 @@ class WorkflowLifecycleMixin:
             return _text
         # 旧记录只有 text+id，分类段在 bus evidence
         _ids = [m.get("id") for m in _msgs if m.get("id")]
-        if not _ids:
-            return _text
-        try:
-            _full = _text + "\n" + "\n".join(self._bb_evidence(_ids))
-        except Exception as _ev_e:
-            LOGGER.debug("rework: 子链 evidence 回查失败 %s: %s", _sf[:12], _ev_e)
-            _full = _text
+        _full = _text
+        if _ids:
+            try:
+                _full = _text + "\n" + "\n".join(self._bb_evidence(_ids))
+            except Exception as _ev_e:
+                LOGGER.debug("rework: 子链 evidence 回查失败 %s: %s", _sf[:12], _ev_e)
         if self._has_issue_classification(_full):
             return _full
         # 第五来源：审查报告文件。完成消息普遍只写「0P0/3P1/…」统计，
@@ -1597,6 +1617,10 @@ class WorkflowLifecycleMixin:
                 if len(_item) < 10:
                     continue
                 (_sys if _kind == "sys" else _biz).append(_item)
+        # P2/P3 是建议不是阻塞：写进【系统问题】段也不该建 maintainer 返工链——
+        # 实测 wf_85faf589be90 被 3 条 P2/P3 引擎建议卡在 s3 2.5h。显式级别过滤
+        # 让排序规则不再是唯一防线；P0/P1（含未标级别）仍照常拦。
+        _sys = [x for x in _sys if not re.match(r"\s*\**\[?P[23]\b", x, re.I)]
         return (_sys, _biz, _roles["sys"], _roles["biz"])
 
 
