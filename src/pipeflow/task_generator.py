@@ -200,7 +200,12 @@ class TaskGeneratorMixin:
                 # 已经是裸名，改消费端可同时覆盖存量与新增）。
                 for _sub_row in conn.execute(
                     "SELECT wi.instance_id, wi.current_step_id, wi.step_results FROM workflow_instances wi "
-                    "WHERE wi.status='running' AND REPLACE(wi.template_id,'WF-','') IN "
+                    # 父链不止 running 一种活跃态（2026-10-22）：角色 wf complete 会把
+                    # 行级 status 置成 step_done_ready，投递连败会置 delivery_blocked，
+                    # 这两种父链同样在等子链回流。只扫 running 时子链跑完也无人消费，
+                    # 父链只能等 24h 全局 cancel（实测 wf_413e05355b 卡 17.4h 即此形态）。
+                    "WHERE wi.status IN ('pending','running','step_done_ready','delivery_blocked') "
+                    "AND REPLACE(wi.template_id,'WF-','') IN "
                     "(SELECT REPLACE(template_id,'WF-','') FROM workflow_templates)"
                 ).fetchall():
                     _sr = json.loads(_sub_row["step_results"] or "{}")
@@ -208,6 +213,29 @@ class TaskGeneratorMixin:
                         if not isinstance(_sdata, dict):
                             continue  # 简写值（如 "done"）没有 subflow_id
                         _sf = _sdata.get("subflow_id", "")
+                        if not _sf:
+                            # 指针会丢：重置/返工路径会 pop 掉 subflow_id
+                            # （engine._REQUEUE_DROP、本文件失败重试分支），而子链行上的
+                            # (parent_wf_id, subflow_source_step_id) 两列在建链事务内写入、
+                            # 从不删。实测 40 条子链里 **20 条**父步已无指针 → 子链跑完也
+                            # 没人消费，父步停在 ''/step_done_ready 直到 4h 全局 cancel
+                            # （wf_85faf589be90/s3、wf_175751a92033/s2 同型）。
+                            # 只补「当前步 + 子链已到终态好」的情形：子链 failed/cancelled
+                            # 时既有路径靠指针做重建，派生旧链会让重试分支重复触发；
+                            # wf_rw_* 是返工链（走 rework_ids），两套键不能混用。
+                            if _step_id == _sub_row["current_step_id"]:
+                                # 只认「同一步最新一条子链」且终态好。重跑/接管会为
+                                # 同一步再建子链，旧链 completed 不能掩盖新链还在跑
+                                # （codex P1）；wf_rw_* 返工链走 rework_ids，不在此通道。
+                                _link = conn.execute(
+                                    "SELECT instance_id, status FROM workflow_instances "
+                                    "WHERE parent_wf_id=? AND subflow_source_step_id=? "
+                                    "ORDER BY created_at DESC LIMIT 1",
+                                    (_sub_row["instance_id"], _step_id)).fetchone()
+                                _sf = (_link["instance_id"]
+                                       if _link and _link["instance_id"].startswith("wf_sub_")
+                                       and _link["status"] in ("completed", "step_done_ready")
+                                       else "")
                         if _sf:
                             # 只处理当前步骤的 subflow：历史步骤的 subflow 已完成会重复
                             # 触发 _advance_production_wf，而 advance 又为带 subflow_template

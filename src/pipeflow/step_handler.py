@@ -1300,10 +1300,15 @@ class StepHandlerMixin:
         # （engine.py:1419）→ N 个卡步叠加成 90s×N/5min 的整轮阻塞。
         # 闸门提示是旁路通知，不该拖住 tick；_notify_role 的 ccs send 有 15s 上限
         # 且自带 (role,title) 30min 冷却与「先投递后记账」，异常也不会中断本轮。
+        # 标题必须稳定：_notify_role 的 30min 冷却按 (role, title) 命中；标题里带失败
+        # 详情时每次文本都不同 → 冷却永不命中 → 每 tick 叫醒角色一次。实测 qa 因此
+        # 在 13 分钟内收到 18 条「重复自检」提醒，只能回同样一句「已完成，无新动作。」
+        # （对话质量实测：qa 整轮零工具 45/84=53.6%）。详情改放 evidence。
         try:
             self._notify_role(
-                self._eff_role(run, step), msg,
-                f"{run.workflow_name}/{step.id}（实例 {run.id}）闸门未通过："
+                self._eff_role(run, step),
+                f"[workflow] {run.workflow_name} {step.id} 闸门未通过",
+                f"{msg}\n\n{run.workflow_name}/{step.id}（实例 {run.id}）闸门未通过："
                 # 标题契约要照抄 exit_condition.text_contains：模板要求的是
                 # "<模板>/<step>-complete"，这里只写 "<step>-complete" 时角色照做也
                 # 永不匹配（69 个步骤是长形态）→ 闸门提示成了死指令。
@@ -1314,20 +1319,37 @@ class StepHandlerMixin:
             LOGGER.debug("gate prompt to role failed: %s", _e)
 
     def _gate_alert(self, key: str, text: str, write) -> None:
-        """闸门失败播报节流：同一步骤同一条失败 ≥5 分钟才再写一次 bus。
+        """闸门失败播报：新原因立即报；同一条按 5/10/20/40/80min 退避，第 6 次停发并升级。
 
-        tick 抢救路径每 10s 复现同一条 schema/verify 失败，逐条写会把总线刷成
-        噪音（R119 实测路径）；失败原因变了（新文本）则立即播报，角色才拿得到新信息。
+        旧实现只做固定 5 分钟节流：同一条 verify/schema 失败每 5 分钟无限重发，
+        实测 reviewer 四轮收到逐字相同的「缺少 REVIEW.md」告警，每轮重跑 3~14 次
+        取证（30 次工具调用），零新增结论。失败原因变了（新文本）仍立即播报。
         """
         _now = time.time()
         _last = getattr(self, "_gate_alert_at", None)
         if _last is None:
             _last = self._gate_alert_at = {}
-        if len(_last) > 1000:      # 常驻 daemon 防增长：丢的是 5 分钟节流记忆
+        if len(_last) > 1000:      # 常驻 daemon 防增长：丢的是节流记忆
             _last.clear()          # （最坏影响 = 同一条失败再播一次）
-        if _last.get(key, (0.0, ""))[1] == text and _now - _last[key][0] < 300:
+        _rec = _last.get(key)
+        if _rec and _rec[1] == text:
+            _n = _rec[2]
+            if _n >= 6:           # 已停发：只留升级记录，不再刷角色
+                return
+            if _now - _rec[0] < 300 * (2 ** min(_n - 1, 4)):
+                return
+            _n += 1
+        else:
+            _n = 1               # 新文本 = 新信息，立即播报
+        _last[key] = (_now, text, _n)
+        if _n >= 6:
+            try:
+                self._bb.write("blocker",
+                    f"[workflow] 闸门连续 {_n} 次未通过，停止重复提示: {key}",
+                    evidence=text[:2000], src="workflow_engine")
+            except Exception as _e:
+                LOGGER.debug("gate escalation write failed: %s", _e)
             return
-        _last[key] = (_now, text)
         write()
 
     def _quality_gate_blocks(self, step: Step, run: WorkflowRun) -> bool:

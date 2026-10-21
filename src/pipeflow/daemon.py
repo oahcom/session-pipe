@@ -51,7 +51,7 @@ from pipeflow.engine import WorkflowEngine
 INTERVAL = 10  # 秒
 
 # tick 卡死取证：超过 _TICK_STACK_DUMP_SEC 自动打印全部线程栈，超过 _TICK_SLOW_SEC 记一条耗时日志。
-# 用环境变量可调。非正数或非法值 → 禁用（daemon 绝不因配置值自身而无法启动）。
+# 用环境变量可调。负值/非法值 → 禁用（daemon 绝不因配置值自身而无法启动）；0 对 TICK_SLOW_SEC 有效。
 def _parse_tick_sec(name, default):
     try:
         _v = int(os.environ.get(name, str(default)))
@@ -316,7 +316,9 @@ def daemon_loop(interval: int):
                 if _TICK_STACK_DUMP_SEC > 0:
                     faulthandler.cancel_dump_traceback_later()
                 _tick_dt = time.monotonic() - _tick_t0
-                if _tick_dt > _TICK_SLOW_SEC:
+                # _TICK_SLOW_SEC 负值 = 禁用（非法/负值统一映射到 -1）；0 仍有效，
+                # 强制每次 tick 都记一条（自检测试与排查用）。
+                if 0 <= _TICK_SLOW_SEC < _tick_dt:
                     LOGGER.warning("tick 耗时 %.0fs（阈值 %ds）", _tick_dt, _TICK_SLOW_SEC)
             time.sleep(interval)
     except KeyboardInterrupt:
