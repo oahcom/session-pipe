@@ -111,6 +111,15 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 
 ## Known issues
 
+### bus 的 `search()` 只做全文匹配
+
+`search()` 是 FTS5 全文检索：`role:`/`cat:`/`fid:` 这类限定符**不支持，也不报错**——
+2026-10-22 实测三者全部返回 0 条。照着它们写的检查会静默退化成 vacuous pass
+（`eval_checker.RequirementConfirmationChecker` 就这样假绿到当天才修）。要按字段筛，
+用 `unconsumed(cat=...)` / `consumed_by(fid)` 或直接 SQL。
+`facts.rc`（UPSERT 冲突时被清零）与 `hc`（旧 search 命中残留，实测单条 21,541）都不是消费判据，
+唯一真相是 `log(typ='consume', fid, cat=消费者)`。
+
 ### Engine bypasses LifecycleManager
 
 `engine.py` has 3 sites that bypass `lifecycle/manager.py` and write SQL directly:
