@@ -160,6 +160,24 @@ def _canonical_tid(wf, fallback: str) -> str:
     return tid if tid.startswith(('WL-', 'WF-')) else 'WF-' + tid
 
 
+def _derive_rework_ids(lm, wf_id: str, step_id: str) -> list:
+    """从行上反查该步仍在跑的返工链（rework_ids 丢了也能认回来）。
+
+    行上的 (parent_wf_id, subflow_source_step_id) 在建链事务内写入、从不删；
+    只认未终结的链——终态的链该走「重投原步」，再建一条只会重复干活。
+    查询失败返回空（按旧行为处理，不因一次读失败卡住重投）。
+    """
+    try:
+        return [r["instance_id"] for r in lm.query(
+            "SELECT instance_id FROM workflow_instances "
+            "WHERE parent_wf_id=? AND subflow_source_step_id=? "
+            "AND instance_id LIKE 'wf_rw_%' "
+            "AND status NOT IN (?,?,?) ORDER BY created_at",
+            (wf_id, step_id, *_REWORK_TERMINAL))]
+    except Exception:
+        return []
+
+
 def _rework_exit(sts: list) -> str:
     """返工链状态集 → 出口：wait / escalate_unfixed / requeue。"""
     if sts and not all(s in _REWORK_TERMINAL for s in sts):
@@ -1319,6 +1337,25 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 但证据仍空时重复建链（rework 防重靠模板匹配，两次解析结果可能不同）。
                 if step_status == "rejected":
                     _rej_sr = results.get(step_id, {}) or {}
+                    # rework_ids 与 subflow_id 同型：都是 JSON 里的指针缓存，整份回写
+                    # 会把它抹掉（实测 wf_85faf589be90/s3 02:04 建过 2 条返工链，03:58
+                    # 读到空 → 又建第 3 条，同一步三份返工并行跑）。行上的
+                    # (parent_wf_id, subflow_source_step_id) 从不删 → 以行为准补回，
+                    # 只认未终结的链（终态的链该走「重投原步」而不是再建一条）。
+                    _rework_ids = _rej_sr.get("rework_ids") or []
+                    if not _rework_ids:
+                        _rework_ids = _derive_rework_ids(lm, inst["instance_id"], step_id)
+                        if _rework_ids:
+                            try:
+                                lm.execute(
+                                    "UPDATE workflow_instances SET step_results="
+                                    "json_set(COALESCE(step_results,'{}'), ?, json(?)) "
+                                    "WHERE instance_id=?",
+                                    (f'$."{step_id}".rework_ids',
+                                     json.dumps(_rework_ids), inst["instance_id"]))
+                            except Exception:
+                                LOGGER.debug("rework_ids 回填失败 %s/%s",
+                                             inst["instance_id"][:12], step_id)
                     # 升级后的终结期限：三个升级入口（等待超时/返工未交付/重投封顶）
                     # 都只在 rework_escalated_at 上落锚、然后 continue——没人处置就一直
                     # 停在这里等 24h 全局 cancel。放在分支入口一次判齐，不必三处各写。
@@ -1328,7 +1365,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 在写的链、留下半成品（codex 三方审查 Q2）。续期而非判死；
                         # 链全部终态后下一轮 a7 仍会走到下面的 close。终态兜底
                         # 是 24h 全局回收——续期不会让实例无限留在这个分支。
-                        _rids = _rej_sr.get("rework_ids") or []
+                        _rids = _rework_ids
                         if _rework_alive(lm, _rids):
                             _now = time.time()
                             try:
@@ -1362,7 +1399,6 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             reason=f"rejected step {step_id} unhandled "
                                    f"{int((time.time() - _esc_at) / 60)}min after escalation")
                         continue
-                    _rework_ids = _rej_sr.get("rework_ids") or []
                     _idx = next((i for i, s in enumerate(wf.steps) if s.id == step_id), -1)
                     _has_next = 0 <= _idx < len(wf.steps) - 1
                     if _has_next and not _rework_ids:
