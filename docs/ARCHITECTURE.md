@@ -90,7 +90,8 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
 - **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
-- **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `pipeline_cursor.db`, `ack_tracker.db`)
+- **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `ack_tracker.db`) — `pipeline_cursor.db` 已随 cursor 机制一并退役（49a7b9d），别再引用
+- **Bus 保留与轮询**：`prune()` 只删有 `consume` 记录的事实（未读消息不按年龄/容量清掉）；`unconsumed(limit=N)` 的 LIMIT 下推到 SQL（带 `role` 过滤时不下推，role 白名单仍在 Python 侧）
 
 ## Route table construction
 
