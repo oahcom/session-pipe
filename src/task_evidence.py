@@ -29,10 +29,38 @@ def _is_system_file(name: str) -> bool:
 # 评估结果幂等守卫：task_id → 上轮评估签名。
 # WHY: 本函数由 daemon 每 10s 调用，而 bus 写入是 ON CONFLICT(t) DO UPDATE（刷新 ts），
 # 重复写会把已沉底的旧 fact 顶回 unread 列表，实测单条 fact 被写 1091 次。
-# 已知边界：签名存进程内存，daemon 重启后首轮会对窗口内任务重写一次
-# （实测 24h 内非计划重启 0 次，代价是可接受的几次重复写）。
-# 若将来重启频率上升，改用 workflow_logs 表存签名（action='evidence_assessed'）。
+# 签名原先只存进程内存，前提是「24h 内非计划重启 0 次」——这条前提已被推翻：
+# daemon 会在任意 src 文件 mtime 变化时就地 re-exec（daemon.py:229），而三个 agent
+# 同时在改这个仓库，等于每次改动都清空签名。实测同一 task 的 [task_evidence] 每
+# ~330s 重发一次、每次投给 5 个观察角色（ccs-monitor/consumer/knowledge_curator/
+# optimizer/pm），6h 133 行。故按本文件预留的方案落库（action='evidence_assessed'）。
 _LAST_ASSESSMENT: dict[str, str] = {}
+_SEEN_LOADED = False
+
+
+def _load_assessed(db) -> None:
+    """从 workflow_logs 恢复签名，跨 os.execv 生效（只做一次）。"""
+    global _SEEN_LOADED
+    if _SEEN_LOADED:
+        return
+    _SEEN_LOADED = True
+    try:
+        for _r in db.execute("SELECT task_id, detail FROM workflow_logs "
+                             "WHERE action='evidence_assessed' ORDER BY id DESC LIMIT 4000"):
+            if _r["task_id"] and _r["task_id"] not in _LAST_ASSESSMENT:
+                _LAST_ASSESSMENT[_r["task_id"]] = _r["detail"]
+    except Exception:
+        pass
+
+
+def _record_assessed(db, task_id, sig) -> None:
+    try:
+        db.execute("INSERT INTO workflow_logs(task_id, action, actor, detail, ts) "
+                   "VALUES(?,?,?,?,?)",
+                   (task_id, "evidence_assessed", "task_evidence", sig, time.time()))
+        db.commit()
+    except Exception:
+        pass
 
 # 产出收益判定不依赖部署路径：文档类产出留在 workspace 即为交付
 
@@ -118,6 +146,7 @@ def evaluate_and_feedback():
 
 def _evaluate_with(db):
     db.row_factory = sqlite3.Row
+    _load_assessed(db)
     _now = time.time()
     _cutoff = _now - 3600
 
@@ -247,6 +276,7 @@ def _evaluate_with(db):
                     capture_output=True, timeout=10)
                 if _r.returncode == 0:
                     _LAST_ASSESSMENT[a["task_id"]] = _sig
+                    _record_assessed(db, a["task_id"], _sig)
             except Exception:
                 pass
         # R2-2 self-reflection（Reflexion 洞察 3）: 无产出任务写 code_fix 根因总结，
