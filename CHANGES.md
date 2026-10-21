@@ -2,13 +2,17 @@
 
 ## 2026-10-22 — 归属更正（9042df0 / a5f7c45）
 
-- `9042df0` 的 commit message 写的是"文档与死码收敛"，实际 `--stat` 只有 3 个文档
-  + `reliability_core.py` −2 行，**没有 .py 逻辑改动**，并顺带带入了另一个 session 的
-  480+ 行文档改写（`SYSTEM_LANDSCAPE` 158 / `TECHNICAL_DEEP_DIVE` 329）。这些行的内容有效，
-  只是归属不在本提交作者名下；`git blame` 会指向 9042df0，以此条为准。
-- 另一仓 `hermes-session-roles` 的 `555c3ac` 数字当时报错：实际删 **14** 个零引用常量、
-  60→20 行、`pytest` 49 passed（报的是 13 个 / 24 行 / 43 passed）。
-  更正详情见 `~/hermes/workspace/R144-删除重复路径常量/验证与待办.md`（不在本仓文件）。
+- `9042df0` 真实 subject：`fix(routing): 文档/注释跟上 cursor 退役 + limit 契约在函数内
+  兑现 + 删死 import`。`--stat` = 4 文件、+117/−380（ARCHITECTURE 4/4、SYSTEM_LANDSCAPE
+  +48/−110、TECHNICAL_DEEP_DIVE +65/−264、`reliability_core.py` −2）——**没有 .py 逻辑改动**。
+  `git blame` 会把两份文档的 47/63 行指向它，但**谁改的无法从 git 判定**（作者字段是
+  `hermes-session`，与相邻提交同作者，无 session 标记），仅记"归属提交在此"。
+- 一并更正我先前在本文件与文档里的三处口径错误（只读子代理逐条复核后）：
+  ① 引文"文档与死码收敛"是**编造**，9042df0 从未有过该 subject；
+  ② "480+ 行文档改写"应为 **487 行 diff 触达（+113/−380）**，158/329 是增删合计不是新增；
+  ③ `555c3ac` 当时 `43 passed` 是**正确的**（该提交下恰 43 个 test def），49 是后续
+  加用例后的现值；当时错的是"13 个常量 / 60→24 行"（实为 14 个 / 60→20）。
+  详见 `~/hermes/workspace/R144-删除重复路径常量/验证与待办.md`。
 - `a5f7c45` 删 6 行零引用常量（`HERMES_TEMPLATES` / `WORKFLOW_GUIDE` /
   `CODEX_SENTINEL_DIR` / `_CONTROL_WORDS`），四仓 grep 零引用 + 12 passed + 463 passed。
 

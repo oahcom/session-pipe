@@ -23,10 +23,10 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **pipeflow/step_handler.py** | 1706 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
 | **pipeflow/role_lifecycle.py** | 1203 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
 | **pipeflow/task_generator.py** | 897 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 2089 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 2095 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
 | **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
 | **template_registry.py** | 937 | 模板注册中心 |
-| **eval_checker.py** | 1487 | 安全白名单命令执行检查 |
+| **eval_checker.py** | 1507 | 安全白名单命令执行检查 |
 | **workflow/client.py** | 487 | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | 383 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
 | **reliability.py** | 432 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
