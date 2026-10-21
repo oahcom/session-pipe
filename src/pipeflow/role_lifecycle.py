@@ -1073,9 +1073,9 @@ class RoleLifecycleMixin:
         if scheduler_noise and role == "coordinator":
             LOGGER.info("send-to-role coordinator 跳过: 调度噪音消息 (wf=%s step=%s)",
                         wf_id[:12] if wf_id else "?", step_id)
-            self._bb.write("blocker",
-                f"[workflow] coordinator 调度噪音已拦截: {wf_id}/{step_id}",
-                evidence=prompt[:200], src="workflow_engine")
+            # 不写 bus：这是**预期路径**（我们主动丢弃噪音），不是事故。实测 24h
+            # blocker 通道 208 条里 37 条（18%）全是它，而全机没有代码读 cat=blocker
+            # —— 唯一效果是把告警通道稀释给读 bus 的角色。引擎日志已留同样信息。
             return False  # 投递未发生：明确语义，避免 engine 将 None 计为失败
         # TASKS.md 只由 _sync_task_file 在**投递成功后**写（见该函数）。
         # 原实现在这里先写一份、判到文件被别的任务占着就只追加 [排队] 再照样发，
