@@ -23,7 +23,7 @@ from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to 
 # 视入口而定（daemon 以 src/ 为 cwd 时不缺，pytest 从仓库根跑时缺）。
 if str(Path(__file__).resolve().parents[1]) not in _sys.path:
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from review_gate import review_verdict  # noqa: E402
+from review_gate import is_review_role, review_verdict  # noqa: E402
 
 
 
@@ -997,7 +997,10 @@ class LifecycleManager:
         # 路径上判定相反，正是 review_gate 模块 docstring 想消灭的那种分歧。
         _verdict = ("approved" if _confirmed
                     else review_verdict(_msgs))
-        if _verdict == "unknown" and _cur_step.get("type") in ("review", "gate"):
+        # 与 engine 路径同口径：只有审查角色 + review/gate 类型才要求表态
+        # （见 review_gate.REVIEW_ROLES 的生产数据）。
+        if (_verdict == "unknown" and _cur_step.get("type") in ("review", "gate")
+                and is_review_role(_cur_step.get("target_role", ""))):
             # 状态回写 step_done_ready：本函数四个调用点都不看返回值，只认 DB 里的
             # status；不写回就等于被调用方随后落的 completed 覆盖（同 rejected 分支
             # 必须落库的理由）。时间戳让 wf_lifecycle 的 unknown 分支认得出这是

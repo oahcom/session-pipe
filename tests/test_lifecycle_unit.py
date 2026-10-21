@@ -73,22 +73,46 @@ class TestLifecycleStateMachine(unittest.TestCase):
         交上来的「已完成，无新动作。」仍被当通过 —— 同一条还原在两条推进路径上
         判定相反，正是 review_gate 模块 docstring 要消灭的那类分歧。
         """
+        # 该表态的角色（reviewer）没写结论 → 拦住
         self.lm.upsert_template("gate_unknown", "GU", "d",
-            [{"step_id": "s1", "title": "review", "target_role": "tester",
+            [{"step_id": "s1", "title": "review", "target_role": "reviewer",
               "type": "review", "prompt_template": "review {topic}",
               "exit_condition": {"bus_category": "notice"}},
-             {"step_id": "s2", "title": "impl", "target_role": "tester",
+             {"step_id": "s2", "title": "impl", "target_role": "reviewer",
               "prompt_template": "do {topic}",
               "exit_condition": {"bus_category": "notice"}}])
         self.assertTrue(self.lm.start_wf("wf_unknown_1", "s1", "gate_unknown"))
         self.lm._set_step_result_unsafe(
             "wf_unknown_1", "s1", "completed",
-            {"exit_messages": [{"text": "已完成，无新动作。", "src": "tester"}]})
+            {"exit_messages": [{"text": "已完成，无新动作。", "src": "reviewer"}]})
         self.assertFalse(self.lm._advance_unsafe("wf_unknown_1", None),
-                         "评审无结论不得推进")
+                         "reviewer 评审无结论不得推进")
         wf = self.lm.get_wf("wf_unknown_1")
         self.assertEqual(wf["current_step_id"], "s1")
         self.assertEqual(self.lm._parse_results(wf)["s1"]["status"], "step_done_ready")
+
+    def test_health_check_role_is_not_blocked_by_unknown(self):
+        """报告型步骤（type=review 但执行者是 maintainer）不该被 unknown 拦住。
+
+        7 天生产库实测：review/gate 类型步骤 unknown+empty 共 41 条，其中 maintainer
+        24 条全是健康检查/修复验证 —— 它们的产出是报告，不含判定词是正常形态。
+        只按 type 判会把维护循环整条冻住，所以 unknown 还要求执行者是审查角色。
+        """
+        self.lm.upsert_template("health_tmpl", "HT", "d",
+            [{"step_id": "s1", "title": "快速健康检查", "target_role": "maintainer",
+              "type": "review", "prompt_template": "check",
+              "exit_condition": {"bus_category": "notice"}},
+             {"step_id": "s2", "title": "fix", "target_role": "maintainer",
+              "prompt_template": "do",
+              "exit_condition": {"bus_category": "notice"}}])
+        self.assertTrue(self.lm.start_wf("wf_health_1", "s1", "health_tmpl"))
+        self.lm._set_step_result_unsafe(
+            "wf_health_1", "s1", "completed",
+            {"exit_messages": [{"text": "服务全绿零僵尸, mem 90.9%→54.9%压力缓解",
+                                "src": "maintainer"}]})
+        self.assertTrue(self.lm._advance_unsafe("wf_health_1", None),
+                        "报告型步骤不应被 unknown 卡住")
+        self.assertEqual(self.lm.get_wf("wf_health_1")["current_step_id"], "s2")
 
 if __name__ == "__main__":
     unittest.main()

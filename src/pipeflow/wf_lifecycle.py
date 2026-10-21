@@ -532,7 +532,11 @@ class WorkflowLifecycleMixin:
         _verdict = ("approved" if _step_sr.get("confirmed_at")
                     else _review_gate.review_verdict(_msgs))
 
-        if _verdict == "unknown" and _step_def.type in ("review", "gate"):
+        # unknown 只拦"该表态却没表态"的步骤：type 是 review/gate 且执行角色是审查
+        # 角色。只看 type 会把 maintainer 的健康检查（7 天 24 条）、product_architect
+        # 的影响评估（9 条）一并冻住 —— 那些步骤的产出是报告，不含判定词是正常的。
+        if (_verdict == "unknown" and _step_def.type in ("review", "gate")
+                and _review_gate.is_review_role(getattr(_step_def, "target_role", ""))):
             # 同一 (实例,步骤,文本) 只播报一次：本函数每 tick 都会再进来，
             # 不记就是每 tick 刷一条 blocker。
             _ukey = (wf_id, step_id, _msgs[:200])

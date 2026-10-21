@@ -78,12 +78,15 @@ def test_review_verdict_three_states():
 def test_unknown_verdict_blocks_review_step_and_notifies_once(mock_run):
     """reviewer 完成但没写结论 → 不推进、留在 step_done_ready、blocker 只播一次。"""
     d = _make_env()
-    _write_wf(d, "rev_unknown", [_step("s1", type="review"), _step("s2")])
+    # 执行者必须是审查角色：unknown 判据 = review/gate 类型 + is_review_role(执行者)，
+    # 只看 type 会把 maintainer 的健康检查（7 天 24 条）一起冻住。
+    _write_wf(d, "rev_unknown", [_step("s1", type="review", target_role="reviewer"),
+                                 _step("s2")])
     eng = WorkflowEngine(d)
     rid = eng.start("rev_unknown", {})
 
     eng.run_once()
-    eng._bb.write("notice", "TOK_S1 已完成", src="test_role")
+    eng._bb.write("notice", "TOK_S1 已完成", src="reviewer")
     _ticks(eng)
 
     s = eng.status(rid)
@@ -94,6 +97,29 @@ def test_unknown_verdict_blocks_review_step_and_notifies_once(mock_run):
 
     n = _blocker_deliveries(eng, f"{rid[:12]}/s1 评审无结论")
     assert n == 1, f"同一 (实例,步骤,文本) 只能播报一次，实际 {n} 次"
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_report_typed_review_step_advances_despite_unknown(mock_run):
+    """type=review 但执行者是报告型角色（maintainer）→ unknown 不得拦。
+
+    7 天生产库实测：review/gate 类型步骤 unknown+empty 41 条，其中 maintainer 24
+    条全是健康检查/修复验证。若只按 type 判 unknown，维护循环整条冻死。
+    """
+    d = _make_env()
+    _write_wf(d, "health_rev", [_step("s1", type="review", target_role="maintainer"),
+                                _step("s2")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("health_rev", {})
+
+    eng.run_once()
+    eng._bb.write("notice", "TOK_S1 服务全绿零僵尸 mem 54.9%", src="maintainer")
+    _ticks(eng, 6)
+
+    s = eng.status(rid)
+    assert s["current_step"] == "s2", \
+        f"报告型步骤不该被 unknown 卡住，实际 {s['current_step']} / {s['results']}"
 
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(

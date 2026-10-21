@@ -47,6 +47,17 @@ import re
 # 改动本表即同时改动 wf_lifecycle / lifecycle.manager / task_generator 三处判据。
 REJECT_KEYWORDS = ("changes_requested", "rejected", "not_approved", "驳回", "未通过")
 
+# 「必须出结论」的角色（unknown 才拦得住）。7 天生产库实测，review/gate 类型步骤里
+# unknown+empty 共 41 条，按角色分：maintainer 24（健康检查）、product_architect 9
+# （影响评估/Triage）、reviewer 4（真的是代码审查没写结论）、其余 4。按 type 拦
+# 会把 maintainer 的健康检查循环整条冻住 —— 那些步骤的产出是报告，永远不会有
+# APPROVED/CHANGES_REQUESTED。判据因此按角色收窄：只有审查角色才有"必须表态"。
+REVIEW_ROLES = ("reviewer",)
+
+
+def is_review_role(role: str) -> bool:
+    return (role or "").strip().lower() in REVIEW_ROLES
+
 # ── 第一级：锚点结论 ──
 
 # 锚点：行首、判定/审批/结论标记之后、破折号之后。
