@@ -26,8 +26,10 @@ BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
 # 前缀匹配覆盖 CLAUDE.md.1/.2 等轮转备份副本（子 agent 审计发现 98% 指标虚增来自此）
 SYSTEM_FILES = ("TASKS.md", "CLAUDE.md", "test_output.md", "base.md")
 SYSTEM_PREFIXES = ("CLAUDE.md.", "TASKS.md.")
-# 非产出目录：缓存/依赖/版本库里的文件不是角色产出（点开头目录另行统一排除）
-NON_OUTPUT_DIRS = ("__pycache__", "node_modules", "venv")
+# 非产出目录：缓存/依赖/版本库里的文件不是角色产出。
+# 用黑名单而非"排除所有点目录"：.github/workflows 这类是合法交付（codex 第 4 轮 nit）。
+NON_OUTPUT_DIRS = ("__pycache__", "node_modules", "venv", ".git", ".pytest_cache",
+                   ".mypy_cache", ".ruff_cache", ".cache", ".venv", ".tox")
 
 
 def _is_system_file(name: str) -> bool:
@@ -88,8 +90,7 @@ def _output_files(role, t_created=None, t_updated=None):
             continue
         # 目录级排除：缓存/依赖/版本库里的文件不是产出。实测 engineer 窗口内只有
         # .coverage(53KB) 与 .pytest_cache/.../nodeids(20KB)，旧口径直接判 positive。
-        if any(p.startswith(".") or p in NON_OUTPUT_DIRS
-               for p in f.relative_to(ws).parts):
+        if any(p in NON_OUTPUT_DIRS for p in f.relative_to(ws).parts):
             continue
         try:
             st = f.stat()
@@ -395,13 +396,10 @@ def _extract_with(db):
             "created_at": r["created_at"],
         })
 
-    # 3. 产出文件统计
+    # 3. 产出文件统计（与评分同一取样口径，否则导出的文件数与评分互相矛盾）
     def count_output_files(role):
-        ws = WORKSPACES / role
-        if not ws.exists():
-            return 0, []
-        files = [f.name for f in ws.rglob("*") if f.is_file() and not _is_system_file(f.name)]
-        return len(files), files[:10]
+        files = _output_files(role)
+        return len(files), [f.name for f in files[:10]]
 
     result = []
     for t in tasks:
