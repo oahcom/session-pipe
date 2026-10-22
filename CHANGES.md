@@ -192,7 +192,7 @@ roles `pytest tests/` → 49 passed、`validate_roles.py` 19 角色 0 错误。
 30min 冷却按 `(role, title)` 命中，于是每次文本都不同，冷却永不命中，每 tick 叫醒执行角色一次。
 
 ### 为什么撤回（fdf4bde）
-冷却键就是 `(role, title)`，而命中后的 `return` 发生在**写 bus 之前**（role_lifecycle.py:844-852），
+冷却键就是 `(role, title)`，而命中后的 `return` 发生在**写 bus 之前**（role_lifecycle.py:902-905），
 同一 `(role, wf, step)` 的**另一种失败原因**在 30min 内整条被吞：既不落 bus 也不发角色。
 实测复现：`tests/test_tick_paths.py::test_tick_verify_failure` 单跑过、整文件跑红
 （同进程内 schema 用例先占了稳定标题）。频率控制改由 `_gate_alert` 的退避承担
@@ -207,10 +207,10 @@ roles `pytest tests/` → 49 passed、`validate_roles.py` 19 角色 0 错误。
 原文另有一处自相矛盾（子集 79 > 全集 68）。
 
 ### 当前行为（可核对）
-- `step_handler.py:1308-1310`：`_notify_role(self._eff_role(...), msg, ...)`，标题即 `msg`，带失败详情
-- `role_lifecycle.py:217`：`_ALERT_COOLDOWN_S = 1800`
+- `step_handler.py:1310-1312`：`_notify_role(self._eff_role(...), msg, ...)`，标题即 `msg`，带失败详情
+- `role_lifecycle.py:245`：`_ALERT_COOLDOWN_S = 1800`
 - 验证：`python3 -m pytest tests/test_r119_gate_prompt.py tests/test_tick_paths.py tests/test_gate_escalation.py -q`
-  → `32 passed in 1.55s`（exit=0，本文档写作时实跑）
+  → 判据是 0 failed（条数现取，不抄绝对值）
 
 ## 2026-10-22 — 投递前 CLI 忙预检
 

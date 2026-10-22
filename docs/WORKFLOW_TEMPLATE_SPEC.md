@@ -89,7 +89,7 @@
 写 bus cat=XXX，title 含 s<N>-complete（验收标准：可二值判定）
 ```
 
-实测（2026-10-22，复算 `python3 src/template_registry.py validate-all`，模板总数用 `select count(*) from workflow_templates`）：少数模板通过 `validate-all`，失败项主要是缺"做什么/怎么做/验收标准"三段与 prompt 过短（如 `test_exit_schema.json` 138B < 150B）。
+实测（2026-10-22，复算 `python3 src/template_registry.py validate-all`，模板总数用 `select count(*) from workflow_templates`）：少数模板通过 `validate-all`，失败项主要是缺"做什么/怎么做/验收标准"三段与 prompt 过短（如 `writer_document.json` 的 138B < 150B）。
 
 **禁止**出现 `## 操作要求` / `## 引用要求` 这两个段落（需要搜索/引用时内联写进指令）。
 校验器只拦两个**字面串**（`template_registry.py:_BOILER_PROMPT_SECTIONS`）：
@@ -209,7 +209,7 @@ PYTHONPATH=src python3 -m template_registry validate path/to/template.json
 PYTHONPATH=src python3 -m template_registry list
 
 # 按场景推荐
-PYTHONPATH=src python3 -m template_registry recommend "编码实现" coordinator engineer
+PYTHONPATH=src python3 -m template_registry recommend "编码实现" coordinator
 
 # 验证所有模板
 PYTHONPATH=src python3 -m template_registry validate-all

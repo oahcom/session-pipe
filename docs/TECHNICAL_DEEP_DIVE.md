@@ -44,8 +44,8 @@ src/
 2026-10-22 扫描（复算：解析 `workflow_templates.steps_json` 统计 `subflow_template` 非空的模板——
 `like`/`grep` 会命中所有模板的空值键，会算多）：**28 个模板里 6 个带子链**：
 `architect_review`、`coordinator_schedule`、`dev_implement`、`food_chain_loop`、
-`full_dev_pipeline`、`产品交付全流程`（DB `workflow_templates` 42 行，其中 7 行带子链）。
-`WF-*`/`WL-*` 重名副本已不存在（`WF-product_delivery` 只是"产品交付全流程"的 workflow_id）。
+`full_dev_pipeline`、`产品交付全流程`（DB `workflow_templates` 42 行，其中 10 行带子链）。
+DB 里仍有 `WF-*`/`WL-*` 重名副本（如 `WL-full_dev_pipeline`、`WF-architect_review`）；`WF-product_delivery` 只是"产品交付全流程"的 workflow_id。
 名单会随模板增删变，别把这份当一个不变量。
 
 ### 3.3 步骤状态机（`lifecycle/manager.py`）

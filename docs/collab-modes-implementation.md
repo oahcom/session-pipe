@@ -60,7 +60,7 @@
 
 ## 6. 测试
 
-- `tests/test_collab_modes.py` + `tests/test_collab_regression.py`：合计 26 个测试（`pytest --collect-only` 实测）。
+- `tests/test_collab_modes.py` + `tests/test_collab_regression.py`：条数现取（`pytest --collect-only -q`），不抄绝对值。
 - 覆盖：guard 收集、wait_roles 门控（全过/缺角色/空 bus/无门）、非法类型、dual_node+wait_roles、角色收集、窗口溢出补查。
 
 ```bash

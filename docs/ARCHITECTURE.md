@@ -99,7 +99,7 @@ Pipeline does NOT read persona JSON directly. The router loads from:
 
 ```python
 # router.py
-_ROLES_EXPORT_PATH = Path.home() / ".hermes" / "data" / "roles_export.json"
+_ROLES_EXPORT_PATH = HERMES_STATE.parent / "data" / "roles_export.json"
 
 def _load_roles_export():
     return {r["name"]: r for r in json.loads(path.read_text()).get("roles", [])}

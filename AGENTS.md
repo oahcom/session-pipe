@@ -88,7 +88,7 @@ python3 src/ccs.py health
 
 ### 5. 每周自进化
 
-- 检查 unconsumed 消息积压（`PYTHONPATH=src python3 -m routing.auto --status`；直接跑 `src/routing/auto.py` 会 `ModuleNotFoundError: reliability`）
+- 检查 unconsumed 消息积压（`PYTHONPATH=src python3 -m routing.auto --daemon`；`--status` 没有派发分支、会落到分发轮真发消息；直接跑 `src/routing/auto.py` 会 `ModuleNotFoundError: reliability`）
 - 检查路由命中率：哪些角色从未被路由到？
 - 检查 TTL 清理是否正常运行
 - 检查熔断器触发次数

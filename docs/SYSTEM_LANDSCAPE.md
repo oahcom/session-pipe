@@ -31,7 +31,7 @@ session-roles（定义层）
 | session-launcher | `python3 src/wf.py <子命令>` | CLI（工作流客户端，含 stats） |
 | session-pipeline | `PYTHONPATH=src python3 -m pipeflow.daemon --interval 10` | systemd / 后台进程 |
 | session-pipeline | `PYTHONPATH=src python3 -m routing_daemon` | 路由守护（常驻） |
-| session-pipeline | `PYTHONPATH=src python3 -m routing.auto --status` | CLI（一次性，非守护） |
+| session-pipeline | `PYTHONPATH=src python3 -m routing.auto --daemon` | CLI（一次性，非守护；`--status` 无派发分支） |
 
 ## 端口与 socket（`ss -ltnp` 实测 2026-10-22）
 
