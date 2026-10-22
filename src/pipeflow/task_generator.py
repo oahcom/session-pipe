@@ -101,30 +101,36 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 # （「构建通过」「产出已就绪」实测 verdict 均 True，codex P0）。
 _HARD_APPROVE = re.compile(
     r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
-# 首行以转述开头（「上游 s3 APPROVED…」）：不是本步结论。
-_ATTRIB_HEAD = re.compile(
-    r"^\s*(上游|下游|前序|前置|父步|子链|子流程|子步骤|兄弟步骤|其他步骤)", re.I)
+# 通过词左侧 24 字内出现这些词 = 转述别人的结论（「上游 s3 APPROVED」）。
+_ATTRIB_LEFT = re.compile(
+    r"(上游|下游|前序|前置|父步|子链|子流程|子步骤|兄弟步骤|其他步骤|"
+    r"参照|参考|如同|上次|此前|上一步|前步)[^。\n]{0,24}$")
 
 
 def _conclusion(text: str) -> bool | None:
     """一条完成消息**自己**的结论：True=通过 / False=驳回 / None=叙述。
 
-    只看**首行**：生产完成消息是 "<模板>/sN-complete … — APPROVED …" 一行，
-    正文接在空行之后；delta 叙述同样带标题，但首行含 "delta"，正文里引用的
-    「上游 s3 APPROVED」不是本步结论。
+    驳回看**全文**（一票否决）：生产消息首行常只是标题，真正的
+    「结论：CHANGES_REQUESTED」写在空行后的正文；只看首行会把最晚的驳回当成
+    叙述跳过，回落到更早的 APPROVED，被驳回的步被盖 completed。
+    放行只看**首行**，且通过词左侧 24 字内有转述词时按叙述处理：正文里引用的
+    「上游 s3 APPROVED」、标题「s4-complete — 参照上游 …」都不是本步结论。
 
     ponytail: 代价不对称——漏放行只是让返工继续（保守），误放行会把被驳回的
     步推成 completed。升级路径：step_handler 写 exit_messages 时把 verdict
     一起落库，不再事后从文本反推。
     """
-    head = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
-    if not head:
-        return None
-    if _review_gate.is_rejected(head):
+    text = text or ""
+    if _review_gate.is_rejected(text):
         return False
-    if "delta" in head.lower() or _ATTRIB_HEAD.match(head):
+    _lines = text.strip().splitlines()
+    head = _lines[0] if _lines else ""
+    if not head or "delta" in head.lower():
         return None
-    return True if _HARD_APPROVE.search(head) else None
+    for _m in _HARD_APPROVE.finditer(head):
+        if not _ATTRIB_LEFT.search(head[max(0, _m.start() - 24):_m.start()]):
+            return True
+    return None
 
 
 def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:

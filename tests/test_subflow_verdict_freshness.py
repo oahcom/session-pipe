@@ -184,6 +184,36 @@ def test_long_attribution_phrase_not_counted_as_approval():
         _sub("CHANGES_REQUESTED"))
 
 
+def test_earlier_approved_plus_later_mixed_message_blocks():
+    """P0 锁定：更早的 APPROVED + 更晚的混合消息 → 必须仍拦。
+
+    只放一条混合消息时旧实现也返回 False（它自己的 verdict 就是驳回），
+    真正能抓 P0 的是「更早有一条 APPROVED」——只要跳过最新那条就回落到它。
+    """
+    assert not _superseded_by_parent(
+        _parent((APPROVED, SUB_TS + 100),
+                ("full_dev_pipeline/s4-complete —— APPROVED 但 CHANGES_REQUESTED: 2 P1",
+                 SUB_TS + 200)),
+        _sub("CHANGES_REQUESTED"))
+
+
+def test_later_rejection_in_body_blocks():
+    """更晚那条的驳回写在正文（首行只是标题）也必须拦（codex P1）。"""
+    assert not _superseded_by_parent(
+        _parent((APPROVED, SUB_TS + 100),
+                ("full_dev_pipeline/s4-complete — 代码审查完成\n\n"
+                 "结论：CHANGES_REQUESTED: 3 P1", SUB_TS + 200)),
+        _sub("CHANGES_REQUESTED"))
+
+
+def test_quoted_approval_in_title_not_superseding():
+    """标题形态（模板前缀）里转述上游的通过不算本步结论（codex P2）。"""
+    assert not _superseded_by_parent(
+        _parent(("full_dev_pipeline/s4-complete — 参照上游 s3 APPROVED，本步待返工",
+                 SUB_TS + 100)),
+        _sub("CHANGES_REQUESTED"))
+
+
 def test_approval_in_body_not_a_conclusion():
     """APPROVED 只出现在正文里时不是本步的通过结论。
 
