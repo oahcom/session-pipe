@@ -11,6 +11,7 @@
   表格   | **pipeflow/engine.py** | 895 | 说明 |
 """
 import argparse
+import ast
 import os
 import re
 from pathlib import Path
@@ -27,11 +28,51 @@ def _resolve(name: str, root: Path) -> Path | None:
     basename 命中多个时判为歧义返回 None：否则已删的 `pipeflow/db.py` 会被
     `workflow/db.py` 顶替，模块没了也校验通过（实测 2026-10-22）。
     """
-    direct = root / "src" / name
-    if direct.exists():
-        return direct
-    cands = list((root / "src").rglob(os.path.basename(name)))
+    for base in (root / name, root / "src" / name):
+        if base.exists():
+            return base
+    if "/" in name:
+        return None  # 带目录的引用要么本仓相对路径，要么跨仓；都不许退到 basename 猜
+    cands = [q for q in root.rglob(os.path.basename(name)) if ".git" not in q.parts]
     return cands[0] if len(cands) == 1 else None
+
+
+FENCE = "```"
+
+
+def _strip_fences(text: str) -> str:
+    """去掉围栏代码块：里面的 file.py:123 是示例（命令、粘贴的日志），不是引用。
+
+    不这么做，一段示例代码就能让校验永久变红，或者逼着人把示例改歪。
+    """
+    out, fence = [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith(FENCE):
+            fence = not fence
+            out.append("")
+            continue
+        out.append("" if fence else line)
+    return "\n".join(out)
+
+
+def _symbols(path: Path) -> set[str] | None:
+    """文件里定义/赋值/导入的名字。用 AST 而不是正则：正则会把注释、字符串、
+    局部变量当成定义。解析失败返回 None，由调用方回退到正则。"""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return None
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name.split(".")[0]) for a in node.names)
+    return names
 
 
 CITE = re.compile(r"([\w./-]+\.py):(\d+)")
@@ -47,14 +88,14 @@ def _cite_check(text: str, root: Path, path: Path = Path()) -> int:
     if path.name in {"ISSUES.md", "CHANGES.md"}:
         return 0  # 这两份是历史快照，行号引用按建单时记，本来就该指不到今天
     bad = 0
-    for m in CITE.finditer(text):
+    for m in CITE.finditer(_strip_fences(text)):
         name, ln = m.group(1), int(m.group(2))
-        p = root / name
-        if not p.exists():
-            cands = list((root / "src").rglob(Path(name).name))
-            if len(cands) != 1:
-                continue
-            p = cands[0]
+        p = _resolve(name, root)
+        if p is None:
+            if "/" not in name:
+                print(f"CITE_MISSING_FILE {name}")  # 裸文件名指不到 = 本仓的烂引用
+                bad += 1
+            continue  # 带目录的多半是跨仓引用，不替它下结论
         lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
         if ln > len(lines):
             print(f"CITE_PAST_EOF {name}:{ln} (file {len(lines)} lines)")
@@ -77,17 +118,22 @@ def _sym_check(text: str, root: Path, path: Path) -> int:
     if path.name in {"ISSUES.md", "CHANGES.md"}:
         return 0
     bad = 0
-    for m in SYM.finditer(text):
+    for m in SYM.finditer(_strip_fences(text)):
         name, sym = m.group(1), m.group(2)
-        p = root / name
-        if not p.exists():
-            cands = list((root / "src").rglob(Path(name).name))
-            if len(cands) != 1:
-                continue
-            p = cands[0]
-        src = p.read_text(encoding="utf-8", errors="ignore")
-        pat = rf"^\s*(?:def|class)\s+{re.escape(sym)}\b|^\s*{re.escape(sym)}\s*[:=]"
-        if not re.search(pat, src, re.M):
+        p = _resolve(name, root)
+        if p is None:
+            if "/" not in name:
+                print(f"SYMBOL_MISSING_FILE {name}")
+                bad += 1
+            continue
+        names = _symbols(p)
+        if names is not None:
+            ok = sym in names
+        else:
+            src = p.read_text(encoding="utf-8", errors="ignore")
+            pat = rf"^\s*(?:def|class)\s+{re.escape(sym)}\b|^\s*{re.escape(sym)}\s*[:=]"
+            ok = bool(re.search(pat, src, re.M))  # 解析不了才退回正则
+        if not ok:
             print(f"SYMBOL_MISSING {name}:{sym}")
             bad += 1
     return bad
