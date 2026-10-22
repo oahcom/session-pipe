@@ -320,7 +320,7 @@ def _evaluate_with(db, hours: float = 1):
             # 不写 TASKS.md（那是惩罚角色），改发 blocker 让运维看引擎侧。
             try:
                 if not _already_reported:
-                    subprocess.run(
+                    _rb = subprocess.run(
                         [str(_bus), "write", "blocker",
                          f"[task_evidence] {a['task_id']} completed 但角色零回话零产出",
                          "--evidence", json.dumps({
@@ -332,8 +332,10 @@ def _evaluate_with(db, hours: float = 1):
                          }, ensure_ascii=False),
                          "--src", "task_evidence"],
                         capture_output=True, timeout=10)
-                    _LAST_ASSESSMENT[a["task_id"]] = _sig
-                    _record_assessed(db, a["task_id"], _sig)
+                    # 只写成功才落账：失败留空让下轮重试（codex P1-1 回归）
+                    if _rb.returncode == 0:
+                        _LAST_ASSESSMENT[a["task_id"]] = _sig
+                        _record_assessed(db, a["task_id"], _sig)
             except Exception:
                 pass
         elif a["quality"] == "negative":

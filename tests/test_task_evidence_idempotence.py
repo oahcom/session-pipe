@@ -117,13 +117,14 @@ def test_failed_write_is_retried(env):
     assert te._LAST_ASSESSMENT.get("t1") is not None, "成功后应落账"
 
 
-def test_tasks_md_feedback_not_skipped(env):
-    """签名未变时 TASKS.md 回写仍须每轮执行（该函数自身按 task_id 幂等）。
+def test_silent_completion_reports_blocker_not_tasks_md(env):
+    """静默完成（角色零回话、零产出）不罚角色：发 blocker，不写 TASKS.md。
 
-    回归：早期实现用 `continue` 跳过整个循环体，连带跳过了 negative 复盘分支。
+    旧契约是"negative 必写 TASKS.md"，但静默完成的 negative 等于让引擎的空推进
+    去惩罚角色 —— 实测 7 天 1120 个 completed 步骤里 349 个（31.2%）角色一句话没说，
+    且 engineer/maintainer 的产出在代码仓库，按 workspace 目录判结构性恒为 0 文件。
     """
     _run_once(env)
     _run_once(env)
-    assert len(env["calls"]) == 2, (
-        f"TASKS.md 回写每轮都须执行，实际 {len(env['calls'])} 次"
-    )
+    assert env["calls"] == [], f"静默完成不该写 TASKS.md，实际 {env['calls']}"
+    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
