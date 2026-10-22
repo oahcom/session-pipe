@@ -591,9 +591,17 @@ class WorkflowLifecycleMixin:
         # （task_generator 按子链末步判词压 rejected）。不带这道门时，软归属早先
         # 塞进来的兄弟实例驳回原文会每 tick 否掉一次「子链判通过 → completed」，
         # 与完成写入互抵——实测 wf_1ecc8/s3 完成↔驳回 13h 自旋 217 次。
-        _verdict = ("approved" if (_step_sr.get("confirmed_at")
-                                   or _step_sr.get("subflow_id"))
-                    else _review_gate.review_verdict(_msgs))
+        if _step_sr.get("confirmed_at"):
+            _verdict = "approved"
+        elif (_step_sr.get("subflow_id") and _live_subflow(lm, _step_sr)):
+            # 子链还活着 = 还没有裁决，父步此刻不表态。旧写法只看 subflow_id
+            # 真值就 approved，等于子链 running 期间门禁提前打开、父步的驳回与
+            # unknown 被吞（codex P1）。子链结案后（不活了）才按回执放行。
+            return
+        elif _step_sr.get("subflow_id"):
+            _verdict = "approved"
+        else:
+            _verdict = _review_gate.review_verdict(_msgs)
 
         # unknown 只拦"该表态却没表态"的步骤：type 是 review/gate 且执行角色是审查
         # 角色。只看 type 会把 maintainer 的健康检查（7 天 24 条）、product_architect

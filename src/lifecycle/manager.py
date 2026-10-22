@@ -1008,8 +1008,15 @@ class LifecycleManager:
         # 路径上判定相反，正是 review_gate 模块 docstring 想消灭的那种分歧。
         # 子链步骤的驳回由子链自己消费：父步只等回执，替它裁决会把子链的判定
         # 在父步上二次否决（分支侧原有守卫）。其余按三态 fail-closed。
-        _verdict = ("approved" if (_confirmed or _cur_sr.get("subflow_id"))
-                    else review_verdict(_msgs))
+        _sf = _cur_sr.get("subflow_id")
+        if _sf and not _confirmed:
+            # 子链还活着时父步不表态（codex P1：只看 subflow_id 真值就 approved，
+            # 子链 running 期间父步的 rejected/unknown 被吞 = 门禁提前打开）。
+            # 与 wf_lifecycle._advance_production_wf 同款，两条路径必须一致。
+            from pipeflow.wf_lifecycle import _live_subflow
+            if _live_subflow(self, _cur_sr):
+                return False
+        _verdict = ("approved" if (_confirmed or _sf) else review_verdict(_msgs))
         # 与 engine 路径同口径：只有审查角色 + review/gate 类型才要求表态
         # （见 review_gate.REVIEW_ROLES 的生产数据）。
         if (_verdict == "unknown" and _cur_step.get("type") in ("review", "gate")

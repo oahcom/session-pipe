@@ -747,3 +747,36 @@ def test_subflow_owned_step_not_vetoed_by_stale_text(mock_run):
     s = eng.status(rid)
     assert s["current_step"] == "s2", f"替别实例报工的文案否决了本步: {s}"
     _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_live_subflow_step_not_pre_approved(mock_run):
+    """子链还在跑时，父步不得凭 subflow_id 就当通过（codex P1）。
+
+    上一条只钉住「子链结案后父步不被兄弟文案否决」，没钉「子链 running 时父步不许
+    提前放行」。旧写法 `approved if subflow_id` 让门禁在子链干活期间就打开 ——
+    父步的驳回与 unknown 全被吞。断言双向：活着不推进、结案后回执放行。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "livef", [_step("s1", type="review"), _step("s2")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("livef", {})
+    lm = eng._lifecycle
+    lm.execute("INSERT INTO workflow_instances (instance_id, template_id, task_id, assigner, "
+               "assignee, status, created_at) VALUES "
+               "('wf_sub_live01', 'biz_flow', 't1', 'a', 'b', 'running', ?)", (time.time(),))
+    lm.execute("UPDATE workflow_instances SET status='step_done_ready' "
+               "WHERE instance_id=?", (rid,))
+    results = {"s1": {"status": "step_done_ready", "subflow_id": "wf_sub_live01",
+                      "exit_messages": [
+        {"id": 1, "text": "产品交付全流程/s1-complete — CHANGES_REQUESTED 2 P1",
+         "evidence": "结论: CHANGES_REQUESTED 0 P0 / 2 P1"}]}}
+    eng._advance_production_wf(rid, lm, "livef", "s1", results)
+    assert eng.status(rid)["current_step"] == "s1", "子链还在跑，父步就被提前推进了"
+    lm.execute("UPDATE workflow_instances SET status='completed' "
+               "WHERE instance_id='wf_sub_live01'")
+    eng._advance_production_wf(rid, lm, "livef", "s1", results)
+    assert eng.status(rid)["current_step"] == "s2", "子链已结案，回执未放行"
+    _cleanup(d)
