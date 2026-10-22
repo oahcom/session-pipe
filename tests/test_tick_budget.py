@@ -217,6 +217,8 @@ def test_guard_sweep_is_bounded_and_rotates(_sp):
     seen = []
 
     def _slow(role, deadline=0.0):
+        # 断言透传真的发生：改回 _ensure_role_alive(_role) 时这条会红（缺 deadline）。
+        assert deadline > 0, "巡检未把 deadline 透传给 _ensure_role_alive"
         seen.append(role)
         time.sleep(0.02)
         return True

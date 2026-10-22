@@ -190,6 +190,11 @@ def _no_live_approval_notify(monkeypatch):
     monkeypatch.setattr(_lm.LifecycleManager, "_notify_result", lambda *a, **k: None)
 
 
+# 测巡检本身（游标/预算）的模块：它用 `del eng._ensure_guard_roles` 撤**实例**桩，
+# 撤不掉 class 级桩，必须整模块豁免。
+_REAL_GUARD_MODULES = {"test_tick_budget"}
+
+
 @pytest.fixture(autouse=True)
 def _no_guard_role_start(request, monkeypatch):
     """守护巡检默认不拉起真角色：run_once() 会走 _ensure_guard_roles → _ensure_role_alive
@@ -198,9 +203,7 @@ def _no_guard_role_start(request, monkeypatch):
     真跑它的用例在 tests/test_role_alive_cache.py / test_ensure_role_alive_race.py，
     它们直接调 _ensure_role_alive，不经本函数，故不受影响。
     """
-    # test_tick_budget 测的就是巡检游标/预算本身（它用 del 撤实例桩去测真实实现）。
-    if (os.environ.get("PYTEST_REAL_GUARD") == "1"
-            or (request.module.__name__ if request.module else "").endswith("test_tick_budget")):
+    if (request.module.__name__ if request.module else "").split(".")[-1] in _REAL_GUARD_MODULES:
         return
     from pipeflow import engine as _eng
     monkeypatch.setattr(_eng.WorkflowEngine, "_ensure_guard_roles", lambda self, *a, **k: set())
@@ -218,14 +221,17 @@ def _fast_role_ready(request, monkeypatch):
     _wait_for_role_ready → sleep(5)）。已有 8 个用例各自 MagicMock 过它 → 共性缺口。
     """
     _mod = (request.module.__name__ if request.module else "").split(".")[-1]
-    if _mod in _REAL_READY_MODULES or os.environ.get("PYTEST_REAL_GUARD") == "1":
+    if _mod in _REAL_READY_MODULES:
         return
     from pipeflow import role_lifecycle as _rl
     monkeypatch.setattr(_rl.RoleLifecycleMixin, "_wait_for_role_ready",
                         lambda self, *a, **k: True)
 
 def _alarm_handler(_signum, _frame):
-    raise TimeoutError("用例超过自带 signal.alarm 预算")
+    # 必须抛 BaseException 子类：TimeoutError 是 OSError→Exception 的子类，
+    # 会被热路径的 except (TimeoutExpired, OSError) / except Exception 吞掉，
+    # 一次性定时器已消耗 → 用例继续挂起，承诺落空。
+    raise pytest.fail.Exception("用例超过自带 signal.alarm 预算（非产品缺陷，见 conftest）")
 
 
 @pytest.fixture(autouse=True)
