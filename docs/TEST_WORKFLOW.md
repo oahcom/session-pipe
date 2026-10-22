@@ -36,6 +36,20 @@ cd /home/administrator/session-pipeline && python3 -m pytest tests/test_engine_e
 （`EXIT=142`、无 summary）。套件疑似卡死时用
 `pytest tests/ -q --timeout=25 --timeout-method=thread` 抓栈，别靠猜。
 
+### 环境隔离的三条硬约束（2026-10-22 修，此前全部静默失效）
+
+隔离没生效时套件照样全绿、写的却是生产数据。三处都改成了硬失败，不许再降级成 warn。
+
+1. **bus DB**：import 失败即 `raise`。旧版只 `warnings.warn` 就继续跑，夹具事实直接写进生产 bus
+   （10-21 实测 3 条 `WF-architect_review` 链真跑了 ~6h）。
+2. **哨兵/健康目录**：光设 env 不够。`CCS_HEALTH_DIR` / `CCS_SENTINEL_DIR` 只对**之后** import 的
+   模块生效，而 conftest 第 50 行就 `import pipeflow`（连带 `liveness`/`paths`），快照早已是生产
+   路径；`drift_detector:17` / `routing_daemon:31` / `survival_monitor:18` 按值拷贝这几个常量。
+   必须额外重绑属性（`3d` 段），新增按值拷贝的模块也要登记进去——否则"没有哨兵"类断言的红绿
+   取决于机器上有没有角色在跑。
+3. **模块快照延迟**：`_PRISTINE['mods']` 在 conftest 导入时抓恒为 `{}`（四个被监视模块那时还没被
+   测试模块 import），还原循环永不触发。现在首次 `_restore_process_globals()` 时才抓。
+
 ## 实测基线（2026-10-22 05:40）
 
 | 命令 | 结果 |
