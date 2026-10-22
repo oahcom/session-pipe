@@ -177,3 +177,15 @@ def _isolate_probes_and_cooldowns(request, monkeypatch):
     for _d in (RoleLifecycleMixin._last_rate_recover, RoleLifecycleMixin._last_compact,
                RoleLifecycleMixin._last_bus_write):
         _d.clear()
+
+@pytest.fixture(autouse=True)
+def _no_live_approval_notify(monkeypatch):
+    """审批结果通知必须隔离：它起子进程调真实 `ccs send`。
+
+    未隔离时任何 confirm_step(approved=True) 的用例都会把消息投给活体角色：
+    2026-10-21 实测 13 条「工作流: wf_pull」通知进了 product_architect
+    （测试夹具 id 直接出现在角色上下文里）。回归守卫见 test_no_live_notify.py。
+    """
+    from lifecycle import manager as _lm
+    monkeypatch.setattr(_lm.LifecycleManager, "_notify_result", lambda *a, **k: None)
+
