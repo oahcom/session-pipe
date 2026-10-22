@@ -26,7 +26,7 @@ def _outside(name: str) -> bool:
     这类引用指向的代码不在这三个仓里，判据管不着；但本仓/兄弟仓都找不到的
     裸名或相对路径必须报错 —— 否则拼错的路径永远绿（第二版审查的批评）。
     """
-    return name.startswith(("~/", "/"))
+    return name.startswith("~")  # 只有 `~/` 一定在三仓之外；绝对路径先试着按仓内解析
 TREE = re.compile(r'([\w/]+\.py)(\s*[─-]+.*?（)(\d+)(\s*行)')
 # 表格两种写法都认：| **path** | 895 | 与 | **`path`** | 895 |
 TABLE = re.compile(r'(\|\s*\*\*)(`?)([\w/]+\.py)\2(\*\*\s*\|\s*)(\d+)(\s*\|)')
@@ -47,9 +47,21 @@ def _resolve(name: str, root: Path) -> Path | None:
             if base.exists():
                 return base
         return None
+    if name.startswith("/"):  # 绝对路径：落在三仓里的按仓内相对路径处理
+        for repo in (root,) + tuple(root.parent / n for n in SIBLINGS if n != root.name):
+            try:
+                rel = Path(name).relative_to(repo)
+            except ValueError:
+                continue
+            for base in (repo / rel, repo / "src" / rel):
+                if base.exists():
+                    return base
+        return None
     if "/" in name:
         return None  # 带目录的引用要么本仓相对路径，要么跨仓；都不许退到 basename 猜
     cands = [q for q in root.rglob(os.path.basename(name)) if ".git" not in q.parts]
+    if len(cands) > 1:
+        return None  # 本仓就有多个同名 → 歧义，不许拿兄弟仓消歧（第七轮审查的批评）
     if len(cands) == 1:
         return cands[0]
     # 跨仓裸名：launcher 的 PUBLIC_API 会写 pipeline 的 `manager.py:414`。只认兄弟仓里
