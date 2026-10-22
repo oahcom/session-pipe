@@ -1,5 +1,29 @@
 # CHANGES.md
 
+## 2026-10-22 — task_evidence：真实产物被「回复≠产出」判死（71% 假中性）
+
+### 问题（可观测证据）
+1. bus feedback #441960/#441971 把 pm 判成「exit_messages 存在（回复≠产出）」，
+   同一条 fact 的 `output_files` 却列着 19 个文件 / 84KB（INTAKE.md、PRD-wf_sub_*.md）。
+2. 根因是判定链顺序：`exit_messages` 判在最前，而几乎每条完成的链都有该字段 ——
+   唯一据实产物判 positive 的规则（≥3 个 ≥1KB 或 ≥1 个 >2KB）成了不可达代码。
+3. 近 7 天最近 120 条 completed 任务：positive 只有 20 条，修正后 105 条（假中性 85 条 = 71%）。
+   评分会回写 role TASKS.md「历史教训」，等于教角色「发消息比写产物重要」。
+
+### 改动
+- `src/task_evidence.py`：抽出 `_classify_outputs(n, size, evidence, bus_evidence)`，顺序即判据
+  （真实产物 > 量小产出/回话/bus > 纯模板）；调用点 6 段 if/elif → 4 行 detail。21 增 22 删。
+- `tests/test_task_evidence_scoring.py`：6 条断言锁住顺序语义，首条即本次回归。
+
+### 验证
+- `pytest tests/test_task_evidence_scoring.py` → 6 passed。
+- `pytest tests/` 全量 → 1384 passed / 0 failed（--junit-xml 记录在 /tmp/jr160f.xml）。
+- `python3 scripts/doccheck.py` → CLEAN（exit 0）。
+
+### 已知边界
+- 历史 bus 里已写的假中性 fact 不会被覆盖（标题含 detail、签名不同）：消费方取最近一条即可，
+  旧 fact 保留作修正前基线，不回填删除。
+
 ## 2026-10-22 — temp-pr-branch 合入 main（漂移收敛，35 文件 / 4 处 modify-delete）## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效
 
 ### 问题（可观测证据）

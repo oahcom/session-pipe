@@ -107,6 +107,21 @@ def _output_summary(files):
     return len(files), total, names
 
 
+def _classify_outputs(n: int, size: int, evidence: str, bus_evidence: bool) -> str:
+    """任务收益 → 质量档。顺序即判据：真实产物 > 量小产出/回话/bus > 纯模板。
+
+    WHY: 旧实现把 exit_messages 判在最前，而几乎每条完成的链都有该字段 ——
+    唯一据实产物判 positive 的规则只在无该字段时才可达（实际几乎不可达）。实测最近 120 条完成任务里，
+    85 条（71%）有 ≥3 个 ≥1KB 产出（如 pm 19 文件/84KB）却被判「回复≠产出」，
+    反过来教角色「发消息比写产物重要」。
+    """
+    if n >= 3 or (n >= 1 and size > 2048):
+        return "positive"
+    if n >= 1 or evidence or bus_evidence:
+        return "neutral"
+    return "negative"
+
+
 def _append_role_feedback(role: str, title: str, task_id: str) -> bool:
     """把 negative 评分回写到 role TASKS.md「历史教训」节。
 
@@ -131,10 +146,11 @@ def _append_role_feedback(role: str, title: str, task_id: str) -> bool:
         return False  # 回写失败不影响主流程
 
 
-def evaluate_and_feedback():
+def evaluate_and_feedback(hours: float = 1):
     """提取已完成任务证据 → 写质量反馈到 bus，供 coordinator/workflow_engine 消费。
 
-    只评估最近 1 小时完成的 workfow，避免重复。
+    默认只评估最近 1 小时完成的 workfow，避免重复。hours 放大窗口用于回填：
+    判据修正后，历史任务需要按新判据重算一次，否则旧的假中性 fact 会一直留着。
     收益判定由规则引擎基于真实产出证据（bus 消息、产出文件、workflow 进度）
     独立评估，不使用标题长度等表面启发式。
 
@@ -144,22 +160,22 @@ def evaluate_and_feedback():
     """
     db = sqlite3.connect(str(DB))
     try:
-        return _evaluate_with(db)
+        return _evaluate_with(db, hours=hours)
     finally:
         db.close()
 
 
-def _evaluate_with(db):
+def _evaluate_with(db, hours: float = 1):
     db.row_factory = sqlite3.Row
     _load_assessed(db)
     _now = time.time()
-    _cutoff = _now - 3600
+    _cutoff = _now - hours * 3600
 
     completed = db.execute(
         "SELECT task_id, title, assignee, created_at, updated_at FROM tasks "
         "WHERE status='completed' AND updated_at > ? "
-        "ORDER BY updated_at DESC LIMIT 10",
-        (_cutoff,)
+        "ORDER BY updated_at DESC LIMIT ?",
+        (_cutoff, 10 if hours <= 1 else 500)
     ).fetchall()
     if not completed:
         return {"evaluated": 0, "assessments": []}
@@ -210,33 +226,18 @@ def _evaluate_with(db):
         _bus = _bus_evidence(_tid)
         _evidence = _wf_evidence.get(_tid, "")
 
-        # 收益判定规则（子 agent 独立评估的规则化实现）：
-        #   1. 有 exit_messages 证据（角色实际产出被引擎记录）→ 有收益
-        #   2. 有 summary 证据（引擎生成的角色完成摘要）→ 有收益
-        #   3. 有真实产出文件（≥1KB，≥3 个或 ≥2KB）→ 有实质产出
-        #   4. 有产出文件但量小 → 疑似模板残留
-        #   5. 无产出但有 bus 证据 → 进行中
-        #   6. 无产出、无证据 → 纯模板任务（无收益）
-        # 存在性 ≠ 质量：exit_messages/summary 仅证明"角色回了话/引擎记了摘要"，
-        # 不证明"做对了"。按 CLAUDE.md 红线，不可用文件存在替代人读判断 → 仅判 neutral。
-        # positive 必须建在真实外部产物（≥1KB 非系统产出文件）上（见下方 _n 分支）。
-        if _evidence == "exit_messages":
-            _quality = "neutral"
-            _detail = f"task《{_title[:40]}》by {_role} — exit_messages 存在（回复≠产出），待真实产物确认"
-        elif _evidence == "summary":
-            _quality = "neutral"
-            _detail = f"task《{_title[:40]}》by {_role} — summary 存在（摘要≠产出），待真实产物确认"
-        elif _n >= 3 or (_n >= 1 and _size > 2048):
-            _quality = "positive"
-            _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），有实质产出"
+        _quality = _classify_outputs(_n, _size, _evidence, _bus)
+        if _quality == "positive":
+            _detail = (f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），有实质产出"
+                       + (f"（另有 {_evidence} 回话证据）" if _evidence else ""))
+        elif _evidence:
+            _ev_label = {"exit_messages": "回复≠产出", "summary": "摘要≠产出"}.get(_evidence, "无产出")
+            _detail = f"task《{_title[:40]}》by {_role} — 仅 {_evidence}，无合格产出文件（{_ev_label}）"
         elif _n >= 1:
-            _quality = "neutral"
             _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），疑似模板残留"
         elif _bus:
-            _quality = "neutral"
             _detail = f"task《{_title[:40]}》by {_role} — 无产出文件但有 bus 证据，进行中"
         else:
-            _quality = "negative"
             _detail = f"task《{_title[:40]}》by {_role} — 无产出、无证据，纯模板任务"
         assessments.append({
             "task_id": _tid, "role": _role,
@@ -444,7 +445,11 @@ def _extract_with(db):
 if __name__ == "__main__":
     import sys
     if "--feedback" in sys.argv:
-        r = evaluate_and_feedback()
+        # --hours N：回填窗口（默认 1h = 正常 tick 口径）
+        _h = 1.0
+        if "--hours" in sys.argv:
+            _h = float(sys.argv[sys.argv.index("--hours") + 1])
+        r = evaluate_and_feedback(hours=_h)
         print(json.dumps(r, ensure_ascii=False, indent=2))
     else:
         data = extract()
