@@ -567,26 +567,25 @@ class WorkflowLifecycleMixin:
             #   同一条消息两条推进路径判定相反。
             # ② 分类段只在 evidence 里，_has_issue_classification 仍要看到它，
             #   否则门禁 fail-open 放行真实驳回。
-            # 替别的实例报工的文案没有否决权：软归属把兄弟实例的驳回原文塞进本步
-            # 后，它每 tick 否掉一次「子链判通过 → completed」，与 task_generator
-            # 的完成写入互抵（实测 wf_1ecc8/s3：完成↔驳回 13h 自旋 217 次，
-            # 链永不可能前进）。本实例自己的驳回原样拦。
-            from pipeflow.step_handler import _claims_own_step_and_foreign_instance as _foreign
-            _exits = [m for m in (_step_sr.get("exit_messages") or [])
-                      if isinstance(m, dict)
-                      and not _foreign(str(m.get("text", "") or ""), wf_id, wf_name, step_id)]
             _msgs = " ".join(
-                (m.get("text", "") or "") for m in _exits
+                (m.get("text", "") or "") for m in (_step_sr.get("exit_messages") or [])
+                if isinstance(m, dict)
             ).lower()
             _full = _msgs + " " + " ".join(
-                (m.get("evidence", "") or "") for m in _exits
+                (m.get("evidence", "") or "") for m in (_step_sr.get("exit_messages") or [])
+                if isinstance(m, dict)
             ).lower()
 
             # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
             # 不会清除它 → 同一份文本被二次判成驳回。与 manager._advance_unsafe
             # 同一缺陷（实测 wf_256be862ea86/s3 确认后卡死 5h）。
+            # 子链已接管本步时，父步自己的文案不再能否决推进：驳回判定归子链
+            # （task_generator 按子链末步判词压 rejected）。不带这道门时，软归属早先
+            # 塞进来的兄弟实例驳回原文会每 tick 否掉一次「子链判通过 → completed」，
+            # 与完成写入互抵——实测 wf_1ecc8/s3 完成↔驳回 13h 自旋 217 次。
             _confirmed = bool(_step_sr.get("confirmed_at"))
-            if not _confirmed and _review_gate.is_rejected(_msgs):
+            _subflow_owned = bool(_step_sr.get("subflow_id"))
+            if not _confirmed and not _subflow_owned and _review_gate.is_rejected(_msgs):
                 LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
                                wf_id[:8], step_id)
                 # 无条件落库 rejected，不再按「有无问题分类」fail-open 放行。

@@ -985,17 +985,10 @@ class LifecycleManager:
         # 驳回语义由 exit_messages 文本判定，与 type 无关。
         _sr = self._parse_results(wf)
         _cur_sr = _sr.get(current, {}) or {}
-        # 替别的实例报工的文案没有否决权（与 wf_lifecycle._advance_production_wf
-        # 同款，两条推进路径必须一致）：兄弟实例的驳回原文被软归属存进来后，每 tick
-        # 否掉一次「子链判通过 → completed」，完成与驳回互抵（wf_1ecc8/s3 13h 217 次）。
-        from pipeflow.step_handler import _claims_own_step_and_foreign_instance as _foreign
-        _exits = [m for m in (_cur_sr.get("exit_messages") or [])
-                  if isinstance(m, dict)
-                  and not _foreign(str(m.get("text", "") or ""), wf_id,
-                                   getattr(wf, "name", "") or "", current)]
         _msgs = " ".join(
             m.get("text", "") for m in
-            _exits
+            (_cur_sr.get("exit_messages") or [])
+            if isinstance(m, dict)
         ).lower()
         # 词表走 review_gate 唯一真相源：此前三处各写一份靠注释约定同步，
         # "未通过"/"驳回"/"not_approved" 曾在 wf_lifecycle 有、本路径没有 →
@@ -1006,8 +999,10 @@ class LifecycleManager:
         # 判成驳回，把刚落的 completed 当场改写回 rejected。步骤一旦被驳回过就
         # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
         # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
+        # 子链接管本步时父步文案不再能否决（与 wf_lifecycle._advance_production_wf
+        # 同款，两条推进路径判定必须一致）。
         _confirmed = bool(_cur_sr.get("confirmed_at"))
-        if not _confirmed and is_rejected(_msgs):
+        if not _confirmed and not _cur_sr.get("subflow_id") and is_rejected(_msgs):
             _sr.setdefault(current, {})["status"] = "rejected"
             self._conn.execute(
                 "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",

@@ -731,14 +731,14 @@ if __name__ == "__main__":
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
-def test_foreign_rejection_text_does_not_veto_own_step(mock_run):
-    """替别的实例报工的驳回原文不得否掉本步。
+def test_subflow_owned_step_not_vetoed_by_stale_text(mock_run):
+    """子链已接管的步骤，父步里冻结的驳回原文不再能否决推进。
 
-    实测 wf_1ecc8/s3：软归属把兄弟实例 wf_0c5e3d807ede 的
-    「产品交付全流程/s3-complete … CHANGES_REQUESTED」收进 exit_messages 后，
-    返工门禁每 tick 据此否掉「子链判通过 → completed」，与 task_generator 的
-    完成写入互抵，13h 自旋 217 次，链永不可能前进。
-    真驳回仍须拦死（test_gate_rejection_blocks_advance 锁的就是那条）。
+    实测 wf_1ecc8/s3：子链已接管该步，父步 exit_messages 却留着兄弟实例
+    wf_0c5e3d807ede 的「产品交付全流程/s3-complete … CHANGES_REQUESTED」，
+    task_generator 每 tick 写 completed、门禁每 tick 判 rejected，互抵 13h 217 次。
+    反向（Anti-ISC）：没有 subflow_id 的步骤同一段原文仍须拦死 —— 见
+    test_gate_rejection_blocks_advance。
     """
     signal.alarm(_TEST_TIMEOUT)
     d = _make_env()
@@ -748,8 +748,9 @@ def test_foreign_rejection_text_does_not_veto_own_step(mock_run):
     lm = eng._lifecycle
     lm.execute("UPDATE workflow_instances SET status='step_done_ready' "
                "WHERE instance_id=?", (rid,))
-    # 标题形态（不是模板名 ownf）+ 别实例 id + 驳回字样：生产里被存进本步的原文
-    results = {"s1": {"status": "step_done_ready", "exit_messages": [
+    # 生产形态：子链已接管（subflow_id）+ 父步冻结着别实例的驳回原文
+    results = {"s1": {"status": "step_done_ready", "subflow_id": "wf_sub_deadbeef",
+                      "exit_messages": [
         {"id": 1, "text": "产品交付全流程/s1-complete wf_foreign777 — CHANGES_REQUESTED 2 P1",
          "evidence": "结论: CHANGES_REQUESTED 0 P0 / 2 P1"}]}}
     eng._advance_production_wf(rid, lm, "ownf", "s1", results)

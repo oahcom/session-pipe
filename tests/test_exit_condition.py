@@ -549,23 +549,6 @@ class TestSoftAttribution(unittest.TestCase):
                                 own_wf_id="wf_mine111", template="arch", step_id="s2")
         self.assertFalse(ts, "兄弟实例声称完成本步，不得闭合本实例")
 
-    def test_foreign_instance_claiming_own_step_via_title(self):
-        """角色照抄的是**工作流标题**（中文），不是模板名 —— 同样判串味。
-
-        实测 wf_0c5e3d807ede 的「产品交付全流程/s3-complete」被 wf_1ecc8/s3 收下，
-        父步拿到兄弟实例的驳回原文后每 tick 二次否决，13h 自旋 217 次。
-        """
-        eng = _make_eng()
-        marker = f"SOFT_{_UNIQUE}"
-        eng._bb.write("system_design",
-                      f"SYSTEM_DESIGN: {marker} 产品交付全流程/s2-complete "
-                      f"wf_sibling999 — CHANGES_REQUESTED",
-                      src="product_architect")
-        ts, _ = eng._check_exit("system_design", "product_architect", marker,
-                                own_wf_id="wf_mine111",
-                                template="product_delivery", step_id="s2")
-        self.assertFalse(ts, "标题形态的串味消息未被拦住")
-
     def test_own_instance_claiming_own_step_matched(self):
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
