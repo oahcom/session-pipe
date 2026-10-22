@@ -45,6 +45,19 @@ _REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
 # thrash loop 判定：同一 Bash command 连续重复 ≥ 此次数且无其他 distinct 命令插入
 _THRASH_REPEAT_MIN = 4
 
+# 轨迹判据（orphan/thrash/schema/盲改）同样只看近窗：判据本身无窗口时，
+# 一次历史事件会让角色永久 FAIL —— 实测 scout 的 orphan_call 来自
+# 2026-10-19 13:34 的转录（bus #387262 记的就是它），此后每 10 分钟一轮
+# 全部判红，任何当轮改进都翻不了绿。与 _SUBAGENT_WINDOW_S 同一理由：
+# 判据要看"现在做得怎样"，不是"三天前错过一次"。
+_TRAJ_WINDOW_S = 24 * 3600
+# 「这次写才诞生」的容差（秒）：文件诞生时间与写时间的差。
+_BIRTH_TOLERANCE_S = 120
+# 负年龄允许范围：时钟偏移/删除重建会让 bt 晚于写时间；超过这个量级说明该写与
+# 这个文件对不上，不按"新建"放过（真数据里最长 -6020s）。
+_BIRTH_NEGATIVE_ALLOW_S = 3600
+
+
 # 子代理遵从只看近窗。不设窗 = 一次旧轮次永久拉低该角色比例，本文件已在
 # orphan_call / schema 自纠两处踩过同一坑（跨 102 session 永久追责）。
 _SUBAGENT_WINDOW_S = 24 * 3600
@@ -538,7 +551,8 @@ def _write_bus(cat: str, text: str, *, evidence: str = "", src: str = "eval_chec
         subprocess.run(
             [sys.executable, str(BUS_SCRIPT), "write", cat, text,
              "--evidence", evidence[:500], "--src", src],
-            capture_output=True, timeout=15,
+            # 15s 也踩过线：实测 bus 事务持锁 5~9.8s，11:05 有一次写入超时。
+            capture_output=True, timeout=30,
         )
     except Exception as e:
         LOGGER.warning("bus write fail: %s", e)
@@ -708,18 +722,23 @@ class RequirementConfirmationChecker:
                 "errors": errors, "checked_requirements": len(findings)}
 
 
+def _ts_epoch(ts: str) -> float | None:
+    """ISO UTC 时间戳 → epoch 秒；解析失败返回 None（调用方各自决定保守方向）。"""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _ts_recent(ts: str, cutoff: float) -> bool:
     """transcript 时间戳是否在 cutoff 之后。ts 为 ISO UTC（…Z）。
 
     解析失败按「不新」处理：宁可少算一轮，也不把无法定时的事实当成新证据。
     """
-    if not ts:
-        return False
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return dt.timestamp() >= cutoff
+    t = _ts_epoch(ts)
+    return t is not None and t >= cutoff
 
 
 def _result_text(blk: dict) -> str:
@@ -820,6 +839,7 @@ class TrajectoryQualityChecker:
                                         "input": blk.get("input", {}),
                                         "id": blk.get("id"), "error": None,
                                         "order": order, "src": str(jf),   # 全路径：同名 jsonl 跨目录存在，basename 会撞 key
+                                        "ts": d.get("timestamp", ""),
                                     })
                                 elif blk.get("type") == "tool_result":
                                     order += 1
@@ -831,6 +851,7 @@ class TrajectoryQualityChecker:
                                         "error": blk.get("is_error", False),
                                         "text": _result_text(blk),
                                         "order": order, "src": str(jf),
+                                        "ts": d.get("timestamp", ""),
                                     })
                 except OSError as e:
                     LOGGER.debug("transcript read fail %s: %s", jf, e)
@@ -847,6 +868,16 @@ class TrajectoryQualityChecker:
             return {"passed": True, "findings": [], "checked_traces": 0}
 
         calls = self._load_tool_calls(sessions)
+        # 时间窗按**记录 timestamp** 过滤，不用文件 mtime：活动文件里可能混着几天前的
+        # 记录（codex 审 P1-2：mtime=现在、记录=3 天前 → 旧账照抓）。
+        _cut = time.time() - _TRAJ_WINDOW_S
+        # 缺 timestamp 的记录按"新鲜"保留（不静默丢证据）；有时间戳的按窗口判。
+        _fresh = [c for c in calls
+                  if not (c.get("ts") or "") or _ts_recent(c.get("ts") or "", _cut)]
+        if len(_fresh) != len(calls):
+            LOGGER.info("轨迹窗口 %s: 丢弃 %d/%d 条旧记录（>%ds）",
+                        role, len(calls) - len(_fresh), len(calls), _TRAJ_WINDOW_S)
+        calls = _fresh
         findings: list[dict] = []
 
         # 工具在该 session 里根本不存在时（"No such tool available"），这次调用从未执行，
@@ -905,6 +936,70 @@ class TrajectoryQualityChecker:
             两侧用同一规则，相等就等价——判据要的是"是不是同一个文件"。
             """
             return os.path.realpath(os.path.expanduser(fp)) if fp else ""
+
+        # 目录名两种写法都真实存在（product_architect 用下划线、ccs-monitor 用连字符），
+        # 只取一种会让另一半角色的豁免恒不生效 —— codex 审出的 P0。
+        _ws_root = Path.home() / "ccs-workspaces"
+        _own_roots = tuple(sorted({
+            os.path.realpath(str(_ws_root / v)).rstrip(os.sep) + os.sep
+            for v in {role.lower(), role.lower().replace("_", "-"), role.lower().replace("-", "_")}
+        }))
+
+        _exempt = 0
+
+        def _birthtime(fp: str) -> float | None:
+            """文件诞生时间（st_birthtime 在本机为 None，走 stat(1) 的 %W）。
+
+            返回 None = 文件不存在或取不到 → 调用方按"新建"处理（宁可少报噪音）。
+            """
+            try:
+                out = subprocess.run(["stat", "-c", "%W", fp], capture_output=True,
+                                     text=True, timeout=2).stdout.strip()
+                bt = float(out)
+                return bt if bt > 0 else None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return None
+
+        def _is_own_ws(fp: str) -> bool:
+            """角色自己的 ccs-workspaces 目录：它自己产出的报告（maintainer 每天整篇
+            重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT），没有"别人的既有内容"可覆盖。
+            """
+            return bool(fp) and os.path.isabs(fp) and _key(fp).startswith(_own_roots)
+
+        def _is_fresh_scratch(fp: str, ts: str) -> bool:
+            """/tmp 下的文件必须是**这次写才诞生**的草稿才算豁免。
+
+            只按目录放过会漏掉"覆盖预存文件"这一路（codex 第二轮复核的残留 P1）：
+            /tmp 下真有人在跑的脚本（/tmp/al.sh 之类），被 Write 覆盖同样该报。
+            用诞生时间判：bt 比写时间早太多 = 预存文件 → 不豁免。
+
+            Edit/MultiEdit 本来就不豁免：/tmp 下 353 个被写路径里 5 个是「起稿后 cp 进
+            仓/系统目录」的（/tmp/20-memory-tuning.conf → systemd drop-in、
+            /tmp/ccs-monitor/pass.sh → 在跑的巡检脚本），首写无害、之后的 Edit 是真盲改。
+            只对**绝对路径**生效：相对路径按判据进程 cwd 解析，判据在 /tmp 下跑时
+            "other.py" 会 realpath 成 /tmp/other.py，凭空拿到豁免（第四轮复核 P2）。
+            fail-open（文件已删 / FS 无 %W / 记录无 timestamp）一律打 WARNING：
+            静默失效与"豁免恒不生效却无输出"同型，是本文件已经踩过两次的坑。
+            ponytail: 天花板=写完就删或 rm 后重写会走 fail-open（有 WARNING 可查）；
+            升级路径=草稿目录白名单配置。
+            """
+            if not fp or not os.path.isabs(fp) or not _key(fp).startswith(("/tmp/", "/var/tmp/")):
+                return False
+            bt = _birthtime(fp)
+            if bt is None:
+                LOGGER.warning("盲改豁免 fail-open: %s 取不到诞生时间（已删/FS 不支持），"
+                               "按新建放过 role=%s", fp, role)
+                return True
+            t = _ts_epoch(ts)
+            if t is None:
+                LOGGER.warning("盲改豁免 fail-open: %s 记录无 timestamp，按新建放过 role=%s",
+                               fp, role)
+                return True
+            # 方向必须是"文件的**诞生年龄**"，不是"bt 早于写时间+容差"：后者对任何
+            # 预存文件都恒真，等价于退回"按目录放过"（第三轮复核实测 /tmp/al.sh
+            # 被覆盖仍放过，根因就是这个反向比较）。
+            age = t - bt
+            return -_BIRTH_NEGATIVE_ALLOW_S <= age <= _BIRTH_TOLERANCE_S
 
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
@@ -1073,8 +1168,15 @@ class TrajectoryQualityChecker:
                     continue
                 if cid and created_by_call.get((c["src"], cid, c["order"])) == _key(fp):
                     continue
-                if (name == "Edit" and fp
-                        and own_written.get((c["src"], _key(fp)), c["order"]) < c["order"]):
+                if (fp and own_written.get(
+                        (c["src"], _key(fp)), c["order"]) < c["order"]):
+                    continue
+                # 自有产物的 Write 不算盲改；/tmp 只认"这次写才诞生"的草稿；Edit 照判。
+                # "别的 transcript 也在写"的门曾被试过并回退：本角色自己的多个会话
+                # 重写同一份报告是常态（maintainer 3 份报告即刻变 6 条红灯）。
+                if name == "Write" and (_is_own_ws(fp)
+                                        or _is_fresh_scratch(fp, c.get("ts") or "")):
+                    _exempt += 1
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
                     findings.append({
@@ -1114,6 +1216,11 @@ class TrajectoryQualityChecker:
             if oid in tail_use_ids:
                 continue
             findings.append({"issue": "orphan_call", "tool": "?", "id": oid})
+
+        # 豁免必须可见：94394b6 的自有 workspace 豁免曾因 role→目录映射写错而**恒不生效**，
+        # 而失效没有任何输出（codex 审 P0/维度 11）。这里每次豁免都留一条计数日志。
+        if _exempt:
+            LOGGER.info("盲改豁免 %s: %d 条（/tmp 或自有 workspace 的 Write）", role, _exempt)
 
         checked_traces = sum(1 for s in sessions for _ in s.glob("*.jsonl"))
         passed = len(findings) == 0
@@ -1202,7 +1309,7 @@ def _weighted_role_sample(roles: list[dict], k: int) -> list[dict]:
 def run_eval_check(role_filter: str | None = None) -> dict:
     """主入口：判据检查按可达判据数加权抽、通用检查均匀抽，各 1-2 个角色。
 
-    两种抽样分开：通用检查（产出语义/需求确认/轨迹/杠杆）按角色跑、与判据数无关，
+    两种抽样分开：通用检查（产出语义/需求确认/轨迹）按角色跑、与判据数无关，
     均匀才不饿死 14/19 个零可执行判据的角色；而判据检查必须加权，否则持判据的
     两个角色被稀释 3.4-4.1 倍（见 _weighted_role_sample）。
     参数 role_filter: 只检查指定角色名。

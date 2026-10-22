@@ -28,37 +28,16 @@
 | `confirm_step(wf_id, step_id, token, approved, reason)` | str, str, str, bool, str | `bool` —— `token` 已无消费者（审批密钥退场，`manager.py` 里恒空，别依赖它的语义） |
 | `fail_step(wf_id, step_id, reason, allow_retry)` | str, str, str, bool | `bool` |
 | `rollback_step(wf_id, step_id)` | str, str | `bool` |
-| `cancel_step(wf_id, step_id)` | str, str | `bool` — `True`=本次取消并写库；`False`=实例已终态（cancelled/completed/failed）的空操作，未写库。步骤不匹配仍 `raise`（校验先于终态判断） |
-| `escalate_step(wf_id, step_id, reason)` | str, str, str | `dict` |
-| `reassign_step(wf_id, step_id, new_role)` | str, str, str | `bool` |
+| `cancel_step(wf_id, step_id)` | str, str | `bool` —— `True`=本次取消并写库；`False`=实例已终态（cancelled/completed/failed）的空操作，未写库。步骤不匹配仍 `raise`（校验先于终态判断） |
 | `get_wf(wf_id)` | str | `Optional[dict]` |
 | `get_step(wf_id, step_id)` | str, str | `Optional[dict]` |
 | `upsert_template(template_id, name, description, steps)` | str, str, str, list | `None` |
-| `get_run(wf_id)` | str | `Optional[dict]` |
-| `get_workflow_context(wf_id)` | str | `dict` |
-| `get_workflow_progress(wf_id)` | str | `dict` |
-| `check_gate_timeouts()` | — | `list[dict]` |
-| `acknowledge_handoff(wf_id, step_id, role)` | str, str, str | `bool` |
-| `close(wf_id)` | str | `None` |
-
-## WorkflowDB (`pipeflow/db.py`)
-
-| 方法 | 参数 | 返回 |
-|------|------|------|
-| `create_task(title, description, assigner, assignee, priority, tags, context)` | str, str, str, str, int, list, dict | `str` (task_id) |
-| `get_task(task_id)` | str | `Optional[dict]` |
-| `update_task(task_id, **kwargs)` | str | `bool` |
-| `delete_task(task_id, actor)` | str, str | `bool` |
-| `list_tasks(status, assigner, assignee, limit)` | str, str, str, int | `list[dict]` |
-| `create_template(name, description, steps_json, steps_mermaid)` | str, str, dict, str | `str` (template_id) |
-| `get_template(template_id)` | str | `Optional[dict]` |
-| `find_template(name)` | str | `Optional[dict]` |
-| `create_workflow(task_id, template_name, assigner, assignee, context)` | str, str, str, str, dict | `Optional[str]` |
-| `get_workflow(instance_id)` | str | `Optional[dict]` |
-| `update_workflow(instance_id, **kwargs)` | str | `bool` |
-| `chain_workflows(task_id, template_names, assigner, assignee)` | str, list, str, str | `list[str]` |
+| `get_assigned_workflows(role)` | str | `list[dict]` |
+| `close()` | — | `None` |
 
 ## Router (`routing/router.py`)
+
+`get_consumers_prioritized(category)` 是 `Router` 实例方法（`router.py:186`），不是模块级函数；调用形如 `get_router().get_consumers_prioritized(cat)`。
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
@@ -66,7 +45,6 @@
 | `role_produce_categories(role)` | str | `list[str]` |
 | `role_consume_categories(role)` | str | `list[str]` |
 | `get_consumers(category)` | str | `list[str]` |
-| `get_consumers_prioritized(category)` | str | `list[str]` |
 | `get_producers(category)` | str | `list[str]` |
 | `routing_summary()` | — | `dict` |
 | `format_pipeline()` | — | `str` |
@@ -76,16 +54,15 @@
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
-| `route_all(consumer, dry_run, parallel, instance_id)` | str, bool, bool, str | `dict` |
+| `route_all(consumer, dry_run, parallel)` | str, bool, bool | `dict` |
 | `route_to_ccs(role_name, dry_run)` | str, bool | `dict` |
 | `route_all_to_ccs(dry_run)` | bool | `dict` |
-| `dispatch_investigator(category, dry_run)` | str, bool | `dict` |
 
 ## AutoRouting (`routing/auto.py`)
 
 | 函数 | 参数 | 返回 |
 |------|------|------|
-| `poll_unconsumed(category, consumer, instance_id, limit)` | str?, str?, str, int | `list[dict]` |
+| `poll_unconsumed(category=None, consumer=None, limit=100)` | str?, str?, int | `list[dict]` |
 | `consume_with_linkage(fact_id, category, consumer)` | int, str, str | `dict` |
 
 ## Reliability (`reliability.py`)

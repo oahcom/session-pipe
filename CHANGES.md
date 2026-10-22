@@ -24,9 +24,13 @@ modify/delete 以"模块是否还存在、是否被引用"为判据。逐段记�
    `deadline=deadline` → 巡检预算夹逼全链恒 0，分支的 ccs start 超时夹逼在生产永不触发
    （与 task_generator 丢 `import re` 同一类；由并行审查指出、补回一行）。
 
-### 不补回的一处
-`cron_scheduler._noop_delta`：分支里也 0 调用方（只有测试在测），main 的剪枝是对的 →
-删掉对应 2 个用例，并去掉 `test_real_fix_passes` 里的该断言。
+### 不补回的两处
+1. `cron_scheduler._noop_delta`：分支里也 0 调用方（只有测试在测），main 的剪枝是对的 →
+   删掉对应 2 个用例，并去掉 `test_real_fix_passes` 里的该断言。
+2. `LeverageAccumulationChecker`（分支 90 行 + 8 行接线）：整块没进合并，19 维审查指出后
+   决定**不补回**——它是观测型（恒 passed），`leverage_count` 全仓唯一消费点是测试里的
+   一个 mock 字段；代价是每次 eval（600s）新建一个 Blackboard 连接并对 3 个仓库各跑一次
+   `git log --since`。主线 docstring 里"4 个通用检查器"的表述同步改成 3 个。
 
 ### 删除
 `src/pipeflow/db.py` 与 `tests/test_workflow_db.py`：分支已连模块一起删，全仓

@@ -201,6 +201,12 @@ def review_verdict(text: str) -> str:
     return REJECTED if _full_scan(text) else UNKNOWN
 
 
+# 二态判据的公开名字：task_generator 只问"这条消息算不算驳回"，用 bool|None 比三态
+# 更直接（`verdict(x) is False`）。合并时这名字被 review_verdict 取代，调用点没跟改 →
+# AttributeError（test_subflow_verdict_freshness 11 红）。别名保持两条入口语义一致。
+verdict = _anchored_verdict
+
+
 def is_rejected(text: str) -> bool:
     """存量判据：只问"是否驳回"，unknown 仍返回 False（fail-open）。"""
     return review_verdict(text) == REJECTED
