@@ -820,18 +820,23 @@ class LeverageAccumulationChecker:
         return True
 
 
+def _ts_epoch(ts: str) -> float | None:
+    """ISO UTC 时间戳 → epoch 秒；解析失败返回 None（调用方各自决定保守方向）。"""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _ts_recent(ts: str, cutoff: float) -> bool:
     """transcript 时间戳是否在 cutoff 之后。ts 为 ISO UTC（…Z）。
 
     解析失败按「不新」处理：宁可少算一轮，也不把无法定时的事实当成新证据。
     """
-    if not ts:
-        return False
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return dt.timestamp() >= cutoff
+    t = _ts_epoch(ts)
+    return t is not None and t >= cutoff
 
 
 def _result_text(blk: dict) -> str:
@@ -1040,26 +1045,47 @@ class TrajectoryQualityChecker:
 
         _exempt = 0
 
-        def _is_scratch(fp: str) -> bool:
-            """角色的草稿区：/tmp 与它自己的 ccs-workspaces 目录。只豁免 Write。
+        def _birthtime(fp: str) -> float | None:
+            """文件诞生时间（st_birthtime 在本机为 None，走 stat(1) 的 %W）。
 
-            自己的 workspace 里是它自己产出的报告（maintainer 的 HEALTH_CHECK /
-            DIAGNOSIS / FIX_REPORT 每天整篇重写），没有"别人的既有内容"可覆盖。
-
-            Write 是全量覆盖，Claude Code 的返回本身写着 "no need to Read it back"，
-            草稿也没有需要保护的既有内容：实测 24h 全 19 角色只剩 2 处 blind_edit，
-            全在 /tmp（engineer /tmp/eng_sim2.py、knowledge_curator /tmp/inspect_rw.py），
-            仓内 0 处；这两处让门禁每轮 checked=2 failed=2、角色还要各花一轮自证。
-
-            Edit/MultiEdit 不豁免：子代理审 1154 个 transcript 发现 /tmp 下 353 个被写
-            路径里 5 个是「起稿后 cp 进仓/系统目录」的（/tmp/20-memory-tuning.conf →
-            systemd drop-in、/tmp/ccs-monitor/pass.sh → 在跑的巡检脚本），首写无害，
-            之后对它们的无 Read Edit 是真盲改，不能按目录放过。
-            ponytail: 天花板=/tmp 下写报告类交付物（12.2% 是 .md/.txt）时不判盲改；
-            升级路径=改成草稿目录白名单配置。
+            返回 None = 文件不存在或取不到 → 调用方按"新建"处理（宁可少报噪音）。
             """
-            k = _key(fp)
-            return k.startswith(("/tmp/", "/var/tmp/")) or k.startswith(_own_roots)
+            try:
+                out = subprocess.run(["stat", "-c", "%W", fp], capture_output=True,
+                                     text=True, timeout=2).stdout.strip()
+                bt = float(out)
+                return bt if bt > 0 else None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return None
+
+        def _is_own_ws(fp: str) -> bool:
+            """角色自己的 ccs-workspaces 目录：它自己产出的报告（maintainer 每天整篇
+            重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT），没有"别人的既有内容"可覆盖。
+            """
+            return _key(fp).startswith(_own_roots)
+
+        def _is_fresh_scratch(fp: str, ts: str) -> bool:
+            """/tmp 下的文件必须是**这次写才诞生**的草稿才算豁免。
+
+            只按目录放过会漏掉"覆盖预存文件"这一路（codex 第二轮复核的残留 P1）：
+            /tmp 下真有人在跑的脚本（/tmp/al.sh 之类），被 Write 覆盖同样该报。
+            用诞生时间判：bt 比写时间早太多 = 预存文件 → 不豁免。
+
+            Edit/MultiEdit 本来就不豁免：/tmp 下 353 个被写路径里 5 个是「起稿后 cp 进
+            仓/系统目录」的（/tmp/20-memory-tuning.conf → systemd drop-in、
+            /tmp/ccs-monitor/pass.sh → 在跑的巡检脚本），首写无害、之后的 Edit 是真盲改。
+            ponytail: btime 取不到时按"新建"放过（本机 stat %W 可用，None 只会出现在
+            文件已删或 FS 不支持）；升级路径=草稿目录白名单配置。
+            """
+            if not _key(fp).startswith(("/tmp/", "/var/tmp/")):
+                return False
+            bt = _birthtime(fp)
+            if bt is None:
+                return True
+            t = _ts_epoch(ts)
+            if t is None:
+                return True
+            return bt <= t + 120          # 诞生于该次写（或写前 2 分钟内）
 
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
@@ -1236,11 +1262,11 @@ class TrajectoryQualityChecker:
                 if (fp and own_written.get(
                         (c["src"], _key(fp)), c["order"]) < c["order"]):
                     continue
-                # 草稿/自有产物的 Write 不算盲改（见 _is_scratch）；Edit 照判。
-                # 加"别的 transcript 也在写"的门曾被试过并回退：本角色自己的多个会话
-                # 重写同一份报告是常态（maintainer 3 份报告即刻变 6 条红灯），
-                # 而真正要防的跨角色共享 /tmp 路径实测为 0/353。
-                if _is_scratch(fp) and name == "Write":
+                # 自有产物的 Write 不算盲改；/tmp 只认"这次写才诞生"的草稿；Edit 照判。
+                # "别的 transcript 也在写"的门曾被试过并回退：本角色自己的多个会话
+                # 重写同一份报告是常态（maintainer 3 份报告即刻变 6 条红灯）。
+                if name == "Write" and (_is_own_ws(fp)
+                                        or _is_fresh_scratch(fp, c.get("ts") or "")):
                     _exempt += 1
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:

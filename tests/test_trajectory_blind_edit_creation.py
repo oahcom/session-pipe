@@ -31,17 +31,17 @@ def _turn(n: int, role: str, content: list, ts: str | None = None) -> str:
     return json.dumps(row)
 
 
-def _write_seq(n: int, cid: str, path: str, result: str) -> list:
-    """一次 Write 及其结果；result 决定它是否被认作"新建"。"""
+def _write_seq(n: int, cid: str, path: str, result: str, ts: str | None = None) -> list:
+    """一次 Write 及其结果；result 决定它是否被认作"新建"，ts 用于时间窗用例。"""
     return [
         _turn(n, "assistant", [
             {"type": "tool_use", "id": cid, "name": "Write",
              "input": {"file_path": path, "content": "x=1"}},
-        ]),
+        ], ts=ts),
         _turn(n + 1, "user", [
             {"type": "tool_result", "tool_use_id": cid, "is_error": False,
              "content": result},
-        ]),
+        ], ts=ts),
     ]
 
 
@@ -689,6 +689,55 @@ def test_fresh_record_still_judged() -> None:
             pass
 
 
+def test_scratch_created_now_is_exempt() -> None:
+    """这次写才诞生的 /tmp 草稿豁免（诞生时间 ≈ 写时间）。"""
+    now = datetime.now(timezone.utc).isoformat()
+    path = f"/tmp/probe_born_{os.getpid()}.sh"
+    Path(path).write_text("# scratch\n", encoding="utf-8")
+    sess = _TRANSCRIPTS_DIR / "-probe-born-role"
+    lines = _write_seq(0, "cb1", path,
+                       f"The file {path} has been updated successfully.", ts=now)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("born", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"刚诞生的草稿不该判盲改: {blind}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_scratch_overwrite_preexisting_is_flagged() -> None:
+    """覆盖**预存**的 /tmp 文件要判盲改：诞生时间远早于写时间。
+
+    codex 第二轮复核留下的 P1：只按目录放过会漏掉被覆盖的在跑脚本（/tmp/al.sh 之类）。
+    这里用"记录的写时间比文件诞生晚 1 小时"造出同一情形。
+    """
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    path = f"/tmp/probe_preexist_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    sess = _TRANSCRIPTS_DIR / "-probe-preexist-role"
+    lines = _write_seq(0, "cp1", path,
+                       f"The file {path} has been updated successfully.", ts=old)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("preexist", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert len(blind) == 1, f"覆盖预存 /tmp 文件必须判盲改: {res['findings']}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -708,6 +757,8 @@ if __name__ == "__main__":
         test_second_write_of_own_file_not_flagged,
         test_scratch_write_not_flagged,
         test_scratch_edit_still_flagged,
+        test_scratch_created_now_is_exempt,
+        test_scratch_overwrite_preexisting_is_flagged,
         test_own_workspace_write_not_flagged,
         test_underscore_role_workspace_exempt,
         test_stale_record_not_judged,
