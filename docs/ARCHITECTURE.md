@@ -123,6 +123,16 @@ These bypasses lose RLock protection and approval workflow.
 
 `route_to_ccs()` calls `ccs.py send` via subprocess. There is no documented API contract or version check between pipeline → launcher. If launcher changes CLI flags, pipeline silently fails.
 
+### 已知缺陷：claim 早于投递（2026-10-22 取证，bus #442309）
+
+`route_all` 对系统类（`architecture`/`code_review`/`code_fix`/`notice`/`blocker` 等 `_SYSTEM_CATEGORIES`）只写 per-role `consume` 记录、不投递；
+而这条 consume 正是 `route_to_ccs` 的可见性判据（`poll_unconsumed`）→ 消息永久不进 pane。实测 #440553 写入后 **4 秒**被 claim，
+devops 的 4 条派单就此消失；另一条（`@devops` + `code_review`）死在 @tag 与分类订阅求交。系统类也不 mint workflow，
+而唯一会 `ccs start` 死 pane 的是 workflow 引擎 → pane 死后没有人拉起（devops 10.5 小时无 pane）。
+
+兜底全盲：`_alert_aged_queue` 只捞「未 consume 且 >24h」；`route_to_ccs` 的 skipped 只进 `details`、journal 无痕；`STALE_AFTER_S=6h` 到点静默 claim。
+修法方向（未实施）：consume 前移到投递成功处 + 未运行角色落一条 warning + 过期 claim 进告警。
+
 ### Delivery prechecks
 
 `role_lifecycle._send_to_role` checks CLI busy (`liveness.pane_cli_busy`: bottom-bar `esc to interrupt` / `retrying`) before `ccs send`; busy returns `"busy"` for the next tick instead of starting a 30s child process that blocks the whole tick. Skipped on force=True (timeout re-push, dual-node, integrity reminder) or when wf_id is empty; a failed probe sends anyway. Only the bottom 6 lines are scanned, so marker words inside a role's own output do not pin it busy.
