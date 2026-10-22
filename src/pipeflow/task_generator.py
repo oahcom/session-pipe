@@ -103,8 +103,8 @@ _HARD_APPROVE = re.compile(
     r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
 # 转述他人的通过（「上游 s3 APPROVED」）不是本步结论：左邻这些词时不算。
 _APPROVE_ATTRIB = re.compile(
-    r"(上游|下游|前一步|前步|上一步|上次|此前|参照|参考|其他步骤|兄弟步骤|"
-    r"子链|子流程|子步骤|如同)[^。\n]{0,12}$")
+    r"(上游|下游|前序|前置|父步|前一步|前步|上一步|上次|此前|参照|参考|"
+    r"其他步骤|兄弟步骤|子链|子流程|子步骤|如同)[^。\n]{0,24}$")
 
 
 def _any_hard_approve(text: str) -> bool:
@@ -143,7 +143,7 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
     if not isinstance(_sub_msgs, list) or not isinstance(_par_msgs, list):
         return False
     _sub_ts = [m.get("ts") for m in _sub_msgs
-               if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))]
+               if isinstance(m, dict) and type(m.get("ts")) in (int, float)]
     if not _sub_ts:
         return False
     # 截止点取**驳回消息**的时刻，而不是子链全部消息的最大 ts：子链
@@ -152,7 +152,7 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
     # 这类无锚点措辞返回 True（词表信号），会把真驳回漏出截止点集合。
     _rej_ts = [m["ts"] for m in _sub_msgs
                if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))
-               and not isinstance(m.get("ts"), bool)
+               and type(m.get("ts")) in (int, float)
                and _review_gate.is_rejected(str(m.get("text", "")))]
     _cutoff = max(_rej_ts) if _rej_ts else max(_sub_ts)
     # 取「更晚的消息里**时间最晚的那条有结论的消息**」再判：只要存在一条更晚的
@@ -166,7 +166,7 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
         if not isinstance(_m, dict):
             continue
         _ts = _m.get("ts")
-        if not isinstance(_ts, (int, float)) or _ts <= _cutoff:
+        if type(_ts) not in (int, float) or _ts <= _cutoff:
             continue
         _txt = str(_m.get("text", ""))
         # verdict() 是词表信号，不是结论检测器：「构建通过」「产出已就绪」

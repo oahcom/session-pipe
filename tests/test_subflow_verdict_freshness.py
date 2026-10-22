@@ -177,5 +177,24 @@ def test_mixed_approve_and_reject_in_one_message_blocks():
         _sub("CHANGES_REQUESTED"))
 
 
+def test_earlier_approved_plus_later_mixed_message_blocks():
+    """P0 锁定：更早的 APPROVED + 更晚的混合消息 → 必须仍拦。
+
+    只放一条混合消息时旧实现也返回 False（它的 verdict 就是 False），
+    真正能抓 P0 的是"更早有一条 APPROVED"——跳过最新那条会回落到它。
+    """
+    assert not _superseded_by_parent(
+        _parent((APPROVED, SUB_TS + 100),
+                ("s4-complete —— APPROVED 但 CHANGES_REQUESTED: 2 P1", SUB_TS + 200)),
+        _sub("CHANGES_REQUESTED"))
+
+
+def test_long_attribution_phrase_not_counted_as_approval():
+    """转述排除不能被长距离绕过：「上游 s1 的最终验收结论为 APPROVED」不算本步通过。"""
+    assert not _superseded_by_parent(
+        _parent(("上游 s1 的最终验收结论为 APPROVED", SUB_TS + 100)),
+        _sub("CHANGES_REQUESTED"))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
