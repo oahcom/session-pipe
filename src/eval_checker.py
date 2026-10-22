@@ -1085,7 +1085,10 @@ class TrajectoryQualityChecker:
             t = _ts_epoch(ts)
             if t is None:
                 return True
-            return bt <= t + 120          # 诞生于该次写（或写前 2 分钟内）
+            # 方向必须是"文件的诞生年龄 <= 120s"，不是"bt 早于写时间+120s"：
+            # 后者对任何预存文件都恒真，等价于退回"按目录放过"（第三轮复核实测
+            # /tmp/al.sh 被覆盖仍放过，根因就是这个反向比较）。
+            return t - bt <= 120
 
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。

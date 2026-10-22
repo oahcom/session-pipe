@@ -9,6 +9,7 @@
 """
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -712,24 +713,41 @@ def test_scratch_created_now_is_exempt() -> None:
 
 
 def test_scratch_overwrite_preexisting_is_flagged() -> None:
-    """覆盖**预存**的 /tmp 文件要判盲改：诞生时间远早于写时间。
+    """覆盖**预存**的 /tmp 文件要判盲改：诞生年龄 > 120s。
 
-    codex 第二轮复核留下的 P1：只按目录放过会漏掉被覆盖的在跑脚本（/tmp/al.sh 之类）。
-    这里用"记录的写时间比文件诞生晚 1 小时"造出同一情形。
+    codex 第二轮复核的 P1：只按目录放过会漏掉被覆盖的在跑脚本（真机 /tmp/al.sh，
+    诞生早于写时间 5h54m，实测被放过）。birthtime 无法回拨，故用打桩把 stat 的
+    诞生时间置为 1 小时前，其余全走真实路径（真文件、真 transcript、真判定）。
+    上一版用例把"写时间"回拨 1 小时、文件却是现在建的 —— 那是物理不可能的情形，
+    改了方向比较之后它才暴露出来（第三轮复核指出）。
     """
-    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    now = datetime.now(timezone.utc)
     path = f"/tmp/probe_preexist_{os.getpid()}.sh"
     Path(path).write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    born = str((now - timedelta(hours=1)).timestamp())
+    real_run = subprocess.run
+
+    class _R:
+        stdout = born
+
+    def _fake(cmd, *a, **k):
+        if isinstance(cmd, list) and cmd[-1] == path:
+            return _R()
+        return real_run(cmd, *a, **k)
+
     sess = _TRANSCRIPTS_DIR / "-probe-preexist-role"
     lines = _write_seq(0, "cp1", path,
-                       f"The file {path} has been updated successfully.", ts=old)
+                       f"The file {path} has been updated successfully.",
+                       ts=now.isoformat())
     jf = _make(sess, lines)
+    subprocess.run = _fake
     try:
         res = TrajectoryQualityChecker().check("preexist", "t")
         blind = [f for f in res["findings"]
                  if f["issue"] == "blind_edit" and f.get("file") == path]
         assert len(blind) == 1, f"覆盖预存 /tmp 文件必须判盲改: {res['findings']}"
     finally:
+        subprocess.run = real_run
         Path(path).unlink(missing_ok=True)
         jf.unlink(missing_ok=True)
         try:
