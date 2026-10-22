@@ -10,10 +10,10 @@ Session 生态的**路由层**——自动感知 bus 新消息，按优先级分
 hermes-session-roles (定义层)
   ├──→ session-launcher (执行层)
   └──→ session-pipeline (路由+执行层 ← 本项目)
-         └──→ launcher/ccs.py send  ← 唯一跨项目调用（subprocess）
+         └──→ launcher/ccs.py {send,start,stop,status-role}  ← 跨项目调用只走 subprocess
 ```
 
-**注意：不是三层流水线。pipeline 通过 subprocess `ccs.py send` 与 launcher 通信。pipeline 的路由数据来自 roles_export.json，不直接读角色 JSON。**
+**注意：不是三层流水线。pipeline 只通过 subprocess 调 launcher 的四个子命令（现查 `grep -rn CCS_CLI src/`），不 import 它的 API。pipeline 的路由数据来自 roles_export.json，不直接读角色 JSON。**
 
 **铁律：不直接创建 CCS，不改 bus_protocol 核心逻辑。**
 
@@ -88,7 +88,7 @@ python3 src/ccs.py health
 
 ### 5. 每周自进化
 
-- 检查 unconsumed 消息积压（`PYTHONPATH=src python3 -m routing.auto --status`；直接跑 `src/routing/auto.py` 会 `ModuleNotFoundError: reliability`）
+- 检查 unconsumed 消息积压（`PYTHONPATH=src python3 -m routing.auto --daemon`；`--status` 没有派发分支、会落到分发轮真发消息；直接跑 `src/routing/auto.py` 会 `ModuleNotFoundError: reliability`）
 - 检查路由命中率：哪些角色从未被路由到？
 - 检查 TTL 清理是否正常运行
 - 检查熔断器触发次数
@@ -107,12 +107,13 @@ python3 src/ccs.py health
 ### 模板必填元数据
 ```bash
 # 每个 ~/.hermes/workflows/*.json 必须含 schema 的 8 个 required 字段（下面 5 个之外还有 name/description/steps）：
-workflow_id="WF-<name>"                     # 可选；缺省时 register 默认 WF-{name}
-trigger_scene=["编码实现", "bug修复"]   # 至少 1 条触发场景
+trigger_scene=["编码实现", "bug修复"]   # 非空字符串数组（只判非空，不判长度）
 allowed_initiators=["coordinator","pm"] # 至少 1 个允许发起角色
-allowed_executors=["engineer"]          # 至少 1 个允许执行角色
-max_duration_hours=24                   # 正整数
-quality_standards="通过 code review..." # ≥8 字符质量标准
+allowed_executors=["engineer"]          # 至少 1 个允许执行角色（不校验是否覆盖 target_role）
+max_duration_hours=24                   # ≥1 的数字
+quality_standards="通过 code review..." # ≥4 字符（schema 写 8，执行的是 4）
+# workflow_id 可选：缺省由 register 补 WF-<name>，只校验 ^(WF|WL)- 前缀
+# 实测 28 个模板里 4 个没有该字段、6 个与模板名不一致 —— 所以它不可能是"必填且与名一致"
 
 # 验证所有模板
 PYTHONPATH=src python3 -m template_registry validate-all

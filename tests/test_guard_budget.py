@@ -64,6 +64,13 @@ def test_ccs_start_timeout_clamped_by_deadline(monkeypatch):
     assert min(starts) <= 6, f"ccs start 超时未按预算夹逼: {starts}"
 
 
+def test_exhausted_budget_does_not_start_role(monkeypatch):
+    """预算已耗尽时不得拉起：拉起会先盖 300s 冷却戳，掐断后既不在缓存又踩冷却。"""
+    seen = _record(monkeypatch)
+    assert _Probe()._check_and_start_role("probe_dead", deadline=time.time() - 1) is False
+    assert not _starts(seen), f"预算耗尽仍真拉起: {seen}"
+
+
 def test_ccs_start_timeout_defaults_to_60_without_deadline(monkeypatch):
     seen = _record(monkeypatch)
     _Probe()._check_and_start_role("probe_budget2")

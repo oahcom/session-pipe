@@ -216,7 +216,9 @@ def test_guard_sweep_is_bounded_and_rotates(_sp):
     eng = _fast(WorkflowEngine(d))
     seen = []
 
-    def _slow(role, deadline=0.0):  # 巡检把预算透传给每个角色（engine.py:1836）
+    def _slow(role, deadline=0.0):  # 巡检把预算透传给每个角色（engine.py 的巡检循环）
+        # 断言透传真的发生：改回 _ensure_role_alive(_role) 时这条会红（缺 deadline）。
+        assert deadline > 0, "巡检未把 deadline 透传给 _ensure_role_alive"
         seen.append(role)
         # 单个角色的耗时必须**远大于**预算：原先 sleep 0.02 配 5ms 预算，在负载高的机器上
         # 连第一次进入循环前的那几毫秒判断都能超时 → seen 恒为 []（实测 PSI full 28% 时必红）。

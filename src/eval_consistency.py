@@ -10,7 +10,31 @@ import json
 import sys
 from pathlib import Path
 
-from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd, CRITERIA_WINDOW
+from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd
+
+
+def _window() -> int:
+    """运行期窗口大小（每轮只跑前 N 条判据）。
+
+    延迟从 eval_checker 取而不是模块级导入：daemon 热重载只刷新 eval_checker，
+    共享模块缓存陈旧时模块级导入会 ImportError，预检与热重载一起静默退化
+    （实测 2026-10-22 09:56-10:27 每 10 分钟一条 WARNING）。
+    """
+    from eval_checker import CRITERIA_WINDOW
+    return CRITERIA_WINDOW
+
+
+def __getattr__(name):
+    """模块级 CRITERIA_WINDOW 按访问时刻取值（PEP 562）。
+
+    常量住在 eval_checker（daemon 热重载只刷它），但外部（含回归用例）要能读
+    eval_consistency.CRITERIA_WINDOW —— 模块级 import 会在清缓存窗口抛
+    ImportError，__getattr__ 把"属性存在"与"取值时机"解耦。
+    """
+    if name == "CRITERIA_WINDOW":
+        from eval_checker import CRITERIA_WINDOW
+        return CRITERIA_WINDOW
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _DEFAULT_PERSONAS = (Path.home() / "hermes-session-roles"
                      / "personas" / "session-roles")
@@ -19,7 +43,7 @@ _DEFAULT_PERSONAS = (Path.home() / "hermes-session-roles"
 def _load_role_criteria(personas_dir: Path) -> list[dict]:
     """加载所有 persona 的 eval_criteria，返回 [{name, criteria, issues}]。
 
-    只统计运行时真正会跑的前 CRITERIA_WINDOW 条：窗口外的判据永远不执行，
+    只统计运行时真正会跑的前 _window() 条：窗口外的判据永远不执行，
     把它们算进 exec_count 就是假绿（knowledge_curator 5 条判据里唯一可执行的
     在第 4 条，旧口径判它非盲区、实际零判据执行）。
     """
@@ -28,7 +52,7 @@ def _load_role_criteria(personas_dir: Path) -> list[dict]:
     for r in roles:
         role_issues = []
         role_no_cmd = []
-        window = r["eval_criteria"][:CRITERIA_WINDOW]
+        window = r["eval_criteria"][:_window()]
         for c in window:
             cmd = _extract_cmd(c)
             if cmd is None:
@@ -43,7 +67,7 @@ def _load_role_criteria(personas_dir: Path) -> list[dict]:
             if issues:
                 role_issues.append({"criterion": c[:120], "issues": issues})
         results.append({"name": r["name"], "criteria_count": len(r["eval_criteria"]),
-                        "window": CRITERIA_WINDOW,
+                        "window": _window(),
                         "exec_count": len(window) - len(role_no_cmd) - len(role_issues),
                         "no_cmd": role_no_cmd, "incompatible": role_issues})
     return results

@@ -230,3 +230,24 @@ def test_systemctl_flags_before_subcommand_are_readonly():
     assert ec._cmd_is_readonly("systemctl", "systemctl is-active x")
     assert not ec._cmd_is_readonly("systemctl", "systemctl --user restart x"), "写操作仍须拒绝"
     assert not ec._cmd_is_readonly("systemctl", "systemctl --now disable x")
+
+def test_word_boundary_not_substring():
+    """判据按词边界比对：'active' 不得被 'inactive' 点亮。"""
+    assert ec._has_word("inactive", ["active"]) is False
+    assert ec._has_word("active", ["active"]) is True
+    assert ec._has_word("服务已 not-approved", ["approved"]) is False
+
+
+def test_all_lines_must_satisfy_when_quanbu():
+    """带「全部返回」的判据：任一行不满足即 FAIL（旧写法 any() + 子串恒真）。"""
+    cmd = "for s in a b; do systemctl --user is-active $s; done"
+    ok = {"stdout": "active\nactive\n", "stderr": "", "returncode": 0, "ok": True}
+    bad = {"stdout": "active\ninactive\n", "stderr": "", "returncode": 0, "ok": True}
+    assert ec._check_passed(ok, cmd + " 全部返回 active", "active")[0] is True
+    assert ec._check_passed(bad, cmd + " 全部返回 active", "active")[0] is False
+
+
+def test_cjk_expected_uses_substring():
+    """CJK 没有词边界：'检查通过' 应命中 '通过'；否定语义要写成负向 expected。"""
+    assert ec._has_word("检查通过", ["通过"]) is True
+    assert ec._has_word("inactive", ["active"]) is False

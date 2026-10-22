@@ -8,17 +8,7 @@
 
 ## 架构定位
 
-```
-session-roles（定义层） ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-         │                                          │
-         ├──→ session-launcher（执行层）              ├──→ 各自独立消费角色定义
-         └──→ session-pipeline（路由+执行） ─ ─ ─ ─ ┘
-                  │
-         pipeline → launcher 的唯一调用:
-         subprocess ccs.py send
-```
-
-pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 通信。
+架构见 [AGENTS.md](AGENTS.md) §整体架构。pipeline **不 import** launcher 的 API，只通过 `subprocess` 调 `ccs.py` 的 send/start/stop/status-role。
 
 > **唯一真实优化标的**：角色对话质量、思考质量、动作质量，不是管道吞吐量。路由/工作流/守护进程都在转 ≠ 系统在工作——近 3 小时零条真实角色产出就是"转而不活"。本项目的所有指标（路由数、running 工作流数、存活角色数）只证明"管道通"，**不可作为角色在高质量产出的证据**。
 
@@ -36,7 +26,8 @@ pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 
 
 ### 验证命令
 ```bash
-# 测试路由规则（10 个 pytest 用例；直接 python 跑只会执行 __main__ 自测块，收集不到它们）
+# 测试路由规则（用例数现算：python3 -m pytest tests/test_router.py --collect-only -q | tail -1；
+# 直接 python 跑只会执行 __main__ 自测块，收集不到它们）
 python3 -m pytest tests/test_router.py -q
 
 # 列出路由表（router CLI）
@@ -52,9 +43,9 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 - ❌ 重启 gateway（SIGKILL 中断长连接）
 - ❌ 用流程指标代理质量判断：路由数、workflow running 数、存活角色数、bus stats 条数只能证明"管道通"，**不可证明角色在高质量产出**。声称优化完成前，必须亲自打开一个角色的对话逐轮读、亲手判断思考与动作质量。禁止用质量分/看板/automated checker 替代"人读对话做判断"——那会让开发者去刷指标而非去想内容。
 - ❌ 把"消息送达"等同于"任务完成"：角色收到 prompt 且回了话，不等于它想对了、做对了；step 盖戳 success 必须基于产出内容成立，不能只看投递成功。
-- ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` "running 且 sr 空>1h" 静默误杀（bus #728c6e4307c1 根因）。
+- ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` 的条件4（running、`timeout_count≥1` 或 `queued` 达降级线、且 pane 与转录**双静默**）静默误杀——光"sr 空"不足以判死（bus #728c6e4307c1 根因）。
 
-## 代码布局（行数 2026-08-23 实测 `wc -l`）
+## 代码布局（行数由 scripts/doccheck.py 校验；新增模块必须手工补进本树——它不校验模块覆盖）
 ```
 src/
   routing/
@@ -69,24 +60,26 @@ src/
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（2056 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1704 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1293 行）
-    task_generator.py ── 任务生成（982 行）
-    wf_lifecycle.py   ── 工作流生命周期（2173 行）
+    engine.py         ── 编排 + CLI（2103 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（1695 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1298 行）
+    task_generator.py ── 任务生成（1016 行）
+    wf_lifecycle.py   ── 工作流生命周期（2195 行）
     daemon.py         ── 工作流守护 while 循环（481 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1146 行）
+    manager.py        ── 工作流状态机（1150 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（495 行）
+    client.py         ── CCS 角色工作流客户端（487 行）
     gateway.py        ── 工作流网关门禁（188 行）
-    workflow/db.py    ── 工作流数据访问（105 行）
+    db.py             ── 工作流数据访问（105 行）
     sync.py           ── 工作流同步（63 行）
 
-  p0_exemption.py     ── P0 豁免通道（coordinator/lr/pm）
+  review_gate.py      ── 驳回/通过词的唯一真相源（REJECT_KEYWORDS / verdict / is_rejected）
+  eval_shared_loader.py ── eval 共用加载器
+  p0_exemption.py     ── P0 豁免通道（正式 P0 仅 coordinator/lr；角色只能标 P0_draft）
   config_loader.py    ── 配置加载（YAML + env override；无热重载，改完重启）
   eval_checker.py     ── 安全白名单命令执行检查
   eval_consistency.py ── 评估一致性
@@ -104,11 +97,10 @@ src/
 
 注：step 终态含 `delivery_blocked`（投递达上限暂停，engine.py close_wf 收敛行级 status）。
 ```
-```
 
 ### P0 豁免快速操作
 ```bash
-# 创建 P0 任务（仅 coordinator/lr/pm；p0_reason ≥15 中文字符）
+# 创建 P0 任务（ALLOWED_P0_ROLES = coordinator/lr；p0_reason ≥15 中文字符）
 PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; e=P0Exemption(role='coordinator'); e.create_p0_task(title='紧急修复', description='修复说明', assignee='engineer', initiator_role='coordinator', p0_reason='紧急故障需要立即修复处理')"
 
 # 审计扫描
@@ -167,7 +159,7 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 - **改了本逻辑需重启 `workflow-engine.service`**（`systemctl --user restart workflow-engine.service`，它跑 `src/pipeflow/daemon.py`，`_check_context_overflow` 在这条链上）；`session-pipeline-daemon.service` 跑的是 `routing_daemon.py`，与这段逻辑无关。系统单元 `session-pipeline.service` 存在但 inactive。
 
 ## SQLite 运维
-生产 DB 位于 `~/.hermes/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
+生产 DB 位于 `~/.hermes/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（历史实测 45 行 / 610MB、99.6% free 页；现状用下方命令现取）。
 
 - **监测阈值**：`freelist_count / page_count > 0.5` 或单一 DB > 50MB 视为膨胀。
 - **恢复**：`VACUUM;`（会新建事务写整个 DB，期间 daemon 应停。VACUUM 前 `cp` 备份）。
@@ -184,7 +176,7 @@ EOF
 ## 测试
 ```bash
 cd ~/session-pipeline && python3 -m pytest tests/ -x -q
-python3 -m py_compile src/**/*.py
+python3 -m py_compile $(git ls-files 'src/*.py')   # ** 无 globstar 时只匹配 src/*/*.py，漏掉 src/ 顶层模块
 ```
 
 ### 手工验证必须走隔离（防止污染生产）

@@ -73,6 +73,18 @@ def test_review_verdict_three_states():
     assert review_gate.is_rejected("已完成") is False
 
 
+def test_evidence_replay_must_not_count_as_this_step_verdict():
+    """evidence 里的"返工来源 CHANGES_REQUESTED"不是本步结论（实测 12/873 步被误判）。
+
+    wf_lifecycle 的结论只拼 text、分类才拼 text+evidence，两条判据喂不同输入。
+    这条钉住"拼进去就会翻成 rejected"——哪次合并图省事合成一份输入，它会红。
+    """
+    text = "已按 PRD 拆 6 个故事，明细见 bus #440123"
+    evidence = "返工来源 CHANGES_REQUESTED — 上一轮 P1 两条"
+    assert review_gate.review_verdict(text) == "unknown"
+    assert review_gate.review_verdict(text + " " + evidence) == "rejected"
+
+
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
     returncode=0, stdout="claude\n", stderr=b""))
 def test_unknown_verdict_blocks_review_step_and_notifies_once(mock_run):

@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 
 DEFAULT_DB = Path.home() / ".hermes" / "sister_bus" / "blackboard.db"
-DB_PATH = Path(os.environ.get("HERMES_BLACKBOARD_DB", str(DEFAULT_DB)))
+# 这条测的是**生产** bus 的连续性。跟着 HERMES_BLACKBOARD_DB 走只会读到 conftest
+# 重定向的临时库 —— 于是「过去 24h 无产出即数据源断了」的断言由测试自己写的数据
+# 满足，另一批则因「窗口不满 24h」被永久 skip（实测 db missing: /tmp/pipeline-test-state-*）。
+DB_PATH = Path(os.environ.get("HERMES_BLACKBOARD_DB_PROD", str(DEFAULT_DB)))
 
 # daemon/cron 脉冲类, 排除 —— 仅统计真实角色推理产出
 PULSE_CATS = {

@@ -34,8 +34,8 @@
 
 | 字段 | 非法形态 | 处理 |
 |------|---------|------|
-| `guard.watch` | 非 list 或含非 str | 丢弃整个 `guard`（`engine.py:499-503`） |
-| `wait_roles` | 非 list 或含非 str | 置 None = 无门控（`engine.py:504-511`） |
+| `guard.watch` | 非 list 或含非 str | 丢弃整个 `guard`（`engine.py` 里 `_clean["guard"] = None` 那段统一结构校验，按符号 grep） |
+| `wait_roles` | 非 list 或含非 str | 置 None = 无门控（同段紧随其后） |
 
 非法值若放过，消费点会逐字符遍历去拉起不存在的角色。
 
@@ -60,7 +60,7 @@
 
 ## 6. 测试
 
-- `tests/test_collab_modes.py` + `tests/test_collab_regression.py`：合计 26 个测试（`pytest --collect-only` 实测）。
+- `tests/test_collab_modes.py` + `tests/test_collab_regression.py`：条数现取（`pytest --collect-only -q`），不抄绝对值。
 - 覆盖：guard 收集、wait_roles 门控（全过/缺角色/空 bus/无门）、非法类型、dual_node+wait_roles、角色收集、窗口溢出补查。
 
 ```bash

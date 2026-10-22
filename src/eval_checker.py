@@ -456,18 +456,12 @@ def _has_word(text: str, words) -> bool:
 
     WHY 不用 `in`：`"active" in "inactive"` 为真 —— 维护者的「全部返回 active」
     判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界只认 ASCII 字母数字
-    和 `-_`：`5xx-error` 不会被 `error` 拆词误伤；CJK 没有词边界，"检查通过"
-    按子串命中 "通过"，但紧跟中文否定前缀（不/未/没/无/非）的命中不算。
-    多字否定（"没有通过"）覆盖不到，这种判据要写负向 expected 或改命令。
+    和 `-_`：`5xx-error` 不会被 `error` 拆词误伤。CJK 没有词边界，按子串命中
+    （"检查通过" 命中 "通过"）；否定语义要写成负向 expected（expected="不通过"），
+    不要用正向词去判可能带否定的中文 —— "不/未/没能/无法顺利" 是开放集合。
     """
-    for w in words:
-        if not w:
-            continue
-        for m in re.finditer(rf"(?<![A-Za-z0-9_-]){re.escape(w)}(?![A-Za-z0-9_-])", text):
-            if m.start() and text[m.start() - 1] in "不未没无非":
-                continue
-            return True
-    return False
+    return any(w and re.search(rf"(?<![A-Za-z0-9_-]){re.escape(w)}(?![A-Za-z0-9_-])", text)
+               for w in words)
 
 
 def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, str):
@@ -559,7 +553,7 @@ def _write_bus(cat: str, text: str, *, evidence: str = "", src: str = "eval_chec
         subprocess.run(
             [sys.executable, str(BUS_SCRIPT), "write", cat, text,
              "--evidence", evidence[:500], "--src", src],
-            # 15s 也踩过线：实测 bus 事务持锁 5~9.8s，11:05 有一次写入超时。
+            # 15s 贴着实测持锁峰值（5~9.8s）不够留量：40 分钟内 4 次写超时。
             capture_output=True, timeout=30,
         )
     except Exception as e:
@@ -571,7 +565,13 @@ def _is_critical(criterion: str) -> bool:
     return bool(re.search(r'severity[:\s=]*critical', criterion, re.IGNORECASE))
 
 
-from eval_shared_loader import _load_roles, CRITERIA_WINDOW
+from eval_shared_loader import _load_roles
+
+# 运行期每轮只跑每条角色的前 N 条判据。常量放这里而不是 eval_shared_loader：
+# daemon 热重载只重载 eval_checker，共享模块缓存陈旧时
+# `from eval_shared_loader import CRITERIA_WINDOW` 会 ImportError（实测 2026-10-22 09:56
+# 起每 10 分钟一条 WARNING，预检与热重载同时静默退化）。
+CRITERIA_WINDOW = 3
 
 
 # 注：此处原有第二个 `run_eval_check` 定义（504-519，含完整 docstring），被 :1031 的

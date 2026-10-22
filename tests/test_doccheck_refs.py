@@ -116,6 +116,29 @@ def test_absolute_path_inside_a_repo_is_checked(tmp_path):
     assert dc._cite_check(f"见 {root}/src/mod.py:99", root, Path("X.md")) == 1
 
 
+def test_cli_subcommand_must_be_declared(tmp_path, capsys):
+    """文档里的 `python3 x.py 子命令` 必须是 add_parser 的真实字面量（R157）。
+
+    反向用例：README 曾写 `ccs.py socket start`，而真子命令里没有 socket —— 那类错
+    读者会照着敲，静态判据能零误报地抓住它。
+    """
+    body = ("import argparse\np = argparse.ArgumentParser()\n"
+            "s = p.add_subparsers()\ns.add_parser('status')\ns.add_parser('new', aliases=['create'])\n")
+    root = _repo(tmp_path, body)
+    assert dc._cli_check("```sh\npython3 src/mod.py status\n```", root, Path("X.md")) == 0
+    assert dc._cli_check("```sh\npython3 src/mod.py create\n```", root, Path("X.md")) == 0
+    assert dc._cli_check("```sh\npython3 src/mod.py socket start\n```", root, Path("X.md")) == 1
+    assert "CLI_BAD_SUBCOMMAND" in capsys.readouterr().out
+
+
+def test_cli_check_stays_silent_when_parser_is_not_static(tmp_path):
+    """判不了就闭嘴：没有 add_parser（手写 argv 分发）、父解析器另有位置参数、路径解析不到。"""
+    root = _repo(tmp_path)
+    assert dc._cli_check("python3 src/mod.py anything", root, Path("X.md")) == 0
+    assert dc._cli_check("python3 nowhere.py socket", root, Path("X.md")) == 0
+    assert dc._cli_check("python3 src/mod.py socket", root, Path("ISSUES.md")) == 0
+
+
 def test_path_escaping_the_repo_is_not_resolved(tmp_path, capsys):
     """`../outside/x.py:1` 逃出仓库目录 → 不算命中，按缺失处理（第十二轮审查）。"""
     root = _repo(tmp_path)

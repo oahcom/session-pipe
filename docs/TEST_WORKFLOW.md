@@ -16,6 +16,26 @@ cd /home/administrator/session-pipeline && python3 -m pytest tests/test_engine_e
 
 `tests/conftest.py` 已把 `src/` 加入 `sys.path`，无需 `PYTHONPATH`；直接跑 `python3 src/...` 才需要。
 
+## 隔离契约（conftest 自动桩）
+
+默认桩掉 4 个会**对外界产生副作用**的入口，否则套件跑不完也跑不干净：
+
+| 夹具 | 桩掉 | 不桩会怎样 |
+|------|------|------------|
+| `_no_guard_role_start` | `WorkflowEngine._ensure_guard_roles` → `set()` | tick 里对不存在的 `test_role` 真跑 `ccs start`（60s+），全量卡在第 29 例 |
+| `_fast_role_ready` | `_wait_for_role_ready` → `True` | 每次派单等 90s（`ccs start` + 10×1s） |
+| `_no_live_role_restart` | `_ensure_role_alive` → `True` | kill-session + 30×1s 重启循环，撞穿用例自带 `signal.alarm` |
+| `_no_live_approval_notify` | `LifecycleManager._notify_result` → `None` | 测试夹具 id 被真 `ccs send` 投进活体角色上下文 |
+
+要测的**就是**这一步时，把模块名加进对应 allowlist（`_REAL_GUARD_MODULES` / `_REAL_READY_MODULES` /
+`_REAL_ENSURE_ALIVE_MODULES`）—— 类级桩撤不掉，只能整模块豁免；instance 级 `del` 对 class 桩无效。
+自定义 patch 必须 `try/finally` 恢复：泄漏的全局 `subprocess.run` 桩会让 `eval_checker` 的
+`stat -c %W` 拿到空串而 fail-open，症状是**其它文件**的用例转红。
+
+带 `signal.alarm(N)` 的用例由 conftest 的 handler 转成一条红用例；没有 handler 时默认动作是杀进程
+（`EXIT=142`、无 summary）。套件疑似卡死时用
+`pytest tests/ -q --timeout=25 --timeout-method=thread` 抓栈，别靠猜。
+
 ## 实测基线（2026-10-22 05:40）
 
 | 命令 | 结果 |

@@ -59,12 +59,6 @@ class _FakeStep:
 
 def _step(exit_condition: dict) -> _FakeStep:
     return _FakeStep(exit_condition)
-    step.max_retries = 1
-    step.id = "s1"
-    step.target_role = "scout"
-    step.dual_node = False
-    step.wait_roles = None
-    return step
 
 
 class _FakeRun:
@@ -103,8 +97,8 @@ def test_tmux_step_completed_blocks_when_bus_contract_without_schema():
             "声明 bus 契约且无 exit_schema 时 tmux 信号不得推进"
 
 
-def test_tmux_step_completed_triggers_exit_without_contract():
-    """无 bus 契约的步骤 → tmux 信号仍可推进（否则只能等超时）。"""
+def test_tmux_step_completed_never_advances_without_contract():
+    """无 bus 契约的步骤也不由 pane 信号推进（7 天 116 步零证据完成全是这条路）。"""
     eng = FakeEngine()
     step = _step({"timeout_minutes": 30})
     run = _run()
@@ -114,9 +108,8 @@ def test_tmux_step_completed_triggers_exit_without_contract():
                                                completion_evidence="s1 完成")) as mock_sig:
         eng._tick(run, step)
         mock_sig.assert_called_once()
-        assert eng._lifecycle.complete_step.call_count == 1, \
-            "无契约步骤的 tmux 完成信号应触发 complete_step"
-        assert eng._lifecycle.complete_step.call_args[0][:2] == ("wf_test", "s1")
+        assert eng._lifecycle.complete_step.call_count == 0, \
+            "pane 文本不是产出证据，任何情况下都不得 complete_step"
 
 
 def test_tmux_idle_triggers_reminder_not_cancel():
@@ -159,7 +152,7 @@ def test_tmux_idle_throttled_after_first():
 
 
 def test_tmux_idle_escalates_to_cancel_after_5():
-    """连续 5 次 idle 信号 → cancel_step（不再等待）。"""
+    """连续 5 次 idle **且角色确实没在产出** → cancel_step（不再等待）。"""
     eng = FakeEngine()
     step = _step({"bus_category": "workflow", "timeout_minutes": 30})
     run = _run()
@@ -167,11 +160,28 @@ def test_tmux_idle_escalates_to_cancel_after_5():
 
     with patch("pipeflow.step_handler.get_conversation_signal",
                return_value=ConversationSignal(idle_complaint=True,
-                                               idle_evidence="无任务待办")):
+                                               idle_evidence="无任务待办")), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
         eng._tick(run, step)
         assert eng._lifecycle.cancel_step.call_count == 1, \
             "第 5 次 idle 应升级 cancel_step"
         assert eng._lifecycle.cancel_step.call_args[0][:2] == ("wf_test", "s1")
+
+
+def test_tmux_idle_does_not_cancel_while_role_is_producing():
+    """活体门：pane 静默但转录在写 = 长思考，不许取消（实测丢了 35.6 分钟产出）。"""
+    eng = FakeEngine()
+    step = _step({"bus_category": "workflow", "timeout_minutes": 30})
+    run = _run()
+    run.step_results["s1"]["tmux_signals"] = {"idle_count": 9}
+
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=ConversationSignal(idle_complaint=True,
+                                               idle_evidence="无任务待办")), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=True):
+        eng._tick(run, step)
+        assert eng._lifecycle.cancel_step.call_count == 0, \
+            "角色在写转录时取消 = 把已写好的产出丢掉"
 
 
 def test_tmux_violation_escalates_to_cancel_after_5():

@@ -6,11 +6,7 @@
 
 Session 生态的**路由层**：自动感知 bus 新消息，按优先级分发给对应 CCS 消费；同时运行工作流引擎（pipeflow）。
 
-```
-roles (定义层 JSON) → launcher (执行层) → pipeline (路由层)
-                                              ↓
-                                         Sister Bus
-```
+架构图见 [AGENTS.md](../AGENTS.md) §整体架构（roles 是两个消费者，不是流水线的第一级）。
 
 ## 2. 代码布局（行数见 [CLAUDE.md](../CLAUDE.md)，由 `scripts/doccheck.py` 校验）
 
@@ -36,12 +32,16 @@ src/
 - 规范模板目录 `~/.hermes/workflows/*.json`：见 `template_registry list`（数量不写死）。
   `python3 -m pipeflow.engine list` 打印引擎实际加载的名字。
 - `WorkflowDef(name, title, description, steps, loop)`；`WorkflowRun(id, workflow_name, context, status, current_step, step_retries, step_results)`。
-- `Step` 关键字段：`type`(single/handoff/review/gate/notify)、`target_role`、`exit_condition`、`exit_schema`、`max_retries`、`verify`、`condition`、`rollback_to`、`subflow_template`、`guard`、`wait_roles`。
+- `Step` 关键字段：`type`(single/handoff/review/gate/notify)、`target_role`、`exit_condition`、`exit_schema`、`max_retries`、`verify`、`subflow_template`、`guard`、`wait_roles`。
+  模板里多写的键不会报错也不会生效（加载器按 `Step` 字段过滤）：`condition`/`rollback_to` 已于 2026-10-22 从模板删除；`approval_prompt` 仍留在 WL-09 与 product_delivery，无读者。
 
 ### 3.2 subflow（编排 → 子链）
 
-2026-10-22 扫描（复算：解析 `workflow_templates.steps_json` 统计 `subflow_template` 非空的模板——`like`/`grep` 会命中所有模板的空值键，会算多）：**10 个模板带子链**（当日实测名单，同名模板有 `WF-`/`WL-` 前后缀重复，按 id 去重后仍是这 10 条）：
-`WF-architect_review`、`WF-coordinator_schedule`、`WF-dev_implement`、`WF-product_delivery`、`WL-food_chain_loop`、`WL-full_dev_pipeline`、`architect_review`、`food_chain_loop`、`full_dev_pipeline`、`产品交付全流程`。
+2026-10-22 扫描（复算：解析 `workflow_templates.steps_json` 统计 `subflow_template` 非空的模板——
+`like`/`grep` 会命中所有模板的空值键，会算多）：**28 个模板里 6 个带子链**：
+`architect_review`、`coordinator_schedule`、`dev_implement`、`food_chain_loop`、
+`full_dev_pipeline`、`产品交付全流程`（DB `workflow_templates` 42 行，其中 10 行带子链）。
+DB 里仍有 `WF-*`/`WL-*` 重名副本（如 `WL-full_dev_pipeline`、`WF-architect_review`）；`WF-product_delivery` 只是"产品交付全流程"的 workflow_id。
 名单会随模板增删变，别把这份当一个不变量。
 
 ### 3.3 步骤状态机（`lifecycle/manager.py`）
@@ -114,7 +114,7 @@ src/
 ### 6.2 判据口径（改 `eval_checker.py` 前先读）
 
 - 轨迹判据只看近 24h（`_TRAJ_WINDOW_S`），按记录的 `timestamp` 过滤，不看 jsonl 文件 mtime；缺时间戳的记录按新鲜保留（不静默丢证据）。理由：一条历史 orphan 会让角色永久 FAIL，当轮改进翻不了绿。
-- 文本判据按 **ASCII 词边界**比对（`_has_word`）：`inactive` 不点亮 `active`、`5xx-error` 不被 `error` 拆词；CJK 无词边界，按子串但跳过 `不/未/没/无/非` 前缀（`检查通过` 命中、`不通过` 不命中；多字否定要写负向 expected）。「全部返回 X」要求 stdout 每一行都满足。
+- 文本判据按 **ASCII 词边界**比对（`_has_word`）：`inactive` 不点亮 `active`、`5xx-error` 不被 `error` 拆词；CJK 无词边界，按子串命中（`检查通过` 命中 `通过`）；否定语义写成负向 expected（`不通过`），不要用正向词去判可能带否定的中文（否定是开放集合）。「全部返回 X」要求 stdout 每一行都满足。
 - 盲改只豁免三类：本次写调用新建的文件（`created_by_call`）、角色自己 `ccs-workspaces/<role>` 下的 Write、同一 transcript 内先写后 Edit（`own_written`）。`/tmp` 草稿靠「本次新建」豁免，不按目录放过——覆盖预存脚本仍应报。
 - bus 写超时 30s：事务持锁实测 5~23s（11:57 为 19.1s、12:11 为 23.4s），15s 会周期性丢 blocker/notice。
 

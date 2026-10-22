@@ -718,3 +718,32 @@ if __name__ == "__main__":
     signal.alarm(0)
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_subflow_owned_step_not_vetoed_by_stale_text(mock_run):
+    """子链已接管的步骤，父步里冻结的驳回原文不再能否决推进。
+
+    实测 wf_1ecc8/s3：子链已接管该步，父步 exit_messages 却留着兄弟实例
+    wf_0c5e3d807ede 的「产品交付全流程/s3-complete … CHANGES_REQUESTED」，
+    task_generator 每 tick 写 completed、门禁每 tick 判 rejected，互抵 13h 217 次。
+    反向（Anti-ISC）：没有 subflow_id 的步骤同一段原文仍须拦死 —— 见
+    test_gate_rejection_blocks_advance。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _make_env()
+    _write_wf(d, "ownf", [_step("s1", type="review"), _step("s2")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("ownf", {})
+    lm = eng._lifecycle
+    lm.execute("UPDATE workflow_instances SET status='step_done_ready' "
+               "WHERE instance_id=?", (rid,))
+    # 生产形态：子链已接管（subflow_id）+ 父步冻结着别实例的驳回原文
+    results = {"s1": {"status": "step_done_ready", "subflow_id": "wf_sub_deadbeef",
+                      "exit_messages": [
+        {"id": 1, "text": "产品交付全流程/s1-complete wf_foreign777 — CHANGES_REQUESTED 2 P1",
+         "evidence": "结论: CHANGES_REQUESTED 0 P0 / 2 P1"}]}}
+    eng._advance_production_wf(rid, lm, "ownf", "s1", results)
+    s = eng.status(rid)
+    assert s["current_step"] == "s2", f"替别实例报工的文案否决了本步: {s}"
+    _cleanup(d)

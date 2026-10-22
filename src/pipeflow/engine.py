@@ -208,6 +208,47 @@ def _derive_rework_ids(lm, wf_id: str, step_id: str) -> list:
         return []
 
 
+def _fail_parent_step(lm, bb, child_id: str, reason: str) -> str:
+    """子链非正常终止（排队超时 / 行被删）→ 父步立即失败 + blocker。
+
+    子链死在半路时没有终态可回写给父步，父步只能空等到自己的超时：R138 现场
+    3 条父链各等 60 分钟以上，1 小时 blocker 0 条（对外零信号）。
+    只 cancel 子链不同时判父步也不行——父步会重建一条新子链排同一个队，
+    堆积只增不减（需求.md「修法优先级」1）。返回父链 id，无父链时空串。
+    """
+    try:
+        _row = lm.query_one(
+            "SELECT parent_wf_id, subflow_source_step_id FROM workflow_instances "
+            "WHERE instance_id=?", (child_id,))
+        _parent = (_row["parent_wf_id"] or "") if _row else ""
+        _psid = (_row["subflow_source_step_id"] or "") if _row else ""
+        if not _parent or not _psid:
+            return ""
+        _p = lm.query_one(
+            "SELECT status, current_step_id FROM workflow_instances WHERE instance_id=?",
+            (_parent,))
+        # 父步已推进 / 父链已终态：这条失败信号过时，不能拿旧步砍整条父链
+        if (not _p or _p["current_step_id"] != _psid
+                or _p["status"] not in ("pending", "running", "step_done_ready")):
+            return _parent
+        lm.execute(
+            "UPDATE workflow_instances SET step_results=json_set("
+            "COALESCE(step_results,'{}'), ?, 'failed', ?, ?) "
+            "WHERE instance_id=? AND json_valid(step_results)",
+            (f'$."{_psid}".status', f'$."{_psid}".child_failed_at', time.time(), _parent))
+        lm.fail_step(_parent, _psid, reason=reason)
+        bb.write("blocker",
+                 f"[workflow] {_parent[:12]}/{_psid} 子链 {child_id[:12]} 非正常终止，父步判失败",
+                 src="workflow_engine",
+                 evidence=f"子链: {child_id}\n父链: {_parent}\n父步: {_psid}\n原因: {reason}")
+        LOGGER.warning("子链 %s 非正常终止 → 父 %s/%s 判失败: %s",
+                       child_id[:12], _parent[:12], _psid, reason)
+        return _parent
+    except Exception as _e:
+        LOGGER.warning("_fail_parent_step %s 失败: %s", child_id[:12], _e)
+        return ""
+
+
 def _rework_exit(sts: list) -> str:
     """返工链状态集 → 出口：wait / escalate_unfixed / requeue。"""
     if sts and not all(s in _REWORK_TERMINAL for s in sts):
@@ -1368,6 +1409,12 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                     inst["instance_id"], status="cancelled",
                                     reason=(f"queue {int((time.time() - _q_since) / 60)}min"
                                             f" >= {int(_q_budget // 60)}min"))
+                                # 排队超时必须同时判父步失败：只回收子链的话，父步
+                                # 下一 tick 会重建一条新子链排同一个队（堆积放大）。
+                                _fail_parent_step(
+                                    self._lifecycle, self._bb, inst["instance_id"],
+                                    reason=(f"子链排队 {int((time.time() - _q_since) / 60)}min "
+                                            f"未认领 >= {int(_q_budget // 60)}min 预算"))
                             except Exception as _e:
                                 LOGGER.debug("queue-cap cancel failed: %s", _e)
                         continue

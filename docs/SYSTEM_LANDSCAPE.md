@@ -9,7 +9,7 @@
 |------|------|------|----------|
 | **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个角色（`roles_export.json`）+ 19 个 persona JSON（`ls personas/session-roles/*.json`）+ prompt 模板 | ≈2.5k 行（14 个 `.py`，src 7） |
 | **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | ≈16k 行（70 个 `.py`，src 31） |
-| **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | ≈46k 行（176 个 `.py`，src 42 / 20530，tests 128） |
+| **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | 现算：`git ls-files '*.py' | wc -l`；`git ls-files 'src/*.py' | xargs wc -l` 取 src 总行数；`ls tests/test_*.py | wc -l` 取测试文件数（不写死，随改动变化） |
 
 **实际关系不是三层流水线，而是两消费者并行：**
 
@@ -31,7 +31,7 @@ session-roles（定义层）
 | session-launcher | `python3 src/wf.py <子命令>` | CLI（工作流客户端，含 stats） |
 | session-pipeline | `PYTHONPATH=src python3 -m pipeflow.daemon --interval 10` | systemd / 后台进程 |
 | session-pipeline | `PYTHONPATH=src python3 -m routing_daemon` | 路由守护（常驻） |
-| session-pipeline | `PYTHONPATH=src python3 -m routing.auto --status` | CLI（一次性，非守护） |
+| session-pipeline | `PYTHONPATH=src python3 -m routing.auto --daemon` | CLI（一次性，非守护；`--status` 无派发分支） |
 
 ## 端口与 socket（`ss -ltnp` 实测 2026-10-22）
 
@@ -55,12 +55,12 @@ session-roles（定义层）
 | 路由表 | `~/.hermes/state/routing.db` | 路由表 + 变更审计 |
 | ~~Pipeline Cursor~~ | `~/.hermes/state/pipeline_cursor.db` | **已退役**（2026-10-22，去重改由 bus consume 记录承担；表 0 行） |
 
-## 哨兵文件（launcher 管，实测在 `~/.hermes/run/`）
+## 哨兵文件（实测在 `~/.hermes/run/`；两个目录写的不是同一份数据）
 
 | 目录 | 内容 |
 |------|------|
-| `~/.hermes/run/ccs-sentinels/` | CCS 运行状态（按角色 JSON） |
-| `~/.hermes/run/ccs-health/` | 进程健康数据（watchdog 状态） |
+| `~/.hermes/run/ccs-sentinels/` | CCS 运行状态（launcher `ops/sentinel.py` 写，含 `health.last_watchdog_check`） |
+| `~/.hermes/run/ccs-health/` | 存活探针（pipeline `survival_monitor.py` 写，键只有 `survival_*`；watchdog 字段**不在这里**） |
 | `~/.hermes/run/ccs-lifecycle-sentinels/` | ondemand 角色生命周期哨兵 |
 
 `/tmp/ccs-sentinels`、`/tmp/ccs-health`、`/tmp/cdx-sentinels` 均已不存在——旧文档里的 `/tmp` 路径是过期记录。

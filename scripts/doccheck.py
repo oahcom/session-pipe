@@ -220,6 +220,51 @@ def _sym_check(text: str, root: Path, path: Path) -> int:
     return bad
 
 
+CLI = re.compile(r"\bpython3?\s+([~\w./-]+\.py)\s+([A-Za-z][\w-]*)(?![\w/.-])")
+
+def _subcmds(p: Path) -> set[str] | None:
+    """脚本声明过的子命令名；判不了（无 subparsers / 名字非字面量 / 父解析器另有位置参数）返回 None。"""
+    try:
+        tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return None
+    names, subs, pos = set(), set(), set()
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+            continue
+        recv = getattr(n.func.value, "id", None)
+        if n.func.attr == "add_subparsers":
+            subs.add(recv)
+        elif n.func.attr == "add_argument" and n.args and isinstance(n.args[0], ast.Constant) \
+                and not str(n.args[0].value).startswith("-"):
+            pos.add(recv)  # 父解析器自己还有位置参数 → 第一个词未必是子命令
+        elif n.func.attr == "add_parser":
+            for v in n.args[:1] + [k.value for k in n.keywords if k.arg == "aliases"]:
+                for e in (v.elts if isinstance(v, (ast.List, ast.Tuple)) else [v]):
+                    if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
+                        return None  # 名字不是字面量 → 集合必不全，不判
+                    names.add(e.value)
+    return None if not names or subs & pos else names
+
+
+def _cli_check(text: str, root: Path, path: Path = Path()) -> int:
+    """md 里 `python3 x.py <子命令>` 必须是该脚本真实声明过的子命令。
+
+    喂**原文**，不喂 _strip_fences 的结果：命令几乎只写在围栏里，而那一步会把围栏抹空。
+    `python3 src/ccs.py socket start` 曾在 README 里活了很久，实际 27 个子命令里没有 socket。
+    """
+    if path.name in {"ISSUES.md", "CHANGES.md"}:
+        return 0
+    bad = 0
+    for m in CLI.finditer(text):
+        p = _resolve(m.group(1), root)
+        names = _subcmds(p) if p else None
+        if names and m.group(2) not in names:
+            print(f"CLI_BAD_SUBCOMMAND {m.group(1)} '{m.group(2)}' (has: {' '.join(sorted(names))})")
+            bad += 1
+    return bad
+
+
 def _real_n(p: Path) -> int:
     return open(p, "rb").read().count(b"\n")
 
@@ -234,7 +279,7 @@ def _rows(text: str):
 
 def _check(path: Path, root: Path) -> int:
     text = path.read_text(encoding="utf-8")
-    bad = _cite_check(text, root, path) + _sym_check(text, root, path)
+    bad = _cite_check(text, root, path) + _sym_check(text, root, path) + _cli_check(text, root, path)
     for name, s, e in _rows(text):
         real_p = _resolve(name, root)
         if not real_p:

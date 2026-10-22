@@ -999,12 +999,16 @@ class LifecycleManager:
         # 判成驳回，把刚落的 completed 当场改写回 rejected。步骤一旦被驳回过就
         # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
         # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
+        # 子链接管本步时父步文案不再能否决（与 wf_lifecycle._advance_production_wf
+        # 同款，两条推进路径判定必须一致）。
         _confirmed = bool(_cur_sr.get("confirmed_at"))
         # 三态 fail-closed 也必须装在这条路径上（R141 五维审查 D1/D3）：
         # unknown 只装在 wf_lifecycle（引擎 tick）时，角色走 `wf complete`
         # （本函数）交上来的「没写结论」仍被当通过——同一条还原在两条推进
         # 路径上判定相反，正是 review_gate 模块 docstring 想消灭的那种分歧。
-        _verdict = ("approved" if _confirmed
+        # 子链步骤的驳回由子链自己消费：父步只等回执，替它裁决会把子链的判定
+        # 在父步上二次否决（分支侧原有守卫）。其余按三态 fail-closed。
+        _verdict = ("approved" if (_confirmed or _cur_sr.get("subflow_id"))
                     else review_verdict(_msgs))
         # 与 engine 路径同口径：只有审查角色 + review/gate 类型才要求表态
         # （见 review_gate.REVIEW_ROLES 的生产数据）。

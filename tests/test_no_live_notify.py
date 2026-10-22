@@ -57,8 +57,15 @@ def test_confirm_step_sends_no_live_notification(_mock_engine_run, monkeypatch):
         seen.append(args)
         return subprocess.CompletedProcess(args, 0, b"", b"")
 
-    monkeypatch.setattr(subprocess, "run", spy)
-    lm.confirm_step(rid, "s1", approved=True, reason="ok")
+    # 用 try/finally 而不是 monkeypatch：这是**全局** subprocess.run，
+    # 泄漏到后续模块会让 eval_checker 的 `stat -c %W` 拿到空输出 → 盲改判据 fail-open
+    # （实测 test_trajectory_blind_edit_creation 三条因它变红）。
+    _orig = subprocess.run
+    subprocess.run = spy
+    try:
+        lm.confirm_step(rid, "s1", approved=True, reason="ok")
+    finally:
+        subprocess.run = _orig
 
     leaked = [s for s in seen if "审批结果通知" in str(s)]
     assert not leaked, f"测试向活体角色投递了审批通知: {leaked[:1]}"

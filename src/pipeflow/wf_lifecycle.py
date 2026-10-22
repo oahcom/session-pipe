@@ -569,18 +569,30 @@ class WorkflowLifecycleMixin:
         # 的「无返工链 → 重投原步」出口，封顶 _MAX_REJECTED_RETRY 后升级 coordinator。
         _step_def = steps[idx]
         _step_sr = ((results or {}).get(step_id, {}) or {})
-        # evidence 也要拼入：分类段在其中，只拼 text 会让 _has_issue_classification
-        # 恒为 False → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
+        # 结论只看 text，分类才看 text+evidence（两条都是实测出来的）：
+        # ① 结论拼接 evidence 会把"返工来源 CHANGES_REQUESTED …"当成这步的驳回
+        #    （实测 12/873 步被误判）；manager.py 的 _advance_unsafe 只拼 text，
+        #    两条推进路径对同一条消息判定相反。
+        # ② 分类段只在 evidence 里，_has_issue_classification 看不到它就恒为 False
+        #    → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
         _msgs = " ".join(
-            (m.get("text", "") or "") + " " + (m.get("evidence", "") or "")
-            for m in (_step_sr.get("exit_messages") or [])
+            (m.get("text", "") or "") for m in (_step_sr.get("exit_messages") or [])
+            if isinstance(m, dict)
+        ).lower()
+        _full = _msgs + " " + " ".join(
+            (m.get("evidence", "") or "") for m in (_step_sr.get("exit_messages") or [])
             if isinstance(m, dict)
         ).lower()
 
         # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
         # 不会清除它 → 同一份文本被二次判成驳回。与 manager._advance_unsafe
         # 同一缺陷（实测 wf_256be862ea86/s3 确认后卡死 5h）。
-        _verdict = ("approved" if _step_sr.get("confirmed_at")
+        # 子链已接管本步时，父步自己的文案不再能否决推进：驳回判定归子链
+        # （task_generator 按子链末步判词压 rejected）。不带这道门时，软归属早先
+        # 塞进来的兄弟实例驳回原文会每 tick 否掉一次「子链判通过 → completed」，
+        # 与完成写入互抵——实测 wf_1ecc8/s3 完成↔驳回 13h 自旋 217 次。
+        _verdict = ("approved" if (_step_sr.get("confirmed_at")
+                                   or _step_sr.get("subflow_id"))
                     else _review_gate.review_verdict(_msgs))
 
         # unknown 只拦"该表态却没表态"的步骤：type 是 review/gate 且执行角色是审查
@@ -617,7 +629,7 @@ class WorkflowLifecycleMixin:
             # 那条，实测 19 例真实驳回被据此放行（WL-01/wf_cd4a9c21df 等），
             # 产物一字未改却让下游拿不存在的东西继续做。
             # 分类只决定返工链建成哪一类；建不出链不是通过审查的理由。
-            if not self._has_issue_classification(_msgs):
+            if not self._has_issue_classification(_full):
                 LOGGER.warning(
                     "rejected 但产出无【系统问题】/【业务问题】分类 %s/%s"
                     " → 交 rejected 消费分支（重投原步，不推进）", wf_id[:8], step_id)
@@ -1025,14 +1037,24 @@ class WorkflowLifecycleMixin:
                 # 与 _can_assign_role 的 MAX_RUNNING_PER_ROLE 同源：子链创建是
                 # 第二条派发路径，不走那里，所以必须在这里自己查。
                 # 满额时 return（falsy）→ 父步自投；等现有子链消化完自然恢复建链。
+                # 只数"已认领"的子链：当前步已被投递出去的才占用产能。排队中的
+                # 子链（step 停在 queued、实例行只是 pending/running）不占额度——
+                # 把它们算进来，额度就永远被排队者占满，新子链一律 skip、排队者
+                # 又推不动，队列只能加深不能消化（R138：q=234/273 的两条子链
+                # 常驻额度，architect 的新子链全部 "subflow skip"）。
+                # ponytail: 认领判据读 step_results 的 status；第 3 步换成
+                # claimed 二值后此处的 status 兜底只为存量行保留。
                 from pipeflow.task_generator import MAX_RUNNING_PER_ROLE
                 _active_sub = conn2.execute(
                     "SELECT COUNT(*) c FROM workflow_instances "
                     "WHERE assignee=? AND parent_wf_id IS NOT NULL "
-                    "AND status IN ('pending','running','step_done_ready')",
+                    "AND status IN ('pending','running','step_done_ready') "
+                    "AND json_valid(step_results) "
+                    "AND json_extract(step_results, '$.' || current_step_id || '.status') "
+                    "IN ('notified','running','step_done_ready')",
                     (tgt_step.target_role,)).fetchone()["c"]
                 if _active_sub >= MAX_RUNNING_PER_ROLE:
-                    LOGGER.info("subflow skip: %s 已有 %d 条活跃子链（上限 %d），%s 不创建",
+                    LOGGER.info("subflow skip: %s 已有 %d 条在跑子链（上限 %d），%s 不创建",
                                 tgt_step.target_role, _active_sub,
                                 MAX_RUNNING_PER_ROLE, tgt_step.subflow_template)
                     return

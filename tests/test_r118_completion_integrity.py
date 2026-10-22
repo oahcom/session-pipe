@@ -65,6 +65,55 @@ def test_fresh_output_passes(tmp_path, monkeypatch):
     assert ok is True, f"本步新产出被判失败: {errs}"
 
 
+def test_claim_matches_engine_instance_title_format():
+    """引擎让角色发的完成标题是 `<实例id>/sN-complete`，不是 `<模板名>/sN-complete`。
+
+    只认模板名时守卫对真实消息恒失效：实测 #439707 一条 db062 的 s1-complete
+    同时闭合了 wf_sub_5a1305523c87 与 wf_sub_b0f5817b0e6e 的 s1（后者的 pm 从未
+    写出任何字节）。反向用例保证本步自己的消息仍放行。
+    """
+    real = "wf_sub_db062335d6c2/s1-complete 需求确认与 PRD · 单文件落地页"
+    assert _claims_own_step_and_foreign_instance(
+        real, "wf_sub_b0f5817b0e6e", "pm_requirements", "s1") is True
+    assert _claims_own_step_and_foreign_instance(
+        real, "wf_sub_db062335d6c2", "pm_requirements", "s1") is False
+    # 声称别的步骤完成不算本步（step_id 边界）
+    assert _claims_own_step_and_foreign_instance(
+        "wf_sub_deadbeef0001/s2-complete 故事拆分完成",
+        "wf_sub_mine00000001", "pm_requirements", "s1") is False
+
+
+def test_claim_requires_completion_suffix_and_ignores_own_id():
+    """两侧误判的回归钉子（codex 三方审查 B1/B2）。
+
+    B1 假阴性：出现本实例 id ≠ 没替别实例报工 → `交付给本实例` 仍要拦。
+    B2 假阳性：`wf_x/s1/README` `wf_x/s1.5-complete` 是路径/版本，不是完成声明。
+    """
+    f = _claims_own_step_and_foreign_instance
+    # B1
+    assert f("wf_sub_other/s1-complete 已交付给 wf_sub_mine",
+             "wf_sub_mine", "pm_requirements", "s1") is True
+    # B2
+    assert f("wf_sub_other/s1/README 已更新",
+             "wf_sub_mine", "pm_requirements", "s1") is False
+
+
+def test_claim_recognizes_chinese_completion_suffix():
+    """角色自发通知写 `wf_xxx/sN 完成`（全库 960 条完成类消息中 26 条该形态），
+    模板名与实例 id 两种前缀都要认；只认 -complete 时守卫对这批消息失效
+    （2026-10-22 回归：收紧 -complete 打挂 TestSoftAttribution，bus #440248）。"""
+    f = _claims_own_step_and_foreign_instance
+    assert f("wf_sub_deadbeef0001/s1 完成，通知下一角色进入 s2",
+             "wf_sub_mine00000001", "pm_requirements", "s1") is True
+    assert f("PRD 落盘 — 实例 wf_sibling999 / arch/s2 完成",
+             "wf_mine111", "arch", "s2") is True
+    # `完成` 后面接文字的是叙述不是完成声明，仍放行
+    assert f("wf_sub_deadbeef0001/s1 完成清单见 README",
+             "wf_sub_mine00000001", "pm_requirements", "s1") is False
+    assert f("wf_sub_other/s1.5-complete 完成",
+             "wf_sub_mine", "pm_requirements", "s1") is False
+
+
 def test_claim_ignores_workflow_id_prefix():
     """父链注册名带 WL- 前缀、角色发出的标题是裸名时，守卫必须命中。"""
     text = "wf_sub_deadbeef0001 · full_dev_pipeline/s4-complete 已产出"

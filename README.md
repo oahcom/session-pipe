@@ -5,10 +5,8 @@
 Session 生态的**路由层**——自动感知 bus 新消息，按优先级分发给对应 CCS 消费。
 
 ```
-hermes-session-roles → session-launcher → session-pipeline (本项目)
-    (定义层)             (执行层)             (路由层)
-                                                    ↓
-                                               Sister Bus
+hermes-session-roles ─┬─→ session-launcher (执行层)
+    (定义层)            └─→ session-pipeline (本项目, 路由层) ─→ Sister Bus  ← 并行消费，不是三层流水线
 ```
 
 ## 快速开始
@@ -42,7 +40,7 @@ python3 -m pytest tests/ -q
 
 ```bash
 # 路由
-PYTHONPATH=src python3 -m routing.auto --status        # 队列状态（缺省行为同）
+PYTHONPATH=src python3 -m routing.auto --daemon        # 只查队列状态（--status 只解析不派发，会落到分发轮真发消息）；不带任何 flag 就是分发一轮（poll_unconsumed → notify_consumers，真发消息）
 PYTHONPATH=src python3 -m routing.auto --route-all     # 路由所有
 PYTHONPATH=src python3 -m routing.auto --health        # 健康检查
 PYTHONPATH=src python3 -m routing.router list          # 路由表
@@ -71,7 +69,7 @@ src/
 
 ## 配置
 
-`config/config.yaml` — 见 `docs/TECHNICAL_DEEP_DIVE.md` §3.7 配置块表。
+`config/config.yaml` — 见 `docs/TECHNICAL_DEEP_DIVE.md` §5 配置块表（8 块）。
 
 ## 进阶文档
 

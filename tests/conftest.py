@@ -25,6 +25,12 @@ _run_dir = tempfile.mkdtemp(prefix="pytest-hermes-run-")
 os.environ["HERMES_RUN_DIR"] = _run_dir
 os.environ["ROUTING_DB_PATH"] = os.path.join(_run_dir, "routing.db")
 os.environ["SESSION_PIPELINE_ACK_DB"] = os.path.join(_run_dir, "ack_tracker.db")
+# CCS_WORKSPACES 的 env 必须在这里设，不能等第 3b 节：step_handler / wf_lifecycle 用
+# `from paths import CCS_WORKSPACES` 拷了值（模块级 alias），谁先 import 谁固化。
+# 本文件第 44 行就 import pipeflow 做 _PRISTINE 快照 → 晚设等于没设：测试写临时目录、
+# 引擎读生产目录（实测 15 个用例假红，2026-10-22）。
+_TEST_WS_DIR = os.path.join(_run_dir, "ccs-workspaces")
+os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
 
 # 0. 保存真实 bus_protocol/config_loader 引用（test_reliability_unit 会篡改
 #    sys.modules 为 MagicMock，后续模块需恢复真实版本）
@@ -122,9 +128,7 @@ _paths_mod.METRICS_JSONL = Path(os.environ["SESSION_PIPELINE_METRICS_JSONL"])
 #     不隔离则每个跑到的用例都写进生产 ~/ccs-workspaces/，实测已污染
 #     scout/engineer 的真实 TASKS.md（2026-10-16 16:22，fixture 的 "test"
 #     任务覆盖真实任务）。同 WORKFLOWS_DB 走 env + 属性重绑双保险。
-_TEST_WS_DIR = os.path.join(_TEST_STATE_DIR, "ccs-workspaces")
-os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
-_paths_mod.CCS_WORKSPACES = Path(_TEST_WS_DIR)
+_paths_mod.CCS_WORKSPACES = Path(_TEST_WS_DIR)  # env 已在文件顶部设过（见那里的注释）
 
 # 3c. ITERATION_WORKSPACES 隔离：_write_step_prompt 读 <根>/<project_name>/PRD.md
 #     生成 {workspace_summary}。不隔离则跑 pytest 会在生产 ~/.hermes/workspace/
@@ -220,6 +224,11 @@ def _no_live_approval_notify(monkeypatch):
     monkeypatch.setattr(_lm.LifecycleManager, "_notify_result", lambda *a, **k: None)
 
 
+# 测巡检本身（游标/预算）的模块：它用 `del eng._ensure_guard_roles` 撤**实例**桩，
+# 撤不掉 class 级桩，必须整模块豁免。
+_REAL_GUARD_MODULES = {"test_tick_budget"}
+
+
 @pytest.fixture(autouse=True)
 def _no_guard_role_start(request, monkeypatch):
     """守护巡检默认不拉起真角色：run_once() 会走 _ensure_guard_roles → _ensure_role_alive
@@ -228,9 +237,7 @@ def _no_guard_role_start(request, monkeypatch):
     真跑它的用例在 tests/test_role_alive_cache.py / test_ensure_role_alive_race.py，
     它们直接调 _ensure_role_alive，不经本函数，故不受影响。
     """
-    # test_tick_budget 测的就是巡检游标/预算本身（它用 del 撤实例桩去测真实实现）。
-    if (os.environ.get("PYTEST_REAL_GUARD") == "1"
-            or (request.module.__name__ if request.module else "").endswith("test_tick_budget")):
+    if (request.module.__name__ if request.module else "").split(".")[-1] in _REAL_GUARD_MODULES:
         return
     from pipeflow import engine as _eng
     monkeypatch.setattr(_eng.WorkflowEngine, "_ensure_guard_roles", lambda self, *a, **k: set())
@@ -283,9 +290,55 @@ def _fast_role_ready(request, monkeypatch):
     _wait_for_role_ready → sleep(5)）。已有 8 个用例各自 MagicMock 过它 → 共性缺口。
     """
     _mod = (request.module.__name__ if request.module else "").split(".")[-1]
-    if _mod in _REAL_READY_MODULES or os.environ.get("PYTEST_REAL_GUARD") == "1":
+    if _mod in _REAL_READY_MODULES:
         return
     from pipeflow import role_lifecycle as _rl
     monkeypatch.setattr(_rl.RoleLifecycleMixin, "_wait_for_role_ready",
                         lambda self, *a, **k: True)
+
+# 直接被测的模块：桩掉就把对象测空了。
+_REAL_ENSURE_ALIVE_MODULES = {
+    "test_role_alive_cache",
+    "test_ensure_role_alive_race",
+    "test_pipeflow_error_paths",
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_live_role_restart(request, monkeypatch):
+    """`_ensure_role_alive` 也会经 on_advance 回调触发：tmux 活着但没有 claude 进程时走
+    `sleep(1)` + kill-session + 30×1s 重启循环——test_workcycle_e2e 因此超 20s 被自带
+    `signal.alarm(20)` 打断（全量此前直接 EXIT=142，看不到这条红）。默认桩成 True。
+    """
+    if (request.module.__name__ if request.module else "").split(".")[-1] in _REAL_ENSURE_ALIVE_MODULES:
+        return
+    from pipeflow import role_lifecycle as _rl
+    monkeypatch.setattr(_rl.RoleLifecycleMixin, "_ensure_role_alive",
+                        lambda self, role, deadline=0.0: True)
+
+
+def _alarm_handler(_signum, _frame):
+    # 必须抛 BaseException 子类：TimeoutError 是 OSError→Exception 的子类，
+    # 会被热路径的 except (TimeoutExpired, OSError) / except Exception 吞掉，
+    # 一次性定时器已消耗 → 用例继续挂起，承诺落空。
+    raise pytest.fail.Exception("用例超过自带 signal.alarm 预算（非产品缺陷，见 conftest）")
+
+
+@pytest.fixture(autouse=True)
+def _alarm_kills_test_not_process():
+    """用例自带 `signal.alarm(N)` 却没装 handler：pytest 下默认动作 = 杀进程。
+
+    实测全量跑到 ~94% 直接 EXIT=142（无 summary），三次复现；`grep -c signal.alarm`
+    集中在 test_workcycle_e2e.py（17 处）。装一个抛 TimeoutError 的 handler，
+    慢用例就变成**一条红用例**，而不是整轮蒸发——这是「全量永远拿不到结论」的第二个原因。
+    """
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+    _old = signal.signal(signal.SIGALRM, _alarm_handler)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, _old)
 

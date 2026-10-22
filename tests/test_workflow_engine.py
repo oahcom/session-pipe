@@ -378,19 +378,19 @@ def test_timeout_escalates_not_fails():
         assert timeout_count >= 1, f"应记录超时次数: {s1_results}"
 
 
-# ── Conditional Steps ────────────────────────────────────────────
+# ── 出口条件未匹配则不推进（Step.condition 无求值器，别用这类名字） ──
 
-def test_conditional_step_blocks():
+def test_unmatched_exit_condition_keeps_step():
     wf_dir = _make_wf_dir()
     steps = [
         {"id": "s1", "title": "调研", "target_role": "scout",
          "prompt_template": "调研{topic}",
          "exit_condition": {"bus_category": "notice", "text_contains": "TESTCOND_S1_DONE"},
-         "max_retries": 0, "condition": "", "rollback_to": ""},
+         "max_retries": 0},
         {"id": "s2", "title": "有条件的步骤", "target_role": "engineer",
          "prompt_template": "实现{topic}",
          "exit_condition": {"bus_category": "notice", "text_contains": "TESTCOND_S2_DONE"},
-         "max_retries": 0, "condition": "s1.status == 'done'", "rollback_to": ""},
+         "max_retries": 0},
     ]
     _write_wf(wf_dir, "cond_test", steps)
     eng = WorkflowEngine(workflows_dir=wf_dir)
@@ -407,27 +407,6 @@ def test_conditional_step_blocks():
     lm._conn.commit()
     s2 = eng.status(rid)
     assert s2["current_step"] == "s2"
-
-
-def test_conditional_blocks_when_not_met():
-    wf_dir = _make_wf_dir()
-    steps = [
-        {"id": "s1", "title": "调研", "target_role": "scout",
-         "prompt_template": "调研{topic}",
-         "exit_condition": {"bus_category": "notice", "text_contains": "TESTCONDBLK_S1_DONE"},
-         "max_retries": 0, "condition": "", "rollback_to": ""},
-        {"id": "s2", "title": "需要 s1 完成", "target_role": "dev",
-         "prompt_template": "做 t",
-         "exit_condition": {"bus_category": "notice", "text_contains": "TESTCONDBLK_S2_DONE"},
-         "max_retries": 0, "condition": "s1.status == 'done'", "rollback_to": ""},
-    ]
-    _write_wf(wf_dir, "cond_block", steps)
-    eng = WorkflowEngine(workflows_dir=wf_dir)
-    rid = eng.start("cond_block", {"topic": "x"})
-    # s1 不匹配，不会推进 → 还在 s1
-    eng.run_once()
-    s = eng.status(rid)
-    assert s["current_step"] == "s1", f"不匹配应停在 s1: {s}"
 
 
 # ── Persistence ──────────────────────────────────────────────────
@@ -567,8 +546,6 @@ if __name__ == "__main__":
         ("advance 完成", test_advance_finishes),
         ("超时触发重试", test_timeout_triggers_retry),
         ("超时不自动失败", test_timeout_escalates_not_fails),
-        ("条件步骤推进", test_conditional_step_blocks),
-        ("条件不满足阻塞", test_conditional_blocks_when_not_met),
         ("run 持久化", test_run_persists_on_tick),
         ("损坏的 run 文件", test_corrupted_run_file),
         ("收集 workspace summary", test_collect_workspace_summary),

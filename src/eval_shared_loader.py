@@ -16,11 +16,6 @@ from pathlib import Path
 # personas 目录（与 eval_checker 一致）
 PERSONAS_DIR = Path.home() / "hermes-session-roles" / "personas" / "session-roles"
 
-# 运行时每轮只跑每条角色的前 N 条判据（eval_checker.run_eval_check）。
-# 预检必须用同一个窗口：不共用时"第 4 条才可执行"的角色在预检里算非盲区、
-# 运行时却零判据执行 —— blind_roles 恒漏报（codex 20 维 F1）。
-CRITERIA_WINDOW = 3
-
 
 def _extract_cmd(criterion: str) -> str | None:
     """从 eval_criterion 提取验证命令；委托 eval_checker 的同名实现。"""

@@ -52,14 +52,6 @@ class WorkflowClient:
 
     # ── Template ──
 
-    def list_templates(self) -> list[dict]:
-        rows = self._conn.execute("SELECT * FROM workflow_templates ORDER BY name").fetchall()
-        return [dict(r) for r in rows]
-
-    def find_template(self, name: str) -> Optional[dict]:
-        row = self._conn.execute("SELECT * FROM workflow_templates WHERE name=?", (name,)).fetchone()
-        return dict(row) if row else None
-
     # ── Task CRUD ──
 
     def create_task(self, title: str, description: str = "",

@@ -1,6 +1,8 @@
 """Unit tests for routing/routes.py — route_all, route_to_ccs, route_all_to_ccs.
 
 Mocks all external deps (bus, subprocess, reliability globals).
+
+TODO(split): 721 行已超 600 红线 —— 按 route_all / route_all_to_ccs 拆成两个文件。
 """
 import sys
 from pathlib import Path

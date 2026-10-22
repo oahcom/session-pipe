@@ -13,7 +13,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
          └──→ launcher/ccs.py send ← 唯一跨项目调用（subprocess）
 ```
 
-**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`~/.hermes/run/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
+**Pipeline 不 import launcher**：只用 `subprocess.run([sys.executable, CCS_CLI, <子命令>, ...])` 调它（send / start / stop / status-role），角色状态读哨兵文件 `~/.hermes/run/ccs-sentinels/`。
 
 ## Module inventory
 
@@ -39,7 +39,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **task_evidence.py** | 任务证据链 |
 | **contract_updater.py** | 合约同步 |
 | **conversation_monitor.py** | 对话监控 |
-| **config_loader.py** | YAML config loading with env override and hot-reload |
+| **config_loader.py** | YAML config loading with env override（**无热重载**：改 config.yaml 需重启进程） |
 | **workflow/gateway.py** | 工作流网关门禁 |
 | **drift_detector.py** | 架构漂移检测 |
 | **cron_scheduler.py** | cron 调度器 |
@@ -99,7 +99,7 @@ Pipeline does NOT read persona JSON directly. The router loads from:
 
 ```python
 # router.py
-_ROLES_EXPORT_PATH = Path.home() / ".hermes" / "data" / "roles_export.json"
+_ROLES_EXPORT_PATH = HERMES_STATE.parent / "data" / "roles_export.json"
 
 def _load_roles_export():
     return {r["name"]: r for r in json.loads(path.read_text()).get("roles", [])}

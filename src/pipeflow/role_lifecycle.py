@@ -775,6 +775,11 @@ class RoleLifecycleMixin:
             _invalidate_tmux()      # 会话刚没，旧快照还会说它在
             alive = False
 
+        # 预算已耗尽就别拉起：拉起会先盖 300s 冷却戳（下面 _last_restart），
+        # 掐断后既不在缓存里、又踩冷却，而巡检游标正好把它排到下一轮首位。
+        if deadline and deadline - time.time() <= 0:
+            LOGGER.warning("CCS %s: 巡检预算已耗尽，本轮不拉起", role)
+            return False
         # 拉起前加锁 + 冷却：check-then-act 的写入侧必须串行化。
         # 锁内不重复探测 tmux（外层刚判过）：并发 tick 的第二个只需看冷却戳即可，
         # 冷却戳由先到的 tick 写入，后者读到后直接退出。
@@ -839,7 +844,7 @@ class RoleLifecycleMixin:
                         except Exception:
                             LOGGER.debug("monitor_audit write failed for %s", role)
                         return True
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, _engine_mod._sp.TimeoutExpired):
             LOGGER.debug("CCS role alive check failed for %s", role)
         return False
 

@@ -100,23 +100,62 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 # 硬通过词：只有这些才算「本步结论是通过」。单独的「通过/就绪」是过程叙述
 # （「构建通过」「产出已就绪」实测 verdict 均 True，codex P0）。
 _HARD_APPROVE = re.compile(
-    r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
-# 转述他人的通过（「上游 s3 APPROVED」）不是本步结论：左邻这些词时不算。
-_APPROVE_ATTRIB = re.compile(
-    r"(上游|前一步|前步|上一步|上次|此前|参照|参考|其他步骤|兄弟步骤|如同)[^。\n]{0,12}$")
+    # (?<![-\w]) 排除步骤名里的 s1-integrity-approved 与 CONDITIONAL_APPROVED：
+    # 实测 24h 里 13 条「…/s1-integrity-approved —— NO_ANOMALY_VERIFY.md」被判通过。
+    # 前置只排除 ASCII 的字母数字/下划线/连字符：\w 在 Python 里含汉字，
+    # 会把「复核APPROVED」这类真实通过也排除掉（codex P3）。
+    r"(?<![A-Za-z0-9_-])(?:CONDITIONAL_)?APPROVED\b|验收通过|"
+    r"判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
+# delta 段提到驳回时，出现这些词才算「返工记录」而非「本步驳回」。
+# 只认中文标记：英文 fixed/resolved 会被 unfixed/unresolved/not fixed 反向命中
+# （生产消息是中文，加英文没有实证收益）。
+_FIX_MARK = re.compile(r"已修复|已处理|已合并|已关闭")
+# CONDITIONAL_APPROVED 也算通过：实测 47 个带该结论的步骤状态全是 completed /
+# step_done_ready（0 P0 的带条件通过），把它当叙述会让父步的更新结论永远压不过
+# 子链的旧驳回（#439027 那类 7h32m 卡死的成因）。
+# 通过词左侧出现这些词 = 转述别人的结论（「上游 s1 的最终验收结论已在
+# 10:20 复核之后确认为 APPROVED」）。只在结论段内匹配，不跨段。
+_ATTRIB_LEFT = re.compile(
+    r"(上游|下游|前序|前置|父步|子链|子流程|子步骤|兄弟步骤|其他步骤|"
+    r"参照|参考|如同|上次|此前|上一步|前步)")
 
 
-def _any_hard_approve(text: str) -> bool:
-    """文本里有没有「本步的通过结论」。
+def _conclusion(text: str) -> bool | None:
+    """一条完成消息**自己**的结论：True=通过 / False=驳回 / None=叙述。
 
-    硬通过词存在，且**不是转述别人**：左邻「上游/参照/上次」等词的命中是复述
-    （实测「上游 s3 APPROVED」verdict=True，但本步并未通过）。
+    判据按**破折号分段**（—）：实测 1358 条 exit_messages 首行里 653 条带 —，
+    结论可能在前段也可能在后段——「… 验收通过 — exit_schema 契约达成」结论在前，
+    「… — CHANGES_REQUESTED 0 P0 / 2 P1」结论在后。故对每段分别判，不整行判：
+    转述词只在**通过词所在段内**生效，「参考上游 reviewer 返工完成 — APPROVED」
+    于是判通过，而「s4-complete — delta: 上游 s3 APPROVED 的 2 项已合并」判叙述。
+
+    含 delta 的首行一律按叙述：正文里「已修复 CHANGES_REQUESTED 的 3 项」是返工
+    记录，不是本步驳回。首行没有明确结论时才回落到全文驳回扫描（生产消息首行
+    常只是标题，真正的「结论：CHANGES_REQUESTED」在空行后的正文里）。
+
+    ponytail: 代价不对称——漏放行只是让返工继续（保守），误放行会把被驳回的
+    步推成 completed。升级路径：step_handler 写 exit_messages 时把 verdict
+    一起落库，不再事后从文本反推。
     """
-    for _m in _HARD_APPROVE.finditer(text or ""):
-        _left = text[max(0, _m.start() - 24):_m.start()]
-        if not _APPROVE_ATTRIB.search(_left):
-            return True
-    return False
+    text = text or ""
+    _lines = text.strip().splitlines()
+    head = _lines[0] if _lines else ""
+    if not head:
+        return None
+    _segs = [s.strip() for s in head.split("—") if s.strip()]
+    _rejected = [s for s in _segs if _review_gate.is_rejected(s)]
+    if any("delta" in s.lower() for s in _segs):
+        # delta 段提到驳回：带「已修复/已处理」才是返工记录（叙述）；否则仍是驳回
+        # ——直接 None 会让更早的 APPROVED 把被驳回的步盖成 completed（codex P2）。
+        return None if all(_FIX_MARK.search(s) for s in _rejected) else (
+            False if _rejected else None)
+    if _rejected:
+        return False
+    for _s in _segs:
+        for _m in _HARD_APPROVE.finditer(_s):
+            if not _ATTRIB_LEFT.search(_s[:_m.start()]):
+                return True
+    return False if _review_gate.is_rejected(text) else None
 
 
 def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
@@ -142,14 +181,17 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
     if not isinstance(_sub_msgs, list) or not isinstance(_par_msgs, list):
         return False
     _sub_ts = [m.get("ts") for m in _sub_msgs
-               if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))]
+               if isinstance(m, dict) and type(m.get("ts")) in (int, float)]
     if not _sub_ts:
         return False
     # 截止点取**驳回消息**的时刻，而不是子链全部消息的最大 ts：子链
     # [驳回 t1, delta t2] 时用 t2 会把 t1 之后、t2 之前的父步通过也拦掉。
+    # 用 is_rejected 而不是 verdict() is False：后者对「没有通过审核，需返工」
+    # 这类无锚点措辞返回 True（词表信号），会把真驳回漏出截止点集合。
     _rej_ts = [m["ts"] for m in _sub_msgs
                if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))
-               and _review_gate.verdict(str(m.get("text", ""))) is False]
+               and type(m.get("ts")) in (int, float)
+               and _review_gate.is_rejected(str(m.get("text", "")))]
     _cutoff = max(_rej_ts) if _rej_ts else max(_sub_ts)
     # 取「更晚的消息里**时间最晚的那条有结论的消息**」再判：只要存在一条更晚的
     # APPROVED 就放行，会把同批更晚的 CHANGES_REQUESTED 盖掉（父步
@@ -162,17 +204,9 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
         if not isinstance(_m, dict):
             continue
         _ts = _m.get("ts")
-        if not isinstance(_ts, (int, float)) or _ts <= _cutoff:
+        if type(_ts) not in (int, float) or _ts <= _cutoff:
             continue
-        _txt = str(_m.get("text", ""))
-        _v = _review_gate.verdict(_txt)
-        # verdict() 是词表信号，不是结论检测器：「构建通过」「产出已就绪」
-        # 「上游 s3 APPROVED」「没有通过审核，需返工」实测都返回 True
-        # （codex P0）。这里再要一个**硬通过词**，并让 is_rejected 有一票否决。
-        if _v is True and not _any_hard_approve(_txt):
-            _v = None
-        if _v is True and _review_gate.is_rejected(_txt):
-            _v = None
+        _v = _conclusion(str(_m.get("text", "")))
         if _v is None:
             continue
         if _latest is None or _ts > _latest[0] or (_ts == _latest[0] and _v is False):
