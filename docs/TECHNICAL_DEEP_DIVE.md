@@ -36,7 +36,8 @@ src/
 - 规范模板目录 `~/.hermes/workflows/*.json`：见 `template_registry list`（数量不写死）。
   `python3 -m pipeflow.engine list` 打印引擎实际加载的名字。
 - `WorkflowDef(name, title, description, steps, loop)`；`WorkflowRun(id, workflow_name, context, status, current_step, step_retries, step_results)`。
-- `Step` 关键字段：`type`(single/handoff/review/gate/notify)、`target_role`、`exit_condition`、`exit_schema`、`max_retries`、`verify`、`condition`、`rollback_to`、`subflow_template`、`guard`、`wait_roles`。
+- `Step` 关键字段：`type`(single/handoff/review/gate/notify)、`target_role`、`exit_condition`、`exit_schema`、`max_retries`、`verify`、`subflow_template`、`guard`、`wait_roles`。
+  模板里多写的键不会报错也不会生效（加载器按 `Step` 字段过滤）：`condition`/`rollback_to` 已于 2026-10-22 从模板删除；`approval_prompt` 仍留在 WL-09 与 product_delivery，无读者。
 
 ### 3.2 subflow（编排 → 子链）
 
