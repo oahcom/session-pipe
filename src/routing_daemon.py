@@ -348,7 +348,19 @@ def main():
                         LOGGER.warning("eval_consistency 预检发现不兼容项 (rc=%s): %s",
                                        _ec_rc, _ec_buf.getvalue()[:400])
                     else:
-                        LOGGER.info("eval_consistency 预检通过")
+                        # 通过时也要落盘：37/52 条判据「无验证命令」恒跳过，13/19 个
+                        # 角色零可执行判据，都不会让 rc 非零 —— 只在这里可见。
+                        # 必须解析 JSON：--json 是多行输出，旧写法 splitlines()[-2:]
+                        # 恒为 ['  "details": []', '}']，盲区名单永远打不出来（实测）。
+                        try:
+                            _ec_doc = json.loads(_ec_buf.getvalue())
+                        except Exception:
+                            _ec_doc = {}
+                        _blind = _ec_doc.get("blind_roles") or []
+                        LOGGER.info("eval_consistency 预检通过: 可执行判据 %s 条；"
+                                    "盲区角色 %d 个: %s",
+                                    _ec_doc.get("exec_total", "?"), len(_blind),
+                                    ", ".join(_blind))
                 except Exception as _ec:
                     LOGGER.warning("eval_consistency 预检异常（不阻塞 eval 执行）: %s", _ec)
                 if _run_eval is None:

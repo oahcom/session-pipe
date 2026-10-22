@@ -44,3 +44,14 @@ def test_incompatible_criterion_not_counted_as_executable(monkeypatch, tmp_path,
     assert rc == 1, "不兼容仍返回 1（旧语义不变）"
     assert out["blind_roles"] == ["rejected"]
     assert out["incompatible_roles"] == 1
+
+def test_blind_roles_are_not_in_last_two_lines(monkeypatch, tmp_path, capsys):
+    """反例锁：旧 daemon 取 splitlines()[-2:] 拿不到名单（实测恒为 details/}）。
+
+    谁把 routing_daemon 改回 [-2:]，这条说明它看不到盲区 —— 必须解析 JSON。
+    """
+    monkeypatch.setattr(ec, "_load_roles", lambda d=None: _roles())
+    ec.main(["--json", "--personas", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "blind_roles" not in "\n".join(out.strip().splitlines()[-2:])
+    assert json.loads(out)["blind_roles"] == ["prose_only", "none"]
