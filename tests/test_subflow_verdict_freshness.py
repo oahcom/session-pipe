@@ -236,6 +236,34 @@ def test_delta_mentioning_rejection_is_still_narrative():
         _sub("CHANGES_REQUESTED"))
 
 
+def test_delta_first_line_progress_words_not_approval():
+    """delta 首行里的「构建通过」「产出已就绪」是进度，不是通过结论（codex P1/P3）。
+
+    旧版对 delta 首行直接跑 review_gate.verdict，词表含「通过/就绪」→ True，
+    于是一条 delta 就能把被子链驳回的父步放行。
+    """
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion("full_dev_pipeline/s4-complete — delta: 构建通过，剩余 3 项待修") is None
+    assert _conclusion("full_dev_pipeline/s4-complete — delta: 产出已就绪") is None
+    assert _conclusion("full_dev_pipeline/s4-complete — delta: 已修复 CHANGES_REQUESTED 的 3 项") is None
+    assert _conclusion("full_dev_pipeline/s4-complete — delta: 上游 s3 APPROVED 的 2 项已合并") is None
+
+
+def test_attribution_before_dash_does_not_block_real_approval():
+    """结论段之前的转述不影响结论段：真通过要放行（codex P2）。
+
+    生产标题形如「wf_x/s4-complete — 参考上游 reviewer 的 3 项 P1 全部返工 — APPROVED」，
+    把左窗口扩到整行会把这种真实通过吞掉，返工后的步继续被陈旧驳回卡住。
+    """
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion(
+        "wf_413e05355b/s4-complete — 参考上游 reviewer 的 3 项 P1 意见全部返工完成 — APPROVED") is True
+    assert _superseded_by_parent(
+        _parent(("wf_413e05355b/s4-complete — 参考上游 reviewer 的 3 项 P1 意见全部返工完成 — APPROVED",
+                 SUB_TS + 100)),
+        _sub("CHANGES_REQUESTED"))
+
+
 def test_quoted_approval_in_title_not_superseding():
     """标题形态（模板前缀）里转述上游的通过不算本步结论（codex P2）。"""
     assert not _superseded_by_parent(

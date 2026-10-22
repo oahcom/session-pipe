@@ -100,22 +100,28 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 # 硬通过词：只有这些才算「本步结论是通过」。单独的「通过/就绪」是过程叙述
 # （「构建通过」「产出已就绪」实测 verdict 均 True，codex P0）。
 _HARD_APPROVE = re.compile(
-    r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
-# 通过词**同句内**左侧出现这些词 = 转述别人的结论（「上游 s1 的最终验收
-# 结论已在 10:20 复核之后确认为 APPROVED」前缀 30 字，加长度上限会漏判）。
+    # (?<![-\w]) 排除步骤名里的 s1-integrity-approved 与 CONDITIONAL_APPROVED：
+    # 实测 24h 里 13 条「…/s1-integrity-approved —— NO_ANOMALY_VERIFY.md」被判通过。
+    r"(?<![-\w])APPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
+# 通过词左侧出现这些词 = 转述别人的结论（「上游 s1 的最终验收结论已在
+# 10:20 复核之后确认为 APPROVED」）。只在结论段内匹配，不跨段。
 _ATTRIB_LEFT = re.compile(
     r"(上游|下游|前序|前置|父步|子链|子流程|子步骤|兄弟步骤|其他步骤|"
-    r"参照|参考|如同|上次|此前|上一步|前步)[^。\n]*$")
+    r"参照|参考|如同|上次|此前|上一步|前步)")
 
 
 def _conclusion(text: str) -> bool | None:
     """一条完成消息**自己**的结论：True=通过 / False=驳回 / None=叙述。
 
-    驳回看**全文**（一票否决）：生产消息首行常只是标题，真正的
-    「结论：CHANGES_REQUESTED」写在空行后的正文；只看首行会把最晚的驳回当成
-    叙述跳过，回落到更早的 APPROVED，被驳回的步被盖 completed。
-    放行只看**首行**，且通过词左侧 24 字内有转述词时按叙述处理：正文里引用的
-    「上游 s3 APPROVED」、标题「s4-complete — 参照上游 …」都不是本步结论。
+    判据按**破折号分段**（—）：实测 1358 条 exit_messages 首行里 653 条带 —，
+    结论可能在前段也可能在后段——「… 验收通过 — exit_schema 契约达成」结论在前，
+    「… — CHANGES_REQUESTED 0 P0 / 2 P1」结论在后。故对每段分别判，不整行判：
+    转述词只在**通过词所在段内**生效，「参考上游 reviewer 返工完成 — APPROVED」
+    于是判通过，而「s4-complete — delta: 上游 s3 APPROVED 的 2 项已合并」判叙述。
+
+    含 delta 的首行一律按叙述：正文里「已修复 CHANGES_REQUESTED 的 3 项」是返工
+    记录，不是本步驳回。首行没有明确结论时才回落到全文驳回扫描（生产消息首行
+    常只是标题，真正的「结论：CHANGES_REQUESTED」在空行后的正文里）。
 
     ponytail: 代价不对称——漏放行只是让返工继续（保守），误放行会把被驳回的
     步推成 completed。升级路径：step_handler 写 exit_messages 时把 verdict
@@ -126,16 +132,16 @@ def _conclusion(text: str) -> bool | None:
     head = _lines[0] if _lines else ""
     if not head:
         return None
-    if "delta" in head.lower():
-        # delta 是状态叙述：正文里「已修复 CHANGES_REQUESTED 的 3 项」是返工
-        # 记录，不是本步驳回；只有首行自带锚点结论才算结论。
-        return _review_gate.verdict(head)
-    if _review_gate.is_rejected(text):
+    _segs = [s.strip() for s in head.split("—") if s.strip()]
+    if any("delta" in s.lower() for s in _segs):
+        return None
+    if any(_review_gate.is_rejected(s) for s in _segs):
         return False
-    for _m in _HARD_APPROVE.finditer(head):
-        if not _ATTRIB_LEFT.search(head[:_m.start()]):
-            return True
-    return None
+    for _s in _segs:
+        for _m in _HARD_APPROVE.finditer(_s):
+            if not _ATTRIB_LEFT.search(_s[:_m.start()]):
+                return True
+    return False if _review_gate.is_rejected(text) else None
 
 
 def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
