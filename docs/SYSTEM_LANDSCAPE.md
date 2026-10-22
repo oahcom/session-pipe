@@ -9,7 +9,7 @@
 |------|------|------|----------|
 | **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个角色（`roles_export.json`）+ 19 个 persona JSON（`ls personas/session-roles/*.json`）+ prompt 模板 | ≈2.5k 行（14 个 `.py`，src 7） |
 | **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | ≈16k 行（70 个 `.py`，src 31） |
-| **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | ≈46k 行（176 个 `.py`，src 42 / 20530，tests 128） |
+| **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | 现算：`git ls-files '*.py' | wc -l` = 179；src 合计 20764 行；tests 136 个（2026-10-22） |
 
 **实际关系不是三层流水线，而是两消费者并行：**
 

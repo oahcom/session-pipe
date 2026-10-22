@@ -5,9 +5,15 @@
 ## Context
 
 驳回语义由 `step_results[step].exit_messages` 的文本关键词判定。词表自 R105 起
-收敛为单一声明 `src/review_gate.py:REJECT_KEYWORDS`
-（`changes_requested` / `rejected` / `not_approved` / `驳回` / `未通过`），
+收敛为单一声明 `src/review_gate.py:REJECT_KEYWORDS`（2026-10-22 实测 7 词：
+`changes_requested` / `rejected` / `not_approved` / `no-go` / `nogo` / `驳回` / `未通过`），
 不再由 4 个消费者各写一份。
+
+**通过侧仍是两档，不是单一 helper**（2026-10-22 复核）：`review_gate.verdict()` 是宽档
+（`_PASS_WORD` 含「通过/就绪」，会把「构建通过」判 True），`pipeflow/task_generator.py`
+的 `_HARD_APPROVE` 是窄档（只认 APPROVED / 验收通过 / 判定通过 / 结论通过），用于
+"Do 子链驳回是否已被父步更新结论覆盖"这类**代价不对称**的判断——误放行会把被驳回的
+步推成 completed，所以宁可漏放行。
 
 `需修复` 与 `回退` 已于 R105 移除：前者是 `无需修复` 的子串（maintainer 健康
 巡检固定写「无异常需修复」，全库 18 例命中全为误报），后者在生产里作动词
@@ -38,7 +44,9 @@ stale-rescue 都读它）。
    已确认的步骤不再判驳回。
 2. 新一轮真实驳回由重投清理 `confirmed_at`/`confirmed_by`（`_REQUEUE_DROP` 已含）保证
    不被旧确认抑制——即「抑制」只作用于**同一轮内**的二次读取，不跨轮。
-3. 判据实现收敛为单一 helper，杜绝第 5、第 6 个消费点重演同一缺陷（见 Residual）。
+3. 驳回判据收敛为单一 helper（`review_gate.is_rejected`），杜绝第 5、第 6 个消费点
+   重演同一缺陷（见 Residual）。**例外**：判断"父步是否已用更新结论覆盖子链驳回"需要区分
+   「叙述」与「结论」，用 `task_generator._conclusion`（三态），不复用二值的 is_rejected。
 
 ## Consequences
 

@@ -39,7 +39,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **task_evidence.py** | 任务证据链 |
 | **contract_updater.py** | 合约同步 |
 | **conversation_monitor.py** | 对话监控 |
-| **config_loader.py** | YAML config loading with env override and hot-reload |
+| **config_loader.py** | YAML config loading with env override（**无热重载**：改 config.yaml 需重启进程） |
 | **workflow/gateway.py** | 工作流网关门禁 |
 | **drift_detector.py** | 架构漂移检测 |
 | **cron_scheduler.py** | cron 调度器 |

@@ -36,7 +36,8 @@ pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 
 
 ### 验证命令
 ```bash
-# 测试路由规则（10 个 pytest 用例；直接 python 跑只会执行 __main__ 自测块，收集不到它们）
+# 测试路由规则（用例数现算：python3 -m pytest tests/test_router.py --collect-only -q | tail -1；
+# 直接 python 跑只会执行 __main__ 自测块，收集不到它们）
 python3 -m pytest tests/test_router.py -q
 
 # 列出路由表（router CLI）
@@ -54,7 +55,7 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 - ❌ 把"消息送达"等同于"任务完成"：角色收到 prompt 且回了话，不等于它想对了、做对了；step 盖戳 success 必须基于产出内容成立，不能只看投递成功。
 - ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` "running 且 sr 空>1h" 静默误杀（bus #728c6e4307c1 根因）。
 
-## 代码布局（行数 2026-08-23 实测 `wc -l`）
+## 代码布局（行数由 scripts/doccheck.py 校验；新增模块必须手工补进本树——它不校验模块覆盖）
 ```
 src/
   routing/
@@ -86,6 +87,8 @@ src/
     db.py             ── 工作流数据访问（105 行）
     sync.py           ── 工作流同步（63 行）
 
+  review_gate.py      ── 驳回/通过词的唯一真相源（REJECT_KEYWORDS / verdict / is_rejected）
+  eval_shared_loader.py ── eval 共用加载器
   p0_exemption.py     ── P0 豁免通道（coordinator/lr/pm）
   config_loader.py    ── 配置加载（YAML + env override；无热重载，改完重启）
   eval_checker.py     ── 安全白名单命令执行检查
@@ -184,7 +187,7 @@ EOF
 ## 测试
 ```bash
 cd ~/session-pipeline && python3 -m pytest tests/ -x -q
-python3 -m py_compile src/**/*.py
+python3 -m py_compile $(git ls-files 'src/*.py')   # ** 无 globstar 时只匹配 src/*/*.py，漏掉 src/ 顶层模块
 ```
 
 ### 手工验证必须走隔离（防止污染生产）
