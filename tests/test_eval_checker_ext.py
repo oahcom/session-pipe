@@ -81,6 +81,13 @@ def test_role_filter_nonexistent():
     assert s["checked"] == 0
 
 
+class _StubTrajectory:
+    """轨迹检查替身：真检查器读线上转录，结果与本用例无关且随时钟变化。"""
+
+    def check(self, *args, **kwargs):
+        return {"passed": True, "findings": [], "checked_traces": 0, "subagent": {}}
+
+
 def test_sampling_is_uniform_without_replacement():
     """抽样必须均匀且无放回。
 
@@ -93,7 +100,7 @@ def test_sampling_is_uniform_without_replacement():
         patch.object(ec, "_run",
                      return_value={"ok": True, "stdout": "active", "stderr": "", "returncode": 0}),
         patch.object(ec, "_write_bus"),
-        patch.object(ec, "TrajectoryQualityChecker", _BenignTrajectory),
+        patch.object(ec, "TrajectoryQualityChecker", _StubTrajectory),
         patch.object(ec.random, "sample", wraps=ec.random.sample) as mock_sample,
     ):
         ec.run_eval_check()
