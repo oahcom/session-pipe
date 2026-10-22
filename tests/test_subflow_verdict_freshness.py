@@ -264,6 +264,29 @@ def test_attribution_before_dash_does_not_block_real_approval():
         _sub("CHANGES_REQUESTED"))
 
 
+def test_delta_with_hard_rejection_is_still_rejection():
+    """delta 段自带硬驳回、且没写「已修复」时，仍是驳回（codex 第 8 轮 P2）。
+
+    早退成 None 会让守卫跳过这条更晚的驳回、回落到更早的 APPROVED，
+    把被驳回的步盖成 completed。
+    """
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion("s4-complete — delta: CHANGES_REQUESTED 3 项未修复") is False
+    assert _conclusion("s4-complete — delta: 已修复 CHANGES_REQUESTED 的 3 项") is None
+    assert not _superseded_by_parent(
+        _parent(("APPROVED", SUB_TS + 100),
+                ("s4-complete — delta: CHANGES_REQUESTED 3 项未修复", SUB_TS + 200)),
+        _sub("CHANGES_REQUESTED"))
+
+
+def test_approved_next_to_chinese_still_counts():
+    """「复核APPROVED」这类中文紧贴的通过词不能被 lookbehind 误伤（codex 第 8 轮 P3）。"""
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion("s4-complete — 复核APPROVED") is True
+    assert _conclusion("s4-complete — 已APPROVED") is True
+    assert _conclusion("s4-complete — s1-integrity-approved") is None
+
+
 def test_conditional_approved_counts_as_pass():
     """CONDITIONAL_APPROVED 是生产里主流的通过形态，不是叙述。
 

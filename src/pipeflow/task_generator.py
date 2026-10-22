@@ -102,8 +102,12 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 _HARD_APPROVE = re.compile(
     # (?<![-\w]) 排除步骤名里的 s1-integrity-approved 与 CONDITIONAL_APPROVED：
     # 实测 24h 里 13 条「…/s1-integrity-approved —— NO_ANOMALY_VERIFY.md」被判通过。
-    r"(?<![-\w])(?:CONDITIONAL_)?APPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过",
-    re.I)
+    # 前置只排除 ASCII 的字母数字/下划线/连字符：\w 在 Python 里含汉字，
+    # 会把「复核APPROVED」这类真实通过也排除掉（codex P3）。
+    r"(?<![A-Za-z0-9_-])(?:CONDITIONAL_)?APPROVED\b|验收通过|"
+    r"判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
+# delta 段提到驳回时，出现这些词才算「返工记录」而非「本步驳回」。
+_FIX_MARK = re.compile(r"已修复|已处理|已合并|已关闭|fixed|resolved", re.I)
 # CONDITIONAL_APPROVED 也算通过：实测 47 个带该结论的步骤状态全是 completed /
 # step_done_ready（0 P0 的带条件通过），把它当叙述会让父步的更新结论永远压不过
 # 子链的旧驳回（#439027 那类 7h32m 卡死的成因）。
@@ -137,9 +141,13 @@ def _conclusion(text: str) -> bool | None:
     if not head:
         return None
     _segs = [s.strip() for s in head.split("—") if s.strip()]
+    _rejected = [s for s in _segs if _review_gate.is_rejected(s)]
     if any("delta" in s.lower() for s in _segs):
-        return None
-    if any(_review_gate.is_rejected(s) for s in _segs):
+        # delta 段提到驳回：带「已修复/已处理」才是返工记录（叙述）；否则仍是驳回
+        # ——直接 None 会让更早的 APPROVED 把被驳回的步盖成 completed（codex P2）。
+        return None if all(_FIX_MARK.search(s) for s in _rejected) else (
+            False if _rejected else None)
+    if _rejected:
         return False
     for _s in _segs:
         for _m in _HARD_APPROVE.finditer(_s):
