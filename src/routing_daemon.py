@@ -131,7 +131,7 @@ def _any_live_targets() -> bool:
 def _check_cron_schedules() -> int:
     """检查角色 JSON 的 cron_schedule，到期角色执行 ccs.py send。
 
-    使用 croniter 做时间匹配，/tmp/cron_schedule_triggered.json 做去重。
+    使用 croniter 做时间匹配，~/.hermes/run/cron_schedule_triggered.json 做去重。
     返回触发次数。各 daemon 调用：routing_daemon 每 300s。
     
     增强版：增加死角色检测，防止盲发导致 ccs_send_fallback 风暴。
@@ -242,6 +242,23 @@ def _check_cron_schedules() -> int:
         LOGGER.info("cron_schedule: 本次触发 %d 个角色", triggered_count)
     return triggered_count
 
+def _forget_eval_modules() -> None:
+    """清掉 eval_checker / eval_consistency / eval_shared_loader 的模块缓存。
+
+    常驻进程会一直持有旧版模块对象：新加的跨模块常量（CRITERIA_WINDOW）在首轮导入时
+    直接 ImportError，预检与热重载整段被跳过（2026-10-22 10:27 journal 实测）。
+    """
+    for _name in ("eval_checker", "eval_consistency", "eval_shared_loader"):
+        for _k in [k for k in sys.modules if k == _name or k.startswith(_name + ".")]:
+            del sys.modules[_k]
+
+
+def _eval_source_mtimes() -> tuple[float, ...]:
+    """eval_checker 依赖的两个源文件 mtime。只比 eval_checker 会漏掉 loader 的改动。"""
+    _d = Path(__file__).parent
+    return tuple(os.path.getmtime(str(_d / f)) for f in ("eval_checker.py", "eval_shared_loader.py"))
+
+
 def main():
     LOGGER.info("routing_daemon 启动 PID=%d", os.getpid())
     last_ccs = 0
@@ -266,7 +283,7 @@ def main():
 
     # 延迟导入 eval_checker（避免模块级循环引用）
     _run_eval = None
-    _eval_checker_mtime = 0.0
+    _eval_mtimes: tuple[float, ...] = ()
 
     try:
         error_backoff = 0
@@ -335,6 +352,7 @@ def main():
                 # D6 生长接入: eval_consistency 预检 persona eval_criteria 与白名单一致性，
                 # 防止运行时 exit=-3 静默跳过（2026-08-11 白名单漂移事故根因）
                 try:
+                    _forget_eval_modules()   # 首轮导入就撞旧模块：见函数注释
                     from eval_consistency import main as _ec_main
                     import io, contextlib
                     _ec_buf = io.StringIO()
@@ -344,70 +362,47 @@ def main():
                     # → 输出永不落盘（实测 30 天 journal 里 0 条），且 _ec_main 的
                     # 返回值被丢弃。该预检的全部意义就是"发现不兼容项"，用不可见
                     # 级别打印等于没做——正是它自己要防的那种静默。
+                    # 盲区名单与 rc 无关：52 条判据里 27 条「无验证命令」恒跳过，按运行期
+                    # 窗口（前 3 条）只有 9 条真能执行、14/19 个角色零可执行判据。这些
+                    # 都不会让 rc 非零，而现实里 rc 恒为 1（19 角色里 1 条不兼容），
+                    # 放在 else 分支等于永不落盘。
+                    # 必须解析 JSON：--json 是多行输出，旧写法 splitlines()[-2:]
+                    # 恒为 ['  "details": []', '}']，盲区名单永远打不出来（实测）。
+                    try:
+                        _ec_doc = json.loads(_ec_buf.getvalue())
+                    except Exception:
+                        _ec_doc = {}
+                    _blind = _ec_doc.get("blind_roles") or []
+                    LOGGER.info("eval_consistency 预检: 可执行判据 %s 条；盲区角色 %d 个: %s",
+                                _ec_doc.get("exec_total", "?"), len(_blind), ", ".join(_blind))
                     if _ec_rc:
                         LOGGER.warning("eval_consistency 预检发现不兼容项 (rc=%s): %s",
                                        _ec_rc, _ec_buf.getvalue()[:400])
                     else:
-                        # 通过时也要落盘：52 条判据里 27 条「无验证命令」恒跳过，按运行期
-                        # 窗口（前 3 条）只有 9 条真能执行、14/19 个角色零可执行判据，
-                        # 都不会让 rc 非零 —— 只在这里可见。
-                        # 必须解析 JSON：--json 是多行输出，旧写法 splitlines()[-2:]
-                        # 恒为 ['  "details": []', '}']，盲区名单永远打不出来（实测）。
-                        try:
-                            _ec_doc = json.loads(_ec_buf.getvalue())
-                        except Exception:
-                            _ec_doc = {}
-                        _blind = _ec_doc.get("blind_roles") or []
-                        LOGGER.info("eval_consistency 预检通过: 可执行判据 %s 条；"
-                                    "盲区角色 %d 个: %s",
-                                    _ec_doc.get("exec_total", "?"), len(_blind),
-                                    ", ".join(_blind))
+                        LOGGER.info("eval_consistency 预检通过")
                 except Exception as _ec:
                     LOGGER.warning("eval_consistency 预检异常（不阻塞 eval 执行）: %s", _ec)
                 if _run_eval is None:
                     try:
                         from eval_checker import run_eval_check
                         _run_eval = run_eval_check
-                        _eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
+                        _eval_mtimes = _eval_source_mtimes()
                     except Exception:
                         _run_eval = lambda: {"checked": 0}
-                # ponytail: 检测 eval_checker.py 变更，热重载无需重启 daemon
-                eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
-                if _eval_checker_mtime != eval_checker_mtime:
-                    _old_mtime = 0.0  # Fix: initialize to avoid UnboundLocalError on exception path
+                # ponytail: 两个源文件任一变更就热重载，无需重启 daemon。
+                # 只比 eval_checker.py 会漏掉 loader：预检用新 CRITERIA_WINDOW，而 _run_eval
+                # 的函数对象钉在旧模块 globals 上，运行期仍按旧口径判（实测 09:56/10:27）。
+                if _eval_mtimes != _eval_source_mtimes():
                     try:
-                        # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）。
-                        # eval_shared_loader 必须一起清：eval_checker 依赖它导出的
-                        # CRITERIA_WINDOW，只重载 eval_checker 会 ImportError（实测
-                        # 09:56 "cannot import name 'CRITERIA_WINDOW'"），热重载静默退化。
-                        for _key in list(sys.modules):
-                            if (_key == "eval_checker" or _key.startswith("eval_checker.")
-                                    or _key == "eval_shared_loader"):
-                                del sys.modules[_key]
+                        _forget_eval_modules()
+                        # purge 后 import 已经重执行模块体；再 reload 会执行第二遍
+                        # （_LAST_SUBAGENT 去重表被清空重建，每角色最坏重发一条 bus）。
                         import eval_checker
-                        importlib.reload(eval_checker)
                         _run_eval = eval_checker.run_eval_check
-                        _old_mtime = _eval_checker_mtime
-                        _eval_checker_mtime = eval_checker_mtime
-                        LOGGER.info("eval_checker 热重载成功 (mtime %s→%s)",
-                                    _old_mtime, eval_checker_mtime)
+                        _old, _eval_mtimes = _eval_mtimes, _eval_source_mtimes()
+                        LOGGER.info("eval_checker 热重载成功 (mtime %s→%s)", _old, _eval_mtimes)
                     except Exception as _e:
-                        LOGGER.warning("eval_checker 热重载失败: %s", _e)
-                        # 热重载失败：尝试强制重新 import（兜底）
-                        try:
-                            for _key in list(sys.modules):
-                                if (_key == "eval_checker" or _key.startswith("eval_checker.")
-                                        or _key == "eval_shared_loader"):
-                                    del sys.modules[_key]
-                            import importlib as _il
-                            eval_checker = _il.import_module("eval_checker")
-                            _run_eval = eval_checker.run_eval_check
-                            _eval_checker_mtime = eval_checker_mtime
-                            LOGGER.info("eval_checker 强制重新 import 成功")
-                        except Exception as _e2:
-                            LOGGER.error("eval_checker 强制重新 import 也失败: %s", _e2)
-                        # Fix: ensure _old_mtime is defined even on fallback failure
-                        _old_mtime = 0.0
+                        LOGGER.error("eval_checker 热重载失败（继续用旧版本）: %s", _e)
                 try:
                     r = _run_eval()
                     if r.get("failed", 0):
