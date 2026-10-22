@@ -189,3 +189,38 @@ def _no_live_approval_notify(monkeypatch):
     from lifecycle import manager as _lm
     monkeypatch.setattr(_lm.LifecycleManager, "_notify_result", lambda *a, **k: None)
 
+
+@pytest.fixture(autouse=True)
+def _no_guard_role_start(request, monkeypatch):
+    """守护巡检默认不拉起真角色：run_once() 会走 _ensure_guard_roles → _ensure_role_alive
+    → `ccs start`（60s 超时 + 30×1s 轮询）。测试里的角色名（test_role）不存在，
+    于是一次 run_once 烧掉 90s+：全量套件卡在第 29 例（15 分钟 0 前进，进程 sleep）。
+    真跑它的用例在 tests/test_role_alive_cache.py / test_ensure_role_alive_race.py，
+    它们直接调 _ensure_role_alive，不经本函数，故不受影响。
+    """
+    # test_tick_budget 测的就是巡检游标/预算本身（它用 del 撤实例桩去测真实实现）。
+    if (os.environ.get("PYTEST_REAL_GUARD") == "1"
+            or (request.module.__name__ if request.module else "").endswith("test_tick_budget")):
+        return
+    from pipeflow import engine as _eng
+    monkeypatch.setattr(_eng.WorkflowEngine, "_ensure_guard_roles", lambda self, *a, **k: set())
+
+# 需要真实 _wait_for_role_ready 的模块：它验的正是「ccs start 失败要可观测」，
+# 桩掉就把被测对象测空了。
+_REAL_READY_MODULES = {"test_role_start_error_text"}
+
+
+@pytest.fixture(autouse=True)
+def _fast_role_ready(request, monkeypatch):
+    """派单前的就绪等待默认桩掉：真实现 = tmux has-session + `ccs start`(60s) + 10×1s 轮询，
+    对不存在的 test_role 烧满 90s。`eng.start()` 第一跳就会走它 → 全量套件卡在
+    test_chain_convergence（thread 栈：start → _write_step_prompt → _send_to_role →
+    _wait_for_role_ready → sleep(5)）。已有 8 个用例各自 MagicMock 过它 → 共性缺口。
+    """
+    _mod = (request.module.__name__ if request.module else "").split(".")[-1]
+    if _mod in _REAL_READY_MODULES or os.environ.get("PYTEST_REAL_GUARD") == "1":
+        return
+    from pipeflow import role_lifecycle as _rl
+    monkeypatch.setattr(_rl.RoleLifecycleMixin, "_wait_for_role_ready",
+                        lambda self, *a, **k: True)
+

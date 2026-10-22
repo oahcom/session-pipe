@@ -622,7 +622,7 @@ class RoleLifecycleMixin:
         # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
         return bool((snap.get(role) or ("", ""))[0])
 
-    def _ensure_role_alive(self, role: str) -> bool:
+    def _ensure_role_alive(self, role: str, deadline: float = 0.0) -> bool:
         """存活探测 + 拉起；正向结果缓存 _ALIVE_CACHE_SEC（实测单次探测 4-5.6s）。
 
         实测 2026-10-22 03:3x：一次 tmux has-session 2.4s、_is_agent_alive 再 2.4s。
@@ -636,13 +636,19 @@ class RoleLifecycleMixin:
             _cache = self._alive_until = {}
         if _cache.get(role, 0.0) > _now:
             return True
-        if self._check_and_start_role(role):
+        if self._check_and_start_role(role, deadline=deadline):
             _cache[role] = time.time() + _ALIVE_CACHE_SEC
             return True
         return False
 
-    def _check_and_start_role(self, role: str) -> bool:
-        """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。"""
+    def _check_and_start_role(self, role: str, deadline: float = 0.0) -> bool:
+        """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。
+
+        deadline：调用方（守护巡检）给的绝对时刻。拉起 `ccs start` 原本写死 60s
+        超时 + 30×1s 轮询，单角色最坏 95s——巡检只在**角色之间**看预算，于是
+        一个角色就能把整个 tick 预算吃光（实测 run_once 卡在 _ensure_guard_roles
+        的 sleep(3) 里，全量套件第 29 例 15 分钟 0 前进）。
+        """
         try:
             alive = _engine_mod._sp.run(
                 ["tmux", "has-session", "-t", f"ccs-{role}"],
@@ -695,11 +701,14 @@ class RoleLifecycleMixin:
         _env = _os.environ.copy()
         _env.pop("VIRTUAL_ENV", None)
         _env.pop("CONDA_PREFIX", None)
+        # 预算内拉起：deadline 留给巡检时，子进程超时必须跟着缩，否则"到点就停"
+        # 只在角色之间成立，单个 ccs start 仍可独占 60s。
+        _start_timeout = 60.0 if not deadline else max(5.0, min(60.0, deadline - time.time()))
         try:
             _st = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "start", role, "--no-attach",
                  "--drive", "infinite", "--no-auto-send"],
-                capture_output=True, timeout=60, env=_env,
+                capture_output=True, timeout=_start_timeout, env=_env,
             )
             # 同一条拉起路径的两个入口（daemon/engine tick 走这里）：返回值曾整体
             # 丢弃，于是"角色起不来"只有 tmux 层的假象，没有原因（codex 20 维 P1）。
@@ -707,6 +716,9 @@ class RoleLifecycleMixin:
                 LOGGER.warning("CCS %s: ccs start 失败 (rc=%s): %s", role, _st.returncode,
                                " ".join(_start_error_text(_st.stdout, _st.stderr).split())[:200])
             for _ in range(30):
+                if deadline and time.time() > deadline:
+                    LOGGER.warning("CCS %s: 拉起预算耗尽，剩余流程交给下一轮巡检", role)
+                    break
                 time.sleep(1)
                 _invalidate_tmux()   # 刚拉起，让下一次探针拿到新会话
                 if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],

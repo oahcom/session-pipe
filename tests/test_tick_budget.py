@@ -216,7 +216,7 @@ def test_guard_sweep_is_bounded_and_rotates(_sp):
     eng = _fast(WorkflowEngine(d))
     seen = []
 
-    def _slow(role):
+    def _slow(role, deadline=0.0):
         seen.append(role)
         time.sleep(0.02)
         return True

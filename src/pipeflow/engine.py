@@ -1800,7 +1800,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             # 单角色异常不得中断整轮：本函数在 run_once 里无 try 保护，
             # 一处抛错则同 tick 的其它角色全部不被拉起。
             try:
-                self._ensure_role_alive(_role)
+                self._ensure_role_alive(_role, deadline=deadline)
             except Exception as _e:
                 LOGGER.warning("ensure_role_alive %s 失败: %s", _role, _e)
         return _alive_roles
