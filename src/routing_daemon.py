@@ -376,9 +376,13 @@ def main():
                 if _eval_checker_mtime != eval_checker_mtime:
                     _old_mtime = 0.0  # Fix: initialize to avoid UnboundLocalError on exception path
                     try:
-                        # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）
+                        # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）。
+                        # eval_shared_loader 必须一起清：eval_checker 依赖它导出的
+                        # CRITERIA_WINDOW，只重载 eval_checker 会 ImportError（实测
+                        # 09:56 "cannot import name 'CRITERIA_WINDOW'"），热重载静默退化。
                         for _key in list(sys.modules):
-                            if _key == "eval_checker" or _key.startswith("eval_checker."):
+                            if (_key == "eval_checker" or _key.startswith("eval_checker.")
+                                    or _key == "eval_shared_loader"):
                                 del sys.modules[_key]
                         import eval_checker
                         importlib.reload(eval_checker)
@@ -392,7 +396,8 @@ def main():
                         # 热重载失败：尝试强制重新 import（兜底）
                         try:
                             for _key in list(sys.modules):
-                                if _key == "eval_checker" or _key.startswith("eval_checker."):
+                                if (_key == "eval_checker" or _key.startswith("eval_checker.")
+                                        or _key == "eval_shared_loader"):
                                     del sys.modules[_key]
                             import importlib as _il
                             eval_checker = _il.import_module("eval_checker")
