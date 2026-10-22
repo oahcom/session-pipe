@@ -38,7 +38,7 @@ def test_start_result_is_captured():
     # （内联副本没有锁/冷却/审计，实测 pg 90s 内被连启 6 次必败）。
     w = re.search(r'def _wait_for_role_ready.*?(?=\n    def )', src, re.S)
     assert w, "未找到 _wait_for_role_ready"
-    assert "self._check_and_start_role(role)" in w.group(0), \
+    assert "self._check_and_start_role(role, deadline)" in w.group(0), \
         "_wait_for_role_ready 不再委托共用拉起路径（副本回归）"
     # tmux 探活仍会用 _sp.run，所以只禁"拉起角色的那一次调用"的指纹
     assert '"start", role' not in w.group(0) and "--drive" not in w.group(0), \

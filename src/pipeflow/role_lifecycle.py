@@ -859,7 +859,10 @@ class RoleLifecycleMixin:
                 # 但没有 _RESTART_LOCK / 300s 冷却 / monitor_audit，于是 90s 窗口内对同一角色
                 # 连发 6 次 ccs start（实测 pg 08:16:30-08:18:08 每 15s 一次，全部因内存不足必败，
                 # 每次阻塞 60s），而审计计数看不见这些尝试（24h 记 36 次 = 低估）。
-                if not self._check_and_start_role(role):
+                # 带上本函数的 deadline：不传时拉起走默认 0.0，单个角色可用
+                # ccs start 60s + 30 轮轮询把整个 max_wait 吃穿（=tick 预算被单角色吃光，
+                # 与 _ensure_guard_roles 同一缺陷；codex 20 维第 3 轮）。
+                if not self._check_and_start_role(role, deadline):
                     time.sleep(check_interval)
                     continue
                 # 拉起函数是 bool 契约：None（探测不可用）与「已拉起」共用 True。
