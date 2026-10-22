@@ -551,7 +551,8 @@ def _write_bus(cat: str, text: str, *, evidence: str = "", src: str = "eval_chec
         subprocess.run(
             [sys.executable, str(BUS_SCRIPT), "write", cat, text,
              "--evidence", evidence[:500], "--src", src],
-            capture_output=True, timeout=15,
+            # 15s 也踩过线：实测 bus 事务持锁 5~9.8s，11:05 有一次写入超时。
+            capture_output=True, timeout=30,
         )
     except Exception as e:
         LOGGER.warning("bus write fail: %s", e)

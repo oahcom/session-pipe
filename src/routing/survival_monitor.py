@@ -312,7 +312,9 @@ class SurvivalMonitor:
             subprocess.run(
                 [sys.executable, str(BUS_SCRIPT), "write", cat, text,
                  "--evidence", evidence[:500], "--src", "survival_monitor"],
-                capture_output=True, timeout=10,
+                # 10s 低于实测 bus 事务持锁（40min 窗口内 5 次，最长 9.8s）→
+                # 10:57 连续 3 次写失败，存活/死亡事实没落盘。取 30s 留 3 倍余量。
+                capture_output=True, timeout=30,
             )
         except Exception as e:
             LOGGER.warning("bus write fail: %s", e)
