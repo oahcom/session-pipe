@@ -86,3 +86,21 @@ def test_subflow_verdict_only_checks_last_step():
     assert not _subflow_verdict_rejected({"s2": sr["s2"]}), "末步 APPROVED 不应判驳回"
     # 全量判会误报 —— 这正是修复前行为
     assert _subflow_verdict_rejected(sr), "全量扫描确实会命中历史驳回（说明必须只看末步）"
+
+
+def test_message_dicts_always_carry_evidence():
+    """所有 exit_message 构造都必须带 evidence。
+
+    驳回分类段（【系统问题→engineer】）只写在 evidence 里，`_parse_review_issues`
+    读不到就建不出返工链（生产实测 3/3 条真实驳回解析为空）。主路径带了，两个
+    兜底路径（宽松推进、协作门补查）丢了——全库 1359 条消息里 1045 条（76.9%）无
+    evidence，正是这两处。这条用例按源码结构钉住，删掉任一处 evidence 即红。
+    """
+    import re
+    from pathlib import Path
+    import pipeflow.step_handler as sh
+    src = Path(sh.__file__).read_text()
+    blocks = re.findall(r'\{"id": _?f\.id, "text": _?f\.t\[:200\][^}]*\}', src, re.S)
+    assert len(blocks) >= 3, f"消息构造点少于预期（{len(blocks)}），检查点可能失效"
+    bad = [b for b in blocks if "evidence" not in b]
+    assert not bad, f"缺 evidence 的消息构造: {bad}"
