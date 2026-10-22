@@ -739,6 +739,13 @@ class RoleLifecycleMixin:
         deadline = time.time() + max_wait
         check_interval = 5
         while time.time() < deadline:
+            # 0. 探测不可用（tmux server 卡死，实测 2026-10-22 09:18 list-sessions 20s
+            # 无响应）≠ 角色死了：必须先于 has-session / ccs start 判断，否则整轮
+            # 先烧 has-session 5s + ccs start 60s + 10×1s 等待才轮到它。
+            # 此刻投递根本走不通，交给下一 tick 重试。
+            if (_probe := self._is_agent_alive(role)) is None:
+                LOGGER.warning("_wait_for_role_ready %s: tmux 探测不可用，本轮不投递", role)
+                return False
             # 1. tmux session 存活
             try:
                 alive = _engine_mod._sp.run(
@@ -795,14 +802,7 @@ class RoleLifecycleMixin:
                     continue
 
             # 2. 检查 claude 进程是否存活
-            # 探测不可用（tmux server 卡死，实测 2026-10-22 09:20 list-sessions 20s
-            # 无响应）≠ 角色死了：这里必须跳出，否则每轮空转 5s、烧光 90s 预算，
-            # 而整条投递路径在 tmux 恢复前根本走不通 —— 交给下一 tick 重试。
-            _alive_probe = self._is_agent_alive(role)
-            if _alive_probe is None:
-                LOGGER.warning("_wait_for_role_ready %s: tmux 探测不可用，本轮不投递", role)
-                return False
-            if not _alive_probe:
+            if not _probe:
                 LOGGER.info("Role %s 无 claude 进程，等待就绪（若持续则角色未被拉起）", role)
                 time.sleep(5)
                 continue
@@ -995,7 +995,7 @@ class RoleLifecycleMixin:
         # 未就绪是**临时**状态（忙/启动中/探测抖动），不是投递失败。返回 "busy"
         # 让 engine 走排队分支（不计数、下 tick 重试）；返回 False 会被 engine
         # 计入 delivery_fail_count，3 次即灌 delivery_blocked 终态且无恢复路径
-        # （该方法唯一的 False 路径是 90s 空转超时，见 _wait_for_role_ready 末尾）。
+        # （该方法的 False 路径只有两条：90s 空转超时、探测不可用提前返回）。
         if not self._wait_for_role_ready(role, wf_id=wf_id, step_id=step_id):
             LOGGER.warning("_send_to_role %s: role not ready, queue for next tick", role)
             return "busy"
