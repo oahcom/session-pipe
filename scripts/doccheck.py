@@ -226,9 +226,10 @@ def main(argv=None) -> int:
             bad += 1
             continue
         if args.fix:
+            # 修完行数仍要跑一遍引用检查：否则 --fix 会对着越界的 xxx.py:NNN 说 CLEAN，
+            # 把"刷新"变成"刷新并宣布没问题"（第二版审查的 P1）。
             print(f"{p}: 已修正 {_fix(p, root)} 处行数声明")
-        else:
-            bad += _check(p, root)
+        bad += _check(p, root)
     print(f"\n{'CLEAN' if bad == 0 else f'{bad} mismatch(es)'}")
     return 1 if bad else 0
 
