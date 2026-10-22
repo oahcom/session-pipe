@@ -18,7 +18,9 @@
 | G9 | `wf_starve.json` 的 `last_active_ts` 是幽灵字段 | 已修 | `daemon.py:211` 每轮写 `state["last_active_ts"] = now` |
 | G10 | `get_workflow_progress` 等用 `step["step_id"]` 直取 DB 模板 | 已修 | `grep -n 'step\["step_id"\"]' src/lifecycle/manager.py` 无命中；PUBLIC_API 中对应方法已不存在 |
 | G11 | 每日 13 次服务重启、无自动拉起（部署健壮性） | **未验证** | `systemctl is-active session-pipeline-daemon.service` → active（2026-10-22 05:49 启动，NRestarts=0）；`journalctl -u session-pipeline-daemon.service --since today` 有"启动"条目。`/etc/systemd/system/session-pipeline.service` **存在但 inactive（disabled）**，不是“不存在”——旧结论来自 `Unit not found` 的误读，排障该用 `systemctl status session-pipeline-daemon.service` |
-| G12 | 19 个角色里 14 个零可执行判据（运行期窗口口径），抽样加权且有放回 | 已修（2026-10-22） | `eval_consistency` 现输出 `blind_roles`（实测 14 个）+ `exec_total`（窗口内可执行 8 条，全表 15 条）；`run_eval_check` 只跑 `eval_criteria[:3]`（`CRITERIA_WINDOW`）并改均匀无放回；daemon 盲区日志原在 `rc==0` 分支而生产 rc 恒为 1 → 提到 rc 分支之前（`4f04a13`）。盲区不设硬失败（每 600s 一条 WARNING 会淹没真不兼容项） |
+| G12 | 19 个角色里 14 个零可执行判据（运行期窗口口径），抽样加权且有放回 | 已修（2026-10-22） | `eval_consistency` 现输出 `blind_roles`（实测 14 个）+ `exec_total`（窗口内可执行 9 条、`no_cmd_total` 27 条；`PYTHONPATH=src python3 src/eval_consistency.py --json` 可复跑）；`run_eval_check` 只跑 `eval_criteria[:3]`（`CRITERIA_WINDOW`）并改均匀无放回；daemon 盲区日志原在 `rc==0` 分支而生产 rc 恒为 1 → 提到 rc 分支之前（`4f04a13`）。盲区不设硬失败（每 600s 一条 WARNING 会淹没真不兼容项） |
+| G13 | 主循环按饥饿排序时 `assignee=''` 的实例被 `assignee < ?` 比较丢到队尾，默认角色实例饿了也不被推进 | 待修（本轮只取证，未改代码） | 判据：`wig` 排序键里空串参与比较；实测这条结论尚未用「同一 tick 内该类实例是否被扫到」的日志证实，**归因待验证** |
+| G14 | 额度退避的 attempt 计数行写盘后必被丢弃（`__rate_n__` 的值是计数不是时间戳，`_load_alert_ts` 的 TTL 过滤把它当 1970 年） | 未修（天花板已知） | `role_lifecycle.py:298` 读 `rows.get((role, "__rate_n__"))`，而 `:247` 的 `now - float(ts) < ttl` 对计数行恒假 → 重启后 attempt 恒 0、退避从 120s 重来。代价可控（每次重启多 1~2 次「继续」），升级路径：计数编码进 tag（`__rate_n__3`）或改存 `retry_at` 时间戳 |
 
 ## 未验证 / 不在本单
 
