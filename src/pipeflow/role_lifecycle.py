@@ -7,6 +7,7 @@
 import fcntl
 import json
 import re
+import sqlite3
 import time
 import logging
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 from paths import CCS_CLI as _CCS_CLI
+from liveness import tmux_snapshot as _tmux_snapshot, invalidate_tmux_snapshot as _invalidate_tmux
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 
 LOGGER = logging.getLogger("workflow.engine")
@@ -441,16 +443,24 @@ class RoleLifecycleMixin:
             # 退避曲线失效（24h 实测 614 次注入、相邻间隔 median 248s = 120s 重置
             # 再等 120s 的形状，<120s 占 17.6%；attempt 从未爬到 5 档封顶）。
             # pane 门（前半）不变：真恢复的角色照样立刻清状态、不被拖到 1800s 起步。
-            if not any(p in _recent for p in self._RATE_LIMIT_PATTERNS) \
-                    and _transcript_progress_after_error(role):
-                # pane 未命中不代表已恢复：15/15 会话 alternate_on=1，capture-pane
-                # 只有视口，错误文案几分钟就滚出视口（实测 24h 1,342 条错误轮里
-                # pane 只认出 9 次 = 0.67%），转录才是落盘事实。
-                # 角色已恢复：清掉退避状态，否则下一次真 403 会从最大退避档
-                # （1800s）起步，恢复要等半小时。
-                self._last_rate_recover.pop(role, None)
-                _save_rate_state(_ALERT_STATE, self._last_rate_recover, now,
-                                self._ALERT_TTL_S, delete_roles=(role,))
+            _pane_err = any(p in _recent for p in self._RATE_LIMIT_PATTERNS)
+            # 错误信号 = pane 文案 或 转录最后一条就是错误轮。两者都没有时
+            # 必须直接跳过：ccebbcf 把判据换成"错误后有进展"后，健康角色
+            # （pane 干净、转录为空）progress=False 会落到下面的发送分支，
+            # 每个 tick 给健康角色发一句「继续」（6 个 rate_recovery 用例红）。
+            if not _pane_err and not _transcript_last_turn_is_api_error(
+                    role, max_age=float("inf")):
+                # 无错误信号 = 没有待重发的请求。只在"确认已恢复"时清退避，否则下一次
+                # 真 403 会从最大退避档（1800s）起步、恢复要等半小时；错误轮后只落了
+                # 纯文本半成品不算恢复（清了会让 429 退避从第 1 档重来）。
+                # 转录读不到（新角色/路径缺失/空文件）= 无证据，按已恢复处理。
+                if (_transcript_progress_after_error(role)
+                        or not _read_transcript_tail(role)):
+                    self._last_rate_recover.pop(role, None)
+                    _save_rate_state(_ALERT_STATE, self._last_rate_recover, now,
+                                    self._ALERT_TTL_S, delete_roles=(role,))
+                # 清完直接跳过本轮，不再落到下面的发送分支
+                # （健康角色每个 tick 被敲一句「继续」）。
                 continue
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt
@@ -690,7 +700,7 @@ class RoleLifecycleMixin:
             LOGGER.debug("kick_stalled error: %s", _e)
 
     @staticmethod
-    def _is_agent_alive(role: str) -> bool | None:
+    def _is_agent_alive(role: str, fresh: bool = False) -> bool | None:
         """检查 CCS tmux pane 是否存活。三态：True=活 / False=判死 / None=探测失败。
 
         ponytail: 用 pane 存活判定而非进程名白名单——claude agent 执行 /goal 时
@@ -702,18 +712,15 @@ class RoleLifecycleMixin:
         None 与 False 必须区分：tmux 瞬时不可达（实测 578ms 抖动）时返回 False
         会让调用方 kill 掉正在工作的活角色。宁可放过一次真死，不可误杀活角色。
         """
-        try:
-            r = _engine_mod._sp.run(
-                ["tmux", "list-panes", "-t", f"ccs-{role}",
-                 "-F", "#{pane_pid}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
-            return r.returncode == 0 and bool(r.stdout.strip())
-        except (_engine_mod._sp.TimeoutExpired, OSError, ValueError, KeyError, TypeError):
+        # fresh=True 绕过快照缓存：kill-session 前的二次确认必须看实时状态，
+        # 否则两次读同一份快照，二次确认退化成一个空动作。
+        snap = _tmux_snapshot(max_age=0.0 if fresh else 2.0)
+        if snap is None:
             return None  # 探测失败 ≠ 判死
+        # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
+        return bool((snap.get(role) or ("", ""))[0])
 
-    def _ensure_role_alive(self, role: str) -> bool:
+    def _ensure_role_alive(self, role: str, deadline: float = 0.0) -> bool:
         """存活探测 + 拉起；正向结果缓存 _ALIVE_CACHE_SEC（实测单次探测 4-5.6s）。
 
         实测 2026-10-22 03:3x：一次 tmux has-session 2.4s、_is_agent_alive 再 2.4s。
@@ -727,13 +734,19 @@ class RoleLifecycleMixin:
             _cache = self._alive_until = {}
         if _cache.get(role, 0.0) > _now:
             return True
-        if self._check_and_start_role(role):
+        if self._check_and_start_role(role, deadline=deadline):
             _cache[role] = time.time() + _ALIVE_CACHE_SEC
             return True
         return False
 
-    def _check_and_start_role(self, role: str) -> bool:
-        """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。"""
+    def _check_and_start_role(self, role: str, deadline: float = 0.0) -> bool:
+        """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。
+
+        deadline：调用方（守护巡检）给的绝对时刻。拉起 `ccs start` 原本写死 60s
+        超时 + 30×1s 轮询，单角色最坏 95s——巡检只在**角色之间**看预算，于是
+        一个角色就能把整个 tick 预算吃光（实测 run_once 卡在 _ensure_guard_roles
+        的 sleep(3) 里，全量套件第 29 例 15 分钟 0 前进）。
+        """
         try:
             alive = _engine_mod._sp.run(
                 ["tmux", "has-session", "-t", f"ccs-{role}"],
@@ -754,11 +767,12 @@ class RoleLifecycleMixin:
             # 二次确认：kill 是破坏性动作，首判可能因启动竞态假阴性
             # （观测：scout 建 25+ 会话，含 1 秒即死实例）。
             time.sleep(1)
-            if self._is_agent_alive(role) is not False:
+            if self._is_agent_alive(role, fresh=True) is not False:
                 return True
             LOGGER.info("CCS %s: tmux alive but no claude, restarting", role)
             _engine_mod._sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
                     capture_output=True, timeout=5)
+            _invalidate_tmux()      # 会话刚没，旧快照还会说它在
             alive = False
 
         # 拉起前加锁 + 冷却：check-then-act 的写入侧必须串行化。
@@ -780,11 +794,13 @@ class RoleLifecycleMixin:
         _env = _os.environ.copy()
         _env.pop("VIRTUAL_ENV", None)
         _env.pop("CONDA_PREFIX", None)
+        # 预算内拉起：deadline 留给巡检时，子进程超时必须跟着缩，否则"到点就停"
+        # 只在角色之间成立，单个 ccs start 仍可独占 60s（tests/test_guard_budget.py）。
         try:
             _st = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "start", role, "--no-attach",
                  "--drive", "infinite", "--no-auto-send"],
-                capture_output=True, timeout=60, env=_env,
+                capture_output=True, timeout=60 if not deadline else max(5.0, min(60.0, deadline - time.time())), env=_env,
             )
             # 同一条拉起路径的两个入口（daemon/engine tick 走这里）：返回值曾整体
             # 丢弃，于是"角色起不来"只有 tmux 层的假象，没有原因（codex 20 维 P1）。
@@ -802,7 +818,11 @@ class RoleLifecycleMixin:
                 except Exception:
                     LOGGER.warning("role-start blocker 写入失败: %s", role)
             for _ in range(30):
+                if deadline and time.time() > deadline:
+                    LOGGER.warning("CCS %s: 拉起预算耗尽，剩余流程交给下一轮巡检", role)
+                    break
                 time.sleep(1)
+                _invalidate_tmux()   # 刚拉起，让下一次探针拿到新会话
                 if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
                            capture_output=True, timeout=5).returncode == 0:
                     time.sleep(3)  # 等 agent 进程启动
@@ -831,6 +851,13 @@ class RoleLifecycleMixin:
         """
         deadline = time.time() + max_wait
         while time.time() < deadline:
+            # 0. 探测不可用（tmux server 卡死，实测 2026-10-22 09:18 list-sessions 20s
+            # 无响应）≠ 角色死了：必须先于 has-session / ccs start 判断，否则整轮
+            # 先烧 has-session 5s + ccs start 60s + 10×1s 等待才轮到它。
+            # 此刻投递根本走不通，交给下一 tick 重试。
+            if (_probe := self._is_agent_alive(role)) is None:
+                LOGGER.warning("_wait_for_role_ready %s: tmux 探测不可用，本轮不投递", role)
+                return False
             # 1. tmux session 存活
             try:
                 alive = _engine_mod._sp.run(
@@ -852,7 +879,7 @@ class RoleLifecycleMixin:
                     continue
 
             # 2. 检查 claude 进程是否存活
-            if not self._is_agent_alive(role):
+            if not _probe:
                 LOGGER.info("Role %s 无 claude 进程，等待就绪（若持续则角色未被拉起）", role)
                 time.sleep(5)
                 continue
@@ -967,6 +994,46 @@ class RoleLifecycleMixin:
                 _ts[_key] = _now - self._ALERT_COOLDOWN_S + self._ALERT_RETRY_S
                 _save_alert_ts(_ALERT_STATE, _ts, _now, self._ALERT_TTL_S, override=(_key,))
 
+    def _sync_task_file(self, role: str, wf_id: str, step_id: str) -> None:
+        """把 TASKS.md 重写成**刚投递成功**的那个任务。
+
+        原实现只在发消息之前写，判到文件里是别的任务就只追加一行 [排队] 然后
+        照样发 —— 角色手里出现两份互相矛盾的任务书（实测 pm 2026-10-22 05:33：
+        TASKS.md 主块是旧任务 + [排队] 行，而 prompt 已经是新任务）。角色按 prompt
+        干活，读这份文件的人和 launcher 的教训注入（roles.py:442）却看到旧任务。
+        """
+        try:
+            rows = self._lifecycle.query(
+                "SELECT title, description FROM tasks WHERE task_id="
+                "(SELECT task_id FROM workflow_instances WHERE instance_id=?)", (wf_id,))
+            if not rows:  # 孤儿实例（生产 1103 条里 1 条）：没有任务行就写不出任务书
+                LOGGER.warning("TASKS.md 未同步 %s/%s：库里没有任务行", role, wf_id[:12])
+                return
+            t = rows[0]
+            body = (f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
+                    f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
+                    f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n")
+            path = _CCS_WORKSPACES / role / "TASKS.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            old = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
+            # 评分回写要活下来：task_evidence 把 negative 教训 append 进 TASKS.md，
+            # 而每次投递整体重写会把它抹掉（实测 17 个 TASKS.md 里 0 个存活）——
+            # 闭环收集了反馈却从不进角色上下文。只保留最近 10 条防无界增长。
+            lessons = [l for l in old.splitlines() if l.startswith("- [negative] ")][-10:]
+            if lessons:
+                body += "\n## 历史教训\n" + "\n".join(lessons) + "\n"
+            if old == body:
+                return  # 同内容不重写：避免每 tick 刷新 mtime
+            path.write_text(body, encoding="utf-8")
+        # 这一步发生在 ccs send 成功之后：抛出去会让 engine.run_once 的整个
+        # for row 循环中断（同一类"单点异常停整轮"）。sqlite3.Error = 并发写 WAL
+        # 撞 locked；AttributeError = _lifecycle 懒加载拿不到库（engine.py:410）。
+        # WARNING 不能降级：daemon 跑 INFO，DEBUG 等于零信号，而同步失败会让本步
+        # 整个周期停在旧任务书（notified 已盖戳，不会重投）。
+        except (ValueError, KeyError, TypeError, OSError, AttributeError,
+                sqlite3.Error) as _e:
+            LOGGER.warning("TASKS.md 同步失败 %s/%s: %s", role, wf_id[:12], _e)
+
     def _send_to_role(self, role: str, prompt: str,
                        wf_id: str = "", step_id: str = "", force: bool = False,
                        scheduler_noise: bool = False):
@@ -1010,7 +1077,7 @@ class RoleLifecycleMixin:
         # 未就绪是**临时**状态（忙/启动中/探测抖动），不是投递失败。返回 "busy"
         # 让 engine 走排队分支（不计数、下 tick 重试）；返回 False 会被 engine
         # 计入 delivery_fail_count，3 次即灌 delivery_blocked 终态且无恢复路径
-        # （该方法唯一的 False 路径是 90s 空转超时，见 _wait_for_role_ready 末尾）。
+        # （该方法的 False 路径只有两条：90s 空转超时、探测不可用提前返回）。
         if not self._wait_for_role_ready(role, wf_id=wf_id, step_id=step_id):
             LOGGER.warning("_send_to_role %s: role not ready, queue for next tick", role)
             return "busy"
@@ -1043,6 +1110,22 @@ class RoleLifecycleMixin:
                 f"[workflow] {role} goal 内容被拒绝: len={len(_goal_content)}",
                 evidence=prompt[:300], src="workflow_engine")
             return False  # 投递未发生：明确语义，避免返回 None 被 engine 计数为失败
+        # prompt 已校验完再查 CLI：非法 prompt 必须走 False/blocker，不能被"忙"掩盖。
+        # 只看 CLI 忙态，不看 300s 活动窗——刚干完活的空闲角色会被活动窗判忙
+        # （bus #395128 的同一根因）。ccs send 等忙 pane 单次 30s，整个 tick 会停。
+        if wf_id and not force:
+            from liveness import pane_cli_busy
+            # force=True 不预检：timeout 重推/dual-node/integrity 提醒都是旁路，
+            # 其中 integrity 在发送前就落了 bypass flag，预检返回 busy 会把提醒永久吞掉。
+            try:
+                _cli_busy = pane_cli_busy(role)
+            except Exception as _pe:  # 探针异常不阻断投递（下一 tick 再试）
+                LOGGER.warning("CLI 忙预检失败 %s: %s", role, _pe)
+                _cli_busy = None
+            if _cli_busy is True:
+                LOGGER.info("send-to-role %s 跳过: CLI 仍在执行 (wf=%s step=%s)",
+                            role, wf_id[:12], step_id)
+                return "busy"
         # 相同 prompt 已在窗口内投递过 → 不重发，按排队返回（不盖 notified、不计失败）。
         # 放在占位符校验之后：非法 prompt 仍走 False（快速暴露），不会被"排队"掩盖。
         _fp = hash((role, wf_id, step_id, prompt))
@@ -1080,85 +1163,13 @@ class RoleLifecycleMixin:
         if scheduler_noise and role == "coordinator":
             LOGGER.info("send-to-role coordinator 跳过: 调度噪音消息 (wf=%s step=%s)",
                         wf_id[:12] if wf_id else "?", step_id)
-            self._bb.write("blocker",
-                f"[workflow] coordinator 调度噪音已拦截: {wf_id}/{step_id}",
-                evidence=prompt[:200], src="workflow_engine")
+            # 不写 bus：这是**预期路径**（我们主动丢弃噪音），不是事故。实测 24h
+            # blocker 通道 208 条里 37 条（18%）全是它，而全机没有代码读 cat=blocker
+            # —— 唯一效果是把告警通道稀释给读 bus 的角色。引擎日志已留同样信息。
             return False  # 投递未发生：明确语义，避免 engine 将 None 计为失败
-        # 写 TASKS.md 到角色 workspace，让模板中"读 TASKS.json"等指令能找到具体任务
-        # 防污染：角色已有其他活跃工作流的任务文件时，拒写本任务（并发任务应排队，
-        # 否则后写者覆盖先写者 → 角色执行错误任务。观测案例：测试风暴覆盖 scout 真实任务）。
-        if wf_id:
-            try:
-                # 走 paths.CCS_WORKSPACES 而非硬编码 Path.home()：该常量支持
-                # SESSION_PIPELINE_CCS_WORKSPACES 覆盖，测试可隔离。硬编码会让
-                # 每个跑测试的用例都写进生产 workspace（实测污染 scout/engineer）。
-                ws_dir = _CCS_WORKSPACES / role
-                ws_dir.mkdir(parents=True, exist_ok=True)
-                task_rows = self._lifecycle.query(
-                    "SELECT title, description FROM tasks WHERE task_id=(SELECT task_id FROM workflow_instances WHERE instance_id=?)",
-                    (wf_id,)
-                ) if hasattr(self, '_lifecycle') else []
-                if task_rows:
-                    t = task_rows[0]
-                    tasks_file = ws_dir / "TASKS.md"
-                    _skip_write = False
-                    if tasks_file.exists():
-                        _existing = tasks_file.read_text(encoding="utf-8", errors="ignore")
-                        # 精确边界匹配：只在 "工作流 wf_id /" 格式中匹配，防止 UUID 前缀碰撞
-                        # （如 wf_abc123 不误匹配 wf_abc123def456）
-                        # 本任务是否已在文中。原写法 `A or B if C else False` 被 Python
-                        # 解析为 `(A or B) if C else False`：文件无 "## 来源" 段时整个表达式
-                        # 恒为 False，**无论 wf_id 是否真在文件里** → 引擎永远当作"别的
-                        # 任务占了文件" → 本任务只追加 [排队]、不写入 → ccs send 退出码 1
-                        # → 投递失败 3 次 → 子链 failed → 父链断。
-                        # 实测 reviewer/engineer/qa 的 TASKS.md 均无 "## 来源" 段（该段
-                        # 只在角色产出含来源元数据时才有）→ 三角色中招率 100%。
-                        _wf_in_existing = (f"工作流 {wf_id} /" in _existing
-                                           or wf_id in _existing.split("## 来源")[-1])
-                        # 僵尸主任务检测：主 wf 不在权威库，或在库但**已终态**，都
-                        # 说明它不是"活跃占用"，允许被新任务覆盖。
-                        # 只判"不在库"时，已完成的主任务会永久占住文件 → 新任务永远
-                        # 只能追加 [排队]，而排队行无任何排空路径 → 无界增长
-                        # （实测 engineer 458 行 / qa 211 行，全部指向终态 wf）。
-                        _main_wf = re.search(r"工作流 (wf_[0-9a-f]{12})", _existing)
-                        _stale_main = False
-                        if _main_wf:
-                            _mw = _main_wf.group(1)
-                            try:
-                                _row = self._lifecycle.query(
-                                    "SELECT status FROM workflow_instances WHERE instance_id=?",
-                                    (_mw,))
-                                _stale_main = (not _row
-                                               or _row[0]["status"] not in _ACTIVE_WF_STATUSES)
-                            except Exception:
-                                _stale_main = False  # 查询失败 → 保守按活跃处理（不覆盖）
-                        if (_existing and "工作流任务" in _existing and not _wf_in_existing
-                                and not _stale_main):
-                            # 已有其他工作流的任务文件 → 不覆盖，追加排队标记。
-                            # 幂等：引擎每 tick 重推同一步骤，无此守卫则同一 wf 被追加
-                            # 数十行（实测 engineer/scout TASKS.md 各 27 行重复）。
-                            # 尾随空格是必需边界：标记恒为 "{wf}/{step} 待当前任务..."，
-                            # 无空格则 s1 会误命中 s10（实测 step_id 当前止于 s7，尚未触发）。
-                            if f"[排队] 新任务 {wf_id}/{step_id} " in _existing:
-                                _skip_write = True
-                            else:
-                                LOGGER.info("TASKS.md 防污染: %s 已有其他任务，本任务 %s 排队（不覆盖）", role, wf_id)
-                                tasks_file.write_text(
-                                    _existing.rstrip() +
-                                    f"\n\n---\n[排队] 新任务 {wf_id}/{step_id} 待当前任务完成后执行\n",
-                                    encoding="utf-8")
-                                _skip_write = True
-                        elif _stale_main:
-                            LOGGER.info("TASKS.md 僵尸主任务 %s 不在权威库，覆盖为新任务 %s",
-                                        _main_wf.group(1), wf_id)
-                    if not _skip_write:
-                        tasks_file.write_text(
-                            f"# 工作流任务\n\n## 标题\n{t['title'] or '?'}\n\n"
-                            f"## 描述\n{t['description'] or t['title'] or '?'}\n\n"
-                            f"## 来源\n工作流 {wf_id} / 步骤 {step_id}\n",
-                            encoding="utf-8")
-            except (ValueError, KeyError, TypeError):
-                pass
+        # TASKS.md 只由 _sync_task_file 在**投递成功后**写（见该函数）。
+        # 原实现在这里先写一份、判到文件被别的任务占着就只追加 [排队] 再照样发，
+        # 于是角色手里出现两份互相矛盾的任务书。
         # _send_to_role 只发任务，分类恒为 task_spec。
         #
         # 原实现用关键词猜告警（prompt 含"异常"/"持续超时"/"超时自动回收"→ 写 blocker），
@@ -1273,4 +1284,10 @@ class RoleLifecycleMixin:
             return False  # 非零退出码且非暂缓 = 投递失败：调用方据此不盖戳，下轮重试
         # 只有真投递成功才记账：失败/暂缓不占窗口，下轮照常重试。
         RoleLifecycleMixin._LAST_SEND[(role, wf_id, step_id)] = (_fp, time.time())
+        # TASKS.md 以**真正投递成功的那次**为准：上面那份写在发消息之前，判到
+        # 别的任务占着文件就只追加一行 [排队] 照样发 —— 文件说"排队等前一个"、
+        # prompt 说"现在做这个"，同一角色手里两份互相矛盾的任务书（实测 pm
+        # 2026-10-22 05:33：主块是旧任务 + [排队] 行，prompt 已是新任务）。
+        if wf_id:
+            self._sync_task_file(role, wf_id, step_id)
         return True  # 投递成功（ccs send 正常退出）

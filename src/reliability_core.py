@@ -12,8 +12,6 @@ Reliability Layer — 可靠性基础设施。
 """
 import json
 import logging
-import os
-import sqlite3
 import sys
 import threading
 import time
@@ -26,85 +24,6 @@ from typing import Callable, Optional, TypeVar
 
 from paths import ensure_paths
 ensure_paths()
-
-# 持久化 cursor 存储（Fix 6：防重启重复处理）
-_CURSOR_DB = Path(os.environ.get(
-    "SESSION_PIPELINE_STATE_DIR",
-    str(Path.home() / ".hermes" / "state")
-)) / "pipeline_cursor.db"
-
-# 模块级持久连接（get/set_last_cursor 高频调用，避免每次 connect+close）
-# check_same_thread=False 供多线程轮询共享；锁防并发写
-_CURSOR_LOCK = threading.Lock()
-_CURSOR_CONN = None
-
-def _get_cursor_conn() -> sqlite3.Connection:
-    """惰性创建 cursor DB 持久连接（模块级，避免高频 connect+close）。"""
-    global _CURSOR_CONN
-    if _CURSOR_CONN is None:
-        _CURSOR_DB.parent.mkdir(parents=True, exist_ok=True)
-        _CURSOR_CONN = sqlite3.connect(str(_CURSOR_DB), check_same_thread=False)
-        _CURSOR_CONN.execute("PRAGMA journal_mode=WAL")
-        _CURSOR_CONN.execute("PRAGMA wal_autocheckpoint=1000")
-        _CURSOR_CONN.execute("PRAGMA busy_timeout=5000")
-    return _CURSOR_CONN
-
-def get_last_cursor(consumer: str, category: str = "", instance_id: str = "") -> int:
-    """获取消费者在分类下的最后处理 fact_id。"""
-    _ensure_cursor_db()
-    with _CURSOR_LOCK:
-        row = _get_cursor_conn().execute(
-            "SELECT last_fact_id FROM cursors WHERE consumer=? AND category=? AND instance_id=?",
-            (consumer, category, instance_id)
-        ).fetchone()
-        return row[0] if row else 0
-
-def set_last_cursor(consumer: str, category: str, fact_id: int, instance_id: str = "") -> None:
-    """更新消费者在分类下的最后处理 fact_id。"""
-    _ensure_cursor_db()
-    with _CURSOR_LOCK:
-        conn = _get_cursor_conn()
-        conn.execute(
-            "INSERT OR REPLACE INTO cursors(consumer, category, instance_id, last_fact_id, updated_at) "
-            "VALUES(?,?,?,?,?)",
-            (consumer, category, instance_id, fact_id, time.time())
-        )
-        conn.commit()
-
-def init_cursor_db() -> None:
-    """初始化 cursor 表（复用持久连接，与 get/set 一致）。"""
-    with _CURSOR_LOCK:
-        conn = _get_cursor_conn()
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS cursors("
-            "consumer TEXT, category TEXT, instance_id TEXT DEFAULT '', "
-            "last_fact_id INT, updated_at REAL, "
-            "PRIMARY KEY(consumer, category, instance_id))"
-        )
-        conn.commit()
-        # 迁移：旧 schema 缺少 instance_id 列时补充
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(cursors)").fetchall()]
-        if "instance_id" not in cols:
-            conn.execute("ALTER TABLE cursors ADD COLUMN instance_id TEXT DEFAULT ''")
-            conn.execute("CREATE TABLE cursors_new("
-                         "consumer TEXT, category TEXT, instance_id TEXT DEFAULT '', "
-                         "last_fact_id INT, updated_at REAL, "
-                         "PRIMARY KEY(consumer, category, instance_id))")
-            conn.execute("INSERT INTO cursors_new SELECT consumer, category, '', last_fact_id, updated_at FROM cursors")
-            conn.execute("DROP TABLE cursors")
-            conn.execute("ALTER TABLE cursors_new RENAME TO cursors")
-        conn.commit()
-
-# 初始化 cursor DB（延迟到首次使用，避免 import 时副作用）
-_CURSOR_INITIALIZED = False
-
-def _ensure_cursor_db():
-    """惰性初始化 cursor DB，仅在首次调用时建表。"""
-    global _CURSOR_INITIALIZED
-    if _CURSOR_INITIALIZED:
-        return
-    init_cursor_db()
-    _CURSOR_INITIALIZED = True
 
 T = TypeVar("T")
 
@@ -461,5 +380,4 @@ __all__ = [
     "CircuitOpenError", "ConsumerHeartbeat", "TtlPruner",
     "MetricsCollector",
     "setup_logging", "JsonFormatter", "with_trace_id", "LOGGER",
-    "init_cursor_db", "get_last_cursor", "set_last_cursor",
 ]

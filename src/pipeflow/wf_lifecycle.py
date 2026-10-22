@@ -74,21 +74,54 @@ def _resolve_value_gate_paths(vg_file: str, vg_ws: str) -> list:
 
 
 def _live_subflow(lm, step_sd: dict) -> bool:
-    """当前步骤挂的子链是否还活着。
+    """当前步骤挂的子链/返工链是否还活着。
 
     父步的活由子链承担：子链运行期间父步没有新产出是正常态，不是卡死。
     缺此判据时，子链结束的瞬间冻结的 queued_since 让父步「停滞 = 从建
     子链至今」，整条父链被回收（实测 8 例，138min 子链工时无接收方）。
+
+    返工链记在 rework_ids（不写 subflow_id），两条路径共用同一套活体口径。
+    调用方必须自带 2 倍年龄上限：本函数只回答"子链还活着"，不回答"父链该
+    陪着等多久"——无限陪等的父链没有自己的钟（子链可能是对回收器不可见的
+    pending 行），那正是"永久孤儿"的成因。
     """
-    # ponytail: 每候选一次主键查询（当轮 running 实例 <100），与旧实现同频（旧版在
-    # 条件 4 内做同一条）；量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
-    _sf = step_sd.get("subflow_id") or ""
-    if not _sf:
-        return False
+    # ponytail: 每候选最多 2 次主键查询（subflow_id 一次 + 返工链一次；当轮 running
+    # 实例 <100），量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
+    # 活体用**活跃白名单**，不用"终态补集"：delivery_blocked 必须算死。
+    # 它是投递连败/角色无响应的停滞态（生产 233 条），非 failed 也非 cancelled；
+    # 当活会让父链在 2 倍阈值内一直悬空，而它要等 _recover_delivery_blocked 恢复
+    # （角色持续离线时永不恢复）——同文件 _subflow_takeover:925-930 踩过同一个坑。
     from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
-    _rows = lm.query(
-        "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
-    return bool(_rows) and _rows[0]["status"] in _ACTIVE_WF_STATUSES
+    _live = lambda _r: _r["status"] in _ACTIVE_WF_STATUSES
+    _sf = step_sd.get("subflow_id") or ""
+    if _sf:
+        _rows = lm.query(
+            "SELECT status, template_id FROM workflow_instances WHERE instance_id=?",
+            (_sf,))
+        if _rows and _live(_rows[0]) and not _engine_mod._is_system_rework(_rows[0]):
+            return True
+    # 返工链不记在 subflow_id 上，而是 rework_ids（list of wf id）。只认 subflow_id 时，
+    # 等返工的父链被判死 → close_wf 级联把仍在跑的返工子链一起杀掉（2026-10-22 两例：
+    # wf_85faf589be90/s3、wf_b808ff2f3611/s3，子链 wf_rw_2664ec3aada3/80322df51ab0）。
+    # 活体判据与子链同源（终态以外都算活）；查不到行 = 链已删，不豁免。
+    # 系统问题链不算"还在写"：maintainer_health_monitor 修的是引擎/模板债，不动产品
+    # 产物，拿它续期会让父链陪着维护队列一路排到 24h（口径与 engine._blocking_rework_sts
+    # 一致，实测维护队列 91 深、3 条主链被一条没投递过的维护链扣 8h+）。
+    # 判据按模板名：评审写「【系统问题→engineer】」时该链被改派成 engineer_feature，
+    # 那时它确实会改产品代码，算活是对的（_create_rework_subflow:1331-1337 的改派块）。
+    _rids = step_sd.get("rework_ids") or []
+    if not isinstance(_rids, (list, tuple)):
+        _rids = [_rids]
+    # 只认非空字符串：畸形存量（dict/数字/None 混入）会让 len() 或占位符与参数不匹配
+    # 抛异常，冒到清理器的整轮 except → 本轮剩余实例全部不回收。
+    _rids = [r for r in _rids if isinstance(r, str) and r]
+    if not _rids:
+        return False
+    _ph = ",".join("?" * len(_rids))
+    return any(_live(r) and not _engine_mod._is_system_rework(r)
+               for r in lm.query(
+                   f"SELECT status, template_id FROM workflow_instances "
+                   f"WHERE instance_id IN ({_ph})", tuple(_rids)))
 
 
 def _bus_evidence_ready(engine, row: dict) -> bool:
@@ -293,7 +326,17 @@ class WorkflowLifecycleMixin:
                 # 子链活着 → 父步没有新产出是正常态，条件 1-4 一律不判死。
                 # 条件 0 例外：步骤自身已终态，子链本就该随之终止。缺这道门时
                 # 24h 兜底会连同活着的子链一起被级联杀掉（在途产出直接丢失）。
-                elif _live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {}):
+                # 2 倍阈值是**含活子链在内**的硬上限：条件 3 自身的 2 倍兜底排在
+                # 这道门之后，不在这里封顶等于活子链把父链的钟整个停掉。实测
+                # wf_0c5e3d807ede 14.4h、wf_175751a92033 10h 都靠活子链豁免，
+                # 而它们的返工子链以 pending 建行（回收器只扫 running/step_done_ready）
+                # → 子链对回收器不可见，父链没有第二个钟能关它（engine 称"永久孤儿"）。
+                # ponytail: 上限只看父龄，不看子链自己多大——父链 47h59m 时新建的
+                # 子链几乎零预算就被连坐。取舍是"宁可少给一个阈值，也不留永久孤儿"；
+                # 升级路径：查询里带出 created_at，按子链年龄封顶——
+                # 取 max(父 2 倍, 子链创建时刻 + 1 个阈值)。
+                elif (_live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {})
+                      and age_h <= _global_limit_h * 2):
                     pass
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
@@ -305,7 +348,15 @@ class WorkflowLifecycleMixin:
                     _cond = "2"
                     reason = f"测试模板 {tpl} 运行{age_h:.0f}h > 2h阈值"
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
-                elif age_h > _global_limit_h:
+                # 硬上限也必须过活体门：条件4 早就有 _role_producing_recently，条件3 没有。
+                # 实测 2026-10-22（state/workflows.db 的 workflow_logs.action='cancelled'
+                # 取 detail 含"全局阈值"者，再比对该 assignee 转录 mtime）：24h 内 5 条触到
+                # 全局阈值，5/5 的角色在判死前 11~31s 仍在写转录/调工具 —— 硬砍等于丢弃
+                # 在途产出，且子链会被级联陪葬。
+                # 上限取 2 倍阈值兜底：真卡住的角色仍会死，只是多给它一个阈值窗口。
+                elif age_h > _global_limit_h and not (
+                        age_h <= _global_limit_h * 2
+                        and _role_producing_recently((d.get("assignee") or "").strip())):
                     _cond = "3"
                     reason = f"{_st} 运行{age_h:.0f}h > {_global_limit_h}h全局阈值"
                 # 条件4: running 且当前步骤确已停滞 >1h
@@ -1261,6 +1312,13 @@ class WorkflowLifecycleMixin:
         # 两个分支都要用同一个"被审产物的人"，算一次（纯查表，无副作用）。
         _subject = self._review_subject_role(wf_name, review_step)
         if not _sys_issues and not _biz_issues:
+            # 解析器滤掉 P2/P3 后条目全空，但分类段本身在：这是"只有建议级问题"
+            # 的驳回，不是"没写分类"。落进兜底会凭一句话造业务问题错派 engineer，
+            # 那条链还会反过来卡住父链（_blocking_rework_sts 只放过系统链）。
+            if re.search(r"【(?:系统|业务)问题|(?:系统|业务)问题[:：]", _msgs_text):
+                LOGGER.info("rework: %s/%s 只有 P2/P3 建议级问题，不建返工链",
+                            wf_id[:8], review_step_id)
+                return False
             # 人工驳回常只写一句话（「PRD 缺验收标准」），没有【业务问题】标记 →
             # 解析恒空 → 只能回退重投原步，3 次封顶后停摆（G 审查实测该形态）。
             # 已知返工对象（映射表内角色）就用这句话建一条业务返工链；表外角色
@@ -1445,6 +1503,28 @@ class WorkflowLifecycleMixin:
         """
         _sf = (step_sdata or {}).get("subflow_id")
         if not _sf:
+            # 驳回文案里写着真正出结论的子链（task_generator 压状态时带过来的），
+            # 这条最可靠：子链驳回路径不写 subflow_id，而按父步反查会命中**最新**的
+            # 返工链（实测 s3 下有 7 条子链，最新的 wf_rw_* 不是产出评审的那条）。
+            _m = re.search(r"wf_(?:sub|rw)_[0-9a-f]{8,}",
+                           str((step_sdata or {}).get("rejection_reason") or ""))
+            _sf = _m.group(0) if _m else ""
+        if not _sf:
+            # 子链驳回路径（rejected_by=subflow_verdict）**不写** subflow_id，
+            # 只有子链自己的 parent_wf_id/subflow_source_step_id 反指父步。
+            # 不回查这里，取子链文案与下面读报告文件的第五来源全都走不到 ——
+            # 实测 3/3 子链驳回的返工提示只剩一行摘要。
+            try:
+                _rows = self._lifecycle.query(
+                    "SELECT instance_id FROM workflow_instances "
+                    "WHERE parent_wf_id=? AND subflow_source_step_id=? "
+                    "AND instance_id NOT LIKE 'wf_rw_%' "
+                    "ORDER BY created_at DESC LIMIT 1", (wf_id, step_id))
+                _sf = _rows[0]["instance_id"] if _rows else ""
+            except Exception as _e:
+                LOGGER.debug("rework: 子链回查失败 %s/%s: %s", wf_id[:8], step_id, _e)
+                _sf = ""
+        if not _sf:
             return ""
         try:
             _rows = self._lifecycle.query(
@@ -1470,13 +1550,88 @@ class WorkflowLifecycleMixin:
             return _text
         # 旧记录只有 text+id，分类段在 bus evidence
         _ids = [m.get("id") for m in _msgs if m.get("id")]
-        if not _ids:
-            return _text
+        _full = _text
+        if _ids:
+            try:
+                _full = _text + "\n" + "\n".join(self._bb_evidence(_ids))
+            except Exception as _ev_e:
+                LOGGER.debug("rework: 子链 evidence 回查失败 %s: %s", _sf[:12], _ev_e)
+        if self._has_issue_classification(_full):
+            return _full
+        # 第五来源：审查报告文件。完成消息普遍只写「0P0/3P1/…」统计，
+        # 逐条明细在 REVIEW*.md；不读文件 → 返工角色只能盲改（见 _review_artifact_text）。
+        _art = self._review_issues_block(_sf)
+        if _art:
+            LOGGER.info("rework: 问题清单补入审查报告 %s（%d 条明细）", _sf[:12], _art.count(chr(10)))
+            return _full + "\n" + _art
+        return _full
+
+    def _review_issues_block(self, instance_id: str) -> str:
+        """把审查报告文件里的逐条问题转成引擎认的分类段（【业务问题】/【系统问题】）。
+
+        实测 2026-10-22：返工任务的问题清单只有「子链 wf_sub_xxx 末步驳回: …
+        0P0/3P1/5P2/4P3」一行统计，返工角色拿不到可执行信息 → 整篇重做 →
+        复查按同样数量再驳回（reject→rework→reject 死循环）。逐条明细在
+        ~/ccs-workspaces/<role>/REVIEW-wf_sub_xxx.md 的
+        「### 【业务问题】」/「### 【系统问题】」两段里，形如 **P1-1 | 问题 | 文件 | 行号**。
+
+        只取这两段的 P0-P3 行（不整篇塞进去：报告里的表格行会被解析成噪声问题，
+        实测一份 16KB 报告整篇喂进去解析出 40 条「维度 | 结论 | 关键实测 |」）。
+        只认文件名或正文提到该实例 id 的文件，避免把别的链的意见派下去。
+        """
+        if not instance_id:
+            return ""
         try:
-            return _text + "\n" + "\n".join(self._bb_evidence(_ids))
-        except Exception as _ev_e:
-            LOGGER.debug("rework: 子链 evidence 回查失败 %s: %s", _sf[:12], _ev_e)
-            return _text
+            _dirs = [d for d in _CCS_WORKSPACES.iterdir() if d.is_dir()]
+        except OSError:
+            return ""
+        _text = ""
+        for _d in _dirs:
+            try:
+                _cands = sorted(_d.glob("REVIEW*.md"),
+                                key=lambda f: f.stat().st_mtime, reverse=True)
+            except OSError:
+                continue
+            for _f in _cands:
+                try:
+                    _t = _f.read_text(errors="ignore")
+                except OSError:
+                    continue
+                # 只认文件名带实例 id 的权威副本：REVIEW.md 是共享的“最新一份”，
+                # 正文里可能只是提到本实例，整份拿来会把别的链的意见派下去。
+                if instance_id in _f.name:
+                    _text = _t
+                    break
+            if _text:
+                break
+        if not _text:
+            return ""
+        _sections = {"biz": [], "sys": []}
+        _cur = ""
+        for _line in _text.splitlines():
+            if "【业务问题" in _line:
+                _cur = "biz"
+                continue
+            if "【系统问题" in _line:
+                _cur = "sys"
+                continue
+            if _line.startswith("#") and _cur:
+                _cur = ""  # 出了该段
+                continue
+            # 条目形态：**P1-1 | …**、- P2 …、**S-P1-1 | …**（系统段用 S- 前缀）
+            if not _cur or not re.match(r"\s*[-*]*\s*\*{0,2}(S-)?P[0-3]", _line):
+                continue
+            _clean = _line.strip().strip("*").lstrip("- ").strip()
+            if len(_clean) >= 10:
+                _sections[_cur].append(_clean[:300])
+        if not (_sections["biz"] or _sections["sys"]):
+            return ""
+        _out = []
+        for _kind, _label in (("biz", "业务问题"), ("sys", "系统问题")):
+            _items = _sections[_kind][:12]
+            _out.append(f"【{_label}】")
+            _out.extend(f"- {i}" for i in _items) if _items else _out.append("无")
+        return "\n".join(_out)
 
     def _rework_tpl_for(self, rework_id: str) -> str:
 
@@ -1554,6 +1709,10 @@ class WorkflowLifecycleMixin:
                 if len(_item) < 10:
                     continue
                 (_sys if _kind == "sys" else _biz).append(_item)
+        # P2/P3 是建议不是阻塞：写进【系统问题】段也不该建 maintainer 返工链——
+        # 实测 wf_85faf589be90 被 3 条 P2/P3 引擎建议卡在 s3 2.5h。显式级别过滤
+        # 让排序规则不再是唯一防线；P0/P1（含未标级别）仍照常拦。
+        _sys = [x for x in _sys if not re.match(r"\s*\**\[?P[23]\b", x, re.I)]
         return (_sys, _biz, _roles["sys"], _roles["biz"])
 
 

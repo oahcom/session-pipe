@@ -18,9 +18,12 @@ sys.path.insert(0, _src)
 # 实测 2026-10-22 未隔离时 pytest 会建表/写生产 routing.db、ack_tracker.db，
 # 并把 1005B/13 角色的 forbidden_ops_cache.json 覆盖成 35B 空表。
 _run_dir = tempfile.mkdtemp(prefix="pytest-hermes-run-")
-os.environ.setdefault("HERMES_RUN_DIR", _run_dir)
-os.environ.setdefault("ROUTING_DB_PATH", os.path.join(_run_dir, "routing.db"))
-os.environ.setdefault("SESSION_PIPELINE_ACK_DB", os.path.join(_run_dir, "ack_tracker.db"))
+# 直接赋值而非 setdefault：外部已 export 这三个变量时 setdefault 会让隔离静默失效
+# （实测 2026-10-22 带着 HERMES_RUN_DIR 跑 pytest，forbidden_ops_cache.json 仍被
+# 写到生产 ~/.hermes/run/）。
+os.environ["HERMES_RUN_DIR"] = _run_dir
+os.environ["ROUTING_DB_PATH"] = os.path.join(_run_dir, "routing.db")
+os.environ["SESSION_PIPELINE_ACK_DB"] = os.path.join(_run_dir, "ack_tracker.db")
 
 # 0. 保存真实 bus_protocol/config_loader 引用（test_reliability_unit 会篡改
 #    sys.modules 为 MagicMock，后续模块需恢复真实版本）
@@ -80,6 +83,13 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 # （实测一轮全量测试后 60 行里 48 行是测试产物）。
 os.environ["SESSION_PIPELINE_METRICS_JSONL"] = os.path.join(_TEST_STATE_DIR, "workflow-metrics.jsonl")
 
+# 2b. BUS_DB 的 env 版隔离：contract_updater 等通过 `python3 bus_client.py write`
+#     写 bus，子进程只认 HERMES_BLACKBOARD_DB，in-process 属性重绑管不到（实测
+#     test_contract_updater_role_map 每次把生产 facts 行 ut 刷成当前时间）。
+#     必须在 paths 导入前设，hermes_bus.config 在 import 时就读它。
+_BLACKBOARD_DB_TEST = os.path.join(_TEST_STATE_DIR, "blackboard.db")
+os.environ["HERMES_BLACKBOARD_DB"] = _BLACKBOARD_DB_TEST
+
 # 3. 确保 paths 模块被加载并覆盖 module-level 常量
 #    （env var 在 paths.py import 时读取；若 paths 已在 sys.modules 缓存则 monkeypatch 补偿）
 import paths as _paths_mod
@@ -105,7 +115,6 @@ _paths_mod.ITERATION_WORKSPACES = Path(_TEST_ITER_DIR)
 # 4. BUS_DB 隔离：重定向 Blackboard 到临时 DB，测试不再写生产 blackboard.db。
 #    Blackboard.__init__ 默认用 blackboard_legacy 模块导入时的 BLACKBOARD_DB 快照，
 #    因此需 patch 快照值本身（blackboard_legacy.BLACKBOARD_DB + hermes_bus.config.BLACKBOARD_DB）。
-_BLACKBOARD_DB_TEST = os.path.join(_TEST_STATE_DIR, "blackboard.db")
 try:
     from hermes_bus import blackboard_legacy as _bb_legacy
     _bb_legacy.BLACKBOARD_DB = Path(_BLACKBOARD_DB_TEST)
@@ -115,6 +124,19 @@ except Exception as _bbe:
     import warnings
     warnings.warn(f"conftest: bus DB 隔离失败（测试将写生产 bus）: {_bbe}", stacklevel=1)
 
+
+# 4b. eval_checker 的转录根：trajectory 测试在模块顶层 `from eval_checker import
+#     _TRANSCRIPTS_DIR` 就把值绑死了，fixture 阶段再 patch 已来不及（名字已绑定）。
+#     必须在收集测试模块前改常量，否则 trajectory 测试在 ~/.claude/projects 下建
+#     -probe-*/-tmp-probe-* 目录（实测一轮 12 个 CREATE+12 个 DELETE），并污染
+#     转录统计分母。
+_TRANSCRIPTS_ROOT = Path(tempfile.mkdtemp(prefix="pytest-claude-projects-"))
+try:
+    import eval_checker as _ec
+    _ec._TRANSCRIPTS_DIR = _TRANSCRIPTS_ROOT
+except Exception as _ece:
+    import warnings
+    warnings.warn(f"conftest: 转录根隔离失败（测试将写生产 ~/.claude/projects）: {_ece}", stacklevel=1)
 
 # 5. 角色转录隔离：_recover_rate_limited_roles 现在以转录里的 API 错误为主判据
 #    （pane 只有视口，实测 24h 1,342 条错误轮里认出 9 次）。不隔离时会读生产
@@ -126,4 +148,87 @@ import pytest  # noqa: E402
 def _isolate_role_transcripts(tmp_path, monkeypatch):
     from pipeflow import role_lifecycle as _rl
     monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probes_and_cooldowns(request, monkeypatch):
+    """投递预检与告警冷却默认不跨用例共享。
+
+    pane_cli_busy 走真实 tmux：服务端卡死时单条 capture-pane 实测 29.6s，
+    未打桩的用例会把整轮测试拖死；默认返回 None（"探测不可用则放行"），
+    需要忙态的用例自己 patch。两个进程级冷却表同理——不清则前一个用例
+    写下的 (role,title)/(role,wf,step) 让后一个用例的告警静默。
+    """
+    import liveness
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    # test_liveness 自己 mock subprocess.run 验底栏判据，打桩会把它测空
+    if "test_liveness" not in (request.module.__name__ if request.module else ""):
+        monkeypatch.setattr(liveness, "pane_cli_busy", lambda role, timeout=3.0: None)
+    # tmux 快照是模块级缓存：不清则上一个用例的 mock 结果泄漏到下一个
+    # （表现为"单跑绿、全量红"）。
+    import liveness as _lv
+    _lv._SNAP_TS, _lv._SNAP = 0.0, None
+    RoleLifecycleMixin._LAST_SEND.clear()
+    RoleLifecycleMixin._ALERT_TS.clear()
+    # 另外三张进程级冷却/去重表此前没清：429 退避、compact 冷却、bus 去重
+    # （role_lifecycle.py:266/281/292）。前一个用例写下的 (role) 条目会让后一个
+    # 用例的恢复/去重分支静默跳过 —— 表现为"单跑绿、全量红"。
+    for _d in (RoleLifecycleMixin._last_rate_recover, RoleLifecycleMixin._last_compact,
+               RoleLifecycleMixin._last_bus_write):
+        _d.clear()
+    # 盘上那份也要清：退避/冷却状态是**跨进程派生数据**，生产路径没错，但用例共用
+    # 同一个临时 HERMES_RUN_DIR，前一个用例写下的 (last, attempt) 会被本用例
+    # in-loop 的 _load_rate_state 读回来 → "应发 1 次却 0 次"（实测
+    # test_rate_recovery 整文件 4 红、逐条跑全绿）。
+    try:
+        (Path(os.environ["HERMES_RUN_DIR"]) / "alert_cooldowns.json").unlink()
+    except OSError:
+        pass
+
+@pytest.fixture(autouse=True)
+def _no_live_approval_notify(monkeypatch):
+    """审批结果通知必须隔离：它起子进程调真实 `ccs send`。
+
+    未隔离时任何 confirm_step(approved=True) 的用例都会把消息投给活体角色：
+    2026-10-21 实测 13 条「工作流: wf_pull」通知进了 product_architect
+    （测试夹具 id 直接出现在角色上下文里）。回归守卫见 test_no_live_notify.py。
+    """
+    from lifecycle import manager as _lm
+    monkeypatch.setattr(_lm.LifecycleManager, "_notify_result", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_guard_role_start(request, monkeypatch):
+    """守护巡检默认不拉起真角色：run_once() 会走 _ensure_guard_roles → _ensure_role_alive
+    → `ccs start`（60s 超时 + 30×1s 轮询）。测试里的角色名（test_role）不存在，
+    于是一次 run_once 烧掉 90s+：全量套件卡在第 29 例（15 分钟 0 前进，进程 sleep）。
+    真跑它的用例在 tests/test_role_alive_cache.py / test_ensure_role_alive_race.py，
+    它们直接调 _ensure_role_alive，不经本函数，故不受影响。
+    """
+    # test_tick_budget 测的就是巡检游标/预算本身（它用 del 撤实例桩去测真实实现）。
+    if (os.environ.get("PYTEST_REAL_GUARD") == "1"
+            or (request.module.__name__ if request.module else "").endswith("test_tick_budget")):
+        return
+    from pipeflow import engine as _eng
+    monkeypatch.setattr(_eng.WorkflowEngine, "_ensure_guard_roles", lambda self, *a, **k: set())
+
+# 需要真实 _wait_for_role_ready 的模块：它验的正是「ccs start 失败要可观测」，
+# 桩掉就把被测对象测空了。
+_REAL_READY_MODULES = {"test_role_start_error_text"}
+
+
+@pytest.fixture(autouse=True)
+def _fast_role_ready(request, monkeypatch):
+    """派单前的就绪等待默认桩掉：真实现 = tmux has-session + `ccs start`(60s) + 10×1s 轮询，
+    对不存在的 test_role 烧满 90s。`eng.start()` 第一跳就会走它 → 全量套件卡在
+    test_chain_convergence（thread 栈：start → _write_step_prompt → _send_to_role →
+    _wait_for_role_ready → sleep(5)）。已有 8 个用例各自 MagicMock 过它 → 共性缺口。
+    """
+    _mod = (request.module.__name__ if request.module else "").split(".")[-1]
+    if _mod in _REAL_READY_MODULES or os.environ.get("PYTEST_REAL_GUARD") == "1":
+        return
+    from pipeflow import role_lifecycle as _rl
+    monkeypatch.setattr(_rl.RoleLifecycleMixin, "_wait_for_role_ready",
+                        lambda self, *a, **k: True)
 

@@ -22,8 +22,7 @@ def _make_fact(fid: int, cat: str, text: str, evidence: str = ""):
 
 
 @contextmanager
-def _poll_ctx(facts, *, config_getter=None, cursor=0,
-              circuit_side_effect=None):
+def _poll_ctx(facts, *, config_getter=None, circuit_side_effect=None):
     """一键 mock polling.py 所有外部依赖。
 
     Yields dict with bb, router, metrics, heartbeat mocks 供断言。
@@ -35,10 +34,13 @@ def _poll_ctx(facts, *, config_getter=None, cursor=0,
         cb_mock.call.side_effect = lambda fn: fn()
 
     bb_mock = mock.MagicMock()
-    # 忠实于真实 API：unconsumed(cat=...) 在 SQL 层过滤（bus_protocol 实测签名）。
-    # 用 return_value 会让「cat 下推」这条契约在测试里失效，改成按参数筛。
-    bb_mock.unconsumed.side_effect = lambda **kw: [
-        f for f in facts if not kw.get("cat") or f.cat == kw["cat"]]
+    # 真 API 把 cat 过滤与 limit 都下推到 SQL（bus_protocol 实测签名
+    # Blackboard.unconsumed(cat=…, limit=…)）；桩必须照做，否则「cat 下推」与
+    # 「limit 生效」两条契约在测试里失效，用例测的只是"桩返回多少条"。
+    def _unconsumed(**kw):
+        rows = [f for f in facts if not kw.get("cat") or f.cat == kw["cat"]]
+        return rows[:kw["limit"]] if kw.get("limit") else rows
+    bb_mock.unconsumed.side_effect = _unconsumed
 
     config_mock = mock.MagicMock()
     if config_getter is None:
@@ -58,7 +60,6 @@ def _poll_ctx(facts, *, config_getter=None, cursor=0,
     logger_mock = mock.MagicMock()
 
     with mock.patch("routing.polling._rt_mod", rt_mock), \
-         mock.patch("routing.polling.get_last_cursor", return_value=cursor), \
          mock.patch("routing.polling.CIRCUIT_BREAKER", cb_mock), \
          mock.patch("routing.polling.METRICS", metrics_mock), \
          mock.patch("routing.polling.HEARTBEAT", hb_mock), \
@@ -153,34 +154,6 @@ class TestPollUnconsumed:
         with _poll_ctx([]):
             from routing.polling import poll_unconsumed
             assert poll_unconsumed() == []
-
-    def test_consumer光标跳过已处理(self):
-        facts = [
-            _make_fact(1, "code_fix", "old"),
-            _make_fact(2, "code_fix", "old2"),
-            _make_fact(3, "code_fix", "new"),
-        ]
-        with _poll_ctx(facts, cursor=2):
-            from routing.polling import poll_unconsumed
-            msgs = poll_unconsumed(consumer="engineer")
-
-        assert len(msgs) == 1
-        assert msgs[0]["id"] == 3
-
-    def test_无consumer不使用光标(self):
-        cursor_spy = mock.MagicMock(return_value=0)
-        with mock.patch("routing.polling._rt_mod"), \
-             mock.patch("routing.polling.get_last_cursor", cursor_spy), \
-             mock.patch("routing.polling.CIRCUIT_BREAKER"), \
-             mock.patch("routing.polling.METRICS"), \
-             mock.patch("routing.polling.HEARTBEAT"), \
-             mock.patch("routing.polling.LOGGER"), \
-             mock.patch("bus_protocol.Blackboard"), \
-             mock.patch("config_loader.get_config"):
-            from routing.polling import poll_unconsumed
-            poll_unconsumed()
-
-        cursor_spy.assert_not_called()
 
     def test_心跳beat被调用(self):
         with _poll_ctx([]) as deps:

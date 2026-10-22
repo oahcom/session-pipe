@@ -92,13 +92,13 @@ def _cancelled_wfs(inst, lm, wf_id):
     return [_w for _w, _st in _closed if _st == "cancelled" and _w == wf_id]
 
 
-def _run(step_sd, pane_state, assignee="reviewer"):
+def _run(step_sd, pane_state, assignee="reviewer", age_h=None, producing=False):
     """跑一次 _cleanup_stale_workflows，stub 掉 pane 探测，返回被取消的 wf_id 列表。"""
     now = time.time()
     row = {
         "instance_id": "wf_test_r98",
         "template_id": _TPL,
-        "created_at": now - 7200,          # age_h=2：> 1h 门控，< 24h 全局阈值
+        "created_at": now - (age_h * 3600 if age_h else 7200),   # 默认 age_h=2：> 1h 门控，< 24h 全局阈值
         "status": "running",
         "current_step_id": "s1",
         "assignee": assignee,
@@ -110,9 +110,10 @@ def _run(step_sd, pane_state, assignee="reviewer"):
     orig = liveness.tmux_pane_active
     orig_prod = wf_lifecycle._role_producing_recently
     liveness.tmux_pane_active = lambda role, **k: pane_state
-    # 第二道门（转录新鲜度）与本用例无关，固定为 False 让结论只由 pane 状态决定；
-    # 否则同一实例在跑测试的机器上可能因真实 transcript 新鲜而豁免，测试不确定。
-    wf_lifecycle._role_producing_recently = lambda role, **k: False
+    # 第二道门（转录新鲜度）默认固定为 False，让结论只由 pane 状态决定；否则同一
+    # 实例在跑测试的机器上可能因真实 transcript 新鲜而豁免，测试不确定。
+    # 条件3（全局阈值）的用例显式传 producing=True 来验活体门。
+    wf_lifecycle._role_producing_recently = lambda role, **k: producing
     try:
         WorkflowLifecycleMixin._cleanup_stale_workflows(inst, lm)
     finally:
@@ -168,8 +169,9 @@ def test_pane_gate_is_load_bearing():
         "pane 状态不影响结论：门控未接入判定，静默/活跃无区别"
 
 
-def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect", age_h=2):
-    """父步挂着子链时跑一次回收，返回被置 cancelled 的 wf_id 列表。"""
+def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect", age_h=2,
+                      rework_status=None, rework_tpl="architect_full_design"):
+    """父步挂着子链/返工链时跑一次回收，返回被置 cancelled 的 wf_id 列表。"""
     now = time.time()
     row = {
         "instance_id": "wf_test_parent",
@@ -183,8 +185,12 @@ def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_archite
 
     class _LM(_FakeLM):
         def query(self, sql, params=()):
+            if "instance_id IN (" in sql:       # 返工链是批量主键查，不是单条
+                return ([{"status": rework_status, "template_id": rework_tpl}]
+                        if rework_status else [])
             if "WHERE instance_id=?" in sql and params and params[0] != "wf_test_parent":
-                return [{"status": sub_status}] if sub_status else []
+                return ([{"status": sub_status, "template_id": "architect_full_design"}]
+                        if sub_status else [])
             return [self._row]
 
     inst = SimpleNamespace(_workflows={}, _notify_role=lambda *a, **k: None)
@@ -214,11 +220,75 @@ def test_dead_subflow_still_allows_reclaim():
           "queued_since": time.time() - 7200, "ts": time.time() - 10}
     assert _run_with_subflow(sd, "cancelled", False), "子链已死却连父链也不回收"
 
+def test_live_rework_child_blocks_parent_reclaim():
+    """返工链只记在 rework_ids、不写 subflow_id → 只认 subflow_id 时父链被判死，
+    close_wf 级联杀掉还在跑的返工子链（2026-10-22 wf_85faf589be90/s3、wf_b808ff2f3611/s3）。"""
+    sd = {"status": "rejected", "rework_ids": ["wf_rw_live"], "queued": 6,
+          "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, None, False, rework_status="running") == [], \
+        "返工子链 running 时父链仍被回收：从未交付的返工产物被级联取消"
+
+def test_system_rework_child_does_not_block_reclaim():
+    """系统维护链不动产品产物 → 不能拿它续期父链（维护队列实测 91 深，
+    3 条主链被一条从未投递的维护链扣 8h+）。"""
+    sd = {"status": "rejected", "rework_ids": ["wf_rw_maint"], "queued": 6,
+          "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, None, False, rework_status="running",
+                             rework_tpl="maintainer_health_monitor"), \
+        "系统维护链在跑就豁免父链：产品链被维护队列扣死"
+
+def test_malformed_rework_ids_are_ignored():
+    """畸形 rework_ids（dict/数字/空串/混入 None）不得抛异常也不得产生查询。
+
+    抛了会冒到 _cleanup_stale_workflows 的整轮 except，本轮**所有**实例停止回收。
+    """
+    class _NoQuery:
+        def query(self, sql, params=()):
+            raise AssertionError(f"畸形值不该产生查询: {sql} {params}")
+
+    for bad in ({}, {"wf_rw_x": 1}, 1, 0, "", [None, 3, ""], None):
+        assert wf_lifecycle._live_subflow(_NoQuery(), {"rework_ids": bad}) is False, bad
+
+def test_delivery_blocked_child_does_not_exempt_reclaim():
+    """delivery_blocked 是投递连败/角色无响应的停滞态（生产 233 条），非 failed 也非
+    cancelled。当活会让父链悬空到 2 倍阈值，而它要等 _recover_delivery_blocked 恢复
+    （角色持续离线时永不恢复）——同文件 _subflow_takeover 踩过同一个坑。"""
+    sd = {"status": "rejected", "rework_ids": ["wf_rw_parked"], "queued": 6,
+          "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, None, False, rework_status="delivery_blocked"), \
+        "delivery_blocked 子链被当活：父链陪着等一个可能永不恢复的停滞态"
+
+def test_live_child_does_not_exempt_beyond_double_budget():
+    """活子链的豁免也要 2 倍封顶：否则父链寿命 = 父龄 + 子链寿命，没有上限。
+
+    pending 子链对回收器不可见（清理器只扫 running/step_done_ready），
+    无限陪等就是"永久孤儿"。
+    """
+    sd = {"subflow_id": "wf_sub_live3", "queued": 20,
+          "queued_since": time.time() - 7200, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, "running", False, age_h=50), \
+        "活子链把父链豁免到 50h（> 2×24h）：2 倍硬兜底被短路，父链可永驻"
+
 def test_live_subflow_blocks_global_24h_reclaim():
     """24h 兜底 + 级联会杀掉仍在产出的子链 → 子链活着时条件3 也必须放行。"""
     sd = {"subflow_id": "wf_sub_live2", "ts": time.time() - 10}
     assert _run_with_subflow(sd, "running", False, age_h=26) == [], \
         "父链过 24h 阈值时活子链被级联杀掉，在途产出丢失"
+
+def test_producing_role_blocks_global_cap():
+    """过全局阈值但角色仍在产出 → 不得砍（2026-10-22 实测 5/5 全是这种误杀）。"""
+    assert _run({}, False, age_h=26, producing=True) == [], \
+        "角色判死前 11~31s 仍在写转录，仍被全局阈值砍掉 —— 在途产出被丢弃"
+
+def test_silent_role_still_hits_global_cap():
+    """过全局阈值且角色已静默 → 硬上限必须保留，否则真卡死实例永驻。"""
+    assert _run({}, False, age_h=26, producing=False), \
+        "角色已静默 + 过全局阈值却没回收：硬上限被活体门吃掉"
+
+def test_hard_stop_at_double_budget():
+    """两倍阈值后不再看活体：防止话痨角色无限续命（堆文档/刷心跳）。"""
+    assert _run({}, False, age_h=50, producing=True), \
+        "50h（> 2×24h）仍在产出就无限续命：硬兜底失效"
 
 def test_select_includes_assignee():
     """主查询漏选 assignee → 角色解析恒空 → 探测恒 None → 条件4 静默失效。"""
@@ -241,6 +311,11 @@ if __name__ == "__main__":
             test_pane_gate_is_load_bearing,
             test_live_subflow_blocks_parent_reclaim,
             test_dead_subflow_still_allows_reclaim,
+            test_live_rework_child_blocks_parent_reclaim,
+            test_system_rework_child_does_not_block_reclaim,
+            test_malformed_rework_ids_are_ignored,
+            test_delivery_blocked_child_does_not_exempt_reclaim,
+            test_live_child_does_not_exempt_beyond_double_budget,
             test_live_subflow_blocks_global_24h_reclaim,
             test_select_includes_assignee)
     _fails = 0

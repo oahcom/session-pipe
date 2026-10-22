@@ -8,15 +8,13 @@ from reliability_core import (
     CircuitBreaker, CircuitState, CircuitOpenError,
     ConsumerHeartbeat, TtlPruner,
     MetricsCollector, METRICS, setup_logging, with_trace_id, LOGGER,
-    get_last_cursor, set_last_cursor,
 )
 
 # re-exports
 __all__ = ["RetryPolicy", "with_retry",
            "CircuitBreaker", "CircuitState", "CircuitOpenError",
            "ConsumerHeartbeat", "TtlPruner", "MetricsCollector",
-           "METRICS", "setup_logging", "with_trace_id", "LOGGER",
-           "get_last_cursor", "set_last_cursor"]
+           "METRICS", "setup_logging", "with_trace_id", "LOGGER"]
 
 import os
 import signal

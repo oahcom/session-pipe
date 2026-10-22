@@ -25,6 +25,7 @@ os.environ.setdefault("SESSION_PIPELINE_SKIP_TTL_PRUNER", "1")
 
 import pipeflow.engine as engine_mod
 from pipeflow.engine import WorkflowEngine, WorkflowRun, Step
+from pipeflow.role_lifecycle import RoleLifecycleMixin
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -40,6 +41,9 @@ def _build_eng() -> WorkflowEngine:
     eng._lm = MagicMock()
     eng._bb = MagicMock()
     eng._sync_step_results = MagicMock()
+    # 同 prompt 去重是进程级类属性：不清则前一个用例的成功投递会让本用例
+    # 在预检被删掉时也返回 busy（假通过）。
+    RoleLifecycleMixin._LAST_SEND.clear()
     return eng
 
 
@@ -72,10 +76,16 @@ def _mock_run_out(**kw) -> MagicMock:
     return m
 
 
+def _snap(present=True):
+    """tmux 快照桩：pane 探针现在读一次 list-panes -a 的结果，不再逐角色调用。"""
+    return lambda max_age=2.0: ({"scout": ("123", str(int(__import__("time").time())))} if present else {})
+
+
 def test_ensure_role_alive_already_running():
     """tmux has-session 返回 0 且 pane 内有 claude -> 直接返回 True。"""
     eng = _build_eng()
-    with patch.object(engine_mod._sp, "run") as mock_run:
+    with patch.object(engine_mod._sp, "run") as mock_run, \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap()):
         mock_run.return_value = _mock_run_out(returncode=0, stdout="claude\n")
         assert eng._ensure_role_alive("scout")
         args = mock_run.call_args_list[0][0][0]  # 首次调用是 has-session
@@ -93,7 +103,8 @@ def test_ensure_role_alive_dead_started():
             return _mock_run_out(returncode=1)  # has-session: not alive → restart CCS
         else:
             return _mock_run_out(returncode=0, stdout="claude\n")  # start/has-session/list-panes: ok
-    with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
+    with patch.object(engine_mod._sp, "run", side_effect=_dispatch), \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap()):
         assert eng._ensure_role_alive("scout")
     assert call_n[0] >= 2, f"应至少调用 2 次: {call_n[0]}"
 
@@ -177,6 +188,69 @@ def test_send_to_role_creates_task_spec():
     title = task_spec_calls[0].args[1]
     assert "needs_implementation" in title
     assert "wf_abc" in title
+
+
+def test_send_to_role_defers_when_cli_busy():
+    """CLI 仍在执行 -> 排队，不启动 ccs send（避免单次投递卡住整个 tick）。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)  # DB 视角：没有别的活跃步
+
+    with patch("liveness.pane_cli_busy", return_value=True) as probe, \
+            patch.object(engine_mod._sp, "run") as mock_run:
+        assert eng._send_to_role("scout", "test prompt",
+                                 wf_id="wf_123", step_id="s1") == "busy"
+
+    probe.assert_called_once_with("scout")
+    mock_run.assert_not_called()
+    assert not eng._bb.write.called
+
+
+def test_invalid_prompt_is_not_masked_by_busy():
+    """预检必须排在 goal 校验之后：非法 prompt 走 blocker，不能被忙态吞掉。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    with patch("liveness.pane_cli_busy", return_value=True) as probe:
+        assert eng._send_to_role("scout", "p", wf_id="wf_x", step_id="s1") is False
+
+    probe.assert_not_called()
+    assert eng._bb.write.called
+
+
+def test_force_bypasses_cli_busy():
+    """force=True（超时重推/双节点/完整性提醒）不许被忙预检拦下。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    with patch("liveness.pane_cli_busy", return_value=True) as probe, \
+            patch.object(engine_mod._sp, "run",
+                         return_value=_mock_run_out(returncode=0)):
+        assert eng._send_to_role("scout", "test prompt", wf_id="wf_force",
+                                 step_id="s1", force=True) is True
+
+    probe.assert_not_called()
+
+
+def test_send_to_role_proceeds_when_cli_probe_fails():
+    """探针异常/None 不阻断投递：沿用“探测不可用则放行”。"""
+    eng = _build_eng()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=True)
+    eng._is_role_busy = MagicMock(return_value=False)
+
+    with patch("liveness.pane_cli_busy", side_effect=OSError("tmux gone")) as probe, \
+            patch.object(engine_mod._sp, "run",
+                         return_value=_mock_run_out(returncode=0)):
+        assert eng._send_to_role("scout", "test prompt",
+                                 wf_id="wf_probe_fail", step_id="s1") is True
+
+    probe.assert_called_once_with("scout")
 
 
 # ═══════════════════════════════════════════════════════════════════════

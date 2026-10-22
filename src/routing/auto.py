@@ -17,10 +17,10 @@ from reliability import (
 from routing import router as _rt_mod
 
 
-def poll_unconsumed(category: str | None = None, consumer: str | None = None, instance_id: str = "", limit: int = 100) -> list[dict]:
+def poll_unconsumed(category: str | None = None, consumer: str | None = None, limit: int = 100) -> list[dict]:
     """拉取未消费消息（re-export from routing.polling）。"""
     from routing.polling import poll_unconsumed as _p
-    return _p(category=category, consumer=consumer, instance_id=instance_id, limit=limit)
+    return _p(category=category, consumer=consumer, limit=limit)
 
 
 def notify_consumers(messages: list[dict]) -> None:

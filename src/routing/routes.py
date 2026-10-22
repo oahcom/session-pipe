@@ -9,7 +9,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from pathlib import Path
 
 # Path setup
@@ -21,7 +20,7 @@ from routing import router as _rt_mod
 from paths import CCS_CLI as _CCS_CLI
 from workflow.client import WorkflowClient
 
-from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT, set_last_cursor
+from reliability import LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT
 from reliability import IDEMPOTENT_CONSUME, ACK_TRACKER
 from output_validator import validate_output
 
@@ -160,7 +159,12 @@ def _is_noop_report(title: str, evidence: str = "") -> bool:
 
 
 
-def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True, instance_id: str = "") -> dict:
+# 超过这个年龄的事实不再投递（只 claim）。6h：角色任务生命周期远短于此，
+# 而视图积压是按天算的（8.6k 条 / 7.7k 条 >24h）。
+STALE_AFTER_S = 6 * 3600
+
+
+def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True) -> dict:
     """自动路由消费：为每条未消费消息并行分配给多个消费者。
 
     P1 改进：
@@ -168,25 +172,21 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
     - 使用 ThreadPoolExecutor 并行消费
     - 幂等消费防重复
     - ACK 记录和 metrics
-    - Fix 6：poll_unconsumed 用 cursor 过滤已处理消息，route_all 结束更新 cursor
-    - Fix 7：instance_id 隔离多 pipeline 实例的 cursor
+    - 去重：每条处理完且无角色报错的事实补记 consumer='pipeline' 的 consume
+      （旧 cursor 已删：随机 instance_id 让游标只写不读；实测该表 0 行/12KB）
 
     dry_run=True 时只展示分配方案。
     parallel=True 时使用线程池并行。
-    instance_id 为空时自动生成，确保每个 route_all 调用周期有独立 cursor。
     """
     from concurrent.futures import ThreadPoolExecutor
     from bus_protocol import Blackboard
-
-    if not instance_id:
-        instance_id = f"pipeline_{uuid.uuid4().hex[:8]}_{os.getpid()}_{int(time.time())}"
 
     # 延迟导入规避循环依赖（poll_unconsumed 定义在 auto_route.py）
     from routing.auto import poll_unconsumed as _poll
 
     bb = Blackboard()
     router = _rt_mod.get_router()
-    messages = _poll(consumer=consumer, instance_id=instance_id)
+    messages = _poll(consumer=consumer)
     if not messages or "error" in messages[0]:
         METRICS.inc("route_errors_total")
         return {"routed": 0, "total": 0, "details": [], "dry_run": dry_run, "parallel": parallel}
@@ -198,6 +198,21 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
         import re as _re
         for msg in messages:
             if "error" in msg:
+                continue
+            # 过期不投：无主事实被 claim 后，视图窗口会向老事实滑动（库里积压 8.6k 条，
+            # 7.7k 条 >24h）。不设闸就会把一天前的任务重新派给角色、并 mint 同标题旧工作流。
+            # 只 claim 不投递 —— 与"它从没被看见"的旧行为一致，但不再占住窗口。
+            if time.time() - (msg.get("ts") or time.time()) > STALE_AFTER_S:
+                METRICS.inc("route_stale_skipped")
+                details.append({"id": msg["id"], "category": msg["category"],
+                                "assigned": [], "reason": "stale"})
+                try:
+                    if not dry_run:
+                        bb.mark_consumed(msg["id"], consumer)
+                    else:
+                        METRICS.inc("route_claim_skipped_dry_run")
+                except Exception as _se:
+                    LOGGER.warning("route claim (stale) failed #%s: %s", msg["id"], _se)
                 continue
             consumers = msg.get("consumers", [])
             # @role 定向路由：@target 的消息只给 target，其他角色跳过
@@ -215,6 +230,16 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
             if not ordered:
                 METRICS.inc("route_orphan_count")
                 details.append({"id": msg["id"], "category": msg["category"], "assigned": [], "reason": "no_consumer"})
+                # 这条已由路由判定"无人可派"（@tag 过滤后为空 / 全是自回声）。
+                # 仍要标记已消费：不标就永久留在视图里被每 60s 重扫（实测 24h
+                # 416/1813=22.9%，领取年龄中位 136min），并挤掉最新 100 条窗口。
+                try:
+                    if not dry_run:
+                        bb.mark_consumed(msg["id"], consumer)
+                    else:
+                        METRICS.inc("route_claim_skipped_dry_run")
+                except Exception as _ce:
+                    LOGGER.warning("route claim (no_consumer) failed #%s: %s", msg["id"], _ce)
                 continue
 
             assignments.append({
@@ -304,16 +329,24 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                         _wc.close()
                                     except Exception as _e:
                                         LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
-                        try:
-                            set_last_cursor(consumer, "", fid, instance_id)
-                        except Exception as _sc_e:
-                            LOGGER.debug("set_last_cursor failed for %s fid=%s: %s", consumer, fid, _sc_e)
                     except Exception as e:
                         LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
                                      extra={"trace_id": str(fid)})
                         METRICS.inc("route_errors_total", labels={"consumer": role})
                         results.append({"role": role, "status": "error", "error": str(e)})
                         ACK_TRACKER.record_ack(fid, role, "error", category=cat, error=str(e))
+                # 路由器已接管该条：poll 的 consumer='pipeline' 视图只认 cat='pipeline'
+                # 的 consume 记录，而上面各角色写的是 cat=<role>。不记这一笔，
+                # 全部事实永久留在该视图里，每轮把最新 100 条重投一遍（实测 10 003 条
+                # 全在视图内、7 777 条 >1 天，同一 preview 每 5~6 分钟重复 3 次）。
+                # 只在没有角色报错时记：有 error 的留到下轮重试。
+                if not any(_r.get("status") == "error" for _r in results):
+                    try:
+                        bb.mark_consumed(fid, consumer)
+                    except Exception as _ce:
+                        # 静默 = 这条事实永远重投且没人看得见。写失败要进 journal。
+                        LOGGER.warning("route claim failed #%s: %s", fid, _ce)
+                        METRICS.inc("route_claim_errors_total")
                 HEARTBEAT.beat(cat)
                 METRICS.inc("route_assigned_count", labels={"category": cat})
                 return {
@@ -326,15 +359,12 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
 
             executor = ThreadPoolExecutor(max_workers=min(8, len(assignments) or 1))
             try:
-                details = list(executor.map(_do_consume_msg, assignments))
+                # extend 而非赋值：规划阶段已把 no_consumer / stale 的跳过原因写进
+                # details，赋值会把它们整批抹掉（调用方永远看不到 reason）。
+                details.extend(executor.map(_do_consume_msg, assignments))
             finally:
                 executor.shutdown(wait=True)
 
-            # Fix 6：更新持久化 cursor，重启后不再重复处理已消费的消息
-            if details:
-                max_id = max(d.get("id", 0) for d in assignments)
-                if max_id:
-                    set_last_cursor(consumer, "", max_id, instance_id)
 
     routed = sum(1 for d in details if d.get("assigned"))
     result = {
@@ -519,7 +549,8 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "routed", "sent_chars": result.get("sent_chars", 0)})
             # 投递成功即标记已消费，防下轮重投同一批。
-            # route_all 走 cursor 推进，route_to_ccs 无 cursor，不标记则永久重复：
+            # 两条路都靠 bus 的 consume 记录去重（cursor 已于 2026-10-22 退役），
+            # route_to_ccs 自己不记就会永久重复：
             # 实测 15 条 P0 blocker 因 rc=0 被无限重投（每 5 分钟一轮）。
             try:
                 _Blackboard().mark_consumed(msg["id"], consumer=role_name)

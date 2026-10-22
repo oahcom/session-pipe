@@ -8,21 +8,23 @@ import uuid
 from routing import router as _rt_mod
 from reliability import (
     LOGGER, METRICS, CIRCUIT_BREAKER, HEARTBEAT,
-    with_retry, DEFAULT_RETRY, get_last_cursor,
+    with_retry, DEFAULT_RETRY,
 )
 
 
 @with_retry(DEFAULT_RETRY)
 def poll_unconsumed(category: str | None = None, consumer: str | None = None,
-                    instance_id: str = "", limit: int = 100) -> list[dict]:
+                    limit: int = 100) -> list[dict]:
     """拉取未消费消息，按优先级排序。
 
     使用 Blackboard.unconsumed() 直接获取，
     不再 subprocess + 字符串解析。
     集成重试、熔断、心跳、指标。
     使用 config.yaml 中的 max_messages_per_poll（Fix 2）。
-    若指定 consumer，跳过 cursor 之前的消息（Fix 6 防重启重复处理）。
-    instance_id 区分不同 pipeline 实例的 cursor（Fix 7：多实例隔离）。
+    去重靠 bus 的 consume 记录（routes._do_consume_msg 记一笔 pipeline 接管），
+    不再用 cursor：旧实现按随机 instance_id 存游标，写完永远读不回来。
+    实测 2026-10-22：该表 0 行 / 12KB（早期注释"21 461 行/2.9MB"未复现）；
+    每轮写入上限是 max_messages_per_poll=100，不是"1 000+ 次"。
     """
     from bus_protocol import Blackboard
     from config_loader import get_config
@@ -36,17 +38,22 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
                         extra={"trace_id": str(uuid.uuid4())[:8]})
         METRICS.inc("config_errors_total")
         max_per_poll = 100
-    since_id = get_last_cursor(consumer, "", instance_id) if consumer else 0
-
     def _do_poll():
         effective_limit = min(limit, max_per_poll) if limit else max_per_poll
         # 关键修复: 必须传 consumer 参数，否则 unconsumed() 返回从未被任何人消费的事实(即 0)
         # cat 下推到 SQL（2026-10-22）：原来把**全部**未消费事实载进内存再切片、出了
         # 本函数才按 cat 过滤 —— 实测单 consumer 未消费 9000+ 条（scout 9060 /
-        # reviewer 9019 / pm 8223），每次 poll 都白搬一遍。limit 不下推：SQL 先 LIMIT
-        # 再丢 since_id 之前的旧 id，会让游标之后的条目被饿掉。
-        return [f for f in bb.unconsumed(consumer=consumer, cat=category)
-                if f.id > since_id][:effective_limit]
+        # reviewer 9019 / pm 8223），每次 poll 都白搬一遍。
+        # limit 也下推：实测 8,697 行的视图在 Python 侧切片要构造 8,697 个 Fact
+        # （54ms/轮，每 60s 一次且 row_factory 逐行建对象）；下推后只取 100 行、1.2ms。
+        # SQL 的 LIMIT 只是省构造 Fact 的优化，不是契约：任何后端（含测试替身）
+        # 都可能返回更多，函数自己的 limit 语义必须在这里兑现（见下方 [:effective_limit]）。
+        if effective_limit <= 0:
+            return []  # max_messages_per_poll=0 是"不轮询"，不是"不限"（旧行为是空列表）
+        # [:effective_limit] 是契约兜底（bus 若返回更多仍按本函数的 limit 语义裁剪），
+        # 不做 try/except 兼容：形参两侧同批上线，吞 TypeError 会盖住函数内部真错并二次调用。
+        return bb.unconsumed(consumer=consumer, cat=category,
+                             limit=effective_limit)[:effective_limit]
 
     try:
         facts = CIRCUIT_BREAKER.call(_do_poll)
@@ -58,11 +65,18 @@ def poll_unconsumed(category: str | None = None, consumer: str | None = None,
     HEARTBEAT.beat("pipeline")
     messages: list[dict] = []
     for f in facts:
+        # cat 的契约兜底：吃下 SQL 已按 cat 过滤的结果，但任何后端（含测试替身）
+        # 都可能忽略 cat= 返回更多，本函数的 category 语义在这里兑现（同 limit 兜底）。
+        if category and f.cat != category:
+            continue
         messages.append({
             "id": f.id,
             "category": f.cat,
             "text": f.t[:100],
             "src": getattr(f, "src", ""),
+            # ts 供路由层判"过期不投"：视图积压 8.6k 条历史事实，不看时间
+            # 就会把一天前的任务重新派给角色（routes.STALE_AFTER_S）。
+            "ts": getattr(f, "ts", 0),
             "evidence": f.e[:120] if f.e else "",
             "priority": _rt_mod.priority(f.cat),
             "consumers": router.get_consumers_prioritized(f.cat),

@@ -18,7 +18,7 @@ hermes-session-roles (定义层)
 **铁律：不直接创建 CCS，不改 bus_protocol 核心逻辑。**
 
 ## Git 工作流
-1. 禁止切换分支，始终在 main 分支工作
+1. 只在当前 worktree 分支工作（2026-10-22 实测分支：`temp-pr-branch`），不改主分支
 2. 小步提交，每完成一个逻辑单元立即 commit
 3. 出错用新提交修复，不要 revert
 4. 本地即生产环境
@@ -50,7 +50,7 @@ print(format_pipeline())
 # 路由表加载正常
 PYTHONPATH=src python3 -c "
 from routing.router import get_router; r = get_router()
-assert len(r._routing) >= 19, f'路由表不完整: {len(r._routing)}'   # roles_export 现为 19
+assert len(r._routing) >= 19, f'路由表不完整: {len(r._routing)}'   # roles_export 现为 19 个角色
 print(f'OK: {len(r._routing)} roles')
 "
 
@@ -69,7 +69,7 @@ print(f'Health: {health_check()[\"status\"]}')
 | D1 正确性 | produce/consume 映射准确 | 对比角色 JSON output_targets |
 | D2 安全性 | 消息不泄露、不注入 | 无 eval/exec |
 | D3 可维护性 | 配置化、不硬编码 | 检查 config.yaml 覆盖 |
-| D4 性能 | 轮询间隔合理、无 N+1 | poll_interval=60s |
+| D4 性能 | 轮询间隔合理、无 N+1 | `max_messages_per_poll`（config **没有** `poll_interval` 键；路由节奏是 `routing_daemon.INTERVAL = 60` 常量，无 CLI 覆写） |
 | D5 一致性 | 优先级表完整 | CATEGORY_PRIORITY 覆盖全部分类 |
 | D6 可测试性 | 路由逻辑可 mock | db_path 参数注入 |
 | D7 可靠性 | 重试/熔断/心跳/TTL 配置 | config.yaml 全部可调 |
@@ -88,7 +88,7 @@ python3 src/ccs.py health
 
 ### 5. 每周自进化
 
-- 检查 unconsumed 消息积压（`python3 src/routing/auto.py --status`）
+- 检查 unconsumed 消息积压（`PYTHONPATH=src python3 -m routing.auto --status`；直接跑 `src/routing/auto.py` 会 `ModuleNotFoundError: reliability`）
 - 检查路由命中率：哪些角色从未被路由到？
 - 检查 TTL 清理是否正常运行
 - 检查熔断器触发次数
@@ -97,7 +97,6 @@ python3 src/ccs.py health
 ## 关键配置
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| bus.poll_interval | 60s | 轮询间隔 |
 | retry.max_retries | 3 | 最大重试次数 |
 | circuit_breaker.failure_threshold | 5 | 熔断阈值 |
 | heartbeat.stale_threshold | 300s | 消费者超时 |
@@ -108,6 +107,7 @@ python3 src/ccs.py health
 ### 模板必填元数据
 ```bash
 # 每个 ~/.hermes/workflows/*.json 必须含 schema 的 8 个 required 字段（下面 5 个之外还有 name/description/steps）：
+workflow_id="WF-<name>"                     # 可选；缺省时 register 默认 WF-{name}
 trigger_scene=["编码实现", "bug修复"]   # 至少 1 条触发场景
 allowed_initiators=["coordinator","pm"] # 至少 1 个允许发起角色
 allowed_executors=["engineer"]          # 至少 1 个允许执行角色
@@ -122,7 +122,7 @@ PYTHONPATH=src python3 -m template_registry validate <template.json>
 ```
 
 ### 创建模板流程
-1. 认真填写 6 个元数据字段及每步的 `failure_patterns`
+1. 认真填写 8 个必填字段（上面 5 个元数据 + name/description/steps）及每步的 `failure_patterns`
 2. 运行 `validate-all` 确保校验通过
 3. 用 `recommend` 验证推荐的场景覆盖符合预期
 

@@ -40,3 +40,9 @@ if [ "$ALLOW_HISTORY_ROLLBACK" != "1" ]; then
     done
   done
 fi
+
+# ── doc-drift: 文档声明的行数与代码不一致时提示（不拦提交）──────────────────
+# 实测 2026-10-22：文档对齐当天行数即因并发改动漂移 11 处，且无人跑过校验工具。
+if [ -f scripts/doccheck.py ] && ! out=$(python3 scripts/doccheck.py 2>&1); then
+  echo "DOC-DRIFT $(printf '%s' "$out" | tail -2 | grep -o '[0-9]* mismatch' || echo '文档行数与代码不一致')（不拦提交）—— 修：python3 scripts/doccheck.py --fix" >&2
+fi

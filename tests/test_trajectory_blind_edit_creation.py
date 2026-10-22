@@ -9,7 +9,9 @@
 """
 import json
 import os
+import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
@@ -19,25 +21,28 @@ if SRC not in sys.path:
 from eval_checker import TrajectoryQualityChecker, _TRANSCRIPTS_DIR
 
 
-def _turn(n: int, role: str, content: list) -> str:
-    return json.dumps({
+def _turn(n: int, role: str, content: list, ts: str | None = None) -> str:
+    row = {
         "type": "assistant" if role == "assistant" else "user",
         "message": {"id": f"m{n}", "type": "message", "role": role,
                     "content": content},
-    })
+    }
+    if ts:                      # 轨迹判据的时间窗按记录 timestamp 判，不用文件 mtime
+        row["timestamp"] = ts
+    return json.dumps(row)
 
 
-def _write_seq(n: int, cid: str, path: str, result: str) -> list:
-    """一次 Write 及其结果；result 决定它是否被认作"新建"。"""
+def _write_seq(n: int, cid: str, path: str, result: str, ts: str | None = None) -> list:
+    """一次 Write 及其结果；result 决定它是否被认作"新建"，ts 用于时间窗用例。"""
     return [
         _turn(n, "assistant", [
             {"type": "tool_use", "id": cid, "name": "Write",
              "input": {"file_path": path, "content": "x=1"}},
-        ]),
+        ], ts=ts),
         _turn(n + 1, "user", [
             {"type": "tool_result", "tool_use_id": cid, "is_error": False,
              "content": result},
-        ]),
+        ], ts=ts),
     ]
 
 
@@ -99,7 +104,7 @@ def test_path_mismatch_and_error_echo_not_exempted() -> None:
     """豁免不能扩大成放过一切写：路径不符 / 结果无创建标记 都要照判盲改。"""
     cases = [
         ("-mismatch", "other.py", f"File created successfully at: {os.path.join(os.sep, 'tmp', 'other.py')}"),
-        ("-pathonly", "/tmp/probe_echo.py", "/tmp/probe_echo.py"),  # 结果只回显路径，无创建标记
+        ("-pathonly", "/data/probe_echo.py", "/data/probe_echo.py"),  # 结果只回显路径，无创建标记
     ]
     for tag, target, result in cases:
         sess = _TRANSCRIPTS_DIR / f"-probe-selfcreate{tag}-role"
@@ -134,12 +139,12 @@ def test_path_mismatch_and_error_echo_not_exempted() -> None:
 def test_non_creation_write_still_flagged() -> None:
     """对照：结果不含"新建"标记的写仍判盲改（豁免不能扩大成放过一切写）。"""
     sess = _TRANSCRIPTS_DIR / "-probe-selfupdate-role"
-    jf = _make(sess, _write_seq(0, "c9", "/tmp/probe_updated.py", "ok"))
+    jf = _make(sess, _write_seq(0, "c9", "/data/probe_updated.py", "ok"))
     try:
         res = TrajectoryQualityChecker().check("selfupdate", "t")
         blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
         assert len(blind) == 1, f"盲改未被标记: {res['findings']}"
-        assert blind[0]["file"] == "/tmp/probe_updated.py"
+        assert blind[0]["file"] == "/data/probe_updated.py"
     finally:
         jf.unlink(missing_ok=True)
         try:
@@ -217,7 +222,7 @@ def test_one_success_result_keeps_blind_edit() -> None:
     反之（只看 error 就跳过）会变成「先失败一次，后面盲写全部免检」的后门。
     """
     sess = _TRANSCRIPTS_DIR / "-probe-mixedretry-role"
-    lines = _write_seq(0, "cm", "/tmp/probe_mixed.py", "ok")
+    lines = _write_seq(0, "cm", "/data/probe_mixed.py", "ok")
     lines.append(_turn(1, "user", [
         {"type": "tool_result", "tool_use_id": "cm", "is_error": True,
          "content": "<tool_use_error>InputValidationError: Write was called with "
@@ -271,7 +276,7 @@ def test_edit_of_own_written_file_not_flagged() -> None:
 def test_edit_before_own_write_still_flagged() -> None:
     """顺序不能反：先 Edit 后 Write 时，那次 Edit 仍算盲改。"""
     sess = _TRANSCRIPTS_DIR / "-probe-ownwrite-order-role"
-    path = "/tmp/probe_own_order.py"
+    path = "/data/probe_own_order.py"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "ce2", "name": "Edit",
@@ -373,11 +378,11 @@ def test_same_file_different_path_form_not_flagged() -> None:
 def test_bash_basename_must_be_path_component() -> None:
     """bash 里出现同名前缀的**别的**文件不算读过：`myx_probe.md` 不豁免 `x_probe.md`。"""
     sess = _TRANSCRIPTS_DIR / "-probe-bashbase-role"
-    target = "/tmp/x_probe.md"
+    target = "/data/x_probe.md"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "b1", "name": "Bash",
-             "input": {"command": "cat /tmp/myx_probe.md"}},
+             "input": {"command": "cat /data/myx_probe.md"}},
         ]),
         _turn(1, "user", [
             {"type": "tool_result", "tool_use_id": "b1", "is_error": False,
@@ -409,7 +414,7 @@ def test_bash_basename_must_be_path_component() -> None:
 def test_bash_absolute_path_must_point_at_same_file() -> None:
     """带绝对路径的 bash 读取必须指向同一文件：同名异目录的 decoy 不豁免。"""
     sess = _TRANSCRIPTS_DIR / "-probe-bashpath-role"
-    decoy, target = "/tmp/decoy/x_path.md", "/tmp/other/x_path.md"
+    decoy, target = "/data/decoy/x_path.md", "/data/other/x_path.md"
     lines = [
         _turn(0, "assistant", [
             {"type": "tool_use", "id": "b3", "name": "Bash",
@@ -511,6 +516,385 @@ def test_second_write_of_own_file_not_flagged() -> None:
             pass
 
 
+
+def test_scratch_write_not_flagged() -> None:
+    """草稿文件（/tmp）的写不算盲改：没有既有内容可被覆盖。"
+
+    实测 24h 全 19 角色只剩 2 处 blind_edit，全在 /tmp（engineer /tmp/eng_sim2.py、
+    knowledge_curator /tmp/inspect_rw.py），仓内 0 处；结果文案是
+    'The file … has been updated successfully'，查不到"新建"标记，所以照判，
+    角色每轮都要多花一轮自证。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-scratch-role"
+    path = "/tmp/probe_scratch.py"
+    lines = _write_seq(0, "ct1", path,
+                       f"The file {path} has been updated successfully. "
+                       '"(file state is current in your context)"')
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("scratch", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"草稿文件的写不该判盲改: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+
+
+def test_scratch_edit_still_flagged() -> None:
+    """草稿目录只豁免 Write：Edit 仍判盲改。
+
+    /tmp 里 353 个被写路径中有 5 个是"起稿后 cp 进仓/系统目录"的
+    （/tmp/20-memory-tuning.conf → systemd drop-in、/tmp/ccs-monitor/pass.sh →
+    在跑的巡检脚本）；首写无害，之后对它们的无 Read Edit 是真盲改。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-scratchedit-role"
+    path = "/tmp/probe_scratch_edit.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "ce9", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ]),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "ce9", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ]),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("scratchedit", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"草稿目录的 Edit 不该被豁免: {res['findings']}"
+        assert blind[0]["file"] == path
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+
+
+def test_own_workspace_write_not_flagged() -> None:
+    """角色写自己 ccs-workspaces 里的报告不算盲改：那是它自己的产出物。
+
+    实测 maintainer 每天整篇重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT。
+    角色名与会话目录必须**真匹配**：上一版 role=ownws--probe 与目录 -probe-ownws-role
+    不匹配，checked_traces=0 也算 passed，于是"豁免恒不生效"溜过去了（codex 审 P1-3）。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-ownws-role"
+    path = "/home/administrator/ccs-workspaces/ownws/REPORT.md"
+    lines = _write_seq(0, "co1", path,
+                       f"The file {path} has been updated successfully.")
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("ownws", "t")
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录，否则等于没测"
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"自己 workspace 的报告写不该判盲改: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_underscore_role_workspace_exempt() -> None:
+    """带下划线的角色名也要认：真实目录是 product_architect（下划线），不是连字符。
+
+    codex 审 P0：只按 role.replace("_","-") 拼路径时，product_architect /
+    knowledge_curator / security_auditor 三个角色的豁免恒不生效。
+    """
+    sess = _TRANSCRIPTS_DIR / "-probe-pa_probe-role"
+    path = "/home/administrator/ccs-workspaces/pa_probe/REPORT.md"
+    lines = _write_seq(0, "cu1", path,
+                       f"The file {path} has been updated successfully.")
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("pa_probe", "t")
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录"
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"下划线角色的自有 workspace 也该豁免: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+
+def test_stale_record_not_judged() -> None:
+    """超过 24h 的**记录**不参与轨迹判据：历史事件不能把角色永久钉红。
+
+    窗口按记录 timestamp 判（skill 21 节），不按文件 mtime：活动文件里混着几天前的
+    记录时，mtime 看不出来（codex 审 P1-2）。
+    """
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-stale-role"
+    path = "/data/probe_stale.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "so1", "name": "Write",
+             "input": {"file_path": path, "content": "x=1"}},
+        ], ts=old_ts),
+        _turn(1, "assistant", [
+            {"type": "tool_use", "id": "so2", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ], ts=old_ts),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("stale", "t")
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录"
+        assert res["findings"] == [], f"过期记录仍被判定: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_fresh_record_still_judged() -> None:
+    """对照：24h 内的记录照判（窗口不能把所有东西都放过）。"""
+    now_ts = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-freshrec-role"
+    path = "/data/probe_fresh.py"
+    lines = [
+        _turn(0, "assistant", [
+            {"type": "tool_use", "id": "fr1", "name": "Edit",
+             "input": {"file_path": path, "old_string": "x=1", "new_string": "x=2"}},
+        ], ts=now_ts),
+        _turn(1, "user", [
+            {"type": "tool_result", "tool_use_id": "fr1", "is_error": False,
+             "content": "The file has been updated successfully."},
+        ], ts=now_ts),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("freshrec", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"窗口内的盲改必须照判: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_scratch_created_now_is_exempt() -> None:
+    """这次写才诞生的 /tmp 草稿豁免（诞生时间 ≈ 写时间）。"""
+    now = datetime.now(timezone.utc).isoformat()
+    path = f"/tmp/probe_born_{os.getpid()}.sh"
+    Path(path).write_text("# scratch\n", encoding="utf-8")
+    sess = _TRANSCRIPTS_DIR / "-probe-born-role"
+    lines = _write_seq(0, "cb1", path,
+                       f"The file {path} has been updated successfully.", ts=now)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("born", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"刚诞生的草稿不该判盲改: {blind}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_scratch_overwrite_preexisting_is_flagged() -> None:
+    """覆盖**预存**的 /tmp 文件要判盲改：诞生年龄 > 120s。
+
+    codex 第二轮复核的 P1：只按目录放过会漏掉被覆盖的在跑脚本（真机 /tmp/al.sh，
+    诞生早于写时间 5h54m，实测被放过）。birthtime 无法回拨，故用打桩把 stat 的
+    诞生时间置为 1 小时前，其余全走真实路径（真文件、真 transcript、真判定）。
+    上一版用例把"写时间"回拨 1 小时、文件却是现在建的 —— 那是物理不可能的情形，
+    改了方向比较之后它才暴露出来（第三轮复核指出）。
+    """
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_preexist_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    born = str((now - timedelta(hours=1)).timestamp())
+    real_run = subprocess.run
+
+    class _R:
+        stdout = born
+
+    def _fake(cmd, *a, **k):
+        if isinstance(cmd, list) and cmd[-1] == path:
+            return _R()
+        return real_run(cmd, *a, **k)
+
+    sess = _TRANSCRIPTS_DIR / "-probe-preexist-role"
+    lines = _write_seq(0, "cp1", path,
+                       f"The file {path} has been updated successfully.",
+                       ts=now.isoformat())
+    jf = _make(sess, lines)
+    subprocess.run = _fake
+    try:
+        res = TrajectoryQualityChecker().check("preexist", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert len(blind) == 1, f"覆盖预存 /tmp 文件必须判盲改: {res['findings']}"
+    finally:
+        subprocess.run = real_run
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_preexisting_real_file_without_monkeypatch() -> None:
+    """真机预存文件、不打桩：写时间比诞生晚 200s → 必须判盲改。
+
+    与"文件诞生于 1 小时前"在数值上等价（age=200 > 120），但不需要伪造 stat，
+    走的是真实 stat 与真实文件。上一版唯一"预存"用例靠 monkeypatch，覆盖不到这里。
+    """
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_real_pre_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    late = (now + timedelta(seconds=200)).isoformat()   # 写时间晚于诞生 200s
+    sess = _TRANSCRIPTS_DIR / "-probe-realpre-role"
+    lines = _write_seq(0, "cr1", path,
+                       f"The file {path} has been updated successfully.", ts=late)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("realpre", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert len(blind) == 1, f"预存文件被覆盖必须判盲改: {res['findings']}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_birth_tolerance_boundary() -> None:
+    """120s 容差边界：age=60 放过、age=200 判盲改（同一个真文件，只改写时间）。"""
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_bound_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\n", encoding="utf-8")
+    sess = _TRANSCRIPTS_DIR / "-probe-bound-role"
+    for offset, expect_flagged in ((60, False), (200, True)):
+        ts = (now + timedelta(seconds=offset)).isoformat()
+        lines = _write_seq(0, f"cf{offset}", path,
+                           f"The file {path} has been updated successfully.", ts=ts)
+        if offset == 200:
+            lines = _write_seq(10, f"cf{offset}", path,
+                               f"The file {path} has been updated successfully.", ts=ts)
+        jf = _make(sess, lines)
+        try:
+            res = TrajectoryQualityChecker().check("bound", "t")
+            blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+            if expect_flagged:
+                assert blind, f"age={offset}s 超过容差必须判盲改"
+            else:
+                assert not blind, f"age={offset}s 在容差内不该判盲改: {blind}"
+        finally:
+            jf.unlink(missing_ok=True)
+    Path(path).unlink(missing_ok=True)
+    try:
+        sess.rmdir()
+    except OSError:
+        pass
+
+
+def test_fail_open_is_logged_not_silent(caplog) -> None:
+    """fail-open（文件已删）必须留 WARNING，不能静默放过。
+
+    第四轮复核 P1-1：三路 fail-open 全无日志，与"豁免恒不生效却无输出"同型。
+    """
+    import logging
+    path = f"/tmp/probe_gone_{os.getpid()}.sh"      # 不创建 → 取不到诞生时间
+    now = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-gone-role"
+    lines = _write_seq(0, "cg1", path,
+                       f"The file {path} has been updated successfully.", ts=now)
+    jf = _make(sess, lines)
+    try:
+        with caplog.at_level(logging.WARNING, logger="session-pipeline.eval_checker"):
+            res = TrajectoryQualityChecker().check("gone", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"取不到诞生时间仍按新建放过: {blind}"
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("fail-open" in m for m in msgs), f"fail-open 必须打 WARNING，实际: {msgs}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_relative_path_gets_no_scratch_exemption() -> None:
+    """相对路径不享受草稿豁免：否则判据在 /tmp 下跑时 "x.py" 会 realpath 成 /tmp/x.py。
+
+    必须在 cwd=/tmp 下跑才锁得住：从仓库 cwd 跑时 "x.py" 解析到仓库内，本来就不享
+    豁免 —— 去掉 isabs 守卫也照样绿（第五轮复核的 P2，与"下界没被锁住"同型）。
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-relpath-role"
+    lines = _write_seq(0, "ch1", "probe_rel.py",
+                       "The file probe_rel.py has been updated successfully.", ts=now)
+    jf = _make(sess, lines)
+    cwd = os.getcwd()
+    try:
+        os.chdir("/tmp")
+        res = TrajectoryQualityChecker().check("relpath", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"相对路径不该拿草稿豁免: {res['findings']}"
+    finally:
+        os.chdir(cwd)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_birth_negative_age_beyond_tolerance_flagged() -> None:
+    """bt 远晚于写时间（时钟偏移/删除重建）不按新建放过：age < -3600 要判。
+
+    真数据里 22/129 次 /tmp 写的 age 为负、最长 -6020s；旧写法只判上界，
+    这些会被无条件放过（codex 20 维复审的 P2）。
+    """
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_negage_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\n", encoding="utf-8")
+    ts = (now - timedelta(seconds=6000)).isoformat()   # 写时间远早于诞生 → age=-6000
+    sess = _TRANSCRIPTS_DIR / "-probe-negage-role"
+    lines = _write_seq(0, "cn1", path,
+                       f"The file {path} has been updated successfully.", ts=ts)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("negage", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert len(blind) == 1, f"负年龄超容差必须判盲改: {res['findings']}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -528,6 +912,19 @@ if __name__ == "__main__":
         test_bash_absolute_path_must_point_at_same_file,
         test_bash_same_absolute_path_still_exempts,
         test_second_write_of_own_file_not_flagged,
+        test_scratch_write_not_flagged,
+        test_scratch_edit_still_flagged,
+        test_scratch_created_now_is_exempt,
+        test_scratch_overwrite_preexisting_is_flagged,
+        test_preexisting_real_file_without_monkeypatch,
+        test_birth_tolerance_boundary,
+        test_fail_open_is_logged_not_silent,
+        test_relative_path_gets_no_scratch_exemption,
+        test_birth_negative_age_beyond_tolerance_flagged,
+        test_own_workspace_write_not_flagged,
+        test_underscore_role_workspace_exempt,
+        test_stale_record_not_judged,
+        test_fresh_record_still_judged,
     )
     for _t in _tests:
         _t()

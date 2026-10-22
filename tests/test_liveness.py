@@ -11,7 +11,7 @@ from liveness import (
     PANE_ACTIVE_WINDOW, _STALE_NOTIFIED_SEC,
     _db_fetch, _health_gate, _load_steps_json, _row_get,
     _s0_alive, _s1_thinking, _s2_producing, _s3_assigned, _s4_stepping,
-    _tmux_has_session, role_liveness, tmux_pane_active,
+    _tmux_has_session, pane_cli_busy, role_liveness, tmux_pane_active,
 )
 
 
@@ -320,6 +320,11 @@ class TestRoleLiveness(unittest.TestCase):
         self.assertIn(1, res["signals"])
 
 
+def _row(payload):
+    """list-panes -a 快照行：会话名\tpane_pid\twindow_activity。"""
+    return f"ccs-qa\t123\t{payload}"
+
+
 class TestTmuxPaneActiveRegression(unittest.TestCase):
     """回归守卫：tmux_pane_active 必须读活动时间戳，不得读焦点标志。
 
@@ -336,18 +341,18 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
 
     def test_reads_window_activity_not_pane_active(self):
         """必须查 #{window_activity}；查 #{pane_active} 则此断言失败。"""
-        _, mock = self._run_stdout(str(int(time.time())) + "\n")
+        _, mock = self._run_stdout(_row(str(int(time.time()))))
         cmd = mock.call_args[0][0]
         self.assertIn("#{window_activity}", cmd[-1],
                       "必须用活动时间戳，焦点标志 pane_active 恒 1 会永远判忙")
         self.assertNotIn("#{pane_active}", cmd[-1])
 
     def test_recent_activity_is_true(self):
-        result, _ = self._run_stdout(str(int(time.time()) - 10) + "\n")
+        result, _ = self._run_stdout(_row(str(int(time.time()) - 10)))
         self.assertIs(result, True, "10s 前有输出应判活跃")
 
     def test_silent_beyond_window_is_false(self):
-        result, _ = self._run_stdout(str(int(time.time()) - 5000) + "\n")
+        result, _ = self._run_stdout(_row(str(int(time.time()) - 5000)))
         self.assertIs(result, False, "静默超窗应判不活跃")
 
     def test_silent_but_cli_busy_is_true(self):
@@ -356,7 +361,7 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
         2026-10-19 P0：只按 window_activity 判活，reviewer 跑 codex review 时
         被判 False → 条件4 auto-cancel 杀掉 wf_sub_8de33/wf_sub_fb975。
         """
-        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        ts = MagicMock(returncode=0, stdout=_row(str(int(time.time()) - 5000)))
         busy = MagicMock(returncode=0, stdout="⏵⏵ bypass permissions on · esc to interrupt")
         with patch("liveness.subprocess.run", side_effect=[ts, busy]):
             result = tmux_pane_active("qa", window=300)
@@ -364,7 +369,7 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
 
     def test_silent_and_cli_idle_is_false(self):
         """静默超窗且底栏无忙态标记 → 真空闲/已死，保留回收路径。"""
-        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        ts = MagicMock(returncode=0, stdout=_row(str(int(time.time()) - 5000)))
         idle = MagicMock(returncode=0, stdout="❯ \n⏵⏵ bypass permissions on")
         with patch("liveness.subprocess.run", side_effect=[ts, idle]):
             result = tmux_pane_active("qa", window=300)
@@ -378,7 +383,7 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
         而该角色 15:58 写出了 s1-complete。退避行 `Retrying in ... · attempt N/M`
         必须与 esc 提示同等视为存活。
         """
-        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        ts = MagicMock(returncode=0, stdout=_row(str(int(time.time()) - 5000)))
         retry = MagicMock(returncode=0,
                           stdout="✻ Retrying in 4m 27s · attempt 19/30\n❯ ")
         with patch("liveness.subprocess.run", side_effect=[ts, retry]):
@@ -387,7 +392,7 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
 
     def test_idle_pane_without_retry_stays_false(self):
         """只看得到 `attempt` 字样（如历史输出残留）而没 `Retrying` → 不算存活。"""
-        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        ts = MagicMock(returncode=0, stdout=_row(str(int(time.time()) - 5000)))
         idle = MagicMock(returncode=0, stdout="done after attempt 3\n❯ ")
         with patch("liveness.subprocess.run", side_effect=[ts, idle]):
             result = tmux_pane_active("qa", window=300)
@@ -395,22 +400,22 @@ class TestTmuxPaneActiveRegression(unittest.TestCase):
 
     def test_busy_probe_failure_is_unknown(self):
         """忙态二次探测失败 → None（保守不杀），不把探测故障翻译成死亡。"""
-        ts = MagicMock(returncode=0, stdout=str(int(time.time()) - 5000) + "\n")
+        ts = MagicMock(returncode=0, stdout=_row(str(int(time.time()) - 5000)))
         with patch("liveness.subprocess.run", side_effect=[ts, FileNotFoundError]):
             result = tmux_pane_active("qa", window=300)
         self.assertIsNone(result)
 
     def test_empty_output_is_unknown_not_busy(self):
         """恒空输出（旧代码失败的形态）必须返回 None，不能返回 True。"""
-        result, _ = self._run_stdout("\n")
+        result, _ = self._run_stdout(_row(""))
         self.assertIsNone(result, "无数据 ≠ 活跃，须交调用方按未知处理")
 
     def test_zero_timestamp_is_unknown(self):
-        result, _ = self._run_stdout("0\n")
+        result, _ = self._run_stdout(_row("0"))
         self.assertIsNone(result)
 
     def test_unparsable_output_is_unknown(self):
-        result, _ = self._run_stdout("not-a-number\n")
+        result, _ = self._run_stdout(_row("not-a-number"))
         self.assertIsNone(result)
 
     def test_tmux_missing_is_unknown(self):
@@ -509,6 +514,36 @@ class TestL4EffectiveRoleOverride(unittest.TestCase):
         s = _s4_stepping("engineer", conn, exclude_wf_id="wf_other")
         self.assertTrue(s["busy"], "裸名模板应回退到 WF- 前缀后判忙")
         conn.close()
+
+
+
+
+class TestPaneCliBusy(unittest.TestCase):
+    """底栏判据只看末尾若干行：角色正文里的同名词不算忙。"""
+
+    def _probe(self, text):
+        with patch("liveness.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout=text)):
+            return pane_cli_busy("qa")
+
+    def test_marker_in_body_is_not_busy(self):
+        text = "\n".join(["讨论 esc to interrupt 的含义"]
+                          + [f"输出 {i}" for i in range(20)] + [">"])
+        self.assertFalse(self._probe(text))
+
+    def test_marker_in_bottom_bar_is_busy(self):
+        text = "\n".join([f"输出 {i}" for i in range(20)]
+                          + ["esc to interrupt · 1m23s", ">"])
+        self.assertTrue(self._probe(text))
+
+    def test_retrying_in_bottom_bar_is_busy(self):
+        text = "\n".join([f"输出 {i}" for i in range(20)]
+                          + ["Retrying in 4m 27s · attempt 19/30", ">"])
+        self.assertTrue(self._probe(text))
+
+    def test_probe_failure_is_none(self):
+        with patch("liveness.subprocess.run", side_effect=OSError("no tmux")):
+            self.assertIsNone(pane_cli_busy("qa"))
 
 
 if __name__ == "__main__":

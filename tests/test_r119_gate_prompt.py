@@ -42,9 +42,9 @@ def test_prompts_eff_role_non_blocking():
     StepHandlerMixin._gate_prompt(fake, _run(), _step(), "缺产出: IMPL_REPORT-wf_rw_test.md")
     args = fake._notify_role.call_args[0]
     assert args[0] == "pg", f"应提示实际执行者 pg，实际 {args[0]}"
-    # 标题必须稳定（30min 冷却按 (role,title) 命中），失败详情走 evidence。
-    assert args[1] == "[workflow] engineer_feature s1 闸门未通过", f"标题应稳定: {args[1]}"
-    assert "IMPL_REPORT-wf_rw_test.md" in args[2], "详情必须进 evidence"
+    # 标题必须带失败详情：_notify_role 的冷却键是 (role, title)，标题换稳定键会把
+    # 同一步骤的另一种失败原因在 30min 内整条吞掉（连 bus 都不写）。
+    assert "IMPL_REPORT-wf_rw_test.md" in args[1], "提示必须带缺失文件名"
     assert "wf_rw_test" in args[2], "证据里要能定位到实例/步骤"
     print("✅ 闸门失败经 _notify_role 直达执行角色 ✓")
 

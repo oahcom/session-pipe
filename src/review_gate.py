@@ -73,7 +73,15 @@ _PASS_WORD = re.compile(
 # `不通过` 必须显式列出：它含"通过"二字，若不先匹配整个词，_PASS_WORD 会把
 # 其中的"通过"当成通过结论（`审批=不通过/CHANGES_REQUESTED` 实测踩到）。
 _REJECT_WORD = re.compile(
-    r"\bREJECTED\b|CHANGES_REQUESTED|\bnot_approved\b|驳回|未通过|不通过|\bno[ _-]?go\b", re.I)
+    # 边界用 (?<![A-Za-z]) 而不是 \b：汉字也算 word char，`建议No-Go` 用 \b
+    # 会判它前面"没有边界"而漏掉（实测 wf_670c2a67d001/s1 因此仍判通过）。
+    r"\bREJECTED\b|CHANGES_REQUESTED|\bnot_approved\b|驳回|未通过|不通过|"
+    r"(?<![A-Za-z])no[ _-]?go(?![A-Za-z])", re.I)
+
+# 「通过指标在前、硬判决词在后」才翻转结论用。中文 `驳回`/`不通过` 不收：它们
+# 在「驳回项全部闭环」「修复 2 处不通过项」里是名词宾语，不是判决。
+_HARD_VERDICT = re.compile(
+    r"\bREJECTED\b|CHANGES_REQUESTED|\bnot_approved\b|(?<![A-Za-z])no[ _-]?go(?![A-Za-z])", re.I)
 # 结论词左侧的否定修饰（`NOT APPROVED` / `未通过` 里的"未"）。
 _NEG_BEFORE = re.compile(
     r"(?:(?:^|[\s(（])(?:not|never|no)|未|不|非)\s*$", re.I)
@@ -124,16 +132,17 @@ def _anchored_verdict(text: str) -> bool | None:
             if any(s <= mm.start() < e for s, e in rej_spans):
                 continue                              # 是驳回词的组成，不是通过
             if _NEG_BEFORE.search(rest[:mm.start()]):
-                hits.append((mm.start(), False))      # NOT APPROVED → 驳回
+                hits.append((mm.start(), False, True))   # NOT APPROVED → 驳回
             else:
-                hits.append((mm.start(), True))
+                hits.append((mm.start(), True, False))
         for mm in _REJECT_WORD.finditer(rest):
             left = rest[max(0, mm.start() - 20):mm.start()]
             if _NEG_CN.search(left + mm.group(0)) or _NEG_EN.search(left + mm.group(0)):
                 continue
             if _QUOTE_CONTEXT.search(left):
                 continue
-            hits.append((mm.start(), False))
+            # 第三元素：该命中是不是「硬判决词」（判句而非名词宾语）
+            hits.append((mm.start(), False, bool(_HARD_VERDICT.fullmatch(mm.group(0)))))
         if not hits:
             continue
         hits.sort()
@@ -144,6 +153,12 @@ def _anchored_verdict(text: str) -> bool | None:
         # 这类"先通过后驳回"的复合句，分号后才是最终结论 → 取最后。
         # 转折词同理：`APPROVED 但 CHANGES_REQUESTED` 的结论在"但"之后。
         contrast = _CONTRAST.search(rest)
+        if hits[0][1] and any(h[2] for h in hits[1:]):
+            # 先通过、后跟**显式判决词**：`pass=9/fail=2 通过率81.8% <90% 未达标
+            # No-Go` 的结论在句末，第一个 PASS 只是指标。限定为硬判决词——中文
+            # `驳回`/`不通过` 在「驳回项全部闭环」「修复 2 处不通过项」里是名词
+            # 宾语，翻转会把已通过的步骤判成驳回（实测 2 例）。
+            return False
         if ((contrast and hits[0][0] < contrast.start() < hits[-1][0])
                 or (any(s in rest for s in (";", "；")) and hits[0][1] != hits[-1][1])):
             return hits[-1][1]

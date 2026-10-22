@@ -3,13 +3,31 @@
 
 覆盖：
 1. 措辞命中：no-op 报告（无职责内修复动作）→ _is_noop_report True（不 mint）
-2. 真修复放行：真修复报告 → _is_noop_report False（不误杀）
-3. 冷却/放行边界：泛词（无异常）不在 mint 抑制子集 → 不误杀
+2. 真修复放行：真修复报告 → _is_noop_report False
+   （原 "状态无 delta → _noop_delta" 用例已随死代码 _noop_delta 一起删：合并后
+    src 侧 0 调用方，main 剪枝把它删了；保住测试等于给死代码续命）
+4. 冷却/放行边界：泛词（无异常）不在 mint 抑制子集 → 不误杀
 """
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+
+@pytest.fixture
+def scheduler(tmp_path, monkeypatch):
+    """隔离 idle-state 文件，避免污染生产 ~/.hermes/run/cron_idle_state.json。
+
+    patch 必须覆盖整个用例而不只是构造：_noop_delta/report_idle 调
+    _save_idle_state() 时才读模块全局 _IDLE_STATE_PATH（实测每轮用例往生产
+    文件写 2 次）。
+    """
+    import cron_scheduler as cs
+    monkeypatch.setattr(cs, "_IDLE_STATE_PATH", tmp_path / "idle.json")
+    monkeypatch.setattr(cs, "PERSONAS_DIR", tmp_path / "nonexistent")
+    return cs.CronScheduler()
 
 
 def test_noop_report_phrase_hit():
@@ -28,7 +46,7 @@ def test_noop_report_phrase_hit():
 
 
 def test_real_fix_passes():
-    """DESIGN §9.3：真修复报告 → 不命中 no-op → 放行。"""
+    """DESIGN §9.3：真修复报告 → 非 no-op → 放行。"""
     from cron_scheduler import _is_noop_report
     _fix = "修复 routing 死锁: 门控误锚跨工作流失败判定, 改动 step_handler"
     assert _is_noop_report(_fix) is False, "真修复不命中 no-op"

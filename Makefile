@@ -1,4 +1,4 @@
-.PHONY: all test lint check doccheck clean
+.PHONY: all test test-full verify-main lint check doccheck clean
 
 all: test lint check doccheck
 
@@ -7,6 +7,13 @@ test:
 
 test-full:
 	python3 -m pytest tests/ -x -v --tb=short
+
+# 在**合并后的树**上跑全量。工作区的绿不等于 main 的绿：
+# R134 一轮 1218 passed 是假绿（跑在分支上，合并后 main 的判据还是旧版）；
+# R135 又踩到 "commit 在 main ≠ 内容在 main"（被后续提交覆盖）。
+# 这条命令就是那两次教训的固化：导出 main → 全量 → 删临时树。
+verify-main:
+	@tmp=$$(mktemp -d) && git archive main | tar -x -C $$tmp && ( cd $$tmp && python3 -m pytest tests/ -q --tb=line -p no:cacheprovider ); rc=$$?; rm -rf $$tmp; exit $$rc
 
 lint:
 	@failed=0; for f in $$(find . -name '*.py' -not -path './.git/*' -not -path './__pycache__/*' -not -path './venv/*'); do python3 -m py_compile "$$f" 2>&1 || failed=1; done; if [ "$$failed" = 1 ]; then exit 1; fi

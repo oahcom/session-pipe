@@ -43,11 +43,52 @@ class TestParseReviewIssuesEvidence:
     def test_single_line_compressed_parsed(self):
         """单行压缩形态（bus evidence 常见）。"""
         sys_txt, biz_txt, _, _ = W._parse_review_issues(
-            "【系统问题】P2|任务未注入 wf_id; P2|引擎 s4 text 带模板前缀契约漂移"
+            "【系统问题】P1|任务未注入 wf_id; P1|引擎 s4 text 带模板前缀契约漂移; P2|模板 verify 漂移"
         )
-        assert "P2|任务未注入 wf_id" in sys_txt
+        assert "P1|任务未注入 wf_id" in sys_txt
         assert any("契约漂移" in x for x in sys_txt)
+        assert not any("verify 漂移" in x for x in sys_txt), f"P2 不得进系统段: {sys_txt}"
         assert biz_txt == []
+
+    def test_non_blocking_suggestions_not_parsed_as_issues(self):
+        """非阻塞建议段不能变成返工项：段内 P2/P3 既非系统问题也非业务问题。
+
+        解析按「标记到下一个标记」切段：建议写在【业务问题】之后会被吞进业务段
+        （实测 3 条引擎建议变成业务项，照样建返工链，把产品链卡 2.5h）。
+        反向用例：业务段自身的 P1 必须照常解析。
+        """
+        sys_txt, biz_txt, _, _ = W._parse_review_issues(
+            "结论: changes_requested（0 P0/2 P1）\n"
+            "非阻塞建议（供 maintainer 参考，不阻塞）\n"
+            "- P2 | 模板 verify 漂移\n"
+            "- P3 | 任务描述截断\n"
+            "【业务问题】\n"
+            "- P1 | ADR 前提错 | DESIGN.md:221\n"
+            "- P1 | 统计无法回传 | IActionHandler.cs:11"
+        )
+        assert sys_txt == [], f"引擎建议不得进系统段: {sys_txt}"
+        assert len(biz_txt) == 2, f"业务段只应有 2 条 P1: {biz_txt}"
+        assert not any("verify 漂移" in x or "任务描述截断" in x for x in biz_txt),             f"非阻塞建议被当成业务问题: {biz_txt}"
+
+    def test_explicit_p2p3_in_system_section_does_not_block(self):
+        """【系统问题】段里的显式 P2/P3 不建返工链（级别过滤，兜住排序规则的漏）。
+
+        形态取自真实驳回：系统段先写 P1，再写建议，建议会被切段吞进系统段 →
+        只靠提示词排序防不住，故解析器按行首级别过滤。反向：P1 必须留下。
+        """
+        sys_txt, biz_txt, sys_role, _ = W._parse_review_issues(
+            "【系统问题→maintainer】\n"
+            "- P1 | 子链驳回丢 evidence | wf_lifecycle.py:1275\n"
+            "非阻塞建议\n"
+            "- P2 | 模板 verify 漂移\n"
+            "- P3 | 任务描述截断\n"
+            "【业务问题】\n- P1 | AC6 无对应步骤 | DESIGN.md:121"
+        )
+        assert any("丢 evidence" in x for x in sys_txt), f"P1 系统问题必须保留: {sys_txt}"
+        assert not any("verify 漂移" in x or "任务描述截断" in x for x in sys_txt), \
+            f"P2/P3 不得进系统段: {sys_txt}"
+        assert sys_role == "maintainer"
+        assert len(biz_txt) == 1, f"业务段应只解析 1 条: {biz_txt}"
 
     def test_biz_section_parsed(self):
         sys_txt, biz_txt, _, _ = W._parse_review_issues(

@@ -20,10 +20,36 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import sys
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from pipeflow.engine import WorkflowEngine
 
 _TIMEOUT = 20
+
+
+class _Alive(dict):
+    """tmux 探针是一次 list-panes -a 快照；真实调用会把不存在角色判死并 sleep 5s。
+
+    本用例只锁投递契约，不碰真 tmux —— 否则首跳就可能吃掉 20s 闹钟（实测 SIGALRM）。
+    """
+
+    def __contains__(self, k):
+        return True
+
+    def get(self, k, d=None):
+        return ("1", "0")
+
+    def __getitem__(self, k):
+        return ("1", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_tmux():
+    with patch("liveness.tmux_snapshot", lambda max_age=2.0: _Alive()), \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", lambda max_age=2.0: _Alive()):
+        yield
+    signal.alarm(0)   # 用例结束必须撤闹钟，否则 20s 后 SIGALRM 打死后续用例
 
 
 def _wf(dirpath, name, steps):
@@ -94,7 +120,9 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
     sent = []
 
     def _record(role, prompt, wf_id="", step_id="", **kw):
-        sent.append((role, step_id))
+        # 催办/完整性提醒也走 _send_to_role，同一步会多次 send；只把真派单计入契约。
+        if "完整性提醒" not in prompt:
+            sent.append((role, step_id, wf_id, prompt[:60]))
         return True
 
     eng._send_to_role = _record
@@ -117,8 +145,11 @@ def test_every_hop_dispatches_to_the_next_role(mock_run):
     _dev_pool = ("engineer", "pg")
     for i, role in enumerate(roles[1:], start=2):
         allowed = _dev_pool if role in _dev_pool else (role,)
-        assert any((_r, f"s{i}") in sent for _r in allowed), \
-            f"s{i} 没有派给 {role}，实投={sent}"
+        hits = [x for x in sent if x[0] in allowed and x[1] == f"s{i}"]
+        assert len(hits) == 1, \
+            f"s{i} 应恰好派给 {role}（池 {allowed}）一次，实投={hits}"
+        # 首跳也必须带 wf_id：不带则投递前 CLI 忙预检整段跳过（tick 仍可能被拖停）。
+        assert hits[0][2] == rid, f"s{i} 投递缺 wf_id: {hits[0]}"
 
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(

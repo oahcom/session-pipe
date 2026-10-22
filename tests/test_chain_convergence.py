@@ -127,3 +127,32 @@ def test_dedupe_adopts_live_chain_instead_of_reporting_none(_mock):
         (rid,))
     assert len(n) == 1, f"同模板返工链不得重复建，实际 {len(n)} 条"
     _cleanup(d)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_suggestions_only_review_builds_no_rework(_mock):
+    """只有 P2/P3 建议的驳回：不算阻塞，也不许凭一句话造业务链错派 engineer。
+
+    P2/P3 在解析里被过滤（52308ed）后，只剩建议级分类的驳回会走进"无分类"兜底，
+    按 rejection_reason 造一条业务问题 → 派 engineer 改不了文档，父链被这条
+    业务返工链卡住（_blocking_rework_sts 只放过系统链）。
+    """
+    d = _make_env()
+    _write_wf(d, "chain", [_step("s1", target_role="product_architect"),
+                           _step("s2", target_role="reviewer", type="review")])
+    _write_wf(d, "architect_full_design", [_step("s1", target_role="product_architect")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("chain", {})
+    review = eng._workflows["chain"].steps[1]
+    msg = {"s2": {"rejection_reason": "PRD 建议补一张流程图",
+                  "exit_messages": [{"text":
+                    "CHANGES_REQUESTED\n【系统问题】\n- P2 | 日志噪音 | engine.py:12\n"
+                    "- P3 | 命名绕 | chain.py:1"}]}}
+    assert eng._create_rework_subflow(
+        rid, eng._lifecycle, "chain", "s2", review, None, msg) is False
+    row = eng._lifecycle.query_one(
+        "SELECT step_results FROM workflow_instances WHERE instance_id=?", (rid,))
+    assert "rework_ids" not in (json.loads(row["step_results"]).get("s2") or {}), \
+        "建议级问题不得建返工链"
+    _cleanup(d)
