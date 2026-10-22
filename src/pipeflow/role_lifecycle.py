@@ -17,6 +17,7 @@ from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # _engine_mod._sp — 保证 patch("pipeflow.engine._sp") 生效
 from paths import CCS_CLI as _CCS_CLI
+from liveness import tmux_snapshot as _tmux_snapshot, invalidate_tmux_snapshot as _invalidate_tmux
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 
 LOGGER = logging.getLogger("workflow.engine")
@@ -601,7 +602,7 @@ class RoleLifecycleMixin:
             LOGGER.debug("kick_stalled error: %s", _e)
 
     @staticmethod
-    def _is_agent_alive(role: str) -> bool | None:
+    def _is_agent_alive(role: str, fresh: bool = False) -> bool | None:
         """检查 CCS tmux pane 是否存活。三态：True=活 / False=判死 / None=探测失败。
 
         ponytail: 用 pane 存活判定而非进程名白名单——claude agent 执行 /goal 时
@@ -613,16 +614,13 @@ class RoleLifecycleMixin:
         None 与 False 必须区分：tmux 瞬时不可达（实测 578ms 抖动）时返回 False
         会让调用方 kill 掉正在工作的活角色。宁可放过一次真死，不可误杀活角色。
         """
-        try:
-            r = _engine_mod._sp.run(
-                ["tmux", "list-panes", "-t", f"ccs-{role}",
-                 "-F", "#{pane_pid}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
-            return r.returncode == 0 and bool(r.stdout.strip())
-        except (_engine_mod._sp.TimeoutExpired, OSError, ValueError, KeyError, TypeError):
+        # fresh=True 绕过快照缓存：kill-session 前的二次确认必须看实时状态，
+        # 否则两次读同一份快照，二次确认退化成一个空动作。
+        snap = _tmux_snapshot(max_age=0.0 if fresh else 2.0)
+        if snap is None:
             return None  # 探测失败 ≠ 判死
+        # pane 存在且有 pid → agent 存活；pane 消失/无输出 → 失活
+        return bool((snap.get(role) or ("", ""))[0])
 
     def _ensure_role_alive(self, role: str) -> bool:
         """存活探测 + 拉起；正向结果缓存 _ALIVE_CACHE_SEC（实测单次探测 4-5.6s）。
@@ -665,11 +663,12 @@ class RoleLifecycleMixin:
             # 二次确认：kill 是破坏性动作，首判可能因启动竞态假阴性
             # （观测：scout 建 25+ 会话，含 1 秒即死实例）。
             time.sleep(1)
-            if self._is_agent_alive(role) is not False:
+            if self._is_agent_alive(role, fresh=True) is not False:
                 return True
             LOGGER.info("CCS %s: tmux alive but no claude, restarting", role)
             _engine_mod._sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
                     capture_output=True, timeout=5)
+            _invalidate_tmux()      # 会话刚没，旧快照还会说它在
             alive = False
         if alive:
             # 代码变更检测已禁用：workspace 的 .py 是角色自己的产出（正常开发），
@@ -709,6 +708,7 @@ class RoleLifecycleMixin:
                                " ".join(_start_error_text(_st.stdout, _st.stderr).split())[:200])
             for _ in range(30):
                 time.sleep(1)
+                _invalidate_tmux()   # 刚拉起，让下一次探针拿到新会话
                 if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
                            capture_output=True, timeout=5).returncode == 0:
                     time.sleep(3)  # 等 agent 进程启动

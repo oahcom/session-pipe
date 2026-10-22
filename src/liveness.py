@@ -55,14 +55,60 @@ _ACTIVE_STEP_STATUS = ("notified", "running")
 _STALE_NOTIFIED_SEC = float(os.environ.get("CCS_STALE_NOTIFIED_SEC", "900"))
 
 
+# ── tmux 快照：一次 list-panes -a 拿全部会话 ─────────────────────────────
+# WHY：每个 tmux 子进程 0.1~5s（实测 10 次采样 2 次 5s 超时，2026-10-22 08:33
+# 三个探针对同一角色全部返回 None），而一个 tick 要探 19 个角色 × 3 个探针
+# ≈ 60 次调用，每次都独立付一次超时 → 巡检 480s、tick 563s、主循环只剩 1 条
+# 实例。快照把 N 次调用压成 1 次。
+# ponytail：快照只新鲜 2s；角色被拉起/杀掉后必须 invalidate_tmux_snapshot()，
+# 否则刚起来的角色会被旧快照判成死（kill-session 是破坏性动作）。
+_SNAP_TS = 0.0
+_SNAP: dict | None = None      # {role: (pane_pid, window_activity)}
+
+
+def invalidate_tmux_snapshot() -> None:
+    """角色被拉起/杀掉后调用：旧快照里没有新会话，会把刚起来的角色判死。"""
+    global _SNAP_TS, _SNAP
+    _SNAP_TS, _SNAP = 0.0, None
+
+
+def tmux_snapshot(max_age: float = 2.0) -> dict | None:
+    """一次 tmux list-panes -a 拿全部 ccs-* 会话的 (pane_pid, window_activity)。
+
+    返回 None = 探测不可用（tmux 卡死/不可达），调用方按"未知"处理。
+    """
+    global _SNAP_TS, _SNAP
+    _now = time.time()
+    # 失败也缓存：tmux server 卡死时（实测 2026-10-22 09:20 list-sessions 20s 无响应）
+    # 每次调用都会付满 5s 超时，而一个 tick 要探十几处 → tick 变成 180s+。
+    # 缓存 None 把"每次 5s"压成"每 max_age 5s"。
+    if _SNAP_TS and _now - _SNAP_TS < max_age:
+        return _SNAP
+    try:
+        r = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{session_name}\t#{pane_pid}\t#{window_activity}"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            raise OSError(r.returncode, "list-panes")
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        _SNAP_TS, _SNAP = _now, None
+        return None
+    _d = {}
+    for _line in r.stdout.splitlines():
+        _p = _line.split("\t")
+        if len(_p) >= 3 and _p[0].startswith("ccs-"):
+            _d.setdefault(_p[0][4:], (_p[1].strip(), _p[2].strip()))
+    _SNAP_TS, _SNAP = _now, _d
+    return _d
+
+
 def _tmux_has_session(role: str, timeout: float = 3.0) -> bool | None:
     """L0: tmux 会话存活。返回 None = 无数据（tmux 不可用），调用方按放行处理。"""
-    try:
-        r = subprocess.run(["tmux", "has-session", "-t", f"ccs-{role}"],
-                           capture_output=True, timeout=timeout)
-        return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None  # OSError: tmux socket 不可达/权限不足（review P3）
+    snap = tmux_snapshot()
+    if snap is None:
+        return None
+    return role in snap
 
 
 def _read_health(role: str, health_dir: Path = HEALTH_DIR) -> dict | None:
@@ -472,23 +518,21 @@ def tmux_pane_active(role: str, timeout: float = 3.0,
     返回值：True=近期有活动或 CLI 忙；False=tmux 可达、静默超窗且 CLI 空闲；
     None=探测不可用（不判忙）。
     """
+    snap = tmux_snapshot()
+    if snap is None:
+        return None  # 探测不可用 ≠ 不活跃
+    if role not in snap:
+        return False  # 会话不存在（与原 list-panes 非零返回同义）
+    raw = snap[role][1]
+    if not raw or raw == "0":
+        return None  # 无数据 ≠ 不活跃，交调用方按未知处理
     try:
-        r = subprocess.run(
-            ["tmux", "list-panes", "-t", f"ccs-{role}", "-F", "#{window_activity}"],
-            capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0:
-            return False
-        raw = r.stdout.strip().split("\n")[0] if r.stdout.strip() else ""
-        if not raw or raw == "0":
-            return None  # 无数据 ≠ 不活跃，交调用方按未知处理
         if (time.time() - float(raw)) < window:
             return True
-        # 仅在耗时阶段付这次额外 capture-pane（正常路径不增加 tmux 调用）
-        return pane_cli_busy(role, timeout)
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+    except (TypeError, ValueError):
         return None
-    except OSError:
-        return None  # tmux socket 不可达/权限不足（review P3）
+    # 仅在耗时阶段付这次额外 capture-pane（正常路径不增加 tmux 调用）
+    return pane_cli_busy(role, timeout)
 
 
 _CLI_BUSY_MARKERS = ("esc to interrupt", "esc to cancel", "ctrl+b to run in background")

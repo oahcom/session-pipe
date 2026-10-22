@@ -16,8 +16,24 @@ _SRC = str(Path.home() / "session-pipeline" / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+import pytest  # noqa: E402
+
 from pipeflow import engine as engine_mod  # noqa: E402
 from pipeflow.engine import WorkflowEngine, _rotate_after  # noqa: E402
+
+# tmux 探针已改为一次 list-panes -a 快照；"所有角色都活着"的桩让用例不碰真 tmux
+# （真实调用会把不存在的 test_role 判死 → _wait_for_role_ready 每次 sleep 5s）。
+_ALIVE = type("_A", (dict,), {
+    "__contains__": lambda s, k: True,
+    "get": lambda s, k, d=None: ("1", "0"),
+    "__getitem__": lambda s, k: ("1", "0"),
+})()
+
+
+@pytest.fixture(autouse=True)
+def _no_tmux():
+    with patch("pipeflow.role_lifecycle._tmux_snapshot", lambda max_age=2.0: _ALIVE):
+        yield
 
 
 def _rows(*ids):

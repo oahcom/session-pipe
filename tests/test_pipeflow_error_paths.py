@@ -76,10 +76,16 @@ def _mock_run_out(**kw) -> MagicMock:
     return m
 
 
+def _snap(present=True):
+    """tmux 快照桩：pane 探针现在读一次 list-panes -a 的结果，不再逐角色调用。"""
+    return lambda max_age=2.0: ({"scout": ("123", str(int(__import__("time").time())))} if present else {})
+
+
 def test_ensure_role_alive_already_running():
     """tmux has-session 返回 0 且 pane 内有 claude -> 直接返回 True。"""
     eng = _build_eng()
-    with patch.object(engine_mod._sp, "run") as mock_run:
+    with patch.object(engine_mod._sp, "run") as mock_run, \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap()):
         mock_run.return_value = _mock_run_out(returncode=0, stdout="claude\n")
         assert eng._ensure_role_alive("scout")
         args = mock_run.call_args_list[0][0][0]  # 首次调用是 has-session
@@ -97,7 +103,8 @@ def test_ensure_role_alive_dead_started():
             return _mock_run_out(returncode=1)  # has-session: not alive → restart CCS
         else:
             return _mock_run_out(returncode=0, stdout="claude\n")  # start/has-session/list-panes: ok
-    with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
+    with patch.object(engine_mod._sp, "run", side_effect=_dispatch), \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap()):
         assert eng._ensure_role_alive("scout")
     assert call_n[0] >= 2, f"应至少调用 2 次: {call_n[0]}"
 

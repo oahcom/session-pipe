@@ -6,6 +6,7 @@
 - 首判空、二次确认有 → 竞态假阴性，不得 kill
 """
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -39,7 +40,12 @@ def _mk(pane_results, kill_log):
             seq["i"] += 1
             if isinstance(item, Exception):
                 raise item
-            return MagicMock(returncode=0, stdout=item)
+            # 快照形态：一次 list-panes -a 返回全部会话（session\tpid\tactivity）。
+            # 用例里的角色名各不相同，所以每条都按同一 pid 播出去。
+            _now = int(time.time())
+            out = "".join(f"ccs-{r}\t{item.strip()}\t{_now}\n"
+                          for r in ("probe_err", "real_dead", "race", "healthy", "x"))
+            return MagicMock(returncode=0, stdout=out)
         return MagicMock(returncode=0, stdout="")
 
     return _run

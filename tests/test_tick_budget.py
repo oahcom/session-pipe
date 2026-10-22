@@ -22,8 +22,30 @@ _SRC = str(Path.home() / "session-pipeline" / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+import pytest  # noqa: E402
+
 from pipeflow import engine as engine_mod  # noqa: E402
 from pipeflow.engine import WorkflowEngine  # noqa: E402
+
+
+class _Alive(dict):
+    """tmux 探针已改为一次 list-panes -a 快照；本用例只关心推进顺序，不碰真 tmux。"""
+
+    def __contains__(self, k):
+        return True
+
+    def get(self, k, d=None):
+        return ("1", "0")
+
+    def __getitem__(self, k):
+        return ("1", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_tmux():
+    with patch("liveness.tmux_snapshot", lambda max_age=2.0: _Alive()), \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", lambda max_age=2.0: _Alive()):
+        yield
 
 
 def _env():

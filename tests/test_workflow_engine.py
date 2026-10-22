@@ -29,12 +29,29 @@ pipeflow.engine._TIMEOUT_GRACE = 0.1  # 100ms grace instead of 10s
 # 模块级 start() 只在 atexit 恢复，全量跑时会污染后续测试模块。
 import pytest
 
+class _AllRoles(dict):
+    """假装所有角色都活着：tmux 探针已改为一次 list-panes -a 快照，
+    真实调用会打到现网 tmux（慢且受 13 个会话影响），单测必须脱离它。"""
+
+    def __contains__(self, k):
+        return True
+
+    def get(self, k, d=None):
+        return ("123", "0")
+
+    def __getitem__(self, k):
+        return ("123", "0")
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _mock_subprocess():
     """mock engine 全部 subprocess；module scope 只在本模块生效，
     避免 atexit/session 级污染后续测试模块。"""
     with patch("pipeflow.engine._sp.run",
-               lambda *a, **k: MagicMock(returncode=0, stdout="claude\n")):
+               lambda *a, **k: MagicMock(returncode=0, stdout="claude\n")), \
+            patch("liveness.tmux_snapshot", lambda max_age=2.0: _AllRoles()), \
+            patch("pipeflow.role_lifecycle._tmux_snapshot",
+                  lambda max_age=2.0: _AllRoles()):
         yield
 
 

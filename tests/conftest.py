@@ -165,6 +165,10 @@ def _isolate_probes_and_cooldowns(request, monkeypatch):
     # test_liveness 自己 mock subprocess.run 验底栏判据，打桩会把它测空
     if "test_liveness" not in (request.module.__name__ if request.module else ""):
         monkeypatch.setattr(liveness, "pane_cli_busy", lambda role, timeout=3.0: None)
+    # tmux 快照是模块级缓存：不清则上一个用例的 mock 结果泄漏到下一个
+    # （表现为"单跑绿、全量红"）。
+    import liveness as _lv
+    _lv._SNAP_TS, _lv._SNAP = 0.0, None
     RoleLifecycleMixin._LAST_SEND.clear()
     RoleLifecycleMixin._ALERT_TS.clear()
     # 另外三张进程级冷却/去重表此前没清：429 退避、compact 冷却、bus 去重
