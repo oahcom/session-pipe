@@ -860,6 +860,34 @@ def test_relative_path_gets_no_scratch_exemption() -> None:
             pass
 
 
+def test_birth_negative_age_beyond_tolerance_flagged() -> None:
+    """bt 远晚于写时间（时钟偏移/删除重建）不按新建放过：age < -3600 要判。
+
+    真数据里 22/129 次 /tmp 写的 age 为负、最长 -6020s；旧写法只判上界，
+    这些会被无条件放过（codex 20 维复审的 P2）。
+    """
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_negage_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\n", encoding="utf-8")
+    ts = (now - timedelta(seconds=6000)).isoformat()   # 写时间远早于诞生 → age=-6000
+    sess = _TRANSCRIPTS_DIR / "-probe-negage-role"
+    lines = _write_seq(0, "cn1", path,
+                       f"The file {path} has been updated successfully.", ts=ts)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("negage", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert len(blind) == 1, f"负年龄超容差必须判盲改: {res['findings']}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -885,6 +913,7 @@ if __name__ == "__main__":
         test_birth_tolerance_boundary,
         test_fail_open_is_logged_not_silent,
         test_relative_path_gets_no_scratch_exemption,
+        test_birth_negative_age_beyond_tolerance_flagged,
         test_own_workspace_write_not_flagged,
         test_underscore_role_workspace_exempt,
         test_stale_record_not_judged,
