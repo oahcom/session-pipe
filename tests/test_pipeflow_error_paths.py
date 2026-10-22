@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-_PIPELINE_SRC = str(Path.home() / "session-pipeline" / "src")
+_PIPELINE_SRC = (Path(__file__).resolve().parent.parent / "src")
 if _PIPELINE_SRC not in sys.path:
     sys.path.insert(0, _PIPELINE_SRC)
 
@@ -76,60 +76,63 @@ def _mock_run_out(**kw) -> MagicMock:
     return m
 
 
-def _snap(present=True):
-    """tmux 快照桩：pane 探针现在读一次 list-panes -a 的结果，不再逐角色调用。"""
-    return lambda max_age=2.0: ({"scout": ("123", str(int(__import__("time").time())))} if present else {})
+def _snap(states):
+    """tmux 快照桩：pane 探针只读一次 list-panes -a，不再逐角色 has-session。
+
+    states 是余额表：每次探测取一个快照，用尽后一直用最后一个。
+    """
+    seq = list(states)
+    return lambda max_age=2.0: seq.pop(0) if len(seq) > 1 else seq[0]
+
+
+_ALIVE = {"scout": ("123", "0")}
+_DEAD = {}
 
 
 def test_ensure_role_alive_already_running():
-    """tmux has-session 返回 0 且 pane 内有 claude -> 直接返回 True。"""
+    """快照里有 pane -> 直接返回 True，不再为同一事实跑 has-session。"""
     eng = _build_eng()
     with patch.object(engine_mod._sp, "run") as mock_run, \
-            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap()):
-        mock_run.return_value = _mock_run_out(returncode=0, stdout="claude\n")
+            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap([_ALIVE])):
         assert eng._ensure_role_alive("scout")
-        args = mock_run.call_args_list[0][0][0]  # 首次调用是 has-session
-        assert "has-session" in args
-        assert "ccs-scout" in args
+    mock_run.assert_not_called()
 
 
 def test_ensure_role_alive_dead_started():
-    """tmux 不在运行 -> subprocess 拉起 CCS -> 轮询直到存活 -> 返回 True。"""
+    """快照无 pane -> 二次确认后 ccs start -> 轮询到 pane 出现 -> True。"""
     eng = _build_eng()
-    call_n = [0]
-    def _dispatch(*a, **kw):
-        call_n[0] += 1
-        if call_n[0] == 1:
-            return _mock_run_out(returncode=1)  # has-session: not alive → restart CCS
-        else:
-            return _mock_run_out(returncode=0, stdout="claude\n")  # start/has-session/list-panes: ok
+    started = []
+    def _dispatch(cmd, *a, **kw):
+        if cmd[0] == "python3":
+            started.append(cmd)   # ccs start
+        return _mock_run_out(returncode=0)
     with patch.object(engine_mod._sp, "run", side_effect=_dispatch), \
-            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap()):
+            patch("pipeflow.role_lifecycle._tmux_snapshot",
+                  _snap([_DEAD, _DEAD, _ALIVE])):
         assert eng._ensure_role_alive("scout")
-    assert call_n[0] >= 2, f"应至少调用 2 次: {call_n[0]}"
+    assert started, "应调用 ccs start"
 
 
 def test_ensure_role_alive_still_dead():
-    """拉起 CCS 后仍不存活 -> 返回 False（轮询内 has-session 全部返回 code=1）。"""
+    """拉起 CCS 后 pane 仍不出现 -> 返回 False（轮询到预算耗尽）。"""
     eng = _build_eng()
-    with patch.object(engine_mod._sp, "run") as mock_run:
-        # 所有调用返回 code=1: has-session 不存活，restart 后轮询仍然不存活
-        mock_run.return_value = _mock_run_out(returncode=1)
-        assert not eng._ensure_role_alive("scout")
+    with patch.object(engine_mod._sp, "run") as mock_run, \
+            patch("pipeflow.role_lifecycle._tmux_snapshot", _snap([_DEAD])):
+        mock_run.return_value = _mock_run_out(returncode=0)
+        assert not eng._ensure_role_alive("scout", deadline=time.time() + 2)
 
 
 def test_ensure_role_alive_subprocess_raises():
-    """CCS 拉起阶段 _sp.run 抛 OSError -> 异常传播（_ensure_role_alive 仅 catch ValueError/KeyError/TypeError）。"""
+    """CCS 拉起阶段 _sp.run 抛 OSError -> 异常传播（_check_and_start_role 只 catch 列出的异常）。"""
     import pytest as _pytest
     eng = _build_eng()
-    call_n = [0]
-    def _dispatch(*a, **kw):
-        call_n[0] += 1
-        if call_n[0] == 1:
-            return _mock_run_out(returncode=1)  # has-session: not alive → restart
+    def _dispatch(cmd, *a, **kw):
+        if cmd[0] == "tmux":       # kill-session（会话已消失，rc 无所谓）
+            return _mock_run_out(returncode=0)
         raise OSError("no ccs")
     with _pytest.raises(OSError, match="no ccs"):
-        with patch.object(engine_mod._sp, "run", side_effect=_dispatch):
+        with patch.object(engine_mod._sp, "run", side_effect=_dispatch), \
+                patch("pipeflow.role_lifecycle._tmux_snapshot", _snap([_DEAD])):
             eng._ensure_role_alive("scout")
 
 

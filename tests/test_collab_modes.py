@@ -78,28 +78,6 @@ class TestMasterSlaveGuard(unittest.TestCase):
         self.assertEqual(called, {"reviewer", "engineer", "qa", "pm"})
 
 
-class TestEnsureRoleAliveFalseBranch(unittest.TestCase):
-    """_ensure_role_alive 的死亡分支: tmux 死 → 真拉起。"""
-
-    def test_tmux_dead_then_restarted(self):
-        eng = _eng()
-        # mock tmux has-session → returncode=1（死亡）
-        # mock tmux new-session → returncode=0（拉起成功）
-        # mock _is_agent_alive → True（拉起后 claude 存活）
-        from unittest.mock import call
-        import pipeflow.role_lifecycle as rl
-        eng._is_agent_alive = MagicMock(return_value=True)
-        eng._detect_code_change = MagicMock(return_value=False)
-        with patch.object(rl, "_engine_mod") as mock_em:
-            mock_em._sp.run = MagicMock(side_effect=[
-                MagicMock(returncode=1),   # has-session: 不存在
-                MagicMock(returncode=0),   # start 成功
-                MagicMock(returncode=0),   # has-session: 已拉起
-            ])
-            result = eng._ensure_role_alive("writer")
-        self.assertTrue(result)
-
-
 # ── 对等模式: track 真实触发 ──────────────────
 
 

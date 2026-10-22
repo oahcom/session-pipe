@@ -51,11 +51,19 @@ class _Engine(RoleLifecycleMixin):
     def __init__(self, bb):
         self._bb = bb
 
-    def _is_agent_alive(self, role):
+    def _is_agent_alive(self, role, fresh=False):
         return False
 
     def _is_role_busy(self, role, exclude_wf_id="", pane_fallback=False):
         return False
+
+
+def test_probe_unavailable_blocks_delivery():
+    """投递前探测不可用（tmux 卡死）→ 不投递：宁可等下一 tick，不向未知状态发任务。"""
+    from unittest.mock import patch
+    lm = RoleLifecycleMixin.__new__(RoleLifecycleMixin)
+    with patch("pipeflow.role_lifecycle._tmux_snapshot", lambda max_age=2.0: None):
+        assert lm._wait_for_role_ready("x", max_wait=1) is False
 
 
 def test_call_site_writes_blocker_with_stdout_error(monkeypatch):

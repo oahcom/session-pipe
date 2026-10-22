@@ -1,9 +1,9 @@
-"""_ensure_role_alive 三态与误杀防护回归。
+"""_ensure_role_alive 三态与误重启防护回归。
 
 判别契约：
-- 探测失败（tmux 瞬时不可达）→ 视为存活，绝不 kill
-- pane 真消失（二次确认仍空）→ 恰好 kill 一次
-- 首判空、二次确认有 → 竞态假阴性，不得 kill
+- 探测失败（tmux 瞬时不可达，快照 None）→ 视为存活，绝不拉起
+- pane 真消失 → 直接拉起（没有 pane 可 kill，不再有 kill-session 动作）
+- pane 在 → 不动它
 """
 import sys
 import time
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path.home() / "session-pipeline" / "src"))
+sys.path.insert(0, (Path(__file__).resolve().parent.parent / "src"))
 
 import pipeflow.engine as em  # noqa: E402
 from pipeflow.role_lifecycle import RoleLifecycleMixin  # noqa: E402
@@ -24,71 +24,56 @@ def lm():
     return obj
 
 
-def _mk(pane_results, kill_log):
-    """构造 _sp.run：has-session 恒存活；list-panes 按 pane_results 依次返回。"""
+def _mk(pane_results, cmds):
+    """构造 _sp.run：ccs start 恒成功；list-panes 按 pane_results 依次返回。"""
     seq = {"i": 0}
 
     def _run(cmd, *a, **k):
-        s = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
-        if "kill-session" in s:
-            kill_log.append(s)
+        line = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+        cmds.append(line)
+        if "list-panes" not in line:
             return MagicMock(returncode=0, stdout="")
-        if "has-session" in s:
-            return MagicMock(returncode=0, stdout="")
-        if "list-panes" in s:
-            item = pane_results[min(seq["i"], len(pane_results) - 1)]
-            seq["i"] += 1
-            if isinstance(item, Exception):
-                raise item
-            # 快照形态：一次 list-panes -a 返回全部会话（session\tpid\tactivity）。
-            # 用例里的角色名各不相同，所以每条都按同一 pid 播出去。
-            _now = int(time.time())
-            out = "".join(f"ccs-{r}\t{item.strip()}\t{_now}\n"
-                          for r in ("probe_err", "real_dead", "race", "healthy", "x"))
-            return MagicMock(returncode=0, stdout=out)
-        return MagicMock(returncode=0, stdout="")
+        item = pane_results[min(seq["i"], len(pane_results) - 1)]
+        seq["i"] += 1
+        if isinstance(item, Exception):
+            raise item
+        # 快照形态：一次 list-panes -a 返回全部会话（session\tpid\tactivity）。
+        # 用例里的角色名各不相同，所以每条都按同一 pid 播出去。
+        _now = int(time.time())
+        out = "".join(f"ccs-{r}\t{item.strip()}\t{_now}\n"
+                      for r in ("probe_err", "real_dead", "race", "healthy", "x"))
+        return MagicMock(returncode=0, stdout=out)
 
     return _run
 
 
-def test_probe_error_treated_as_alive_not_killed(lm):
-    """探测失败 → 判不出 ≠ 判死，不得 kill（tmux 抖动实测存在）。"""
-    kills = []
-    with patch.object(em._sp, "run", _mk([em._sp.TimeoutExpired("tmux", 5)], kills)):
-        r = lm._ensure_role_alive("probe_err")
-    assert r is True, "探测失败必须视为存活"
-    assert kills == [], f"探测失败不得 kill，实际 {kills}"
+def _starts(cmds):
+    return [c for c in cmds if " start " in f" {c} "]
 
 
-def test_real_death_killed_exactly_once(lm):
-    """pane 真消失且二次确认仍空 → 恰好 kill 一次，拉起后恢复。
-
-    mock 序列：两次判死 → kill → 拉起 → 第三次 list-panes 返回 pid（角色已就绪）。
-    避免拉起分支的 has-session 等待循环空转（每次 sleep(1)+sleep(3)）。
-    """
-    kills = []
-    with patch.object(em._sp, "run", _mk(["", "", "4242\n"], kills)):
-        r = lm._ensure_role_alive("real_dead")
-    assert len(kills) == 1, f"真死应 kill 一次，实际 {len(kills)}"
-    assert r is True, "拉起成功后应返回 True"
+def test_probe_error_treated_as_alive_not_restarted(lm):
+    """探测失败 → 判不出 ≠ 判死，不得拉起（tmux 抖动实测存在）。"""
+    cmds = []
+    with patch.object(em._sp, "run", _mk([em._sp.TimeoutExpired("tmux", 5)], cmds)):
+        assert lm._ensure_role_alive("probe_err") is True
+    assert not _starts(cmds), f"探测失败不得拉起: {cmds}"
 
 
-def test_race_false_negative_not_killed(lm):
-    """首判空、二次确认有 pid → 竞态假阴性，不得 kill。"""
-    kills = []
-    with patch.object(em._sp, "run", _mk(["", "4242\n"], kills)):
-        r = lm._ensure_role_alive("race")
-    assert r is True
-    assert kills == [], f"竞态假阴性不得 kill，实际 {kills}"
+def test_pane_gone_restarted_without_kill(lm):
+    """pane 消失 → 直接拉起；没有 pane 可 kill，不得再跑 kill-session。"""
+    cmds = []
+    with patch.object(em._sp, "run", _mk(["", "", "4242\n"], cmds)):
+        assert lm._ensure_role_alive("real_dead") is True
+    assert not [c for c in cmds if "kill-session" in c], f"没有 pane 可 kill: {cmds}"
+    assert _starts(cmds), f"应拉起: {cmds}"
 
 
 def test_alive_untouched(lm):
-    """正常存活 → 不 kill 不重启。"""
-    kills = []
-    with patch.object(em._sp, "run", _mk(["777\n"], kills)):
-        r = lm._ensure_role_alive("healthy")
-    assert r is True
-    assert kills == []
+    """pane 在 → 不拉起。"""
+    cmds = []
+    with patch.object(em._sp, "run", _mk(["777\n"], cmds)):
+        assert lm._ensure_role_alive("healthy") is True
+    assert not _starts(cmds), f"存活不得拉起: {cmds}"
 
 
 def test_is_agent_alive_returns_none_on_timeout(lm):
