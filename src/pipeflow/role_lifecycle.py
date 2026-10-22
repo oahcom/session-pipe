@@ -844,12 +844,19 @@ class RoleLifecycleMixin:
         这是 dispatch 前的关键检查，确保角色真正就绪才发送任务。
         """
         deadline = time.time() + max_wait
+        _tag = f"{role}（wf={wf_id or '-'} step={step_id or '-'}）"
+
+        def _nap() -> None:
+            # 睡眠不得越过 deadline：否则预算耗尽的最后一次还要白睡满 5s，
+            # 多角色顺序调用时把 tick 又堆回 max_wait+check_interval。
+            time.sleep(max(0.0, min(check_interval, deadline - time.time())))
+
         while time.time() < deadline:
             # 探测不可用（tmux server 卡死，实测 2026-10-22 09:18 list-sessions 20s
             # 无响应）≠ 角色死了：必须先于 ccs start 判断，否则整轮先烧
             # ccs start 60s + 10×1s 等待才轮到它。此刻投递走不通，交给下一 tick。
             if (_alive := self._is_agent_alive(role)) is None:
-                LOGGER.warning("_wait_for_role_ready %s: tmux 探测不可用，本轮不投递", role)
+                LOGGER.warning("_wait_for_role_ready %s: tmux 探测不可用，本轮不投递", _tag)
                 return False
             # 1. pane 存活（与上面同一次快照探测，不再逐角色付 has-session）
             if not _alive:
@@ -863,14 +870,14 @@ class RoleLifecycleMixin:
                 # ccs start 60s + 30 轮轮询把整个 max_wait 吃穿（=tick 预算被单角色吃光，
                 # 与 _ensure_guard_roles 同一缺陷；codex 20 维第 3 轮）。
                 if not self._check_and_start_role(role, deadline):
-                    time.sleep(check_interval)
+                    _nap()
                     continue
                 # 拉起函数是 bool 契约：None（探测不可用）与「已拉起」共用 True。
                 # 投递侧必须自己复核一次——原来靠下面那条「_probe 为假就等 5s」兜住，
                 # 该分支已随重复探针删除，不复核就会把任务发给刚判不存在的 pane
                 # （codex 20 维两轮都指到这里）。
                 if self._is_agent_alive(role) is not True:
-                    time.sleep(check_interval)
+                    _nap()
                     continue
 
             # 存活即可投递：这里原来还探一次 _is_role_busy，但 busy 与空闲都 return True
@@ -879,8 +886,7 @@ class RoleLifecycleMixin:
             LOGGER.info("Role %s is ready (pane alive)", role)
             return True
 
-        LOGGER.warning("_wait_for_role_ready: %s（wf=%s step=%s）%ds 内未就绪",
-                       role, wf_id or "-", step_id or "-", max_wait)
+        LOGGER.warning("_wait_for_role_ready: %s %ds 内未就绪", _tag, max_wait)
         return False
 
     # 开发角色池（DEV_ROLE_POOL / _pick_dev_role）已删除 —— 见 _send_to_role
