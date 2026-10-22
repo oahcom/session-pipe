@@ -22,7 +22,7 @@
 
 | 四种模式能力 | 引擎实现 | 位置 | 引擎更强处 |
 |-------------|---------|------|-----------|
-| 主从（守护伙伴） | `_ensure_role_alive` 每 tick 拉起 | role_lifecycle.py:197 | 每 10s vs watchdog 30s |
+| 主从（守护伙伴） | `_ensure_role_alive` 每 tick 拉起 | role_lifecycle.py:716 | 每 10s vs watchdog 30s |
 | 对等（轮次追踪） | `exit_condition` + `_check_exit` | step_handler.py:468 | 精确 bus 消息匹配 |
 | 超时防死锁 | timeout_count + 重推 + 升级 | step_handler.py:59-145 | 3 级升级到 coordinator |
 | 角色忙检测 | `_is_role_busy` 双信号 | `role_lifecycle.py:_is_role_busy` | survival health + DB |
