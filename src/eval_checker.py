@@ -547,7 +547,13 @@ def _is_critical(criterion: str) -> bool:
     return bool(re.search(r'severity[:\s=]*critical', criterion, re.IGNORECASE))
 
 
-from eval_shared_loader import _load_roles, CRITERIA_WINDOW
+from eval_shared_loader import _load_roles
+
+# 运行期每轮只跑每条角色的前 N 条判据。常量放这里而不是 eval_shared_loader：
+# daemon 热重载只重载 eval_checker，共享模块缓存陈旧时
+# `from eval_shared_loader import CRITERIA_WINDOW` 会 ImportError（实测 2026-10-22 09:56
+# 起每 10 分钟一条 WARNING，预检与热重载同时静默退化）。
+CRITERIA_WINDOW = 3
 
 
 # 注：此处原有第二个 `run_eval_check` 定义（504-519，含完整 docstring），被 :1031 的
