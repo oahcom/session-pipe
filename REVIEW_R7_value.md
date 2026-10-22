@@ -24,7 +24,7 @@
 - 这是**未提交的本地改动**（blame 显示 `Not Committed Yet 2026-08-23`）。`git diff --stat` 仅 `wf_lifecycle.py +11/-4`。
 
 ### 1.4 双阈值不冲突
-- step 级硬取消：_auto_cancel_at = `max(max_retries+3,4)` = `max(4,4)=4`，每步 timeout=35min，真卡死（非 busy）4 次超时 = 140min ≈ 2.3h 取消（`step_handler.py:163/232`）。
+- step 级硬取消：_auto_cancel_at = `max(max_retries+3,4)` = `max(4,4)=4`，每步 timeout=35min，真卡死（非 busy）4 次超时 = 140min ≈ 2.3h 取消（`step_handler.py` 里检索 `_auto_cancel_at`）。
 - wf 级 stale：`running>1h 且 timeout_count>=1`（条件4）/ 全步 max timeout_count>=6（条件1）/ 模板全局 24h（条件3）。
 - busy 路径（角色在跑别的事）**不递增** timeout_count（`step_handler.py:195,222`），仅延长窗口——避免"忙时被误杀"。
 

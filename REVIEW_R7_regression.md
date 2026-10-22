@@ -90,6 +90,6 @@ D11-D20 N/A (无 CLI/网关改动)。
 
 **P0=0, P1=1, P2=2** → **达标** (P0=0 且 P1<=2)
 
-Round 7 变更实现了其意图：将 `running + age_h>1 + sr_empty` (误杀长任务根源) 改为 `running + age_h>1 + current_step.timeout_count>=1` (真实超时才回收)。timeout_count 写路径 (step_handler.py:224) 与读路径 (wf_lifecycle.py:92) 契约一致，三级 elif 互不干扰，条件1 (>=6) 回收不受影响。
+Round 7 变更实现了其意图：将 `running + age_h>1 + sr_empty` (误杀长任务根源) 改为 `running + age_h>1 + current_step.timeout_count>=1` (真实超时才回收)。timeout_count 写路径 (step_handler.py:224) 与读路径 (`wf_lifecycle.py` 里检索 `timeout_count`) 契约一致，三级 elif 互不干扰，条件1 (>=6) 回收不受影响。
 
 唯一 P1: 缺少 `_cleanup_stale_workflows` 条件4 的 directly unit test (建议补充，见 D6)。
