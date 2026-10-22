@@ -839,7 +839,7 @@ class RoleLifecycleMixin:
 
     def _wait_for_role_ready(self, role: str, wf_id: str = "", step_id: str = "",
                               max_wait: int = 90, check_interval: int = 5) -> bool:
-        """等待角色真正就绪：pane 存在（_is_agent_alive）+ 不在 busy 状态。
+        """等待角色就绪：pane 存在（_is_agent_alive）。忙闲由投递层判，不在这里等。
 
         这是 dispatch 前的关键检查，确保角色真正就绪才发送任务。
         """
@@ -873,17 +873,14 @@ class RoleLifecycleMixin:
                     time.sleep(check_interval)
                     continue
 
-            # 2. 检查是否 busy（如果 busy 说明正在处理其他任务，这其实是好的）
-            busy = self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=True)
-            if busy:
-                LOGGER.info("Role %s is busy (processing other work), ready to queue", role)
-                return True  # busy 说明角色在工作，可以排队
-
-            # 角色空闲且存活，可以发送任务
-            LOGGER.info("Role %s is ready (idle & alive)", role)
+            # 存活即可投递：这里原来还探一次 _is_role_busy，但 busy 与空闲都 return True
+            # （排队语义由 _send_to_role 的 pane_cli_busy 判定承担）→ 白付一次探测，
+            # tmux 卡顿还会把已判活的投递拖过 max_wait（codex 20 维第 4 轮）。
+            LOGGER.info("Role %s is ready (pane alive)", role)
             return True
 
-        LOGGER.warning("_wait_for_role_ready: role %s not ready after %ds", role, max_wait)
+        LOGGER.warning("_wait_for_role_ready: %s（wf=%s step=%s）%ds 内未就绪",
+                       role, wf_id or "-", step_id or "-", max_wait)
         return False
 
     # 开发角色池（DEV_ROLE_POOL / _pick_dev_role）已删除 —— 见 _send_to_role
