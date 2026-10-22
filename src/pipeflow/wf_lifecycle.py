@@ -561,11 +561,18 @@ class WorkflowLifecycleMixin:
         # 末步仍不拦——无 next_step 可退回，且无 rework 承接方。
         if not is_last:
             _step_sr = ((results or {}).get(step_id, {}) or {})
-            # evidence 也要拼入：分类段在其中，只拼 text 会让 _has_issue_classification
-            # 恒为 False → 门禁 fail-open 放行真实驳回（与 _create_rework_subflow 同源缺陷）。
+            # 结论只看 text，分类才看 text+evidence：
+            # ① evidence 是"返工来源 CHANGES_REQUESTED …"这类复述，拼进结论会把它
+            #   当成本步的驳回（实测 12/873 步被误判）——manager.py:1003 只拼 text，
+            #   同一条消息两条推进路径判定相反。
+            # ② 分类段只在 evidence 里，_has_issue_classification 仍要看到它，
+            #   否则门禁 fail-open 放行真实驳回。
             _msgs = " ".join(
-                (m.get("text", "") or "") + " " + (m.get("evidence", "") or "")
-                for m in (_step_sr.get("exit_messages") or [])
+                (m.get("text", "") or "") for m in (_step_sr.get("exit_messages") or [])
+                if isinstance(m, dict)
+            ).lower()
+            _full = _msgs + " " + " ".join(
+                (m.get("evidence", "") or "") for m in (_step_sr.get("exit_messages") or [])
                 if isinstance(m, dict)
             ).lower()
 
@@ -584,7 +591,7 @@ class WorkflowLifecycleMixin:
                 # 那条，实测 19 例真实驳回被据此放行（WL-01/wf_cd4a9c21df 等），
                 # 产物一字未改却让下游拿不存在的东西继续做。
                 # 分类只决定返工链建成哪一类；建不出链不是通过审查的理由。
-                if not self._has_issue_classification(_msgs):
+                if not self._has_issue_classification(_full):
                     LOGGER.warning(
                         "rejected 但产出无【系统问题】/【业务问题】分类 %s/%s"
                         " → 交 rejected 消费分支（重投原步，不推进）", wf_id[:8], step_id)
