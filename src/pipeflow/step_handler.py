@@ -605,12 +605,10 @@ class StepHandlerMixin:
                 # ~70s 后即被自动取消（queued_since→cancel 97~121s），子链全灭。
                 # 与 engine.py 的排队回收共用 _queue_budget_sec（queued_since 不随 ts 刷新）。
                 _q_since = self._step_sd(run, step).get("queued_since") or time.time()
-                # 升级只在首次达到阈值时发一次，避免 6→10 每 tick 重发 coordinator
-                if _queued == 6:
-                    self._send_to_role("coordinator",
-                        f"[workflow] {run.workflow_name}/{run.current_step} "
-                        f"排队 {_queued} 次仍未响应（角色 {_eff} 活跃但可能卡死），请介入",
-                        wf_id=run.id, step_id=run.current_step, force=True, scheduler_noise=True)
+                # 排队告警只有下面这条 auto-cancel blocker（带证据）。原来的"排队 6 次
+                # 请 coordinator 介入"是死代码：scheduler_noise=True 对 coordinator 在
+                # role_lifecycle:1093 直接 return（既不投递也不写 bus），且 6 次 = 约 60 秒，
+                # 远短于角色正常一步的耗时 —— 2026-10-22 24h 内 coordinator 转录零命中。
                 # 排队上限 = 角色被其他工作流长期占用，子链无法执行 → auto-cancel
                 # 但「被占用」≠「卡死」：实测 8h 内 product_architect 名下 14 条子链
                 # 全部在排队满 60min 时被取消，而同期它真正跑完的子链耗时 113~237min。
