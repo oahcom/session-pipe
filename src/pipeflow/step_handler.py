@@ -826,8 +826,12 @@ class StepHandlerMixin:
                     # 且必须匹配**完整 id**：wf_sub_4…/wf_sub_b… 这类前缀在
                     # [:8] 截断下大面积碰撞（实测 31 次宽松推进 29 次是别的工作流
                     # 的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
+                    # evidence 一并带上：驳回分类段【系统问题→x】写在 evidence 里，
+                    # 只取标题会让 _parse_review_issues 解析为空（与 :1662 同源）。
                     _relaxed = [
-                        {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
+                        {"id": f.id, "text": f.t[:200],
+                         "evidence": (getattr(f, "e", "") or "")[:2000],
+                         "ts": f.ts, "src": f.src}
                         for f in _role_msgs
                         if f.src == _eff
                         and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
@@ -1685,7 +1689,9 @@ class StepHandlerMixin:
                     # 与主路径同源：同用 _mentions（旧 "'wf_' in t" 会放行无 id 消息）。
                     if wf_id and not _mentions(_f, wf_id, fields="t"):
                         continue
-                    _rmsg = {"id": _f.id, "text": _f.t[:200], "ts": _f.ts, "src": _f.src}
+                    _rmsg = {"id": _f.id, "text": _f.t[:200],
+                             "evidence": (getattr(_f, "e", "") or "")[:2000],
+                             "ts": _f.ts, "src": _f.src}
                     break
                 if _rmsg is None:
                     return (0.0, [])  # 还有角色没产出，不推进
