@@ -59,12 +59,6 @@ class _FakeStep:
 
 def _step(exit_condition: dict) -> _FakeStep:
     return _FakeStep(exit_condition)
-    step.max_retries = 1
-    step.id = "s1"
-    step.target_role = "scout"
-    step.dual_node = False
-    step.wait_roles = None
-    return step
 
 
 class _FakeRun:
@@ -103,8 +97,8 @@ def test_tmux_step_completed_blocks_when_bus_contract_without_schema():
             "声明 bus 契约且无 exit_schema 时 tmux 信号不得推进"
 
 
-def test_tmux_step_completed_triggers_exit_without_contract():
-    """无 bus 契约的步骤 → tmux 信号仍可推进（否则只能等超时）。"""
+def test_tmux_step_completed_never_advances_without_contract():
+    """无 bus 契约的步骤也不由 pane 信号推进（7 天 116 步零证据完成全是这条路）。"""
     eng = FakeEngine()
     step = _step({"timeout_minutes": 30})
     run = _run()
@@ -114,9 +108,8 @@ def test_tmux_step_completed_triggers_exit_without_contract():
                                                completion_evidence="s1 完成")) as mock_sig:
         eng._tick(run, step)
         mock_sig.assert_called_once()
-        assert eng._lifecycle.complete_step.call_count == 1, \
-            "无契约步骤的 tmux 完成信号应触发 complete_step"
-        assert eng._lifecycle.complete_step.call_args[0][:2] == ("wf_test", "s1")
+        assert eng._lifecycle.complete_step.call_count == 0, \
+            "pane 文本不是产出证据，任何情况下都不得 complete_step"
 
 
 def test_tmux_idle_triggers_reminder_not_cancel():

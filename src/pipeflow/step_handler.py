@@ -139,7 +139,8 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     if not wf_id or not template or not step_id:
         return False
     ids = set(_WF_ID_RE.findall(text or ""))
-    if not ids or wf_id in ids:
+    foreign = ids - {wf_id}
+    if not foreign:
         return False
     # 模板名带不带 WL-/WF- 前缀都要认：父链注册名是 WL-full_dev_pipeline，而
     # 角色照抄提示词发出的完成标题是 full_dev_pipeline/s4-complete（前缀由
@@ -148,8 +149,20 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     _tpl = re.sub(r'^(?:WL-|WF-)', '', str(template))
     # 尾部断言用 (?![\\w]) 不用 (?![\\w-])：角色完成标题固定写 `s4-complete`，
     # 紧邻的连字符会被 (?![\\w-]) 拒掉 → 即便前缀修好也恒不命中；step_id=s4 仍不会误匹配 s40。
-    claim = re.search(r'(?<![\w-])(?:WL-|WF-)?' + re.escape(_tpl) + r'/' + re.escape(step_id) + r'(?![\w])',
-                      text or "")
+    # 前缀认两种形态：模板名（`pm_requirements/s1-complete`）与实例 id
+    # （`wf_sub_db062/s1-complete`）。后者才是引擎让角色发的标题——任务提示里
+    # 给的是 `[实例] wf_xxx`，角色照抄。只认模板名时守卫对真实消息恒失效：
+    # 实测一条 db062 的 s1-complete 同时闭合了 5a130 与 b0f58 的 s1（#439707）。
+    # 只匹配**别的**实例：消息里出现本实例 id 不等于它没有同时替别的实例报工，
+    # `wf_sub_other/s1-complete 交付给 wf_sub_mine` 必须仍判串味。
+    # 后缀认两种真实完成形态：`-complete`（模板要求的标题格式，#439707）与
+    # 中文「完成」（角色自发通知写 `wf_xxx/s2 完成`，全库 960 条完成类消息中
+    # 26 条是该形态；只认 -complete 会让这 26 条串味消息逃过守卫，既有
+    # TestSoftAttribution 用例锁的正是它）。两种都不要求时，`wf_sub_other/
+    # s1/README 已更新` 这种路径引用会被当成完成声明，守卫就从拦截变成误伤。
+    claim = re.search(r'(?<![\w-])(?:(?:WL-|WF-)?' + re.escape(_tpl)
+                      + r'|' + '|'.join(map(re.escape, sorted(foreign))) + r')/'
+                      + re.escape(step_id) + r'(?:-complete|\s*完成)(?![\w])', text or "")
     return bool(claim)
 
 
@@ -419,58 +432,20 @@ class StepHandlerMixin:
             except Exception as _e:
                 LOGGER.debug("tick rescue failed for %s/%s: %s", run.workflow_name, step.id, _e)
             return  # P2-1 修复：complete 后不 fall-through 到 integrity/timeout（防重复 complete）
-        # ── tmux 信号补充（bus 信号延迟/丢失时的兜底）──
-        # conversation_monitor 从角色 tmux pane 提取 3 信号，作为 bus exit_condition 补充：
-        #   step_completed → 直接推进（产出已在 pane 可见）
+        # ── tmux 信号补充 ──
+        # conversation_monitor 从角色 tmux pane 提取 3 信号，只消费两类：
         #   idle_complaint → 发提醒（不 cancel）
         #   violation      → 注入停止指令（越界操作）
+        # step_completed 信号**不推进步骤**：pane 文本是角色的叙述，不是产出证据。
+        # 实测 _COMPLETION_PATTERNS 的 (s\d+ .*完成) 会命中「s1 闭环（已完成）」
+        # 「s2 还没完成」「s1 完成了吗？」；7 天内 116 步零证据完成（exit_messages
+        # 空、无 bus_anchor）全部由此推进（24h 44 例）。步骤完成只认 bus 匹配 /
+        # 已落盘的 exit_schema / 超时窗口后的降级推进（726 值门、892 宽松推进）。
         try:
             sig = get_conversation_signal(_eff)
         except Exception as _e:
             LOGGER.debug("conversation_monitor 信号获取失败: %s", _e)
             sig = None
-        if sig and sig.step_completed:
-            # wait_roles 协作门：tmux 信号不能绕过协作门控（2026-08-10 codex P1），
-            # 等所有声明角色都产出匹配消息才允许推进
-            _wr = getattr(step, "wait_roles", None)
-            _wr_ok = not _wr or set(_wr).issubset({m.get("src", "") for m in self._step_sd(run, step).get("exit_messages", [])})
-            # 契约门：tmux 信号只证明角色「自称完成」，产出文件可能还没落盘。
-            # 实测 food_chain_loop/s7：16:54:18 被信号推进，而 VALUE_AUDIT.md
-            # 16:55:32 才落盘——盖戳时契约文件根本不存在。主路径的 bus 匹配分支
-            # 对 exit_schema 有同语义门，此处补齐。
-            _schema_ok = True
-            if step.exit_schema:
-                _schema_ok, _schema_errs = self._validate_exit_schema(step, run)
-                if not _schema_ok:
-                    LOGGER.info("tmux 信号暂缓 %s/%s: 契约未满足 %s",
-                                run.workflow_name, step.id, "; ".join(_schema_errs))
-            # 契约优先：步骤声明了 bus 契约（bus_category/text_contains/
-            # source_contains）时，tmux 信号**不得**推进。pane 文本是角色的
-            # 叙述，不是产出证据——_COMPLETION_PATTERNS 的 `(s\d+ .*完成)`
-            # 会命中「s1 闭环（已完成）」「s2 还没完成」「s1 完成了吗？」等
-            # 任意含 s<N>+完成 的句子。实测 wf_7045df494d/s1：投递 04:49:27
-            # → 04:51:05 判完成（98 秒），exit_messages 为空，completed_by=
-            # workflow_engine，角色自曝触发源是它上一轮回复里的排版文字。
-            # 7 日内声明了 bus 契约却零 exit_messages 的完成步 347 个。
-            # 保留信号价值：无契约的步骤仍走此路（否则那类步骤只能等超时）。
-            _has_bus_contract = bool(
-                ec.get("bus_category") or ec.get("text_contains")
-                or ec.get("source_contains"))
-            # 声明了 bus 契约时，pane 文本不足以自证：必须有**声明且校验通过**的
-            # exit_schema（真实文件落盘）。无 schema 的步骤 pane 文本是角色的
-            # 叙述，`s1 闭环（已完成）`「我在检查 s4 完成的证据」都会命中。
-            # 无 bus 契约的步骤维持原语义，否则那类步骤只能等超时。
-            _contract_ok = bool(step.exit_schema) and _schema_ok
-            if _wr_ok and _schema_ok and (not _has_bus_contract or _contract_ok):
-                try:
-                    self._lifecycle.complete_step(run.id, step.id)
-                    LOGGER.info("tmux 信号推进: %s/%s step_completed", run.workflow_name, step.id)
-                except Exception as _e:
-                    LOGGER.debug("tmux 信号 complete_step 失败: %s", _e)
-                return  # 产出已确认，跳过 timeout/催办
-            if _has_bus_contract and not _contract_ok:
-                LOGGER.debug("tmux 信号不推进 %s/%s: 声明了 bus 契约但无已满足的 exit_schema",
-                             run.workflow_name, step.id)
         # ── tmux 信号节流与升级 ──
         # 计数存于 step_results["tmux_signals"]（跨 tick 持久化），
         # 防高频骚扰：闲置提醒 ≥3 次/越界 ≥1 次后各自冷却 5 分钟；
@@ -1332,7 +1307,7 @@ class StepHandlerMixin:
     def _gate_text_id(text: str) -> str:
         """失败文本的稳定身份：verify 的 stderr 每次都带时长/临时路径/行号，
         原文比较会把同一条失败当成"新原因"，退避永远不生效。"""
-        return re.sub(r"[0-9a-f]{6,}|\d+(?:\.\d+)?", "#", text)
+        return re.sub(r"(?<![A-Za-z])[0-9a-f]{6,}(?![A-Za-z])|\d+(?:\.\d+)?", "#", text)
 
     def _gate_alert(self, key: str, text: str, write) -> None:
         """闸门失败播报：新原因立即报；同一条按 5/10/20/40/80min 退避，第 6 次停发并升级。
