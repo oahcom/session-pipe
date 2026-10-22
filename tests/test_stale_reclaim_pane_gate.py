@@ -170,7 +170,7 @@ def test_pane_gate_is_load_bearing():
 
 
 def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_architect", age_h=2,
-                      rework_status=None):
+                      rework_status=None, rework_tpl="architect_full_design"):
     """父步挂着子链/返工链时跑一次回收，返回被置 cancelled 的 wf_id 列表。"""
     now = time.time()
     row = {
@@ -186,7 +186,8 @@ def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_archite
     class _LM(_FakeLM):
         def query(self, sql, params=()):
             if "instance_id IN (" in sql:       # 返工链是批量主键查，不是单条
-                return [{"status": rework_status}] if rework_status else []
+                return ([{"status": rework_status, "template_id": rework_tpl}]
+                        if rework_status else [])
             if "WHERE instance_id=?" in sql and params and params[0] != "wf_test_parent":
                 return [{"status": sub_status}] if sub_status else []
             return [self._row]
@@ -225,6 +226,27 @@ def test_live_rework_child_blocks_parent_reclaim():
           "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
     assert _run_with_subflow(sd, None, False, rework_status="running") == [], \
         "返工子链 running 时父链仍被回收：从未交付的返工产物被级联取消"
+
+def test_system_rework_child_does_not_block_reclaim():
+    """系统维护链不动产品产物 → 不能拿它续期父链（维护队列实测 91 深，
+    3 条主链被一条从未投递的维护链扣 8h+）。"""
+    sd = {"status": "rejected", "rework_ids": ["wf_rw_maint"], "queued": 6,
+          "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, None, False, rework_status="running",
+                             rework_tpl="maintainer_health_monitor"), \
+        "系统维护链在跑就豁免父链：产品链被维护队列扣死"
+
+def test_malformed_rework_ids_are_ignored():
+    """畸形 rework_ids（dict/数字/空串/混入 None）不得抛异常也不得产生查询。
+
+    抛了会冒到 _cleanup_stale_workflows 的整轮 except，本轮**所有**实例停止回收。
+    """
+    class _NoQuery:
+        def query(self, sql, params=()):
+            raise AssertionError(f"畸形值不该产生查询: {sql} {params}")
+
+    for bad in ({}, {"wf_rw_x": 1}, 1, 0, "", [None, 3, ""], None):
+        assert wf_lifecycle._live_subflow(_NoQuery(), {"rework_ids": bad}) is False, bad
 
 def test_live_subflow_blocks_global_24h_reclaim():
     """24h 兜底 + 级联会杀掉仍在产出的子链 → 子链活着时条件3 也必须放行。"""
@@ -269,6 +291,8 @@ if __name__ == "__main__":
             test_live_subflow_blocks_parent_reclaim,
             test_dead_subflow_still_allows_reclaim,
             test_live_rework_child_blocks_parent_reclaim,
+            test_system_rework_child_does_not_block_reclaim,
+            test_malformed_rework_ids_are_ignored,
             test_live_subflow_blocks_global_24h_reclaim,
             test_select_includes_assignee)
     _fails = 0

@@ -80,8 +80,8 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     缺此判据时，子链结束的瞬间冻结的 queued_since 让父步「停滞 = 从建
     子链至今」，整条父链被回收（实测 8 例，138min 子链工时无接收方）。
     """
-    # ponytail: 每候选一次主键查询（当轮 running 实例 <100），与旧实现同频（旧版在
-    # 条件 4 内做同一条）；量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
+    # ponytail: 每候选最多 2 次主键查询（subflow_id 一次 + 返工链一次；当轮 running
+    # 实例 <100），量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
     from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
     _sf = step_sd.get("subflow_id") or ""
     if _sf:
@@ -93,15 +93,23 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     # 等返工的父链被判死 → close_wf 级联把仍在跑的返工子链一起杀掉（2026-10-22 两例：
     # wf_85faf589be90/s3、wf_b808ff2f3611/s3，子链 wf_rw_2664ec3aada3/80322df51ab0）。
     # 活体判据与子链同源（_ACTIVE_WF_STATUSES）；查不到行 = 链已删，不豁免。
+    # 系统问题链不算"还在写"：maintainer_health_monitor 修的是引擎/模板债，不动产品
+    # 产物，拿它续期会让父链陪着维护队列一路排到 24h（口径与 engine._blocking_rework_sts
+    # 一致，实测维护队列 91 深、3 条主链被一条没投递过的维护链扣 8h+）。
     _rids = step_sd.get("rework_ids") or []
-    _rids = ([_rids] if isinstance(_rids, str)
-             else (list(_rids) if isinstance(_rids, dict) else _rids))
+    if not isinstance(_rids, (list, tuple)):
+        _rids = [_rids]
+    # 只认非空字符串：畸形存量（dict/数字/None 混入）会让 len() 或占位符与参数不匹配
+    # 抛异常，冒到清理器的整轮 except → 本轮剩余实例全部不回收。
+    _rids = [r for r in _rids if isinstance(r, str) and r]
     if not _rids:
         return False
     _ph = ",".join("?" * len(_rids))
-    return any(r["status"] in _ACTIVE_WF_STATUSES for r in lm.query(
-        f"SELECT status FROM workflow_instances WHERE instance_id IN ({_ph})",
-        tuple(_rids)))
+    return any(r["status"] in _ACTIVE_WF_STATUSES
+               and (r["template_id"] or "").replace("WF-", "") != SYSTEM_REWORK_TPL
+               for r in lm.query(
+                   f"SELECT status, template_id FROM workflow_instances "
+                   f"WHERE instance_id IN ({_ph})", tuple(_rids)))
 
 
 def _bus_evidence_ready(engine, row: dict) -> bool:
