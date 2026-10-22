@@ -264,6 +264,20 @@ def test_attribution_before_dash_does_not_block_real_approval():
         _sub("CHANGES_REQUESTED"))
 
 
+def test_conditional_approved_counts_as_pass():
+    """CONDITIONAL_APPROVED 是生产里主流的通过形态，不是叙述。
+
+    实测 47 个带该结论的步骤状态全是 completed / step_done_ready；判成叙述会让
+    父步的更新结论永远压不过子链旧驳回（#439027 那类卡死）。
+    """
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion(
+        "reviewer_pr_review/s1-complete wf_sub_83b60ec1e2f9 — 结论: CONDITIONAL_APPROVED 0 P0 / 2 P1") is True
+    assert _conclusion("WL-food_chain_loop/s6-complete wf_x — 结论: CONDITIONAL_APPROVED 0 P0 / 2 P1") is True
+    assert _conclusion("上游 s3 CONDITIONAL_APPROVED") is None
+    assert _conclusion("s4-complete — CONDITIONAL_APPROVED 不成立，CHANGES_REQUESTED 2 P1") is False
+
+
 def test_quoted_approval_in_title_not_superseding():
     """标题形态（模板前缀）里转述上游的通过不算本步结论（codex P2）。"""
     assert not _superseded_by_parent(

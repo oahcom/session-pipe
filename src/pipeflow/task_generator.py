@@ -102,7 +102,11 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 _HARD_APPROVE = re.compile(
     # (?<![-\w]) 排除步骤名里的 s1-integrity-approved 与 CONDITIONAL_APPROVED：
     # 实测 24h 里 13 条「…/s1-integrity-approved —— NO_ANOMALY_VERIFY.md」被判通过。
-    r"(?<![-\w])APPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
+    r"(?<![-\w])(?:CONDITIONAL_)?APPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过",
+    re.I)
+# CONDITIONAL_APPROVED 也算通过：实测 47 个带该结论的步骤状态全是 completed /
+# step_done_ready（0 P0 的带条件通过），把它当叙述会让父步的更新结论永远压不过
+# 子链的旧驳回（#439027 那类 7h32m 卡死的成因）。
 # 通过词左侧出现这些词 = 转述别人的结论（「上游 s1 的最终验收结论已在
 # 10:20 复核之后确认为 APPROVED」）。只在结论段内匹配，不跨段。
 _ATTRIB_LEFT = re.compile(
