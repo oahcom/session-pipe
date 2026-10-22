@@ -189,7 +189,8 @@ def _run_with_subflow(step_sd, sub_status, pane_state, assignee="product_archite
                 return ([{"status": rework_status, "template_id": rework_tpl}]
                         if rework_status else [])
             if "WHERE instance_id=?" in sql and params and params[0] != "wf_test_parent":
-                return [{"status": sub_status}] if sub_status else []
+                return ([{"status": sub_status, "template_id": "architect_full_design"}]
+                        if sub_status else [])
             return [self._row]
 
     inst = SimpleNamespace(_workflows={}, _notify_role=lambda *a, **k: None)
@@ -248,6 +249,15 @@ def test_malformed_rework_ids_are_ignored():
     for bad in ({}, {"wf_rw_x": 1}, 1, 0, "", [None, 3, ""], None):
         assert wf_lifecycle._live_subflow(_NoQuery(), {"rework_ids": bad}) is False, bad
 
+def test_delivery_blocked_child_does_not_exempt_reclaim():
+    """delivery_blocked 是投递连败/角色无响应的停滞态（生产 233 条），非 failed 也非
+    cancelled。当活会让父链悬空到 2 倍阈值，而它要等 _recover_delivery_blocked 恢复
+    （角色持续离线时永不恢复）——同文件 _subflow_takeover 踩过同一个坑。"""
+    sd = {"status": "rejected", "rework_ids": ["wf_rw_parked"], "queued": 6,
+          "queued_since": time.time() - 3.5 * 3600, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, None, False, rework_status="delivery_blocked"), \
+        "delivery_blocked 子链被当活：父链陪着等一个可能永不恢复的停滞态"
+
 def test_live_child_does_not_exempt_beyond_double_budget():
     """活子链的豁免也要 2 倍封顶：否则父链寿命 = 父龄 + 子链寿命，没有上限。
 
@@ -304,6 +314,7 @@ if __name__ == "__main__":
             test_live_rework_child_blocks_parent_reclaim,
             test_system_rework_child_does_not_block_reclaim,
             test_malformed_rework_ids_are_ignored,
+            test_delivery_blocked_child_does_not_exempt_reclaim,
             test_live_child_does_not_exempt_beyond_double_budget,
             test_live_subflow_blocks_global_24h_reclaim,
             test_select_includes_assignee)
