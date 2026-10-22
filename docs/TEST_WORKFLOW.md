@@ -39,5 +39,7 @@ python3 -m pytest tests/test_engine_e2e.py -q
 
 ## 已知缺口
 
-- `_cleanup_stale_workflows` 条件 3/4 已有专门回归：`test_stale_reclaim_pane_gate.py`（pane 活体、全局阈值双预算、子链与返工链活体、主查询必带 assignee）。仍无覆盖：`step_handler._has_live_subflow` 的 tmux 空闲取消路径（只看 `subflow_id`，不看 `rework_ids`）。
+- `_cleanup_stale_workflows` 条件 3/4 已有专门回归：`test_stale_reclaim_pane_gate.py`（pane 活体、全局阈值双预算、子链与返工链活体、主查询必带 assignee）。
+- tmux 空闲取消是**两道门**，各有回归：`_has_live_subflow`（`test_tick_paths.py` 的 4 个 idle 用例，覆盖活子链/子链已死/无子链/parent 链接回退）+ `_role_producing_recently`（`test_idle_cancel_blocked_when_role_still_producing`、`test_idle_cancel_noop_logs_debug_not_info`）。
+- 已知缺口：`_has_live_subflow` 只看 `subflow_id` / parent 链接，不看 `rework_ids`。**实测未触发**：6 天内 249 个"角色不响应"取消实例里，只有 1 个的子链活过父取消（`wf_f269a67e6e6/s2`，且该子链自身已 cancelled）= 0.4%。要修就复用 `engine._derive_rework_ids` / `_rework_alive`，别新写判定。
 - 手工验证 `SurvivalMonitor().tick()` 会写生产 bus/哨兵，必须按 [CLAUDE.md](../CLAUDE.md) 三重 env 隔离后再跑。

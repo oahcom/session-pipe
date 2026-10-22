@@ -1,5 +1,37 @@
 # CHANGES.md
 
+## 2026-10-22 — 空闲判死接活体门 + cancel_step 终态幂等 + 文档同源
+
+### 问题（角色转录/日志实证）
+1. tmux 空闲分支 `idle_count>=5`（约 50s）直接取消步骤，而角色长思考时 pane 静默是正常态。
+   两个实例的完成消息在 cancel **之后**才落 bus：`wf_e688c4fafc/s4` +27.6s、
+   `wf_sub_c5620e70dd31/s1` +235s —— 产出已写好被丢弃，父链重建子链多花 35.6 分钟。
+   同仓排队分支（`_queued>=10`）早有 `not _role_producing_recently(_eff)` 活体门，两条判死路径口径不一致。
+2. `cancel_step` 不判终态：`wf_ae31fd1c4c11` 一条链 31.3 分钟落 49 行 `step_cancelled`
+   （中位间隔 10.7s，正好一 tick 一行）。**注意时效**：该实测是 10-16 的数据，近 24h 全库仅
+   1 行 —— 故幂等属预防性不变量，不是当下止血。
+3. `cancel_step` 的幂等判断一度放在 `current_step_id` 校验之前，已终态实例收到错步骤会被
+   静默吞成 `False`，掩盖调用方 bug（codex 一轮 P1）。
+
+### 改动
+- `step_handler.py`：空闲判死加活体门；按 `cancel_step` 返回值记 info「取消」/ debug「空操作」。
+- `manager.py`：先校验 `current_step_id`（错步骤仍 raise）→ 终态 `cancelled/completed/failed`
+  短路（`rollback` 后 `return False`，不得裸 return，否则事务挂连接）。
+- `tests/`：新增 `test_cancel_step_idempotent.py`（3 例 + 三终态 subTest）、
+  `test_tick_paths.py` 增 2 例；4 个既有 idle 用例显式 patch `_role_producing_recently`
+  （原先隐式依赖 scout 真实转录 mtime，角色一跑就可能翻红）。反向验证：去掉活体门、
+  恢复无条件 info 日志、去掉终态守卫，对应用例分别失败。
+- 文档：`PUBLIC_API.md` 补 `cancel_step` 契约；`docs/TEST_WORKFLOW.md` 把"空闲取消"改为
+  两道门并写明 rework_ids 缺口的实测未触发率（6 天 249 例里 1 例 = 0.4%，且该子链自身已死）。
+
+### 验证
+`1253 passed, 1 deselected, 2 subtests`；`scripts/doccheck.py` → CLEAN；
+生效：daemon 就地重执行 `源码已更新 (mtime=1792625695)` = 07:34:55 > 文件 mtime 07:32:48。
+
+### 未做
+- `_has_live_subflow` 仍未看 `rework_ids`：实测 0.4% 且子链已死，属"可修但无需求"，
+  要修就复用 `engine._derive_rework_ids` / `_rework_alive`，别新写判定。
+
 ## 2026-10-22 — 归属更正（9042df0 / a5f7c45）
 
 - `9042df0` 真实 subject：`fix(routing): 文档/注释跟上 cursor 退役 + limit 契约在函数内

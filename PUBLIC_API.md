@@ -28,6 +28,7 @@
 | `confirm_step(wf_id, step_id, token, approved, reason)` | str, str, str, bool, str | `bool` |
 | `fail_step(wf_id, step_id, reason, allow_retry)` | str, str, str, bool | `bool` |
 | `rollback_step(wf_id, step_id)` | str, str | `bool` |
+| `cancel_step(wf_id, step_id)` | str, str | `bool` —— `True`=本次取消并写库；`False`=实例已终态（cancelled/completed/failed）的空操作，未写库。步骤不匹配仍 `raise`（校验先于终态判断） |
 | `get_wf(wf_id)` | str | `Optional[dict]` |
 | `get_step(wf_id, step_id)` | str, str | `Optional[dict]` |
 | `upsert_template(template_id, name, description, steps)` | str, str, str, list | `None` |
