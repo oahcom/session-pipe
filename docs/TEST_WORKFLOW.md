@@ -41,5 +41,6 @@ python3 -m pytest tests/test_engine_e2e.py -q
 
 - `_cleanup_stale_workflows` 条件 3/4 已有专门回归：`test_stale_reclaim_pane_gate.py`（pane 活体、全局阈值双预算、子链与返工链活体、主查询必带 assignee）。
 - tmux 空闲取消是**两道门**，各有回归：`_has_live_subflow`（`test_tick_paths.py` 的 4 个 idle 用例，覆盖活子链/子链已死/无子链/parent 链接回退）+ `_role_producing_recently`（`test_idle_cancel_blocked_when_role_still_producing`、`test_idle_cancel_noop_logs_debug_not_info`）。
-- 已知缺口：`_has_live_subflow` 只看 `subflow_id` / parent 链接，不看 `rework_ids`。实测 6 天内 reason=角色不响应的取消 **19** 例，其中 1 例的子链活过父取消（`wf_f269a67e6e6/s2`，5.3%，且该子链自身已 cancelled）。**n=19 不足以下结论**（1 SE≈23pp），故不新增判定；要修就复用 `engine._derive_rework_ids` / `_rework_alive`。（分母别用"全部取消"的 249 —— 那是 0.4%，会低估 10 倍。）
+- 已知缺口：`_has_live_subflow` 只看 `subflow_id` / parent 链接，不看 `rework_ids`。**按守卫引入时间切窗实测**（守卫 `421f657` 是 10-19 17:45 加的）：引入**前** 10 例 reason 含「不响应」的取消里有 1 例子链活过父取消（`wf_f269a67e6e6/s2`，10-17，子链 `wf_sub_4af5167d8b89` 直到 22:26 才结束 = 父取消后 55 分钟，10%）；引入**后** 9 例里 0 例。故该缺口目前**无守卫引入后的证据**，n=9 也偏小，本轮不加判定。要修就复用 `engine._derive_rework_ids` / `_rework_alive`。
+  ⚠️ 测这类缺口必须**按守卫引入时间切窗**：不切窗会把守卫修好之前的案例算成守卫的缺口（我前两版就是这么错的）。
 - 手工验证 `SurvivalMonitor().tick()` 会写生产 bus/哨兵，必须按 [CLAUDE.md](../CLAUDE.md) 三重 env 隔离后再跑。
