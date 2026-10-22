@@ -118,7 +118,10 @@ _API_ERROR_AGE = 120
 # 「继续」必须带信息：24h 1,247 次注入里 611 次的后续轮没有任何工具调用（另 520
 # 次立刻又撞错），裸「继续」只能被角色复述。重试的单位是**被中断的那次请求**，
 # 不是整个任务（gemini-cli checkpoint 恢复的是那条 tool call，不是重新规划）。
-_RATE_LIMIT_NUDGE = "上一轮 API 错误中断（0 产出）。继续：重发被中断的那次请求，不要重新规划，不要写自检报告。"
+# 「0 产出」是假的：6h 内 11 次中断里 10 次被杀前已调 7~92 次工具（几乎全 Bash），
+# 断言零产出会让角色重做已做过的动作。改成"先核对落盘，再重发被中断的那次请求"。
+_RATE_LIMIT_NUDGE = ("上一轮 API 错误中断。继续，但先核对已完成的动作有没有落盘（读/写可能只做了一半），"
+                     "再重发被中断的那次请求；不要重新规划，不要写自检报告。")
 
 
 def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AGE) -> bool:
@@ -857,6 +860,13 @@ class RoleLifecycleMixin:
                 # 连发 6 次 ccs start（实测 pg 08:16:30-08:18:08 每 15s 一次，全部因内存不足必败，
                 # 每次阻塞 60s），而审计计数看不见这些尝试（24h 记 36 次 = 低估）。
                 if not self._check_and_start_role(role):
+                    time.sleep(check_interval)
+                    continue
+                # 拉起函数是 bool 契约：None（探测不可用）与「已拉起」共用 True。
+                # 投递侧必须自己复核一次——原来靠下面那条「_probe 为假就等 5s」兜住，
+                # 该分支已随重复探针删除，不复核就会把任务发给刚判不存在的 pane
+                # （codex 20 维两轮都指到这里）。
+                if self._is_agent_alive(role) is not True:
                     time.sleep(check_interval)
                     continue
 

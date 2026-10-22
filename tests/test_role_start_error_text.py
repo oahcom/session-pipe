@@ -58,6 +58,17 @@ class _Engine(RoleLifecycleMixin):
         return False
 
 
+def test_started_but_pane_still_missing_not_delivered():
+    """拉起函数返回 True 但复核仍无 pane（None/False 共用 True）→ 不投递。"""
+    lm = RoleLifecycleMixin.__new__(RoleLifecycleMixin)
+    lm._check_and_start_role = lambda role, deadline=0.0: True
+    lm._is_agent_alive = lambda role, fresh=False: False
+    lm._is_role_busy = MagicMock(return_value=False)
+
+    assert lm._wait_for_role_ready("x", max_wait=1, check_interval=0.01) is False
+    lm._is_role_busy.assert_not_called()
+
+
 def test_probe_unavailable_blocks_delivery():
     """投递前探测不可用（tmux 卡死）→ 不投递：宁可等下一 tick，不向未知状态发任务。"""
     from unittest.mock import patch
