@@ -6,6 +6,8 @@
 "File created successfully at: ..." 的新建写，却让角色耗整轮去自证清白。
 
 运行：cd session-pipeline && python3 tests/test_trajectory_blind_edit_creation.py
+
+TODO(split): 930 行已超 600 红线 —— 夹具与判据用例分文件。
 """
 import json
 import os

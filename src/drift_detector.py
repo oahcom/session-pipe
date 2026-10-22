@@ -39,8 +39,15 @@ _ENGINE_WRITEBACK_CATS = {"workflow", "task_spec", "scheduler", "monitor_wf_heal
 # 且形成自指循环：写教训 → 被判漂移 → 再写教训。engineer #370527 取证确认。
 # session_log: base.md 要求所有角色在 /compact 前写核心结论，persona 普遍不声明
 # → 7 天 14 条漂移告警、涉 9 个角色（optimizer 最多，4 条）。
+# blocker: prompts/base.md:15/24/37/38 要求**所有角色**拿不到证据时写 blocker，
+# 放进全局白名单的理由和 reflexion_lesson 同源——不放开就是"按规则交付被判越界"，
+# 5 天 127 条无人消费的 role_drift 里主体是它。
+# 不放开 code_review/feedback/verification：routes._SYSTEM_CATEGORIES 的语义是
+# "这类信号不建工作流"，不是"谁都能产出"；它们有明确的 output_targets 归属，
+# 全局放开会掩盖真实越界（codex 三方审查）。
 _ALWAYS_ALLOWED = ({"notice", "architecture", "monitor_audit", "reflexion_lesson", "session_log"}
-                   | _ENGINE_WRITEBACK_CATS)
+                   | _ENGINE_WRITEBACK_CATS
+                   | {"blocker"})
 
 
 def _load_role_config(role: str) -> Optional[dict]:

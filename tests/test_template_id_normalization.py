@@ -41,7 +41,22 @@ def test_idempotent_after_normalize():
         twice = canon_tid(once, "foo")
         assert once == twice, f"not idempotent: {raw} -> {once} -> {twice}"
 
+def test_template_ids_includes_bare_alias():
+    """JSON→DB 同步必须同时刷规范行与裸名别名行。
+
+    子链实例按模板 JSON 的 subflow_template（裸名）建实例、按实例 template_id
+    读模板行；只刷 WF- 规范行 → 裸行停在旧定义，pm 收的还是旧提示词。
+    """
+    from pipeflow.engine import _template_ids
+    assert _template_ids("WF-pm_requirements") == ["WF-pm_requirements", "pm_requirements"]
+    assert _template_ids("WL-full_dev_pipeline") == ["WL-full_dev_pipeline", "full_dev_pipeline"]
+    # 无前缀时只有一个键，不得凭空造别名
+    assert _template_ids("pm_requirements") == ["pm_requirements"]
+    # 前缀叠加污染也只出一个裸名，函数自身幂等
+    assert _template_ids("WF-WF-foo") == ["WF-WF-foo", "foo"]
+
 if __name__ == "__main__":
     test_re_sub_converges()
+    test_template_ids_includes_bare_alias()
     test_idempotent_after_normalize()
     print("test_template_id_normalization: PASS (re.sub 收敛 + 幂等)")

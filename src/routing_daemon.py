@@ -10,6 +10,8 @@ routing_daemon.py — 路由分发 daemon，定期轮询 bus 未消费消息并�
 与 workflow-engine.service（pipeflow/daemon.py）职责分离：
   本 daemon = 消息路由分发（bus → 角色）
   workflow daemon = 工作流步骤推进（engine.run_once）
+
+TODO(split): 612 行已超 600 红线（AGENTS.md §9）—— 健康检查/重连段可独立成模块。
 """
 import fcntl, importlib, importlib.util, json, os, subprocess, sys, time
 from pathlib import Path

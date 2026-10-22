@@ -15,7 +15,7 @@ from pathlib import Path
 
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
-from pipeflow.engine import Step, WorkflowRun
+from pipeflow.engine import Step, WorkflowRun, _fail_parent_step
 from pipeflow.wf_lifecycle import _value_audit_failed, _role_producing_recently
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
 from conversation_monitor import get_conversation_signal
@@ -635,6 +635,12 @@ class StepHandlerMixin:
                             src="workflow_engine")
                     except Exception as _cancel_e:
                         LOGGER.debug("auto-cancel subflow failed: %s", _cancel_e)
+                    # 子链排队超时同样要判父步失败：父步没有终态可回写，只回收
+                    # 子链等于让它在同一队列里重建一条（需求.md「修法优先级」1）。
+                    _fail_parent_step(
+                        self._lifecycle, self._bb, run.id,
+                        reason=(f"子链排队 {_q_age_min}min 未认领 >= "
+                                f"{int(_q_budget // 60)}min 预算，角色 {_eff} 长期无产出"))
                     # 已取消的工作流不应再继续排队递增与 timeout_count，
                     # 否则达阈值时会再 close_wf 一次，并对已取消实例发"超时自动回收"假告警。
                     return
