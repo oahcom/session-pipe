@@ -21,7 +21,7 @@ src/
   pipeflow/           engine.py 编排+CLI（导入 4 个 mixin）
                       · step_handler.py 步骤处理 · role_lifecycle.py 投递与守护 ·
                       task_generator.py 任务/异常/自愈 · wf_lifecycle.py 推进/回收/loop ·
-                      daemon.py 守护循环（10s） · db.py 三层 SQLite · integrity.py 完整性提醒
+                      daemon.py 守护循环（10s） · integrity.py 完整性提醒（DB 在 workflow/db.py，pipeflow 无 db.py）
   lifecycle/manager.py  工作流状态机（RLock + WAL）
   workflow/             client.py 角色客户端 · gateway.py 门禁 · db.py · sync.py
   routing_daemon.py     路由守护（含 P0 阶梯扫描）
@@ -33,15 +33,16 @@ src/
 
 ### 3.1 模板与数据模型
 
-- 规范模板目录 `~/.hermes/workflows/*.json`：**28 个**（2026-10-22 `ls | wc -l`）。
+- 规范模板目录 `~/.hermes/workflows/*.json`：见 `template_registry list`（数量不写死）。
   `python3 -m pipeflow.engine list` 打印引擎实际加载的名字。
 - `WorkflowDef(name, title, description, steps, loop)`；`WorkflowRun(id, workflow_name, context, status, current_step, step_retries, step_results)`。
 - `Step` 关键字段：`type`(single/handoff/review/gate/notify)、`target_role`、`exit_condition`、`exit_schema`、`max_retries`、`verify`、`condition`、`rollback_to`、`subflow_template`、`guard`、`wait_roles`。
 
 ### 3.2 subflow（编排 → 子链）
 
-2026-10-22 扫描到 6 个模板引用 `subflow_template`，共 7 个子链模板：
-`architect_full_design`、`closer_close_loop`、`coordinator_dispatch`、`engineer_feature`、`pm_requirements`、`qa_test_execute`、`reviewer_pr_review`。
+2026-10-22 扫描（复算：解析 `workflow_templates.steps_json` 统计 `subflow_template` 非空的模板——`like`/`grep` 会命中所有模板的空值键，会算多）：**10 个模板带子链**（当日实测名单，同名模板有 `WF-`/`WL-` 前后缀重复，按 id 去重后仍是这 10 条）：
+`WF-architect_review`、`WF-coordinator_schedule`、`WF-dev_implement`、`WF-product_delivery`、`WL-food_chain_loop`、`WL-full_dev_pipeline`、`architect_review`、`food_chain_loop`、`full_dev_pipeline`、`产品交付全流程`。
+名单会随模板增删变，别把这份当一个不变量。
 
 ### 3.3 步骤状态机（`lifecycle/manager.py`）
 
@@ -70,7 +71,7 @@ src/
 
 ### 4.2 优先级
 
-`CATEGORY_PRIORITY` 由 `routing/routes.py` 的 `_CANONICAL` 分类表推导：**52 个分类**，`security`/`security_audit`=1、`code_fix`/`code_review`/`bug_report`/`blocker`=2、`architecture`=3；未列出的分类默认 11（`router.py:57`）。
+`CATEGORY_PRIORITY` 由 `routing/router.py` 载入的 `~/.hermes/data/bus_canonical.json`（`_CANONICAL`）推导：分类数随 `~/.hermes/data/bus_canonical.json` 变（复算 `jq length`）；优先级 `security`/`security_audit`=1、`code_fix`/`code_review`/`bug_report`/`blocker`=2、`architecture`=3，未列出的默认 11（`router.py` 的 `_CANONICAL` 推导处，按名检索）。
 
 ### 4.3 路由即建链
 
@@ -83,7 +84,7 @@ src/
 
 ## 5. 可靠性层（`reliability.py` + `reliability_core.py`）
 
-`config/config.yaml` 的 8 个配置块：`bus` `retry` `circuit_breaker` `heartbeat` `ttl_pruner` `logging` `graceful_shutdown` `health`（无 `priority`/`routing` 块——优先级是代码里的 `_CANONICAL`）。
+`config/config.yaml` 的 8 个配置块：`bus` `retry` `circuit_breaker` `heartbeat` `ttl_pruner` `logging` `graceful_shutdown` `health`（无 `priority`/`routing` 块——优先级表在 `~/.hermes/data/bus_canonical.json`，由 `router.py` 载入）。
 
 | 机制 | 配置键 | 语义 |
 |------|--------|------|

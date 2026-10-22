@@ -89,7 +89,7 @@
 写 bus cat=XXX，title 含 s<N>-complete（验收标准：可二值判定）
 ```
 
-实测（2026-10-22）：28 个模板仅 4 个通过 `validate-all`，失败项主要是缺"做什么/怎么做/验收标准"三段与 prompt 过短（如 `test_exit_schema.json` 138B < 150B）。
+实测（2026-10-22，复算 `python3 src/template_registry.py validate-all`，模板总数用 `select count(*) from workflow_templates`）：少数模板通过 `validate-all`，失败项主要是缺"做什么/怎么做/验收标准"三段与 prompt 过短（如 `test_exit_schema.json` 138B < 150B）。
 
 **禁止**出现以下段落：`## 操作要求`、`## 产出物要求`、`## 质量门禁`、`## 引用要求`（已全局清除；需要搜索/引用时内联写进指令）。
 
@@ -131,7 +131,7 @@
   产品交付全流程          → pm_requirements, architect_full_design, reviewer_pr_review,
                             engineer_feature, qa_test_execute
 
-其余 22 个模板（含上述 7 个被引用的子链）
+其余模板（清单见 `template_registry list`），含上面那些带子链的
 ```
 
 ### 3.2 subflow_template 使用规则
@@ -267,7 +267,7 @@ PYTHONPATH=src python3 -c "from pipeflow.engine import WorkflowEngine; WorkflowE
 | 情况 | 推荐分类 | 不要用 |
 |------|----------|--------|
 | 通知下游角色 | 业务相关分类 | `notice`（太泛） |
-| 状态更新 | 领域分类 | `architecture`（兜底分类；2026-10-22 实测 88 步中 11 步在用，`code_fix` 13 步最多） |
+| 状态更新 | 领域分类 | `architecture`（兜底分类；2026-10-22 实测各模板写入步骤的分类分布：`code_fix` 最多、`architecture` 次之——复算要真跑一次再统计，别抄这里的排名） |
 | 技术决策 | `tech_decision` | `architecture` |
 | 架构设计 | `system_design` 或 `architecture` | — |
 | 代码修复 | `code_fix` | `architecture` |

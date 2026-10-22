@@ -7,9 +7,9 @@
 
 | 项目 | 类比 | 职责 | 实测规模 |
 |------|------|------|----------|
-| **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个角色（`roles_export.json`）+ 29 个 persona JSON + prompt 模板 | 13 个 `.py` / 2420 行（src 7 / 1481） |
-| **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | 66 个 `.py` / 15900 行（src 31 / 8517） |
-| **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | 172 个 `.py` / 44836 行（src 43 / 20206，tests 128 / 24529） |
+| **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个角色（`roles_export.json`）+ 19 个 persona JSON（`ls personas/session-roles/*.json`）+ prompt 模板 | ≈2.5k 行（14 个 `.py`，src 7） |
+| **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | ≈16k 行（70 个 `.py`，src 31） |
+| **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | ≈46k 行（176 个 `.py`，src 42 / 20530，tests 128） |
 
 **实际关系不是三层流水线，而是两消费者并行：**
 

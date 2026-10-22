@@ -36,8 +36,8 @@ pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 
 
 ### 验证命令
 ```bash
-# 测试路由规则
-python3 tests/test_router.py -x -q
+# 测试路由规则（10 个 pytest 用例；直接 python 跑只会执行 __main__ 自测块，收集不到它们）
+python3 -m pytest tests/test_router.py -q
 
 # 列出路由表（router CLI）
 PYTHONPATH=src python3 -m routing.router list
@@ -69,11 +69,11 @@ src/
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（2022 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1716 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1203 行）
+    engine.py         ── 编排 + CLI（2023 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（1719 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1211 行）
     task_generator.py ── 任务生成（933 行）
-    wf_lifecycle.py   ── 工作流生命周期（2108 行）
+    wf_lifecycle.py   ── 工作流生命周期（2140 行）
     daemon.py         ── 工作流守护 while 循环（483 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 

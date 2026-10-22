@@ -30,7 +30,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **workflow/client.py** | High-level API for CCS roles to interact with workflow DB |
 | **reliability_core.py** | Core implementations of retry/circuit/heartbeat/TTL/metrics |
 | **reliability.py** | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
+| **routing/routes.py** | Dispatch logic: route_all, route_to_ccs |
 | **routing/router.py** | Route table: derive produce/consume from roles_export.json, priority routing |
 | **routing/survival_monitor.py** | 存活监测 |
 | **routing/rdb.py** | Route table SQLite persistence + audit log |
@@ -53,7 +53,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 | **workflow/sync.py** | 工作流同步 |
 | **p0_exemption.py** | P0 豁免通道 |
 
-**本表只列主要模块，不是全集**：模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`（2026-10-22 为 37，合计约 20k 行；表里没列 `liveness.py`/`review_gate.py`/`pipeflow/integrity.py`/`eval_shared_loader.py`）。`pipeflow/db.py` 已删，持久化在 `workflow/db.py`。
+**本表只列主要模块，不是全集**：模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`（2026-10-22 为 37；表里没列 `liveness.py`/`review_gate.py`/`pipeflow/integrity.py`/`eval_shared_loader.py`）。`pipeflow/db.py` 已删，持久化在 `workflow/db.py`。
 
 ## Data flow
 
@@ -76,7 +76,7 @@ CCS (tmux + claude) ←── Sister Bus (ACK/linkage)
 pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
     │
     ├── _ensure_role_alive() ──→ subprocess ccs.py start
-    ├── SQLite scan workflow_instances (pending/running)
+    ├── SQLite scan workflow_instances (pending/running/step_done_ready；行级还可能是 delivery_blocked)
     ├── _send_to_role() ──→ subprocess ccs.py send
     └── _check_anomalies() ──→ timeout escalation
 ```
@@ -111,11 +111,11 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 
 ### Engine bypasses LifecycleManager
 
-`engine.py` 至少 3 个函数绕过 `lifecycle/manager.py` 直接写 SQL（`wf_lifecycle.py` 内 `conn.execute` 共 12+ 处，不止这三处）：
+绕过 `lifecycle/manager.py` 直接写 SQL 的不止一处（`wf_lifecycle.py` 内 `conn.execute` 实测 21 处）。engine.py 拆分后，三个典型函数分散在 mixin 里：
 
-- `_advance_production_wf()` -- updates step_results via raw conn.execute
-- `_tick()` -- timeout detection writes directly via `_sync_step_results()`
-- `_scan_tasks()` -- sub-workflow completion pushes parent workflow
+- `wf_lifecycle.py:_advance_production_wf()` -- updates step_results via raw conn.execute
+- `step_handler.py:_tick()` -- timeout detection writes directly via `_sync_step_results()`
+- `task_generator.py:_scan_tasks()` -- sub-workflow completion pushes parent workflow
 
 These bypasses lose RLock protection and approval workflow.
 

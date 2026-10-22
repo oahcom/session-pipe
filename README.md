@@ -34,8 +34,8 @@ python3 -m pytest tests/ -q
 |------|------|--------|
 | 路由映射 | `routing/router.py` | 从 roles_export.json 推导 produce/consume |
 | 自动分发 | `routing/auto.py` | 轮询 bus → 按优先级分发给 CCS |
-| 工作流引擎 | `pipeflow/engine.py` | 加载 `~/.hermes/workflows/*.json`（实测 28 个模板） |
-| 步骤状态机 | `lifecycle/manager.py` | 审批/回滚/升级/重分配 |
+| 工作流引擎 | `pipeflow/engine.py` | 加载 `~/.hermes/workflows/*.json`（清单见 `template_registry list`） |
+| 步骤状态机 | `lifecycle/manager.py` | 审批/回滚/失败/终态取消（升级在 `engine.py`，P0 豁免在 `p0_exemption.py`） |
 | 可靠性 | `reliability.py` | 重试/熔断/心跳/TTL/Metrics |
 
 ## CLI

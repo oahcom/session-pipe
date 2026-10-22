@@ -17,7 +17,7 @@
 | G8 | `delivery_blocked` 达恢复上限成永久孤儿 | 已修 | `engine.py:1783-1800` 达 3 次即 `UPDATE ... status='failed'` 并写 blocker |
 | G9 | `wf_starve.json` 的 `last_active_ts` 是幽灵字段 | 已修 | `daemon.py:211` 每轮写 `state["last_active_ts"] = now` |
 | G10 | `get_workflow_progress` 等用 `step["step_id"]` 直取 DB 模板 | 已修 | `grep -n 'step\["step_id"\"]' src/lifecycle/manager.py` 无命中；PUBLIC_API 中对应方法已不存在 |
-| G11 | 每日 13 次服务重启、无自动拉起（部署健壮性） | **未验证** | `systemctl is-active session-pipeline-daemon.service` → active（2026-10-22 05:49 启动，NRestarts=0）；`journalctl -u session-pipeline-daemon.service --since today` 有"启动"条目。`session-pipeline.service` 不存在，旧命令恒返回 Unit not found |
+| G11 | 每日 13 次服务重启、无自动拉起（部署健壮性） | **未验证** | `systemctl is-active session-pipeline-daemon.service` → active（2026-10-22 05:49 启动，NRestarts=0）；`journalctl -u session-pipeline-daemon.service --since today` 有"启动"条目。`/etc/systemd/system/session-pipeline.service` **存在但 inactive（disabled）**，不是“不存在”——旧结论来自 `Unit not found` 的误读，排障该用 `systemctl status session-pipeline-daemon.service` |
 | G12 | 19 个角色里 13 个无可执行判据，抽样按判据数加权且有放回 | 已修（2026-10-22） | `python3 src/eval_consistency.py` 现输出 `blind_roles` 名单（实测 13 个，含 engineer/reviewer/qa/pm）；`run_eval_check` 改均匀无放回。盲区不设硬失败（每 600s 一条 WARNING 会淹没真不兼容项） |
 
 ## 未验证 / 不在本单

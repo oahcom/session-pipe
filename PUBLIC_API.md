@@ -17,7 +17,7 @@
 | `cancel(wid)` | str | `bool` |
 | `run_once()` | — | `None` |
 | `list_workflows()` | — | `list[str]` |
-| `tick()` | — | `int` |
+| `tick()` | — | `int`（恒 `0`：只调 `run_once()`） |
 
 ## LifecycleManager (`lifecycle/manager.py`)
 
@@ -25,7 +25,7 @@
 |------|------|------|
 | `start_wf(wf_id, current_step_id, template_id)` | str, str, str | `bool` |
 | `complete_step(wf_id, step_id)` | str, str | `str` (result status) |
-| `confirm_step(wf_id, step_id, token, approved, reason)` | str, str, str, bool, str | `bool` |
+| `confirm_step(wf_id, step_id, token, approved, reason)` | str, str, str, bool, str | `bool` —— `token` 已无消费者（审批密钥退场，`manager.py` 里恒空，别依赖它的语义） |
 | `fail_step(wf_id, step_id, reason, allow_retry)` | str, str, str, bool | `bool` |
 | `rollback_step(wf_id, step_id)` | str, str | `bool` |
 | `cancel_step(wf_id, step_id)` | str, str | `bool` —— `True`=本次取消并写库；`False`=实例已终态（cancelled/completed/failed）的空操作，未写库。步骤不匹配仍 `raise`（校验先于终态判断） |
@@ -80,7 +80,7 @@
 | `TTL_PRUNER` | 消息 TTL 清理 |
 | `DEFAULT_RETRY` | 重试策略 |
 | `GRACEFUL_SHUTDOWN` | 优雅关闭 |
-| `METRICS` | Prometheus 指标 |
+| `METRICS` | Prometheus 指标（定义在 `reliability_core.py:376`，`reliability.py` 只是 re-export） |
 | `IDEMPOTENT_CONSUME` | 幂等消费 |
 | `ACK_TRACKER` | ACK 跟踪 |
 
@@ -88,4 +88,4 @@
 
 | 文件 | 引用 | 说明 |
 |------|------|------|
-| `routing/auto.py` | `from routing import router` → sentinel | 延迟导入 |
+| `routing/auto.py` | `from routing import router`（`auto.py:17`） | **不构成反向依赖**：同包内 import，且 auto.py 无 sentinel 逻辑（旧说法已错，留档对照） |
