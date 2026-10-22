@@ -5,10 +5,13 @@
 ## 运行
 
 ```bash
-cd /home/administrator/session-pipeline
-python3 -m pytest tests/ -q                 # 全量
-python3 -m pytest tests/ -q --collect-only  # 只收集（秒级，验证导入是否坏）
-python3 -m pytest tests/test_engine_e2e.py -q
+# 判据是 0 error + 全 passed；条数不写死（并发改动每天在变），别把某个数字当门禁。
+cd /home/administrator/session-pipeline      && python3 -m pytest tests/ -q
+cd /home/administrator/hermes-session-roles  && python3 -m pytest tests/ -q
+cd /home/administrator/session-launcher      && python3 -m pytest tests/ -q
+
+cd /home/administrator/session-pipeline && python3 -m pytest tests/ -q --collect-only  # 秒级，验证导入是否坏
+cd /home/administrator/session-pipeline && python3 -m pytest tests/test_engine_e2e.py -q
 ```
 
 `tests/conftest.py` 已把 `src/` 加入 `sys.path`，无需 `PYTHONPATH`；直接跑 `python3 src/...` 才需要。
