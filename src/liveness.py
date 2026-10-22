@@ -214,7 +214,6 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
     - 跳过 wf_sub_ 子链（仅当 parent_wf_id == exclude_wf_id，codex 三维度审查 P2 修复）
     - step_results[step].status in _ACTIVE_STEP_STATUS（notified/running；
       step_done_ready 等审批时角色已空闲，见常量注释）
-    - queued>=6 且同一工作流 → 豁免
     - timeout_count<3 才判忙
     """
     if db_conn is None:
@@ -312,10 +311,6 @@ def _s4_stepping(role: str, db_conn=None, exclude_wf_id: str = "", workflows=Non
                 if not isinstance(_sdata, dict):
                     continue
                 if _sdata.get("status") in _ACTIVE_STEP_STATUS:
-                    _q = _sdata.get("queued", 0)
-                    if _q >= 6 and exclude_wf_id and inst_id == exclude_wf_id:
-                        LOGGER.info("liveness: %s queued=%d 同一工作流 → 豁免 busy", role, _q)
-                        continue
                     # 陈旧的 notified（投递后长期零响应）不构成"占用"：否则两条
                     # 互不相干的链各卡一个 notified 步骤时互为"忙"，双双饿死。
                     # 只豁免 notified；running 是角色主动写的，仍是真占用。

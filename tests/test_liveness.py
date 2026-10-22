@@ -146,11 +146,14 @@ class TestL4Stepping(unittest.TestCase):
         conn.close()
 
     def test_queued_6_exempt_same_wf(self):
+        """同链不与自己互斥。豁免来自 exclude_wf_id 早退，不是 queued>=6 那个分支
+        （该分支因早退恒不成立，2026-10-22 已删）。反向断言锁住它不会变成空转用例：
+        queued=0 与 6 结果相同、换个 exclude 必须判忙。"""
         conn = self._conn()
         conn.execute("INSERT INTO workflow_instances VALUES('wf_1','tpl',?,'engineer',NULL,'running')",
                       (json.dumps({"s1": {"status": "running", "queued": 6, "timeout_count": 0}}),))
-        s = _s4_stepping("qa", conn, exclude_wf_id="wf_1")
-        self.assertFalse(s["busy"])
+        self.assertFalse(_s4_stepping("qa", conn, exclude_wf_id="wf_1")["busy"])
+        self.assertTrue(_s4_stepping("qa", conn, exclude_wf_id="wf_2")["busy"])
         conn.close()
 
     def test_subflow_exempt(self):

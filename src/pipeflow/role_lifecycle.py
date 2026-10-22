@@ -7,7 +7,6 @@
 import fcntl
 import json
 import re
-import sys
 import time
 import logging
 import threading
@@ -317,7 +316,6 @@ def _save_rate_state(path: Path, states: dict, now: float, ttl: float,
 class RoleLifecycleMixin:
     """WorkflowEngine 的角色管理 mixin。"""
     _HEALTH_DIR = Path.home() / ".hermes" / "run" / "ccs-health"
-    _OVERFLOW_THRESHOLD_LINES = 2000   # pane scrollback 行数超过此值触发 /compact（备用指标）
     _OVERFLOW_COOLDOWN = 300           # 同一角色两次 /compact 最小间隔（秒）
     # 告警冷却：同一 (role, title) 30min 内只投一次（见 _notify_role）。
     # 状态放类属性（进程级）而非实例：与 _BACKLOG_ALERT_TS 同口径——限流是进程级
@@ -762,11 +760,6 @@ class RoleLifecycleMixin:
             _engine_mod._sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
                     capture_output=True, timeout=5)
             alive = False
-        if alive:
-            # 代码变更检测已禁用：workspace 的 .py 是角色自己的产出（正常开发），
-            # 全量 md5 扫描会误判"代码变更"→ 杀死正在工作的角色（2026-08-01 观测 8 次误杀）。
-            # 如需热替换 launcher 代码，由运维手动 ccs restart 完成。
-            return True
 
         # 拉起前加锁 + 冷却：check-then-act 的写入侧必须串行化。
         # 锁内不重复探测 tmux（外层刚判过）：并发 tick 的第二个只需看冷却戳即可，
@@ -826,9 +819,7 @@ class RoleLifecycleMixin:
 
         这是 dispatch 前的关键检查，确保角色真正就绪才发送任务。
         """
-        import time
         deadline = time.time() + max_wait
-        check_interval = 5
         while time.time() < deadline:
             # 1. tmux session 存活
             try:

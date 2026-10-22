@@ -10,7 +10,6 @@ import uuid
 import logging
 import hashlib
 import threading
-import re  # 修复: _scan_tasks 用 re.match 但漏 import, 导致每 tick NameError 使任务生成静默死亡
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -678,7 +677,6 @@ class TaskGeneratorMixin:
         - 已有 running/pending workflow 的角色跳过
         - 生成标题描述性（≥12字符），非占位符
         """
-        getattr(self, '_TASK_GEN_COOLDOWN', {})
         _now = time.time()
         _COOLDOWN_S = 120  # 2min，平衡速度与稳定性
 
@@ -731,11 +729,8 @@ class TaskGeneratorMixin:
                         if "backlog_scan" not in (_f.t or ""):
                             _demand_text += (_f.t or "") + " " + (_f.e or "") + " "
                 # 需求信号必须与目标角色相关：标题或内容含角色名/其职责关键词才算
-                _role_hits = (
-                    f"@{_role}" in _demand_text
-                    or f"assignee={_role}" in _demand_text
-                    or _role in _demand_text
-                )
+                # 子串判据已覆盖 "@role" / "assignee=role" 两种写法，不必单列。
+                _role_hits = _role in _demand_text
                 _has_demand = bool(_demand_text) and _role_hits and _demand_text.strip() != ""
                 if not _has_demand:
                     continue
