@@ -842,17 +842,24 @@ def test_fail_open_is_logged_not_silent(caplog) -> None:
 
 
 def test_relative_path_gets_no_scratch_exemption() -> None:
-    """相对路径不享受草稿豁免：否则判据在 /tmp 下跑时 "x.py" 会 realpath 成 /tmp/x.py。"""
+    """相对路径不享受草稿豁免：否则判据在 /tmp 下跑时 "x.py" 会 realpath 成 /tmp/x.py。
+
+    必须在 cwd=/tmp 下跑才锁得住：从仓库 cwd 跑时 "x.py" 解析到仓库内，本来就不享
+    豁免 —— 去掉 isabs 守卫也照样绿（第五轮复核的 P2，与"下界没被锁住"同型）。
+    """
     now = datetime.now(timezone.utc).isoformat()
     sess = _TRANSCRIPTS_DIR / "-probe-relpath-role"
     lines = _write_seq(0, "ch1", "probe_rel.py",
                        "The file probe_rel.py has been updated successfully.", ts=now)
     jf = _make(sess, lines)
+    cwd = os.getcwd()
     try:
+        os.chdir("/tmp")
         res = TrajectoryQualityChecker().check("relpath", "t")
         blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
         assert len(blind) == 1, f"相对路径不该拿草稿豁免: {res['findings']}"
     finally:
+        os.chdir(cwd)
         jf.unlink(missing_ok=True)
         try:
             sess.rmdir()
