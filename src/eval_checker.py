@@ -464,7 +464,8 @@ def _has_word(text: str, words) -> bool:
         if not w:
             continue
         for m in re.finditer(rf"(?<![A-Za-z0-9_-]){re.escape(w)}(?![A-Za-z0-9_-])", text):
-            if m.start() and text[m.start() - 1] in "不未没无非":
+            if text[max(0, m.start() - 2):m.start()].endswith(
+                    ("不", "未", "没", "无", "非", "无法", "未能", "没有", "不能")):
                 continue
             return True
     return False

@@ -238,4 +238,6 @@ def test_cjk_expected_uses_substring():
     assert ec._has_word("检查通过", ["通过"]) is True
     assert ec._has_word("不通过", ["通过"]) is False
     assert ec._has_word("未通过", ["通过"]) is False
+    assert ec._has_word("无法通过", ["通过"]) is False
+    assert ec._has_word("没有通过", ["通过"]) is False
     assert ec._has_word("inactive", ["active"]) is False
