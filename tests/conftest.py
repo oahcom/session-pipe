@@ -224,3 +224,25 @@ def _fast_role_ready(request, monkeypatch):
     monkeypatch.setattr(_rl.RoleLifecycleMixin, "_wait_for_role_ready",
                         lambda self, *a, **k: True)
 
+def _alarm_handler(_signum, _frame):
+    raise TimeoutError("用例超过自带 signal.alarm 预算")
+
+
+@pytest.fixture(autouse=True)
+def _alarm_kills_test_not_process():
+    """用例自带 `signal.alarm(N)` 却没装 handler：pytest 下默认动作 = 杀进程。
+
+    实测全量跑到 ~94% 直接 EXIT=142（无 summary），三次复现；`grep -c signal.alarm`
+    集中在 test_workcycle_e2e.py（17 处）。装一个抛 TimeoutError 的 handler，
+    慢用例就变成**一条红用例**，而不是整轮蒸发——这是「全量永远拿不到结论」的第二个原因。
+    """
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+    _old = signal.signal(signal.SIGALRM, _alarm_handler)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, _old)
+
