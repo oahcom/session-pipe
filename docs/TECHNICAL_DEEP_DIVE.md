@@ -116,7 +116,7 @@ src/
 - 轨迹判据只看近 24h（`_TRAJ_WINDOW_S`），按记录的 `timestamp` 过滤，不看 jsonl 文件 mtime；缺时间戳的记录按新鲜保留（不静默丢证据）。理由：一条历史 orphan 会让角色永久 FAIL，当轮改进翻不了绿。
 - 文本判据按 **ASCII 词边界**比对（`_has_word`）：`inactive` 不点亮 `active`、`5xx-error` 不被 `error` 拆词；CJK 无词边界，仍按子串（`检查通过` 命中 `通过`，否定语义要写负向 expected）。「全部返回 X」要求 stdout 每一行都满足。
 - 盲改只豁免三类：本次写调用新建的文件（`created_by_call`）、角色自己 `ccs-workspaces/<role>` 下的 Write、同一 transcript 内先写后 Edit（`own_written`）。`/tmp` 草稿靠「本次新建」豁免，不按目录放过——覆盖预存脚本仍应报。
-- bus 写超时 30s：事务持锁实测 5~9.8s，15s 会周期性丢 blocker/notice。
+- bus 写超时 30s：事务持锁实测 5~23s（11:57 为 19.1s、12:11 为 23.4s），15s 会周期性丢 blocker/notice。
 
 ## 7. 与 Sister Bus 的集成
 
