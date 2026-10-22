@@ -451,6 +451,17 @@ def _is_tool_error(result: dict) -> bool:
     return False
 
 
+def _has_word(text: str, words) -> bool:
+    r"""text 里是否按**词边界**出现 words 中任意一个。
+
+    WHY 不用 `in`：`"active" in "inactive"` 为真 —— 维护者的「全部返回 active」
+    判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界同时排除 `-_`，
+    避免 `5xx-error` 这类被拆词误伤；中文/CJK 也算 \w，"不通过" 不会命中 "通过"。
+    """
+    return any(w and re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text)
+               for w in words)
+
+
 def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, str):
     """根据命令输出和预期结果判断 pass/fail。
 
@@ -477,11 +488,14 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
         return (True, f"无匹配=健康 (grep exit=1, expected={expected[:40]})")
 
     if "全部返回" in cmd_raw:
-        # 检查 stdout 包含关键字
-        keywords = expected.replace("、", " ").split()
-        if keywords:
-            passed = any(k in stdout for k in keywords)
-            detail = f"expected={expected} | stdout={stdout[:120]}"
+        # 「全部返回 X」= 每一行都要按词边界出现 X。旧写法 any(k in stdout) 让
+        # "active" 命中 "inactive"：实测 inactive/inactive 也判 PASS，维护者那条
+        # 核心服务判据因此恒真（2026-10-22 三轮审查复核）。
+        keywords = [k for k in expected.replace("、", " ").split() if k]
+        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+        if keywords and lines:
+            passed = all(_has_word(ln, keywords) for ln in lines)
+            detail = f"expected={expected} | 行={lines[:6]}"
             return (passed, detail)
 
     # 检查预期是否含数字
@@ -500,8 +514,9 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
             detail = f"{val}{op}{ref} | stdout={stdout[:120]}"
             return (passed, detail)
 
-    # 简单文本包含检查
-    passed = expected in stdout or expected in stderr
+    # 简单文本包含检查（按词边界）：子串匹配会把 "active" 吃进 "inactive"、
+    # "OK" 吃进 "NOT OK"，是判据恒真最常见的来源。
+    passed = _has_word(stdout, [expected]) or _has_word(stderr, [expected])
     detail = f"expected={expected[:60]} | stdout={stdout[:120]} | exit={rc}"
     return (passed, detail)
 

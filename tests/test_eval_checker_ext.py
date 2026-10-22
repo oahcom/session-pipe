@@ -215,3 +215,19 @@ def test_weighted_sample_prefers_roles_with_criteria():
                if ec._weighted_role_sample([rich, blind], 1)[0]["name"] == "rich")
     assert hits >= 120, f"权重 3:1 时应抽到 rich ≥60%，实测 {hits}/200"
     assert ec._weighted_role_sample([rich, blind], 2) != [], "k=2 仍要返回两个不同角色"
+
+
+def test_word_boundary_not_substring():
+    """判据按词边界比对：'active' 不得被 'inactive' 点亮。"""
+    assert ec._has_word("inactive", ["active"]) is False
+    assert ec._has_word("active", ["active"]) is True
+    assert ec._has_word("服务已 not-approved", ["approved"]) is False
+
+
+def test_all_lines_must_satisfy_when_quanbu():
+    """带「全部返回」的判据：任一行不满足即 FAIL（旧写法 any() + 子串恒真）。"""
+    cmd = "for s in a b; do systemctl --user is-active $s; done"
+    ok = {"stdout": "active\nactive\n", "stderr": "", "returncode": 0, "ok": True}
+    bad = {"stdout": "active\ninactive\n", "stderr": "", "returncode": 0, "ok": True}
+    assert ec._check_passed(ok, cmd + " 全部返回 active", "active")[0] is True
+    assert ec._check_passed(bad, cmd + " 全部返回 active", "active")[0] is False
