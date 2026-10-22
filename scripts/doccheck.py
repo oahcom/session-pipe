@@ -38,13 +38,21 @@ def _resolve(name: str, root: Path) -> Path | None:
     basename 命中多个时判为歧义返回 None：否则已删的 `pipeflow/db.py` 会被
     `workflow/db.py` 顶替，模块没了也校验通过（实测 2026-10-22）。
     """
+    def inside(base: Path, repo: Path) -> bool:
+        # `../x.py:1` 这种引用能逃出仓库目录 —— 落在仓库外的文件不校验也不算命中
+        try:
+            return base.resolve().is_relative_to(repo.resolve())
+        except (OSError, ValueError):
+            return False
+
     for base in (root / name, root / "src" / name):
-        if base.exists():
+        if base.exists() and inside(base, root):
             return base
     head, _, rest = name.partition("/")
     if head in SIBLINGS:  # 显式跨仓路径 session-pipeline/src/x.py 是可校验的，别当跨仓丢掉
-        for base in (root.parent / name, root.parent / head / "src" / rest):
-            if base.exists():
+        repo = root.parent / head
+        for base in (root.parent / name, repo / "src" / rest):
+            if base.exists() and inside(base, repo):
                 return base
         return None
     if name.startswith("/"):  # 绝对路径：落在三仓里的按仓内相对路径处理

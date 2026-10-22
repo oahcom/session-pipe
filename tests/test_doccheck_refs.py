@@ -114,3 +114,12 @@ def test_absolute_path_inside_a_repo_is_checked(tmp_path):
     ref = f"见 {root}/src/mod.py:2"
     assert dc._cite_check(ref, root, Path("X.md")) == 0
     assert dc._cite_check(f"见 {root}/src/mod.py:99", root, Path("X.md")) == 1
+
+
+def test_path_escaping_the_repo_is_not_resolved(tmp_path, capsys):
+    """`../outside/x.py:1` 逃出仓库目录 → 不算命中，按缺失处理（第十二轮审查）。"""
+    root = _repo(tmp_path)
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "x.py").write_text("a = 1\n", encoding="utf-8")
+    assert dc._resolve("../outside/x.py", root) is None
+    assert dc._cite_check("见 ../outside/x.py:1", root, Path("X.md")) == 1
