@@ -5,10 +5,14 @@
 （如 pm 19 文件/84KB）却被判「回复≠产出」。
 """
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import task_evidence as te
 from task_evidence import _classify_outputs
 
 
@@ -46,3 +50,22 @@ def test_small_files_are_neutral_not_positive():
 
 def test_nothing_at_all_is_negative():
     assert _classify_outputs(0, 0, "", False) == "negative"
+
+
+def test_non_output_dirs_are_not_artifacts(tmp_path, monkeypatch):
+    """缓存/版本库目录里的文件不是产出。实测 engineer 窗口内只有 .coverage 与
+    .pytest_cache —— 旧口径会把这 73KB 判成"有实质产出"。"""
+    ws = tmp_path / "role"
+    (ws / "__pycache__").mkdir(parents=True)
+    (ws / ".pytest_cache").mkdir()
+    (ws / "PRD.md").write_text("x" * 2048)
+    (ws / "__pycache__" / "a.pyc").write_text("y" * 4096)
+    (ws / ".pytest_cache" / "nodeids").write_text("z" * 4096)
+    monkeypatch.setattr(te, "WORKSPACES", tmp_path)
+    names = [f.name for f in te._output_files("role", time.time() - 60, time.time())]
+    assert names == ["PRD.md"], names
+
+
+def test_output_files_survives_missing_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(te, "WORKSPACES", tmp_path)
+    assert te._output_files("nosuchrole", time.time() - 60, time.time()) == []

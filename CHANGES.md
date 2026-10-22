@@ -7,22 +7,33 @@
    同一条 fact 的 `output_files` 却列着 19 个文件 / 84KB（INTAKE.md、PRD-wf_sub_*.md）。
 2. 根因是判定链顺序：`exit_messages` 判在最前，而几乎每条完成的链都有该字段 ——
    唯一据实产物判 positive 的规则（≥3 个 ≥1KB 或 ≥1 个 >2KB）成了不可达代码。
-3. 近 7 天最近 120 条 completed 任务：positive 只有 20 条，修正后 105 条（假中性 85 条 = 71%）。
-   评分会回写 role TASKS.md「历史教训」，等于教角色「发消息比写产物重要」。
+3. 最近 120 条 completed 任务（7d 窗口）实测：旧顺序 positive **11** 条、neutral 97、negative 12；
+   新顺序 **78 / 30 / 12**。评分会回写 role TASKS.md「历史教训」，等于教角色「发消息比写产物重要」。
+   （早先一版口径写 20→105，含 `.coverage`/`.pytest_cache` 假阳性与跨任务重复计数，已按下方收紧取样后作废。）
 
 ### 改动
 - `src/task_evidence.py`：抽出 `_classify_outputs(n, size, evidence, bus_evidence)`，顺序即判据
-  （真实产物 > 量小产出/回话/bus > 纯模板）；调用点 6 段 if/elif → 4 行 detail。21 增 22 删。
-- `tests/test_task_evidence_scoring.py`：6 条断言锁住顺序语义，首条即本次回归。
+  （真实产物 > 量小产出/回话/bus > 纯模板）；调用点 6 段 if/elif → 4 行 detail。
+- 取样口径收紧（顺序改动会把旧口径的假阳性变成真 positive）：
+  `_output_files` 排除点开头目录/__pycache__/node_modules/venv；时间窗从
+  `[created-30min, updated+30min]` 收成任务尾部 `[max(created, updated-1h)-5min, updated+5min]`；
+  `_output_summary` 的 stat 接 OSError（并发删文件不再让整轮评估抛异常）。
+- `--hours` 回填不设 LIMIT（原 LIMIT 500 让 7d 窗口里更旧的记录永远轮不到），并做参数校验；
+  评语版本进幂等签名（`_DETAIL_VERSION`），文案变更后回填才能重写历史 fact。
+- `tests/test_task_evidence_quality_gate.py`：删掉复刻判据的本地实现（生产改回旧顺序它也全绿 = 假闸门），
+  改为直接调 `_classify_outputs`；`tests/test_task_evidence_scoring.py` 11 条（顺序/边界/取样）。
 
 ### 验证
-- `pytest tests/test_task_evidence_scoring.py` → 6 passed。
-- `pytest tests/` 全量 → 1384 passed / 0 failed（--junit-xml 记录在 /tmp/jr160f.xml）。
+- `pytest tests/test_task_evidence_scoring.py tests/test_task_evidence_quality_gate.py` → 13 passed。
+- `pytest tests/` 全量 → 1391 passed / 0 failed（`--junit-xml` 记录）。
 - `python3 scripts/doccheck.py` → CLEAN（exit 0）。
+- 回填实测：`--hours 24` → 51 条重算（48 positive / 3 neutral），bus 442338..442388。
 
 ### 已知边界
-- 历史 bus 里已写的假中性 fact 不会被覆盖（标题含 detail、签名不同）：消费方取最近一条即可，
-  旧 fact 保留作修正前基线，不回填删除。
+- 历史 bus 里已写的假中性 fact 不会被删除：消费方取最近一条；判据/文案再次变更时靠
+  `_DETAIL_VERSION` + `--hours` 重写。
+- 产出归属仍只靠 workspace + 时间窗：实测 120 条窗口内 381 个文件命中、去重 258，
+  **73 个文件被多个任务共用**（约 19%）→ positive 数应视为上界，不写成"真实交付数"。
 
 ## 2026-10-22 — temp-pr-branch 合入 main（漂移收敛，35 文件 / 4 处 modify-delete）## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效
 

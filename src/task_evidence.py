@@ -26,6 +26,8 @@ BUS_CLIENT = Path.home() / ".hermes" / "scripts" / "bus_client.py"
 # 前缀匹配覆盖 CLAUDE.md.1/.2 等轮转备份副本（子 agent 审计发现 98% 指标虚增来自此）
 SYSTEM_FILES = ("TASKS.md", "CLAUDE.md", "test_output.md", "base.md")
 SYSTEM_PREFIXES = ("CLAUDE.md.", "TASKS.md.")
+# 非产出目录：缓存/依赖/版本库里的文件不是角色产出（点开头目录另行统一排除）
+NON_OUTPUT_DIRS = ("__pycache__", "node_modules", "venv")
 
 
 def _is_system_file(name: str) -> bool:
@@ -40,6 +42,8 @@ def _is_system_file(name: str) -> bool:
 # ~330s 重发一次、每次投给 5 个观察角色（ccs-monitor/consumer/knowledge_curator/
 # optimizer/pm），6h 133 行。故按本文件预留的方案落库（action='evidence_assessed'）。
 _LAST_ASSESSMENT: dict[str, str] = {}
+# 评语文案版本：进签名用。改 detail 文案时 +1，让历史 fact 在回填时能重写（codex 第 3 轮 P2）
+_DETAIL_VERSION = 2
 _SEEN_LOADED = False
 
 
@@ -82,15 +86,22 @@ def _output_files(role, t_created=None, t_updated=None):
     for f in ws.rglob("*"):
         if not f.is_file() or _is_system_file(f.name):
             continue
+        # 目录级排除：缓存/依赖/版本库里的文件不是产出。实测 engineer 窗口内只有
+        # .coverage(53KB) 与 .pytest_cache/.../nodeids(20KB)，旧口径直接判 positive。
+        if any(p.startswith(".") or p in NON_OUTPUT_DIRS
+               for p in f.relative_to(ws).parts):
+            continue
         try:
             st = f.stat()
             # 排除空文件与 <1KB 的疑似模板残留
             if st.st_size < 1024:
                 continue
-            # 时间窗口过滤：文件 mtime 必须在任务创建与更新之间
-            # 30min 缓冲覆盖角色创建文件的时差，同时避免跨任务文件重叠
+            # 时间窗口：只认任务**尾部**产出。旧口径 [created-30min, updated+30min]
+            # 覆盖整段任务时长，长链/并发链会把同一份产出重复算给多个 task_id
+            # （实测 qa 同窗命中 test_cases.md 与 test_cases-wf_sub_*.md 两份）。
             if t_created and t_updated:
-                if not (t_created - 1800 <= st.st_mtime <= t_updated + 1800):
+                lo = max(t_created, t_updated - 3600) - 300
+                if not (lo <= st.st_mtime <= t_updated + 300):
                     continue
         except OSError:
             continue
@@ -102,7 +113,13 @@ def _output_summary(files):
     """产出摘要：文件数 + 总大小 + 样例。"""
     if not files:
         return 0, 0, []
-    total = sum(f.stat().st_size for f in files)
+    # stat 可能因并发删除抛错：一个文件失败不该让整轮评估炸掉（反馈全丢）
+    total = 0
+    for f in files:
+        try:
+            total += f.stat().st_size
+        except OSError:
+            continue
     names = sorted(f.name for f in files)[:5]
     return len(files), total, names
 
@@ -175,7 +192,8 @@ def _evaluate_with(db, hours: float = 1):
         "SELECT task_id, title, assignee, created_at, updated_at FROM tasks "
         "WHERE status='completed' AND updated_at > ? "
         "ORDER BY updated_at DESC LIMIT ?",
-        (_cutoff, 10 if hours <= 1 else 500)
+        # 回填不设上限：LIMIT 500 会让 7 天窗口里更旧的 246 条永远轮不到（codex 第 3 轮 P2）
+        (_cutoff, 10 if hours <= 1 else -1)
     ).fetchall()
     if not completed:
         return {"evaluated": 0, "assessments": []}
@@ -227,11 +245,12 @@ def _evaluate_with(db, hours: float = 1):
         _evidence = _wf_evidence.get(_tid, "")
 
         _quality = _classify_outputs(_n, _size, _evidence, _bus)
+        # 措辞按 evidence 取值：exit_messages 是"回复"，summary 是"摘要"，不能混称
+        _ev_label = {"exit_messages": "回复≠产出", "summary": "摘要≠产出"}.get(_evidence, "无产出")
         if _quality == "positive":
             _detail = (f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），有实质产出"
-                       + (f"（另有 {_evidence} 回话证据）" if _evidence else ""))
+                       + (f"（另有 {_evidence}）" if _evidence else ""))
         elif _evidence:
-            _ev_label = {"exit_messages": "回复≠产出", "summary": "摘要≠产出"}.get(_evidence, "无产出")
             _detail = f"task《{_title[:40]}》by {_role} — 仅 {_evidence}，无合格产出文件（{_ev_label}）"
         elif _n >= 1:
             _detail = f"task《{_title[:40]}》by {_role} — {_n} 个产出文件（{_size//1024}KB），疑似模板残留"
@@ -263,7 +282,8 @@ def _evaluate_with(db, hours: float = 1):
         # 签名只取"结论"维度：output_count/output_size 每 tick 都在抖（角色还在写），
         # 带上它们等于每分钟一个新签名 → 实测 83min 内同一任务写 18 条同文案 fact
         # （engineer s4 / PA s2 / pm s1 / reviewer 共 53 条），每个角色都得读一遍自证。
-        _sig = f"{a['quality']}|{a['evidence_type']}"
+        # 文案版本也进签名：措辞变了要重写，否则 --hours 回填对"质量不变、detail 变"的历史 fact 无效
+        _sig = f"{a['quality']}|{a['evidence_type']}|{_DETAIL_VERSION}"
         _already_reported = _LAST_ASSESSMENT.get(a["task_id"]) == _sig
         # 签名只在写入**成功后**落账（codex P1-1）。先记后写会让瞬时失败
         # （bus 锁冲突/超时）在 1h 窗口内永不重试——原实现每 tick 重写恰好
@@ -448,7 +468,10 @@ if __name__ == "__main__":
         # --hours N：回填窗口（默认 1h = 正常 tick 口径）
         _h = 1.0
         if "--hours" in sys.argv:
-            _h = float(sys.argv[sys.argv.index("--hours") + 1])
+            try:
+                _h = max(1.0, float(sys.argv[sys.argv.index("--hours") + 1]))
+            except (IndexError, ValueError):
+                print("--hours 需要数字，回落到 1h", file=sys.stderr)
         r = evaluate_and_feedback(hours=_h)
         print(json.dumps(r, ensure_ascii=False, indent=2))
     else:
