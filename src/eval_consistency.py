@@ -64,15 +64,17 @@ def main(argv: list[str] | None = None) -> int:
     bad = [r for r in roles if r["incompatible"]]
 
     _no_cmd = sum(len(r["no_cmd"]) for r in roles)
-    # 零可执行判据的角色要按名字列出来：只给总数（旧版只有 no_cmd_total）时，
-    # 13 个盲区角色与"37 条判据跳过"混在一个数字里，没人知道是哪 13 个。
+    # 零可执行判据的角色要按名字列出来：只给总数时，盲区角色与「N 条判据跳过」
+    # 混在一个数字里，没人知道是哪些角色。
     blind = [r["name"] for r in roles if r["exec_count"] == 0]
     exec_total = sum(r["exec_count"] for r in roles)
     if args.json:
+        # details 必须排在摘要字段前：daemon 的 WARNING 分支只打前 400 字节，
+        # 摘要字段在前会把不兼容明细挤出截断点（codex 20 维 P2）。
         print(json.dumps({"roles": len(roles), "incompatible_roles": len(bad),
+                          "details": bad,
                           "no_cmd_total": _no_cmd, "exec_total": exec_total,
-                          "blind_roles": blind,
-                          "details": bad}, ensure_ascii=False, indent=2))
+                          "blind_roles": blind}, ensure_ascii=False, indent=2))
         return 1 if bad else 0
 
     total_incompatible = sum(len(r["incompatible"]) for r in bad)
