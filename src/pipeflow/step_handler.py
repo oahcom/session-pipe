@@ -146,7 +146,6 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     # 角色照抄提示词发出的完成标题是 full_dev_pipeline/s4-complete（前缀由
     # engine 生成 id 时加，不进提示词）。旧实现按全名精确匹配恒不命中 → 守卫
     # 恒失效 → 8.7 小时前、属兄弟实例 wf_sub_61581e191d0a 的消息把本步闭合。
-    _tpl = re.sub(r'^(?:WL-|WF-)', '', str(template))
     # 尾部断言用 (?![\\w]) 不用 (?![\\w-])：角色完成标题固定写 `s4-complete`，
     # 紧邻的连字符会被 (?![\\w-]) 拒掉 → 即便前缀修好也恒不命中；step_id=s4 仍不会误匹配 s40。
     # 前缀认两种形态：模板名（`pm_requirements/s1-complete`）与实例 id
@@ -172,8 +171,11 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     # 一刀切会把它们从所有实例上丢掉 → 步骤空等到超时（codex P1）。
     if wf_id in ids:
         return False
-    return bool(re.search(r'(?<![\w-])(?:WL-|WF-)?' + re.escape(_tpl) + r'/' + _suffix,
-                          text or ""))
+    # 前缀不限模板名：角色照抄的是提示里的**工作流标题**，实测
+    # 「产品交付全流程/s3-complete … wf_0c5e3d807ede」被 wf_1ecc8/s3 收下，父步
+    # 拿到兄弟实例的驳回原文后每 tick 二次否决，13h 自旋 217 次。只认模板名
+    # （product_delivery）时这一批消息全逃过守卫。
+    return bool(re.search(r'(?<![\w-])[^\s/]{1,60}/' + _suffix, text or ""))
 
 
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:

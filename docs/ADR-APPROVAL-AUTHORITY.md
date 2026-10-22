@@ -31,8 +31,8 @@ stale-rescue 都读它）。
 
 | # | 消费者 | 作用 | P0 修复后守卫 |
 |---|--------|------|--------------|
-| 1 | `lifecycle/manager._advance_unsafe` | 角色 `wf complete` 推进门禁 | ✅ `_confirmed` |
-| 2 | `pipeflow/wf_lifecycle._advance_production_wf` | 引擎 tick 推进门禁 | ✅ `_confirmed` |
+| 1 | `lifecycle/manager._advance_unsafe` | 角色 `wf complete` 推进门禁 | ✅ `_confirmed` + 归属过滤 |
+| 2 | `pipeflow/wf_lifecycle._advance_production_wf` | 引擎 tick 推进门禁 | ✅ `_confirmed` + 归属过滤 |
 | 3 | `pipeflow/engine._REQUEUE_DROP` | 重投清理键（防旧确认残留放行新驳回） | ✅ |
 | 4 | `pipeflow/task_generator._subflow_verdict_rejected` | 子链末步驳回检测 | ✅ `confirmed_at`（R105 补齐） |
 
@@ -47,6 +47,14 @@ stale-rescue 都读它）。
 3. 驳回判据收敛为单一 helper（`review_gate.is_rejected`），杜绝第 5、第 6 个消费点
    重演同一缺陷（见 Residual）。**例外**：判断"父步是否已用更新结论覆盖子链驳回"需要区分
    「叙述」与「结论」，用 `task_generator._conclusion`（三态），不复用二值的 is_rejected。
+4. **归属权威性**：替**别的实例**报工的文案不参与本步的驳回判定。判据是
+   `step_handler._claims_own_step_and_foreign_instance`（消息点名别的实例、且不含本实例 id、
+   且声称完成了本步），两条推进门禁（消费者 #1/#2）都要过这道滤。
+   理由：软归属把兄弟实例的驳回原文存进本步后，它每 tick 否掉一次「子链判通过 → `completed`」，
+   与 `task_generator.py:459` 的完成写入互抵——`wf_1ecc8/s3` 完成↔驳回互抵 13h 217 次，
+   链永不可能前进。本实例自己的驳回原样拦，不受影响。
+   前缀形态不限模板名：角色照抄的是提示里的**工作流标题**（`产品交付全流程/s3-complete`），
+   只认模板名 `product_delivery` 时这一批消息全逃过滤。
 
 ## Consequences
 

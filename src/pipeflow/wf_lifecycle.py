@@ -567,13 +567,19 @@ class WorkflowLifecycleMixin:
             #   同一条消息两条推进路径判定相反。
             # ② 分类段只在 evidence 里，_has_issue_classification 仍要看到它，
             #   否则门禁 fail-open 放行真实驳回。
+            # 替别的实例报工的文案没有否决权：软归属把兄弟实例的驳回原文塞进本步
+            # 后，它每 tick 否掉一次「子链判通过 → completed」，与 task_generator
+            # 的完成写入互抵（实测 wf_1ecc8/s3：完成↔驳回 13h 自旋 217 次，
+            # 链永不可能前进）。本实例自己的驳回原样拦。
+            from pipeflow.step_handler import _claims_own_step_and_foreign_instance as _foreign
+            _exits = [m for m in (_step_sr.get("exit_messages") or [])
+                      if isinstance(m, dict)
+                      and not _foreign(str(m.get("text", "") or ""), wf_id, wf_name, step_id)]
             _msgs = " ".join(
-                (m.get("text", "") or "") for m in (_step_sr.get("exit_messages") or [])
-                if isinstance(m, dict)
+                (m.get("text", "") or "") for m in _exits
             ).lower()
             _full = _msgs + " " + " ".join(
-                (m.get("evidence", "") or "") for m in (_step_sr.get("exit_messages") or [])
-                if isinstance(m, dict)
+                (m.get("evidence", "") or "") for m in _exits
             ).lower()
 
             # 已确认的步骤不再判驳回：exit_messages 是第一轮的驳回文本，审批确认
