@@ -270,7 +270,10 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 # （poll 用 NOT EXISTS consume），记了 = 接收者永远看不到。
                 # 实测 2026-10-22：4/5 条 @devops 派单在系统分类分支被 4 秒内 claim 掉，
                 # devops pane 已死 10.5h，消息永久消失（bus #442309）。
-                "directed": bool(_head_tags),
+                # task_spec 例外：route_to_ccs 对「@你 + task_spec」显式不投（派发记录，
+                # 引擎已自己 ccs send 过正文）。它若也算 directed，就既不在这里 claim
+                # 也不会被投递 → 永远留在视图里每 60s 重扫。
+                "directed": bool(_head_tags) and msg.get("category") != "task_spec",
             })
 
         if dry_run:

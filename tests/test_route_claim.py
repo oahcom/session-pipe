@@ -168,7 +168,7 @@ def test_directed_system_fact_is_not_role_claimed():
     res, sc, _bb = _run_directed("architecture", "[@devops] 复核路由缺陷",
                                  {"engineer": {"consume": ["architecture"]},
                                   "devops": {"consume": ["architecture"]}})
-    claimed = [c.args[1] for c in sc.call_args_list]
+    claimed = [c.args[2] for c in sc.call_args_list]
     assert "devops" not in claimed, claimed
     assert any(a.get("role") == "devops" and a.get("status") == "delegated"
                for d in res["details"] for a in (d.get("assigned") or [])), res["details"]
@@ -181,4 +181,16 @@ def test_directed_tag_extends_consumers_beyond_subscription():
                                   "devops": {"consume": ["architecture"]}})
     assigned = [a.get("role") for d in res["details"] for a in (d.get("assigned") or [])]
     assert "devops" in assigned, res["details"]
-    assert "devops" not in [c.args[1] for c in sc.call_args_list]
+    assert "devops" not in [c.args[2] for c in sc.call_args_list]
+
+def test_directed_task_spec_is_still_claimed():
+    """@你 + task_spec 是派发记录，引擎已自己投过正文：必须照旧 claim。
+
+    否则它既不 claim（本改动）也不被 route_to_ccs 投（_is_for_me 对 directed task_spec
+    显式返回 False），会永远留在视图里每 60s 重扫。
+    """
+    res, sc, bb = _run_directed("task_spec", "[@devops] 工作流任务 wf_x",
+                                {"engineer": {"consume": ["task_spec"]},
+                                 "devops": {"consume": ["task_spec"]}})
+    assert "devops" in [c.args[2] for c in sc.call_args_list], sc.call_args_list
+    assert any(c.args == (4545, "pipeline") for c in bb.mark_consumed.call_args_list),         bb.mark_consumed.call_args_list
