@@ -116,7 +116,13 @@ def test_notify_role_backs_off_after_failed_send():
     with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)) as _run:
         eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
     assert _run.call_count == 0, "退避窗口内不得重投"
-    RoleLifecycleMixin._ALERT_TS[key] = time.time() - RoleLifecycleMixin._ALERT_COOLDOWN_S
+    _old = time.time() - RoleLifecycleMixin._ALERT_COOLDOWN_S
+    RoleLifecycleMixin._ALERT_TS[key] = _old
+    # 盘上那份必须同步：_notify_role 每次都合并盘上的表（跨进程冷却），只改内存会被覆盖回来
+    import pipeflow.role_lifecycle as _rlmod
+    # override：落盘走的是"取较大者"的合并，不 override 会被上一轮的 now-1200 顶回来
+    _rlmod._save_alert_ts(_rlmod._ALERT_STATE, {key: _old}, time.time(),
+                          RoleLifecycleMixin._ALERT_TTL_S, override=(key,))
     with patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0)) as _run2:
         eng._notify_role("maintainer", "工作流多步骤超时: wf_y", "2 个步骤…")
     assert _run2.call_count == 1, "退避到期后必须重投"

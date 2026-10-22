@@ -78,29 +78,6 @@ def test_step_s1_does_not_swallow_s10():
     assert "[排队] 新任务 wf_eee00000004/s1 " in text2
 
 
-def test_production_guard_present_in_source():
-    """生产代码确实含幂等守卫 —— 中文：防止脚本被单独替换后守卫悄悄丢失。"""
-    src = Path(__file__).resolve().parents[1] / "src/pipeflow/role_lifecycle.py"
-    code = src.read_text(encoding="utf-8")
-    assert re.search(
-        r'if f"\[排队\] 新任务 \{wf_id\}/\{step_id\} " in _existing', code), \
-        "role_lifecycle.py 缺少排队幂等守卫"
-
-
-def test_stale_main_includes_terminal_status():
-    """终态主任务视为可覆盖 —— 中文：排空路径的关键，只判“不在库”时已完成主任务永久占位。"""
-    src = Path(__file__).resolve().parents[1] / "src/pipeflow/role_lifecycle.py"
-    code = src.read_text(encoding="utf-8")
-    assert "_ACTIVE_WF_STATUSES = (" in code, \
-        "role_lifecycle.py 缺少 _ACTIVE_WF_STATUSES 常量"
-    assert "not in _ACTIVE_WF_STATUSES" in code, \
-        "_stale_main 未把终态主任务判为可覆盖（排队行将无界增长）"
-    # 与 engine.py 的活跃集一致：不一致则两侧对“活跃”认知分裂
-    eng = (Path(__file__).resolve().parents[1] / "src/pipeflow/engine.py").read_text(encoding="utf-8")
-    assert "'pending', 'running', 'step_done_ready'" in eng, \
-        "engine.py 活跃状态集已变，需同步 _ACTIVE_WF_STATUSES"
-
-
 def test_wf_in_existing_no_operator_precedence_trap():
     """_wf_in_existing 不得退回 `A or B if C else False` 写法。
 

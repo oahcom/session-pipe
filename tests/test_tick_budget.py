@@ -216,18 +216,20 @@ def test_guard_sweep_is_bounded_and_rotates(_sp):
     eng = _fast(WorkflowEngine(d))
     seen = []
 
-    def _slow(role):
+    def _slow(role, deadline=0.0):  # 巡检把预算透传给每个角色（engine.py:1836）
         seen.append(role)
-        time.sleep(0.02)
+        # 单个角色的耗时必须**远大于**预算：原先 sleep 0.02 配 5ms 预算，在负载高的机器上
+        # 连第一次进入循环前的那几毫秒判断都能超时 → seen 恒为 []（实测 PSI full 28% 时必红）。
+        time.sleep(0.5)
         return True
 
     eng._ensure_role_alive = _slow
     eng._collect_guard_roles = lambda: {"r1", "r2", "r3"}
     del eng._ensure_guard_roles      # 撤掉 _fast 的桩，测真实实现
 
-    eng._ensure_guard_roles(deadline=time.time() + 0.005)   # 时间只够 1 个角色
+    eng._ensure_guard_roles(deadline=time.time() + 0.4)   # 时间只够 1 个角色
     assert len(seen) == 1, f"预算内应只巡视 1 个角色: {seen}"
-    eng._ensure_guard_roles(deadline=time.time() + 0.005)
+    eng._ensure_guard_roles(deadline=time.time() + 0.4)
     assert seen[1] != seen[0], f"第二轮必须换角色，否则固定前缀永久饿死: {seen}"
 
 

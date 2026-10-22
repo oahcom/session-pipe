@@ -37,6 +37,20 @@ except ImportError as e:
     import warnings
     warnings.warn(f"conftest: 无法预加载 bus_protocol/config_loader: {e}", stacklevel=1)
 
+# 被抓走的进程全局：导入期就抓原值，不能等第一个用例的 setup —— 模块级赋值
+# （test_alert_cooldown_persist.py:43 就是）在**收集期**已发生，setup 抓到的就是桩。
+_WATCHED_MODULES = ('routing_daemon', 'eval_consistency', 'eval_shared_loader', 'eval_checker')
+try:
+    from pipeflow import role_lifecycle as _pristine_rl
+except Exception:  # 导入失败不阻断收集：还原逻辑对它做 None 判断
+    _pristine_rl = None
+_PRISTINE = {
+    'run': subprocess.run,
+    'engine_mod': getattr(_pristine_rl, '_engine_mod', None),
+    'mods': {n: sys.modules[n] for n in _WATCHED_MODULES if n in sys.modules},
+}
+
+
 
 def pytest_runtest_setup(item):
     """每个测试用例前恢复真实 bus_protocol/config_loader 引用。
@@ -239,30 +253,19 @@ def _no_guard_role_start(request, monkeypatch):
 # 还原放在**下一个用例的 setup**而不是上一个的 teardown：teardown 里写回会被
 # monkeypatch.undo 再覆盖一次（undo 在 fixture 收尾后跑，写回它当初保存的 MagicMock），
 # 泄漏照样成立；setup 侧还原与 fixture 收尾顺序无关。
-_WATCHED_MODULES = ("routing_daemon", "eval_consistency", "eval_shared_loader", "eval_checker")
-_PRISTINE = {}
-
-
 def _pristine():
-    """首次调用（第一个用例 setup）时抓一份"未被任何用例借走"的句柄。"""
-    if not _PRISTINE:
-        from pipeflow import role_lifecycle as _rl
-        _PRISTINE.update(
-            run=subprocess.run,
-            engine_mod=_rl._engine_mod,
-            mods={n: sys.modules[n] for n in _WATCHED_MODULES if n in sys.modules},
-        )
     return _PRISTINE
 
 
 def _restore_process_globals() -> None:
-    from pipeflow import role_lifecycle as _rl
     p = _pristine()
-    if subprocess.run is not p["run"]:
-        subprocess.run = p["run"]
-    if _rl._engine_mod is not p["engine_mod"]:
-        _rl._engine_mod = p["engine_mod"]
-    for _name, _mod in p["mods"].items():
+    if subprocess.run is not p['run']:
+        subprocess.run = p['run']
+    _rl = sys.modules.get('pipeflow.role_lifecycle')
+    if (_rl is not None and p['engine_mod'] is not None
+            and getattr(_rl, '_engine_mod', None) is not p['engine_mod']):
+        _rl._engine_mod = p['engine_mod']
+    for _name, _mod in p['mods'].items():
         if sys.modules.get(_name) is not _mod:
             sys.modules[_name] = _mod
 

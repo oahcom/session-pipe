@@ -211,20 +211,9 @@ class TestIsRoleBusyEdgeCases(_MockTestCase):
         eng._workflows = {"tpl": _WorkflowStub()}
         self.assertFalse(eng._is_role_busy("qa", exclude_wf_id="wf_t"))
 
-    def test_queued_six_escalates_to_coordinator(self):
-        eng = _eng()
-        eng._is_role_busy = MagicMock(return_value=True)
-        eng._send_to_role = MagicMock()
-        eng._sync_step_results = MagicMock()
-        run = _run()
-        step = _step(target_role="qa", max_retries=0, exit_condition={"timeout_minutes": 1})
-        run.step_results["s1"] = {"ts": time.time() - 100, "queued": 5}
-        with patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
-            eng._tick(run, step)
-        eng._send_to_role.assert_called()
-        args = eng._send_to_role.call_args[0]
-        self.assertEqual(args[0], "coordinator")
-        self.assertIn("排队", args[1])
+    # 排队 6 次向 coordinator 升级的告警已在 4259715 删除（scheduler_noise 对 coordinator
+    # 在 role_lifecycle 直接 return，24h 转录零命中）；对应断言随之删除，
+    # 忙时路径的行为由 test_busy_role_resets_ts_not_increments_timeout 覆盖。
 
     def test_busy_role_resets_ts_not_increments_timeout(self):
         """忙时排队路径重置 ts，不递增 timeout_count（防误回收）。"""
