@@ -15,7 +15,7 @@
 | 组合 | 两者叠加 | daemon 线程 | ❌ 随 CLI 退出死亡 |
 | 仲裁 | 多 partner | daemon 线程 | ❌ 随 CLI 退出死亡 |
 
-根因: `core.py:490` 启动的 `threading.Thread(daemon=True)` 随 CLI 进程退出被杀。
+根因: `session-launcher/src/core.py:490` 启动的 `threading.Thread(daemon=True)` 随 CLI 进程退出被杀。
 已实测: `last_watchdog_check: 0.0` 持续 60s+ 未更新。
 
 ### 1.2 引擎已覆盖的能力（无需新增）
@@ -111,7 +111,7 @@ self._bb.write("monitor_audit",
 
 ### B. 修复 tracker 假死锁（去噪音）
 
-`tracker.py:77-79` 增加"分类是否有人负责"校验:
+`session-launcher/src/ops/tracker.py:77-79` 增加"分类是否有人负责"校验:
 
 ```python
 if not latest:
