@@ -756,6 +756,110 @@ def test_scratch_overwrite_preexisting_is_flagged() -> None:
             pass
 
 
+def test_preexisting_real_file_without_monkeypatch() -> None:
+    """真机预存文件、不打桩：写时间比诞生晚 200s → 必须判盲改。
+
+    与"文件诞生于 1 小时前"在数值上等价（age=200 > 120），但不需要伪造 stat，
+    走的是真实 stat 与真实文件。上一版唯一"预存"用例靠 monkeypatch，覆盖不到这里。
+    """
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_real_pre_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    late = (now + timedelta(seconds=200)).isoformat()   # 写时间晚于诞生 200s
+    sess = _TRANSCRIPTS_DIR / "-probe-realpre-role"
+    lines = _write_seq(0, "cr1", path,
+                       f"The file {path} has been updated successfully.", ts=late)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("realpre", "t")
+        blind = [f for f in res["findings"]
+                 if f["issue"] == "blind_edit" and f.get("file") == path]
+        assert len(blind) == 1, f"预存文件被覆盖必须判盲改: {res['findings']}"
+    finally:
+        Path(path).unlink(missing_ok=True)
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_birth_tolerance_boundary() -> None:
+    """120s 容差边界：age=60 放过、age=200 判盲改（同一个真文件，只改写时间）。"""
+    now = datetime.now(timezone.utc)
+    path = f"/tmp/probe_bound_{os.getpid()}.sh"
+    Path(path).write_text("#!/bin/sh\n", encoding="utf-8")
+    sess = _TRANSCRIPTS_DIR / "-probe-bound-role"
+    for offset, expect_flagged in ((60, False), (200, True)):
+        ts = (now + timedelta(seconds=offset)).isoformat()
+        lines = _write_seq(0, f"cf{offset}", path,
+                           f"The file {path} has been updated successfully.", ts=ts)
+        if offset == 200:
+            lines = _write_seq(10, f"cf{offset}", path,
+                               f"The file {path} has been updated successfully.", ts=ts)
+        jf = _make(sess, lines)
+        try:
+            res = TrajectoryQualityChecker().check("bound", "t")
+            blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+            if expect_flagged:
+                assert blind, f"age={offset}s 超过容差必须判盲改"
+            else:
+                assert not blind, f"age={offset}s 在容差内不该判盲改: {blind}"
+        finally:
+            jf.unlink(missing_ok=True)
+    Path(path).unlink(missing_ok=True)
+    try:
+        sess.rmdir()
+    except OSError:
+        pass
+
+
+def test_fail_open_is_logged_not_silent(caplog) -> None:
+    """fail-open（文件已删）必须留 WARNING，不能静默放过。
+
+    第四轮复核 P1-1：三路 fail-open 全无日志，与"豁免恒不生效却无输出"同型。
+    """
+    import logging
+    path = f"/tmp/probe_gone_{os.getpid()}.sh"      # 不创建 → 取不到诞生时间
+    now = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-gone-role"
+    lines = _write_seq(0, "cg1", path,
+                       f"The file {path} has been updated successfully.", ts=now)
+    jf = _make(sess, lines)
+    try:
+        with caplog.at_level(logging.WARNING, logger="session-pipeline.eval_checker"):
+            res = TrajectoryQualityChecker().check("gone", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert not blind, f"取不到诞生时间仍按新建放过: {blind}"
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("fail-open" in m for m in msgs), f"fail-open 必须打 WARNING，实际: {msgs}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_relative_path_gets_no_scratch_exemption() -> None:
+    """相对路径不享受草稿豁免：否则判据在 /tmp 下跑时 "x.py" 会 realpath 成 /tmp/x.py。"""
+    now = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-relpath-role"
+    lines = _write_seq(0, "ch1", "probe_rel.py",
+                       "The file probe_rel.py has been updated successfully.", ts=now)
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("relpath", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"相对路径不该拿草稿豁免: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -777,6 +881,10 @@ if __name__ == "__main__":
         test_scratch_edit_still_flagged,
         test_scratch_created_now_is_exempt,
         test_scratch_overwrite_preexisting_is_flagged,
+        test_preexisting_real_file_without_monkeypatch,
+        test_birth_tolerance_boundary,
+        test_fail_open_is_logged_not_silent,
+        test_relative_path_gets_no_scratch_exemption,
         test_own_workspace_write_not_flagged,
         test_underscore_role_workspace_exempt,
         test_stale_record_not_judged,

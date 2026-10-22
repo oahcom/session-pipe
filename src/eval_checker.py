@@ -51,6 +51,11 @@ _THRASH_REPEAT_MIN = 4
 # 全部判红，任何当轮改进都翻不了绿。与 _SUBAGENT_WINDOW_S 同一理由：
 # 判据要看"现在做得怎样"，不是"三天前错过一次"。
 _TRAJ_WINDOW_S = 24 * 3600
+# 「这次写才诞生」的容差（秒）：文件诞生时间与写时间的差。
+_BIRTH_TOLERANCE_S = 120
+# 负年龄允许范围：时钟偏移/删除重建会让 bt 晚于写时间；超过这个量级说明该写与
+# 这个文件对不上，不按"新建"放过（真数据里最长 -6020s）。
+_BIRTH_NEGATIVE_ALLOW_S = 3600
 
 
 # 子代理遵从只看近窗。不设窗 = 一次旧轮次永久拉低该角色比例，本文件已在
@@ -1062,7 +1067,7 @@ class TrajectoryQualityChecker:
             """角色自己的 ccs-workspaces 目录：它自己产出的报告（maintainer 每天整篇
             重写 HEALTH_CHECK / DIAGNOSIS / FIX_REPORT），没有"别人的既有内容"可覆盖。
             """
-            return _key(fp).startswith(_own_roots)
+            return bool(fp) and os.path.isabs(fp) and _key(fp).startswith(_own_roots)
 
         def _is_fresh_scratch(fp: str, ts: str) -> bool:
             """/tmp 下的文件必须是**这次写才诞生**的草稿才算豁免。
@@ -1074,21 +1079,30 @@ class TrajectoryQualityChecker:
             Edit/MultiEdit 本来就不豁免：/tmp 下 353 个被写路径里 5 个是「起稿后 cp 进
             仓/系统目录」的（/tmp/20-memory-tuning.conf → systemd drop-in、
             /tmp/ccs-monitor/pass.sh → 在跑的巡检脚本），首写无害、之后的 Edit 是真盲改。
-            ponytail: btime 取不到时按"新建"放过（本机 stat %W 可用，None 只会出现在
-            文件已删或 FS 不支持）；升级路径=草稿目录白名单配置。
+            只对**绝对路径**生效：相对路径按判据进程 cwd 解析，判据在 /tmp 下跑时
+            "other.py" 会 realpath 成 /tmp/other.py，凭空拿到豁免（第四轮复核 P2）。
+            fail-open（文件已删 / FS 无 %W / 记录无 timestamp）一律打 WARNING：
+            静默失效与"豁免恒不生效却无输出"同型，是本文件已经踩过两次的坑。
+            ponytail: 天花板=写完就删或 rm 后重写会走 fail-open（有 WARNING 可查）；
+            升级路径=草稿目录白名单配置。
             """
-            if not _key(fp).startswith(("/tmp/", "/var/tmp/")):
+            if not fp or not os.path.isabs(fp) or not _key(fp).startswith(("/tmp/", "/var/tmp/")):
                 return False
             bt = _birthtime(fp)
             if bt is None:
+                LOGGER.warning("盲改豁免 fail-open: %s 取不到诞生时间（已删/FS 不支持），"
+                               "按新建放过 role=%s", fp, role)
                 return True
             t = _ts_epoch(ts)
             if t is None:
+                LOGGER.warning("盲改豁免 fail-open: %s 记录无 timestamp，按新建放过 role=%s",
+                               fp, role)
                 return True
-            # 方向必须是"文件的诞生年龄 <= 120s"，不是"bt 早于写时间+120s"：
-            # 后者对任何预存文件都恒真，等价于退回"按目录放过"（第三轮复核实测
-            # /tmp/al.sh 被覆盖仍放过，根因就是这个反向比较）。
-            return t - bt <= 120
+            # 方向必须是"文件的**诞生年龄**"，不是"bt 早于写时间+容差"：后者对任何
+            # 预存文件都恒真，等价于退回"按目录放过"（第三轮复核实测 /tmp/al.sh
+            # 被覆盖仍放过，根因就是这个反向比较）。
+            age = t - bt
+            return -_BIRTH_NEGATIVE_ALLOW_S <= age <= _BIRTH_TOLERANCE_S
 
         def _bash_read(fp: str) -> bool:
             """命令里出现过该文件即算读过。绝对路径写法必须指向同一文件。
