@@ -323,6 +323,46 @@ def test_idle_cancel_no_subflow_unchanged():
     eng._lm.cancel_step.assert_called_once()
 
 
+
+# ── 8d. 活体门：角色在产出时不得按空闲取消 ─────────────────────────
+
+def test_idle_cancel_blocked_when_role_still_producing():
+    """角色仍在写转录（长思考）→ 活体门拦住，不得取消步骤。
+
+    实测两个实例的完成消息在 cancel 之后才落 bus：wf_e688c4fafc/s4 +27.6s、
+    wf_sub_c5620e70dd31/s1 +235s —— 产出已写好被丢弃，父链重建子链多花 35.6 分钟。
+    """
+    eng = _build_eng()
+    eng._lm.query_one.return_value = {"status": "cancelled"}  # 子链已死 → 会走取消分支
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=True):
+        eng._tick(_idle_run(), _make_step())
+    eng._lm.cancel_step.assert_not_called()
+
+
+def test_idle_cancel_noop_logs_debug_not_info():
+    """cancel_step 返回 False（实例已终态）→ 只记 debug 空操作，不得记「取消成功」。
+
+    运维要能分清首次取消与空转：旧实现忽略返回值，同一次取消每 tick 打一行
+    info（实测一条链 31.3 分钟 49 行，中位间隔 10.7s）。
+    """
+    eng = _build_eng()
+    eng._lm.query_one.return_value = {"status": "cancelled"}
+    eng._lm.cancel_step.return_value = False
+    with patch("pipeflow.step_handler.get_conversation_signal",
+               return_value=_fake_sig_idle()), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False), \
+         patch("pipeflow.step_handler.LOGGER") as log:
+        eng._tick(_idle_run(), _make_step())
+    cancel_infos = [c.args for c in log.info.call_args_list
+                    if c.args and "取消" in str(c.args[0])]
+    assert not cancel_infos, f"空操作不得打取消 info: {cancel_infos}"
+    noop = [c for c in log.debug.call_args_list
+            if c.args and "空操作" in str(c.args[0])]
+    assert noop, "空操作必须记 debug，否则运维看不到取消没生效"
+
+
 # ── 9. 空 exit_condition ──────────────────────────────────────────
 
 def test_tick_empty_exit_condition():

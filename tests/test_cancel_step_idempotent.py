@@ -45,3 +45,14 @@ class TestCancelStepIdempotent(unittest.TestCase):
         self.lm.cancel_step("wf_idem", "s1")
         with self.assertRaises(ValueError):
             self.lm.cancel_step("wf_idem", "s9")
+
+    def test_other_terminal_states_are_not_reopened(self):
+        """completed/failed 的实例再调 cancel_step 不得被改回 cancelled。"""
+        for status in ("completed", "failed"):
+            with self.subTest(status=status):
+                self.lm.start_wf(f"wf_term_{status}", "s1", "t_idem")
+                self.lm.close_wf(f"wf_term_{status}", status=status)
+                self.assertFalse(self.lm.cancel_step(f"wf_term_{status}", "s1"),
+                                 f"{status} 实例不应被重新取消")
+                wf = self.lm.get_wf(f"wf_term_{status}")
+                self.assertEqual(wf["status"], status, f"{status} 状态不得被覆写")
