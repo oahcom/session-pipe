@@ -93,6 +93,89 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
     return _review_gate.is_rejected(_txt)
 
 
+# 硬通过词：只有这些才算「本步结论是通过」。单独的「通过/就绪」是过程叙述
+# （「构建通过」「产出已就绪」实测 verdict 均 True，codex P0）。
+_HARD_APPROVE = re.compile(
+    r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
+# 转述他人的通过（「上游 s3 APPROVED」）不是本步结论：左邻这些词时不算。
+_APPROVE_ATTRIB = re.compile(
+    r"(上游|前一步|前步|上一步|上次|此前|参照|参考|其他步骤|兄弟步骤|如同)[^。\n]{0,12}$")
+
+
+def _any_hard_approve(text: str) -> bool:
+    """文本里有没有「本步的通过结论」。
+
+    硬通过词存在，且**不是转述别人**：左邻「上游/参照/上次」等词的命中是复述
+    （实测「上游 s3 APPROVED」verdict=True，但本步并未通过）。
+    """
+    for _m in _HARD_APPROVE.finditer(text or ""):
+        _left = text[max(0, _m.start() - 24):_m.start()]
+        if not _APPROVE_ATTRIB.search(_left):
+            return True
+    return False
+
+
+def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
+    """父步是否有**更晚且明确通过**的结论，使子链快照失去否决权。
+
+    WHY：子链完成后结论被冻结（step_results 整键替换、bus_anchor 锚在最早匹配，
+    见 step_handler.py:1676），而父步仍会被角色持续写入新完成消息。实测
+    wf_413e05355b/s4：子链 20:25 CHANGES_REQUESTED，父步 01:16 已 APPROVED，
+    03:58 仍按 7h32m 前的子链快照压回 rejected（#439027）。
+
+    只看**本步**的 exit_messages：别的步骤的 APPROVED 不构成本步的通过结论。
+
+    只认「明确通过」（review_gate.verdict is True），delta 叙述等无锚点消息
+    （verdict is None）和更晚的驳回都不放行——否则返工后的再次驳回会被旧
+    APPROVED 盖掉。
+    """
+    if not isinstance(sub_last, dict) or not isinstance(parent_step, dict):
+        return False
+    _sub_msgs = sub_last.get("exit_messages")
+    _par_msgs = parent_step.get("exit_messages")
+    # 生产 408 行 step_results 形状非法（"exit_messages": 17）：不是 list 就当空，
+    # 让 TypeError 冒泡会把整轮调度打断。
+    if not isinstance(_sub_msgs, list) or not isinstance(_par_msgs, list):
+        return False
+    _sub_ts = [m.get("ts") for m in _sub_msgs
+               if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))]
+    if not _sub_ts:
+        return False
+    # 截止点取**驳回消息**的时刻，而不是子链全部消息的最大 ts：子链
+    # [驳回 t1, delta t2] 时用 t2 会把 t1 之后、t2 之前的父步通过也拦掉。
+    _rej_ts = [m["ts"] for m in _sub_msgs
+               if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))
+               and _review_gate.verdict(str(m.get("text", ""))) is False]
+    _cutoff = max(_rej_ts) if _rej_ts else max(_sub_ts)
+    # 取「更晚的消息里**时间最晚的那条有结论的消息**」再判：只要存在一条更晚的
+    # APPROVED 就放行，会把同批更晚的 CHANGES_REQUESTED 盖掉（父步
+    # [(APPROVED,+100s),(CHANGES_REQUESTED,+200s)] 实测返回 True）——
+    # 返工后的再次驳回被旧通过覆盖，rejected 步被置 completed。
+    # 同一时刻的通过+驳回按驳回算：同批写入没有先后，宁可多拦一次返工，
+    # 也不能把驳回吞掉。
+    _latest = None
+    for _m in _par_msgs:
+        if not isinstance(_m, dict):
+            continue
+        _ts = _m.get("ts")
+        if not isinstance(_ts, (int, float)) or _ts <= _cutoff:
+            continue
+        _txt = str(_m.get("text", ""))
+        _v = _review_gate.verdict(_txt)
+        # verdict() 是词表信号，不是结论检测器：「构建通过」「产出已就绪」
+        # 「上游 s3 APPROVED」「没有通过审核，需返工」实测都返回 True
+        # （codex P0）。这里再要一个**硬通过词**，并让 is_rejected 有一票否决。
+        if _v is True and not _any_hard_approve(_txt):
+            _v = None
+        if _v is True and _review_gate.is_rejected(_txt):
+            _v = None
+        if _v is None:
+            continue
+        if _latest is None or _ts > _latest[0] or (_ts == _latest[0] and _v is False):
+            _latest = (_ts, _v)
+    return _latest is not None and _latest[1] is True
+
+
 
 def _last_metrics(path: Path) -> dict:
     """读 workflow-metrics.jsonl 末行；文件不存在/损坏 → {}（不阻断本轮）。"""
@@ -295,9 +378,13 @@ class TaskGeneratorMixin:
                                 # 审批是人工对这一步的最终处置，覆盖子链的原始结论
                                 # （ADR-APPROVAL-AUTHORITY 的同一原则，消费者 #4
                                 # 之前只管子链侧 confirmed_at，漏了父步侧）。
+                                # 时效守卫：父步有更晚且明确通过的结论时，子链的
+                                # 陈旧快照同样失去否决权（子链结论会被冻结，见
+                                # _superseded_by_parent 注释；实测 #439027）。
                                 _verdict_rejected = (
                                     _subflow_verdict_rejected(_sub_verdict_sr)
-                                    and not _sdata.get("confirmed_at"))
+                                    and not _sdata.get("confirmed_at")
+                                    and not _superseded_by_parent(_sdata, _sub_last))
                                 if _verdict_rejected:
                                     # 交父链自己的 rejected 消费分支（engine.py 的
                                     # `step_status == "rejected"` 段）：有分类→建返工链、
