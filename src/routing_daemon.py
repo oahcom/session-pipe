@@ -254,9 +254,17 @@ def _forget_eval_modules() -> None:
 
 
 def _eval_source_mtimes() -> tuple[float, ...]:
-    """eval_checker 依赖的两个源文件 mtime。只比 eval_checker 会漏掉 loader 的改动。"""
+    """eval_checker 依赖的两个源文件 mtime；取不到时返回 ()。
+
+    只比 eval_checker 会漏掉 loader 的改动。调用点在主循环里、外层只有 finally：
+    部署窗口里文件短暂缺失时抛 OSError 会直接结束 daemon 进程，所以这里吞掉。
+    """
     _d = Path(__file__).parent
-    return tuple(os.path.getmtime(str(_d / f)) for f in ("eval_checker.py", "eval_shared_loader.py"))
+    try:
+        return tuple(os.path.getmtime(str(_d / f))
+                     for f in ("eval_checker.py", "eval_shared_loader.py"))
+    except OSError:
+        return ()
 
 
 def main():

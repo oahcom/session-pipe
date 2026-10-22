@@ -184,6 +184,11 @@ def test_word_boundary_not_substring():
     assert ec._has_word("服务已 not-approved", ["approved"]) is False
 
 
+def test_cjk_expected_uses_substring():
+    """CJK 没有词边界：'检查通过' 应命中 '通过'，不能被 ASCII 边界误杀。"""
+    assert ec._has_word("检查通过", ["通过"]) is True
+
+
 def test_all_lines_must_satisfy_when_quanbu():
     """带「全部返回」的判据：任一行不满足即 FAIL（旧写法 any() + 子串恒真）。"""
     cmd = "for s in a b; do systemctl --user is-active $s; done"
