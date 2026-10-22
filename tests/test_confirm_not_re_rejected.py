@@ -188,3 +188,80 @@ if __name__ == "__main__":
             print(f"\nTIMEOUT after {_TEST_TIMEOUT}s"), sys.exit(1)))
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def _make_child(eng, name):
+    """建一条真子链行：_advance_unsafe 的 _subflow_done 判据要查它的 status。
+
+    模板必须先于 WorkflowEngine(d) 落盘——engine 构造时才扫 workflows_dir。
+    """
+    return eng.start(name, {})
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_manager_advance_lets_subflow_done_step_pass(mock_run):
+    """manager._advance_unsafe：子链已终结 + 父步冻结驳回原文 → 必须推进。
+
+    与 wf_lifecycle._advance_production_wf 同款（wf_1ecc8/s3 完成↔驳回互抵 13h 217 次：
+    子链判通过写 completed，门禁拿父步冻结文案判 rejected）。反过来，子链还在跑时
+    驳回照拦 —— 见 test_manager_advance_keeps_veto_while_subflow_running。
+    """
+    signal.alarm(_TEST_TIMEOUT)
+    d = _env()
+    _write_wf(d, "sf_done", [_step("s1"), _step("s2", type="single")])
+    _write_wf(d, "sf_child_done", [_step("s1", type="single")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("sf_done", {})
+    lm = eng._lifecycle
+    child = _make_child(eng, "sf_child_done")
+    lm.execute("UPDATE workflow_instances SET status='completed' WHERE instance_id=?", (child,))
+    _seed_rejected_step(rid, lm, "s1")
+    _sr = json.loads(lm.query_one("SELECT step_results FROM workflow_instances "
+                              "WHERE instance_id=?", (rid,))["step_results"])
+    _sr["s1"]["subflow_id"] = child
+    lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+               (json.dumps(_sr, ensure_ascii=False), rid))
+
+    lm._advance_unsafe(rid, None)
+
+    row = lm.query_one("SELECT current_step_id, step_results FROM workflow_instances "
+                       "WHERE instance_id=?", (rid,))
+    s1 = json.loads(row["step_results"])["s1"]
+    assert s1["status"] == "completed", f"子链已终结，父步文案不该再否决：{s1}"
+    assert row["current_step_id"] == "s2", f"应推进到 s2，实际 {row['current_step_id']}"
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_manager_advance_keeps_veto_while_subflow_running(mock_run):
+    """反向（Anti-ISC）：子链还在跑 → 父步收到的驳回仍然有效。"""
+    signal.alarm(_TEST_TIMEOUT)
+    d = _env()
+    _write_wf(d, "sf_run", [_step("s1"), _step("s2", type="single")])
+    _write_wf(d, "sf_child_run", [_step("s1", type="single")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("sf_run", {})
+    lm = eng._lifecycle
+    child = _make_child(eng, "sf_child_run")
+    _seed_rejected_step(rid, lm, "s1")
+    _sr = json.loads(lm.query_one("SELECT step_results FROM workflow_instances "
+                              "WHERE instance_id=?", (rid,))["step_results"])
+    _sr["s1"]["subflow_id"] = child
+    lm.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+               (json.dumps(_sr, ensure_ascii=False), rid))
+
+    lm._advance_unsafe(rid, None)
+
+    row = lm.query_one("SELECT current_step_id, step_results FROM workflow_instances "
+                       "WHERE instance_id=?", (rid,))
+    s1 = json.loads(row["step_results"])["s1"]
+    # 合入 main 后的口径（6988d1c codex P1）：子链活着时父步**不表态**——
+    # 既不写 rejected（rejected 会触发父步返工重投，与在跑的子链抢同一角色），
+    # 也不放行。子链结案后同一条路径才按回执/文案裁决。
+    assert s1["status"] != "completed", f"子链未终结时父步不得放行：{s1}"
+    assert row["current_step_id"] == "s1", f"不得推进，实际 {row['current_step_id']}"
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)

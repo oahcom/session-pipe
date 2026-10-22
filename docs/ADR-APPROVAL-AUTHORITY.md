@@ -55,8 +55,10 @@ DB 里已无法复现 `confirmed_at` 与 `rejected` 并存，只剩当时的会�
 3. 驳回判据收敛为单一 helper（`review_gate.is_rejected`），杜绝第 6、第 7 个消费点
    重演同一缺陷（见 Residual）。**不是例外**：判断"父步是否已用更新结论覆盖子链驳回"用的
    `task_generator._conclusion` 是三态外壳，段级判据仍复用 `is_rejected`（:146/:158）。
-4. **子链权威性**：`step_results[step].subflow_id` 非空的步骤，父步自己的 `exit_messages`
-   不再参与驳回判定——该步的结论由子链末步给出（`task_generator` 已按子链判词压 `rejected`）。
+4. **子链权威性**：`step_results[step].subflow_id` 非空**且该子链已终结**（`_live_subflow`
+   为假）的步骤，父步自己的 `exit_messages` 不再参与驳回判定——该步的结论由子链末步给出
+   （`task_generator` 已按子链判词压 `rejected`）。子链还在跑时驳回仍然有效：那时该步尚未交付，
+   父步收到的否决是实时的（codex 第 3 轮 Q1）。
    理由：软归属早先塞进父步的兄弟实例驳回原文，会每 tick 否掉一次「子链判通过 →
    `completed`」，与 `task_generator.py:460-461` 的完成写入互抵——`wf_1ecc8/s3`
    完成↔驳回互抵 13h 217 次，链永不可能前进。

@@ -16,7 +16,7 @@
 
 ### 路由策略
 - 消息按 bus 分类自动路由到对应角色
-- 优先级：`P0 > P1 > P2 > P3 > 常规`
+- 优先级：`1..11` 整数（`~/.hermes/data/bus_canonical.json` 生成，1=security 最高；`_DEFAULT_PRIORITY=11`，打印成 `[P11]`）。**P0 不是路由优先级**，那是 `p0_exemption.py` 的豁免通道
 - 超时熔断：连续 N 次路由失败暂停 30s
 
 ### 工作流引擎 (pipeflow)
@@ -43,7 +43,7 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 - ❌ 重启 gateway（SIGKILL 中断长连接）
 - ❌ 用流程指标代理质量判断：路由数、workflow running 数、存活角色数、bus stats 条数只能证明"管道通"，**不可证明角色在高质量产出**。声称优化完成前，必须亲自打开一个角色的对话逐轮读、亲手判断思考与动作质量。禁止用质量分/看板/automated checker 替代"人读对话做判断"——那会让开发者去刷指标而非去想内容。
 - ❌ 把"消息送达"等同于"任务完成"：角色收到 prompt 且回了话，不等于它想对了、做对了；step 盖戳 success 必须基于产出内容成立，不能只看投递成功。
-- ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` 的条件4（running、`timeout_count≥1` 或 `queued` 达降级线、且 pane 与转录**双静默**）静默误杀——光"sr 空"不足以判死（bus #728c6e4307c1 根因）。
+- ❌ 在 `engine.run_once` 中把 `_send_to_role` 的返回值当 void 处理、无条件盖戳 `notified`：`_send_to_role` 投递被并发守卫/变量校验拦截时返回 `False`，调用方**必须**据此决定 step 状态机（投递失败 → 不盖戳 → 下轮重试）。否则 step 永久停在空 `step_results` 的 running 状态，触发 `_cleanup_stale_workflows` 的条件4（running、`timeout_count≥1` 或 `queued` 达降级线、**且停滞 ≥ 排队预算**（下限 30min，模板缺失回落 3600s）、且 pane 与转录**双静默**）静默误杀——光"sr 空"不足以判死（bus #728c6e4307c1 根因）。
 
 ## 代码布局（行数由 scripts/doccheck.py 校验；新增模块必须手工补进本树——它不校验模块覆盖）
 ```
@@ -65,14 +65,14 @@ src/
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1269 行）
     task_generator.py ── 任务生成（1016 行）
     wf_lifecycle.py   ── 工作流生命周期（2203 行）
-    daemon.py         ── 工作流守护 while 循环（481 行）
+    daemon.py         ── 工作流守护 while 循环（501 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
     manager.py        ── 工作流状态机（1157 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（487 行）
+    client.py         ── CCS 角色工作流客户端（506 行）
     gateway.py        ── 工作流网关门禁（188 行）
     db.py             ── 工作流数据访问（105 行）
     sync.py           ── 工作流同步（63 行）
@@ -104,7 +104,7 @@ src/
 PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; e=P0Exemption(role='coordinator'); e.create_p0_task(title='紧急修复', description='修复说明', assignee='engineer', initiator_role='coordinator', p0_reason='紧急故障需要立即修复处理')"
 
 # 审计扫描
-PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption().p0_audit_scan()"
+PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption(role='system').p0_audit_scan()"
 ```
 
 
@@ -135,7 +135,7 @@ P0_draft 是工程师等角色可标记的预备 P0 任务，通过自动化阶�
 
 **运行时接线**：
 - `routing_daemon.py` 每 30 分钟 (`P0_CHECK_INTERVAL=1800`) 调用 `p0_audit_scan()`，自动驱动阶梯机制
-- 如需手动触发升级链：`PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption()._check_escalation_chain()`"
+- 如需手动触发升级链：`PYTHONPATH=src python3 -c "from p0_exemption import P0Exemption; P0Exemption(role='system')._check_escalation_chain()`"
 
 ## 上下文溢出自动 /compact（role_lifecycle）
 

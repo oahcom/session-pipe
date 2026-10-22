@@ -18,7 +18,7 @@ hermes-session-roles (定义层)
 **铁律：不直接创建 CCS，不改 bus_protocol 核心逻辑。**
 
 ## Git 工作流
-1. 只在当前 worktree 分支工作（2026-10-22 实测分支：`temp-pr-branch`），不改主分支
+1. 只在当前 worktree 分支工作（分支以 `git rev-parse --abbrev-ref HEAD` 现查，别照抄文档），不改主分支
 2. 小步提交，每完成一个逻辑单元立即 commit
 3. 出错用新提交修复，不要 revert
 4. 本地即生产环境

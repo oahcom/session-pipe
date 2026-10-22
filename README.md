@@ -12,7 +12,7 @@ hermes-session-roles ─┬─→ session-launcher (执行层)
 ## 快速开始
 
 ```bash
-cd /home/administrator/session-pipeline
+cd /home/administrator/session-pipeline   # 依赖跑的是这份；改本仓时 cd "$(git rev-parse --show-toplevel)"
 
 # 验证导入（必须带 PYTHONPATH=src，项目未安装为包）
 PYTHONPATH=src python3 -c "

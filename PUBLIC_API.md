@@ -32,7 +32,6 @@
 | `get_wf(wf_id)` | str | `Optional[dict]` |
 | `get_step(wf_id, step_id)` | str, str | `Optional[dict]` |
 | `upsert_template(template_id, name, description, steps)` | str, str, str, list | `None` |
-| `get_assigned_workflows(role)` | str | `list[dict]` |
 | `close()` | — | `None` |
 
 ## Router (`routing/router.py`)
