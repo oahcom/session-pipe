@@ -65,14 +65,14 @@ src/
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1228 行）
     task_generator.py ── 任务生成（1022 行）
     wf_lifecycle.py   ── 工作流生命周期（2165 行）
-    daemon.py         ── 工作流守护 while 循环（483 行）
+    daemon.py         ── 工作流守护 while 循环（503 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
     manager.py        ── 工作流状态机（1149 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（487 行）
+    client.py         ── CCS 角色工作流客户端（506 行）
     gateway.py        ── 工作流网关门禁（188 行）
     db.py             ── 工作流数据访问（105 行）
     sync.py           ── 工作流同步（63 行）
