@@ -10,20 +10,26 @@ import json
 import sys
 from pathlib import Path
 
-from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd
+from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd, CRITERIA_WINDOW
 
 _DEFAULT_PERSONAS = (Path.home() / "hermes-session-roles"
                      / "personas" / "session-roles")
 
 
 def _load_role_criteria(personas_dir: Path) -> list[dict]:
-    """加载所有 persona 的 eval_criteria，返回 [{name, criteria, issues}]。"""
+    """加载所有 persona 的 eval_criteria，返回 [{name, criteria, issues}]。
+
+    只统计运行时真正会跑的前 CRITERIA_WINDOW 条：窗口外的判据永远不执行，
+    把它们算进 exec_count 就是假绿（knowledge_curator 5 条判据里唯一可执行的
+    在第 4 条，旧口径判它非盲区、实际零判据执行）。
+    """
     results = []
     roles = _load_roles(personas_dir)
     for r in roles:
         role_issues = []
         role_no_cmd = []
-        for c in r["eval_criteria"]:
+        window = r["eval_criteria"][:CRITERIA_WINDOW]
+        for c in window:
             cmd = _extract_cmd(c)
             if cmd is None:
                 # 抽不出可执行命令 = 运行时恒 skipped（角色永远拿不到这条判据的
@@ -37,7 +43,8 @@ def _load_role_criteria(personas_dir: Path) -> list[dict]:
             if issues:
                 role_issues.append({"criterion": c[:120], "issues": issues})
         results.append({"name": r["name"], "criteria_count": len(r["eval_criteria"]),
-                        "exec_count": len(r["eval_criteria"]) - len(role_no_cmd) - len(role_issues),
+                        "window": CRITERIA_WINDOW,
+                        "exec_count": len(window) - len(role_no_cmd) - len(role_issues),
                         "no_cmd": role_no_cmd, "incompatible": role_issues})
     return results
 

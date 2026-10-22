@@ -192,3 +192,23 @@ def test_all_lines_must_satisfy_when_quanbu():
     assert ec._check_passed(ok, cmd + " 全部返回 active", "active")[0] is True
     assert ec._check_passed(bad, cmd + " 全部返回 active", "active")[0] is False
 
+
+def test_reachable_criteria_counts_only_runtime_window():
+    """窗口外的可执行判据不算权数：运行时根本不跑（codex 20 维 F1/N1）。"""
+    late = {"name": "late", "eval_criteria": [
+        "叙述一", "叙述二", "叙述三", "验证: echo ok 输出 ok"]}
+    assert ec._reachable_criteria(late) == 0, "第 4 条判据在窗口外，不贡献权重"
+    early = {"name": "early", "eval_criteria": ["验证: echo ok 输出 ok", "叙述"]}
+    assert ec._reachable_criteria(early) == 1
+
+
+def test_weighted_sample_prefers_roles_with_criteria():
+    """持判据的角色不能被均匀抽样稀释（maintainer 曾从 31 次/天掉到 7.6 次/天）。"""
+    import random as _r
+    rich = {"name": "rich", "eval_criteria": ["验证: echo ok 输出 ok"] * 3}
+    blind = {"name": "blind", "eval_criteria": ["叙述一", "叙述二"]}
+    _r.seed(20261022)
+    hits = sum(1 for _ in range(200)
+               if ec._weighted_role_sample([rich, blind], 1)[0]["name"] == "rich")
+    assert hits >= 120, f"权重 3:1 时应抽到 rich ≥60%，实测 {hits}/200"
+    assert ec._weighted_role_sample([rich, blind], 2) != [], "k=2 仍要返回两个不同角色"
