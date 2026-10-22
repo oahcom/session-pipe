@@ -558,6 +558,33 @@ class TestSoftAttribution(unittest.TestCase):
                                 own_wf_id="wf_mine111", template="arch", step_id="s2")
         self.assertTrue(ts)
 
+    def test_combined_report_with_own_and_foreign_ids_matched(self):
+        """多实例合并报告（本实例 id + 别实例 id）必须放行（codex 第 13 轮 P1）。
+
+        生产标题形如
+        「full_dev_pipeline/s2-complete + engineer_feature/s1-complete … (父链 wf_mine111/s2)」，
+        模板名 + 本步 id 是正常形态；一刀切会把它从所有实例上丢掉 → 空等到超时。
+        """
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("system_design",
+                      f"SYSTEM_DESIGN: {marker} arch/s2-complete + dev/s1-complete（父链 wf_mine111/s2）",
+                      src="product_architect")
+        ts, _ = eng._check_exit("system_design", "product_architect", marker,
+                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+        self.assertTrue(ts, "带本实例 id 的合并报告不得被判串味")
+
+    def test_foreign_instance_claiming_own_step_still_blocked_with_own_id(self):
+        """别实例点名本步 + 本实例 id 也在 → 仍是串味（B1 用例不能回归）。"""
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("system_design",
+                      f"SYSTEM_DESIGN: {marker} wf_other222/s2-complete 交付给 wf_mine111",
+                      src="product_architect")
+        ts, _ = eng._check_exit("system_design", "product_architect", marker,
+                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+        self.assertFalse(ts)
+
     def test_no_instance_id_still_matched(self):
         """no-op 巡检类消息不带 id —— 保持放行，否则步骤熬到超时。"""
         eng = _make_eng()

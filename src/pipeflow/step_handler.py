@@ -160,10 +160,20 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     # 26 条是该形态；只认 -complete 会让这 26 条串味消息逃过守卫，既有
     # TestSoftAttribution 用例锁的正是它）。两种都不要求时，`wf_sub_other/
     # s1/README 已更新` 这种路径引用会被当成完成声明，守卫就从拦截变成误伤。
-    claim = re.search(r'(?<![\w-])(?:(?:WL-|WF-)?' + re.escape(_tpl)
-                      + r'|' + '|'.join(map(re.escape, sorted(foreign))) + r')/'
-                      + re.escape(step_id) + r'(?:-complete|\s*完成)(?![\w])', text or "")
-    return bool(claim)
+    _suffix = (re.escape(step_id) + r'(?:-complete|\s*完成)(?![\w])')
+    # 别的**实例**点名本步：即便消息里也有本实例 id，也算替别人报工
+    # （wf_sub_other/s1-complete 交付给 wf_sub_mine）。
+    if re.search(r'(?<![\w-])(?:' + '|'.join(map(re.escape, sorted(foreign))) + r')/'
+                 + _suffix, text or ""):
+        return True
+    # 模板名形态：full_dev_pipeline/s2-complete 是本步的正常标题，只有当消息里
+    # **没有**本实例 id 时才是替别的实例报工。生产多实例合并报告形如
+    # 「full_dev_pipeline/s2-complete + engineer_feature/s1-complete …(父链 wf_8440/s2)」，
+    # 一刀切会把它们从所有实例上丢掉 → 步骤空等到超时（codex P1）。
+    if wf_id in ids:
+        return False
+    return bool(re.search(r'(?<![\w-])(?:WL-|WF-)?' + re.escape(_tpl) + r'/' + _suffix,
+                          text or ""))
 
 
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
