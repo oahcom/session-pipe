@@ -69,3 +69,22 @@ def test_non_output_dirs_are_not_artifacts(tmp_path, monkeypatch):
 def test_output_files_survives_missing_path(tmp_path, monkeypatch):
     monkeypatch.setattr(te, "WORKSPACES", tmp_path)
     assert te._output_files("nosuchrole", time.time() - 60, time.time()) == []
+
+
+def test_dotfile_coverage_is_not_artifact(tmp_path, monkeypatch):
+    """.coverage 是点文件不是交付物（codex 第 5 轮 blocker：53KB 会让零产出判 positive）。"""
+    ws = tmp_path / "role"
+    ws.mkdir()
+    (ws / ".coverage").write_text("x" * 4096)
+    monkeypatch.setattr(te, "WORKSPACES", tmp_path)
+    assert te._output_files("role") == []
+
+
+def test_github_workflow_file_is_artifact(tmp_path, monkeypatch):
+    """.github/workflows 是合法交付，黑名单不能连点目录一起排除。"""
+    ws = tmp_path / "role"
+    (ws / ".github" / "workflows").mkdir(parents=True)
+    (ws / ".github" / "workflows" / "ci.yml").write_text("y" * 2048)
+    monkeypatch.setattr(te, "WORKSPACES", tmp_path)
+    names = [f.name for f in te._output_files("role")]
+    assert names == ["ci.yml"], names

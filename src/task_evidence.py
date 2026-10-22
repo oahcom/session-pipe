@@ -45,7 +45,7 @@ def _is_system_file(name: str) -> bool:
 # optimizer/pm），6h 133 行。故按本文件预留的方案落库（action='evidence_assessed'）。
 _LAST_ASSESSMENT: dict[str, str] = {}
 # 评语文案版本：进签名用。改 detail 文案时 +1，让历史 fact 在回填时能重写（codex 第 3 轮 P2）
-_DETAIL_VERSION = 2
+_DETAIL_VERSION = 3
 _SEEN_LOADED = False
 
 
@@ -90,7 +90,10 @@ def _output_files(role, t_created=None, t_updated=None):
             continue
         # 目录级排除：缓存/依赖/版本库里的文件不是产出。实测 engineer 窗口内只有
         # .coverage(53KB) 与 .pytest_cache/.../nodeids(20KB)，旧口径直接判 positive。
-        if any(p in NON_OUTPUT_DIRS for p in f.relative_to(ws).parts):
+        # 点文件（.coverage/.DS_Store 等）从来不是交付物；点**目录**只按黑名单排除，
+        # 以便 .github/workflows/ci.yml 这类合法交付仍计入（codex 第 5 轮 blocker）
+        if f.name.startswith(".") or any(p in NON_OUTPUT_DIRS
+                                         for p in f.relative_to(ws).parts):
             continue
         try:
             st = f.stat()
@@ -266,6 +269,10 @@ def _evaluate_with(db, hours: float = 1):
             "output_files": _names,
             "output_count": _n,
             "output_size": _size,
+            # 角色到底有没有"说过话"：无 exit_messages 且无 bus 证据 = 引擎空推进，
+            # 那不是角色的错（实测 7 天 1120 个 completed 步骤里 349 个无任何回话，
+            # 其中 engineer/maintainer 的产出在代码仓库、不在 workspace，按目录判必然 0 文件）
+            "role_spoke": bool(_evidence or _bus),
             "has_bus_evidence": _bus,
             "has_exit_messages": _evidence == "exit_messages",
             "has_summary": _evidence == "summary",
@@ -308,7 +315,28 @@ def _evaluate_with(db, hours: float = 1):
                 pass
         # R2-2 self-reflection（Reflexion 洞察 3）: 无产出任务写 code_fix 根因总结，
         # 供后续 session 消费避免同类错误重复（失败后语言化复盘 > 纯重试）
-        if a["quality"] == "negative":
+        if a["quality"] == "negative" and not a.get("role_spoke", True):
+            # 引擎空推进：步骤 completed 但角色一句话没说、workspace 里也没有文件。
+            # 不写 TASKS.md（那是惩罚角色），改发 blocker 让运维看引擎侧。
+            try:
+                if not _already_reported:
+                    subprocess.run(
+                        [str(_bus), "write", "blocker",
+                         f"[task_evidence] {a['task_id']} completed 但角色零回话零产出",
+                         "--evidence", json.dumps({
+                             "task_id": a["task_id"], "role": a["role"],
+                             "title": a["title"][:60],
+                             "detail": a["detail"],
+                             "why": "exit_messages/summary/bus 全空 → 步骤疑似被引擎空推进；"
+                                    "该角色产出若在代码仓库，按 workspace 目录判也必然 0 文件",
+                         }, ensure_ascii=False),
+                         "--src", "task_evidence"],
+                        capture_output=True, timeout=10)
+                    _LAST_ASSESSMENT[a["task_id"]] = _sig
+                    _record_assessed(db, a["task_id"], _sig)
+            except Exception:
+                pass
+        elif a["quality"] == "negative":
             try:
                 _reflect = {
                     "task_id": a["task_id"], "role": a["role"],
@@ -396,9 +424,9 @@ def _extract_with(db):
             "created_at": r["created_at"],
         })
 
-    # 3. 产出文件统计（与评分同一取样口径，否则导出的文件数与评分互相矛盾）
-    def count_output_files(role):
-        files = _output_files(role)
+    # 3. 产出文件统计（与评分同一取样口径**含任务时间窗**，否则导出与评分互相矛盾）
+    def count_output_files(role, t_created=None, t_updated=None):
+        files = _output_files(role, t_created, t_updated)
         return len(files), [f.name for f in files[:10]]
 
     result = []
@@ -423,7 +451,7 @@ def _extract_with(db):
                     max_tc = max(max_tc, v.get("timeout_count", 0))
 
         # 产出文件
-        n_files, sample_files = count_output_files(role)
+        n_files, sample_files = count_output_files(role, t["created_at"], t["updated_at"])
 
         # exit_messages 检查：引擎是否捕获了角色产出证据
         has_exit_messages = any(

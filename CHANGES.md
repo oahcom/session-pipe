@@ -1,5 +1,29 @@
 # CHANGES.md
 
+## 2026-10-22 — 空推进的步骤不再罚角色（negative 拆成「角色没做」与「引擎放行」）
+
+### 问题（可观测证据）
+1. `~/ccs-workspaces/engineer/TASKS.md` 与 `maintainer/TASKS.md` 里 4 条 `[negative]`
+   全是"无产出/无证据/模板残留"，而对应步骤的 `step_results` 里**连一条 exit_messages 都没有**
+   （`task_sub_54ca8d6a`/`task_rework_c22e1c79`/`task_rework_f05fc3d2`/`task_rework_51cc883e`）。
+2. 7 天窗口实测：1120 个 `completed` 步骤里 **349 个（31.2%）无任何角色回话**，`completed_by` 全是
+   `workflow_engine` 或缺失 —— 引擎把步骤标成完成，角色一句话没说。
+3. engineer/maintainer 的真实产出落在代码仓库，不在 `~/ccs-workspaces/<role>`，
+   按目录数文件对这些角色**结构性恒为 0** → 旧逻辑必然给出 negative 并写进 TASKS.md，
+   等于拿引擎的空推进去惩罚角色。
+
+### 改动（+27/-1）
+- 评估结果新增 `role_spoke`（= 有 exit_messages 或 bus 证据）。
+- negative 且 `not role_spoke` → 改发 **blocker**（"completed 但角色零回话零产出"，供运维查引擎），
+  **不写 TASKS.md**；negative 且角色确实说过话才继续走原复盘路径。
+- `_DETAIL_VERSION` 2 → 3：语义变了，历史 fact 需按新口径重写。
+- 数据修正：删掉 engineer 3 条、maintainer 1 条误罚行（备份 /tmp/eng_tasks.bak、/tmp/mnt_tasks.bak）。
+
+### 验证
+- `--feedback --hours 24` → 51 条重算：33 positive / 14 neutral / 4 negative；9 条 `role_spoke=false`。
+- 4 条 negative 全部落地成 blocker fact（bus 442740/442759/442762/442765），
+  `grep -c negative` 两个 TASKS.md 均为 **0**。
+
 ## 2026-10-22 — task_evidence：真实产物被「回复≠产出」判死（71% 假中性）
 
 ### 问题（可观测证据）
@@ -15,7 +39,7 @@
 - `src/task_evidence.py`：抽出 `_classify_outputs(n, size, evidence, bus_evidence)`，顺序即判据
   （真实产物 > 量小产出/回话/bus > 纯模板）；调用点 6 段 if/elif → 4 行 detail。
 - 取样口径收紧（顺序改动会把旧口径的假阳性变成真 positive）：
-  `_output_files` 排除点开头目录/__pycache__/node_modules/venv；时间窗从
+  `_output_files` 排除点文件（.coverage 等）与黑名单目录（.git/.pytest_cache/__pycache__/node_modules/venv…）；时间窗从
   `[created-30min, updated+30min]` 收成任务尾部 `[max(created, updated-1h)-5min, updated+5min]`；
   `_output_summary` 的 stat 接 OSError（并发删文件不再让整轮评估抛异常）。
 - `--hours` 回填不设 LIMIT（原 LIMIT 500 让 7d 窗口里更旧的记录永远轮不到），并做参数校验；
