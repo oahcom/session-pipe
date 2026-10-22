@@ -11,7 +11,7 @@
 
 **通过侧仍是两档，不是单一 helper**（2026-10-22 复核）：`review_gate.verdict()` 是宽档
 （`_PASS_WORD` 含「通过/就绪」，会把「构建通过」判 True），`pipeflow/task_generator.py`
-的 `_HARD_APPROVE` 是窄档（只认 APPROVED / 验收通过 / 判定通过 / 结论通过），用于
+的 `_HARD_APPROVE` 是窄档（只认 (CONDITIONAL_)?APPROVED / 验收通过 / 判定通过 / 结论通过），用于
 "Do 子链驳回是否已被父步更新结论覆盖"这类**代价不对称**的判断——误放行会把被驳回的
 步推成 completed，所以宁可漏放行。
 

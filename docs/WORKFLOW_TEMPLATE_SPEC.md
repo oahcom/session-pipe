@@ -91,7 +91,12 @@
 
 实测（2026-10-22，复算 `python3 src/template_registry.py validate-all`，模板总数用 `select count(*) from workflow_templates`）：少数模板通过 `validate-all`，失败项主要是缺"做什么/怎么做/验收标准"三段与 prompt 过短（如 `test_exit_schema.json` 138B < 150B）。
 
-**禁止**出现以下段落：`## 操作要求`、`## 产出物要求`、`## 质量门禁`、`## 引用要求`（已全局清除；需要搜索/引用时内联写进指令）。
+**禁止**出现 `## 操作要求` / `## 引用要求` 这两个段落（需要搜索/引用时内联写进指令）。
+校验器只拦两个**字面串**（`template_registry.py:_BOILER_PROMPT_SECTIONS`）：
+`## 操作要求\n1. 理解任务背景` 与 `## 引用要求\n所有事实性声明标注来源`——续行不同就漏；
+`## 产出物要求` / `## 质量门禁` **没有任何判据**。所以「已全局清除」不成立：
+2026-10-22 实测 `lr_tech_decision.json` 仍有 2 处 `## 产出物要求`、`knowledge_sync.json` 2 处
+`## 引用要求`，validate-all 都不报。
 
 ### 2.4 Failure Patterns 规则
 
@@ -179,8 +184,9 @@ PYTHONPATH=src python3 -m template_registry validate path/to/template.json
 | allowed_initiators | 非空列表 |
 | allowed_executors | 非空列表，覆盖全步骤 target_role |
 | max_duration_hours | ≥1 |
-| prompt 三段式 | 含「你负责……/你要做的/完成」且 ≥150B |
-| prompt 模板段落残留 | 不含 `## 操作要求` / `## 原始提示` |
+| prompt 三段式 | 含子串「做什么 / 怎么做 / 验收标准」三者且 ≥150B（`_validate_step_content`） |
+| prompt 完成标头 | 含 `## 完成` 标头（单独硬检，不在三段式里） |
+| prompt 模板段落残留 | 不含上节两个泡沫串（无「`## 原始提示`」判据） |
 | failure_patterns 泛化 | 不含"产出物为空或仅模板占位符"等 |
 | failure_patterns 回退模式 | 不含"执行步骤未达预期质量标准" |
 
@@ -189,7 +195,7 @@ PYTHONPATH=src python3 -m template_registry validate path/to/template.json
 ```
 1. 确定模板归属层（编排/领域/原子）
 2. 编写 steps，按规范填写所有字段
-3. 运行 validate-all 确保通过
+3. 运行 validate-all 看输出——**它不返回非零**：2026-10-22 实测 24/28 FAIL 而 rc=0，不能当 CI 门禁
 4. 用 recommend 验证场景匹配
 5. 如果是领域层模板，确认已有编排层引用它
 ```

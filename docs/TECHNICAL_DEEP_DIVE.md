@@ -40,8 +40,11 @@ src/
 
 ### 3.2 subflow（编排 → 子链）
 
-2026-10-22 扫描（复算：解析 `workflow_templates.steps_json` 统计 `subflow_template` 非空的模板——`like`/`grep` 会命中所有模板的空值键，会算多）：**10 个模板带子链**（当日实测名单，同名模板有 `WF-`/`WL-` 前后缀重复，按 id 去重后仍是这 10 条）：
-`WF-architect_review`、`WF-coordinator_schedule`、`WF-dev_implement`、`WF-product_delivery`、`WL-food_chain_loop`、`WL-full_dev_pipeline`、`architect_review`、`food_chain_loop`、`full_dev_pipeline`、`产品交付全流程`。
+2026-10-22 扫描（复算：解析 `workflow_templates.steps_json` 统计 `subflow_template` 非空的模板——
+`like`/`grep` 会命中所有模板的空值键，会算多）：**28 个模板里 6 个带子链**：
+`architect_review`、`coordinator_schedule`、`dev_implement`、`food_chain_loop`、
+`full_dev_pipeline`、`产品交付全流程`（DB `workflow_templates` 42 行，其中 7 行带子链）。
+`WF-*`/`WL-*` 重名副本已不存在（`WF-product_delivery` 只是"产品交付全流程"的 workflow_id）。
 名单会随模板增删变，别把这份当一个不变量。
 
 ### 3.3 步骤状态机（`lifecycle/manager.py`）
