@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """eval_consistency 盲区可见化：零可执行判据的角色必须按名字列出。
 
-反向验证：把 exec_count 改回「只看 criteria_count」，test_blind_roles_named 必须变红
-（见 README 的 mutation 命令）。
+反向验证：把 exec_count 改回「只看 criteria_count」，test_blind_roles_named 必须变红。
+**必须在隔离目录/只跑本文件**：全量跑时别的用例把生产树 src 插到 sys.path 前面，
+本文件会 import 到生产代码，变异假绿（实测：全量 20 passed / 隔离 2 failed）。
 """
 import json
 import sys

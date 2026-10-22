@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-_SRC = str(Path.home() / "session-pipeline" / "src")
+# 必须按本文件定位：硬编码生产树会让副本/worktree 里的用例 import 到生产代码，
+# 变异检查因此假绿（实测：全量跑 20 passed，隔离跑 2 failed）。
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
@@ -88,26 +90,44 @@ class _StubTrajectory:
         return {"passed": True, "findings": [], "checked_traces": 0, "subagent": {}}
 
 
-def test_sampling_is_uniform_without_replacement():
-    """抽样必须均匀且无放回。
+class _Recorder:
+    """通用检查替身：只记录被抽到的角色，结果恒通过。"""
 
-    旧版 random.choices(weights=按可执行判据数)：19 个角色里 13 个零判据
-    （2026-10-22 实测），加权让它们的通用检查（语义/需求/轨迹）几乎饿死；
-    有放回还会在同一轮抽到同一角色两次，另一个角色整轮没检查。
+    def __init__(self, sink):
+        self.sink = sink
+
+    def check(self, role, *args, **kwargs):
+        self.sink.append(role)
+        return {"passed": True, "findings": [], "checked_traces": 0,
+                "checked_files": 0, "checked_requirements": 0,
+                "subagent": {}, "leverage_count": 0}
+
+
+def test_sampling_covers_roles_without_criteria():
+    """零判据角色也必须被抽到，且同一轮不能重复抽同一角色。
+
+    旧版 weights=可执行判据数 + 有放回：0 判据角色权重 1 被挤掉，同一角色
+    还可能占掉两个名额。这里断言行为（抽到了谁），不锁 random.sample 的签名
+    —— 签名断言既会误杀等价重构，也测不到「饿死」这个真问题。
     """
+    picked: list[str] = []
+    seen: set[str] = set()
     with (
         patch.object(ec, "_load_roles", return_value=_ALL_ROLES),
         patch.object(ec, "_run",
                      return_value={"ok": True, "stdout": "active", "stderr": "", "returncode": 0}),
         patch.object(ec, "_write_bus"),
-        patch.object(ec, "TrajectoryQualityChecker", _StubTrajectory),
-        patch.object(ec.random, "sample", wraps=ec.random.sample) as mock_sample,
+        patch.object(ec, "OutputSemanticChecker", lambda: _Recorder(picked)),
+        patch.object(ec, "RequirementConfirmationChecker", lambda: _Recorder(picked)),
+        patch.object(ec, "TrajectoryQualityChecker", lambda: _Recorder(picked)),
+        patch.object(ec, "LeverageAccumulationChecker", lambda: _Recorder(picked)),
     ):
-        ec.run_eval_check()
-
-    args, kwargs = mock_sample.call_args
-    assert list(args[0]) == _ALL_ROLES, "抽样池应是全部角色"
-    assert kwargs == {"k": 2}, "不得再传 weights（会退回按判据数加权）"
+        for _ in range(20):
+            picked.clear()
+            ec.run_eval_check()
+            assert len(set(picked)) == 2, f"单轮应抽 2 个不同角色: {sorted(set(picked))}"
+            seen.update(picked)
+    assert "无命令角色" in seen, "零判据角色 20 轮都没被抽到 —— 加权饿死回归"
 
 
 def test_is_tool_error():

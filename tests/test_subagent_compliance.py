@@ -125,6 +125,18 @@ def test_ignored_few_tools_exempt_or_soft() -> None:
         "5 次工具调用应记灰区"
 
 
+def test_threshold_boundary_10_vs_11() -> None:
+    """10 次算灰区、11 次算硬忽略 —— 阈值从 >10 漂到 >11 必须变红。"""
+    def run(n: int) -> dict:
+        calls = [_say(_DIRECTIVE, _ts(-60))] + [_use("Bash") for _ in range(n)] + [_result()]
+        return TrajectoryQualityChecker()._subagent_compliance(calls)
+
+    assert run(2)["hard_ignored"] == 0 and run(2)["soft_ignored"] == 0, "2 次按例外豁免"
+    assert run(3)["soft_ignored"] == 1, "3 次进灰区"
+    assert run(10) == {"rounds": 1, "followed": 0, "hard_ignored": 0, "soft_ignored": 1}
+    assert run(11) == {"rounds": 1, "followed": 0, "hard_ignored": 1, "soft_ignored": 0}
+
+
 def main() -> int:
     n = 0
     for name, fn in sorted(globals().items()):
