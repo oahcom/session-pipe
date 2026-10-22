@@ -103,7 +103,8 @@ _HARD_APPROVE = re.compile(
     r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
 # 转述他人的通过（「上游 s3 APPROVED」）不是本步结论：左邻这些词时不算。
 _APPROVE_ATTRIB = re.compile(
-    r"(上游|前一步|前步|上一步|上次|此前|参照|参考|其他步骤|兄弟步骤|如同)[^。\n]{0,12}$")
+    r"(上游|下游|前一步|前步|上一步|上次|此前|参照|参考|其他步骤|兄弟步骤|"
+    r"子链|子流程|子步骤|如同)[^。\n]{0,12}$")
 
 
 def _any_hard_approve(text: str) -> bool:
@@ -147,9 +148,12 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
         return False
     # 截止点取**驳回消息**的时刻，而不是子链全部消息的最大 ts：子链
     # [驳回 t1, delta t2] 时用 t2 会把 t1 之后、t2 之前的父步通过也拦掉。
+    # 用 is_rejected 而不是 verdict() is False：后者对「没有通过审核，需返工」
+    # 这类无锚点措辞返回 True（词表信号），会把真驳回漏出截止点集合。
     _rej_ts = [m["ts"] for m in _sub_msgs
                if isinstance(m, dict) and isinstance(m.get("ts"), (int, float))
-               and _review_gate.verdict(str(m.get("text", ""))) is False]
+               and not isinstance(m.get("ts"), bool)
+               and _review_gate.is_rejected(str(m.get("text", "")))]
     _cutoff = max(_rej_ts) if _rej_ts else max(_sub_ts)
     # 取「更晚的消息里**时间最晚的那条有结论的消息**」再判：只要存在一条更晚的
     # APPROVED 就放行，会把同批更晚的 CHANGES_REQUESTED 盖掉（父步
@@ -165,14 +169,17 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
         if not isinstance(_ts, (int, float)) or _ts <= _cutoff:
             continue
         _txt = str(_m.get("text", ""))
-        _v = _review_gate.verdict(_txt)
         # verdict() 是词表信号，不是结论检测器：「构建通过」「产出已就绪」
         # 「上游 s3 APPROVED」「没有通过审核，需返工」实测都返回 True
-        # （codex P0）。这里再要一个**硬通过词**，并让 is_rejected 有一票否决。
-        if _v is True and not _any_hard_approve(_txt):
+        # （codex P0）。判序：先看有没有驳回信号（一票否决 → False，不能置 None，
+        # 否则会回落到更早的 APPROVED 上，等于把最新驳回吞掉）；再看通过是否
+        # 带硬通过词（没有就是过程叙述 → 无结论）。
+        if _review_gate.is_rejected(_txt):
+            _v = False
+        elif _review_gate.verdict(_txt) is True and not _any_hard_approve(_txt):
             _v = None
-        if _v is True and _review_gate.is_rejected(_txt):
-            _v = None
+        else:
+            _v = _review_gate.verdict(_txt)
         if _v is None:
             continue
         if _latest is None or _ts > _latest[0] or (_ts == _latest[0] and _v is False):

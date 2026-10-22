@@ -166,5 +166,16 @@ def test_malformed_exit_messages_does_not_break_earlier_guard():
         {"s1": {"exit_messages": [{"text": "CHANGES_REQUESTED"}]}}) is True
 
 
+def test_mixed_approve_and_reject_in_one_message_blocks():
+    """一条消息里既有 APPROVED 又有 CHANGES_REQUESTED：按驳回算（codex P0）。
+
+    旧实现把 is_rejected 命中置 None，等于跳过最新那条，回落到更早的 APPROVED。
+    """
+    assert not _superseded_by_parent(
+        _parent(("full_dev_pipeline/s4-complete —— APPROVED 但 CHANGES_REQUESTED: 2 P1",
+                 SUB_TS + 200)),
+        _sub("CHANGES_REQUESTED"))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
