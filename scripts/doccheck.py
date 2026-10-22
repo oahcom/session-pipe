@@ -17,6 +17,16 @@ import re
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
+SIBLINGS = ("session-launcher", "session-pipeline", "hermes-session-roles")
+
+
+def _outside(name: str) -> bool:
+    """三仓之外的文件（`~/.hermes/...`、绝对路径）不校验也报错。
+
+    这类引用指向的代码不在这三个仓里，判据管不着；但本仓/兄弟仓都找不到的
+    裸名或相对路径必须报错 —— 否则拼错的路径永远绿（第二版审查的批评）。
+    """
+    return name.startswith(("~/", "/"))
 TREE = re.compile(r'([\w/]+\.py)(\s*[─-]+.*?（)(\d+)(\s*行)')
 # 表格两种写法都认：| **path** | 895 | 与 | **`path`** | 895 |
 TABLE = re.compile(r'(\|\s*\*\*)(`?)([\w/]+\.py)\2(\*\*\s*\|\s*)(\d+)(\s*\|)')
@@ -31,10 +41,24 @@ def _resolve(name: str, root: Path) -> Path | None:
     for base in (root / name, root / "src" / name):
         if base.exists():
             return base
+    head, _, rest = name.partition("/")
+    if head in SIBLINGS:  # 显式跨仓路径 session-pipeline/src/x.py 是可校验的，别当跨仓丢掉
+        for base in (root.parent / name, root.parent / head / "src" / rest):
+            if base.exists():
+                return base
+        return None
     if "/" in name:
         return None  # 带目录的引用要么本仓相对路径，要么跨仓；都不许退到 basename 猜
     cands = [q for q in root.rglob(os.path.basename(name)) if ".git" not in q.parts]
-    return cands[0] if len(cands) == 1 else None
+    if len(cands) == 1:
+        return cands[0]
+    # 跨仓裸名：launcher 的 PUBLIC_API 会写 pipeline 的 `manager.py:414`。只认兄弟仓里
+    # 唯一的同名文件 —— 否则 "本仓烂引用" 与 "别人的文件" 分不开，门禁会天天假红。
+    # 只认三仓本身，不扫 worktree：/home/administrator 下还有几十个 wt-*/ 工作树，
+    # 扫进去同名文件必然多个 → 全判歧义 → 门禁又变成假红。
+    sibs = [q for n in SIBLINGS if n != root.name and (root.parent / n / "src").is_dir()
+            for q in (root.parent / n / "src").rglob(os.path.basename(name))]
+    return sibs[0] if len(sibs) == 1 else None
 
 
 FENCE = "```"
@@ -56,8 +80,8 @@ def _strip_fences(text: str) -> str:
 
 
 def _symbols(path: Path) -> set[str] | None:
-    """文件里定义/赋值/导入的名字。用 AST 而不是正则：正则会把注释、字符串、
-    局部变量当成定义。解析失败返回 None，由调用方回退到正则。"""
+    """文件里定义/绑定/导入的名字。用 AST 而不是正则：正则会把注释、字符串当成定义。
+    解析失败返回 None，由调用方跳过（不拿正则兜底，否则又回到误判）。"""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
     except SyntaxError:
@@ -66,16 +90,14 @@ def _symbols(path: Path) -> set[str] | None:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)  # 赋值/元组解包/for/with/except/海象 都算绑定
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             names.update((a.asname or a.name.split(".")[0]) for a in node.names)
     return names
 
 
-CITE = re.compile(r"([\w./-]+\.py):(\d+)")
+CITE = re.compile(r"([~\w./-]+\.py):(\d+)")
 
 
 def _cite_check(text: str, root: Path, path: Path = Path()) -> int:
@@ -92,10 +114,10 @@ def _cite_check(text: str, root: Path, path: Path = Path()) -> int:
         name, ln = m.group(1), int(m.group(2))
         p = _resolve(name, root)
         if p is None:
-            if "/" not in name:
-                print(f"CITE_MISSING_FILE {name}")  # 裸文件名指不到 = 本仓的烂引用
+            if not _outside(name):
+                print(f"CITE_MISSING_FILE {name}")  # 三仓都找不到 = 烂引用
                 bad += 1
-            continue  # 带目录的多半是跨仓引用，不替它下结论
+            continue
         lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
         if ln > len(lines):
             print(f"CITE_PAST_EOF {name}:{ln} (file {len(lines)} lines)")
@@ -106,7 +128,7 @@ def _cite_check(text: str, root: Path, path: Path = Path()) -> int:
     return bad
 
 
-SYM = re.compile(r"([\w./-]+\.py):([A-Za-z_]\w*)")
+SYM = re.compile(r"([~\w./-]+\.py):([A-Za-z_]\w*)")
 
 
 def _sym_check(text: str, root: Path, path: Path) -> int:
@@ -122,7 +144,7 @@ def _sym_check(text: str, root: Path, path: Path) -> int:
         name, sym = m.group(1), m.group(2)
         p = _resolve(name, root)
         if p is None:
-            if "/" not in name:
+            if not _outside(name):
                 print(f"SYMBOL_MISSING_FILE {name}")
                 bad += 1
             continue
