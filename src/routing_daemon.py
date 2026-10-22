@@ -344,24 +344,24 @@ def main():
                     # → 输出永不落盘（实测 30 天 journal 里 0 条），且 _ec_main 的
                     # 返回值被丢弃。该预检的全部意义就是"发现不兼容项"，用不可见
                     # 级别打印等于没做——正是它自己要防的那种静默。
+                    # 盲区名单与 rc 无关：52 条判据里 27 条「无验证命令」恒跳过，按运行期
+                    # 窗口（前 3 条）只有 9 条真能执行、14/19 个角色零可执行判据。这些
+                    # 都不会让 rc 非零，而现实里 rc 恒为 1（19 角色里 1 条不兼容），
+                    # 放在 else 分支等于永不落盘。
+                    # 必须解析 JSON：--json 是多行输出，旧写法 splitlines()[-2:]
+                    # 恒为 ['  "details": []', '}']，盲区名单永远打不出来（实测）。
+                    try:
+                        _ec_doc = json.loads(_ec_buf.getvalue())
+                    except Exception:
+                        _ec_doc = {}
+                    _blind = _ec_doc.get("blind_roles") or []
+                    LOGGER.info("eval_consistency 预检: 可执行判据 %s 条；盲区角色 %d 个: %s",
+                                _ec_doc.get("exec_total", "?"), len(_blind), ", ".join(_blind))
                     if _ec_rc:
                         LOGGER.warning("eval_consistency 预检发现不兼容项 (rc=%s): %s",
                                        _ec_rc, _ec_buf.getvalue()[:400])
                     else:
-                        # 通过时也要落盘：52 条判据里 27 条「无验证命令」恒跳过，按运行期
-                        # 窗口（前 3 条）只有 9 条真能执行、14/19 个角色零可执行判据，
-                        # 都不会让 rc 非零 —— 只在这里可见。
-                        # 必须解析 JSON：--json 是多行输出，旧写法 splitlines()[-2:]
-                        # 恒为 ['  "details": []', '}']，盲区名单永远打不出来（实测）。
-                        try:
-                            _ec_doc = json.loads(_ec_buf.getvalue())
-                        except Exception:
-                            _ec_doc = {}
-                        _blind = _ec_doc.get("blind_roles") or []
-                        LOGGER.info("eval_consistency 预检通过: 可执行判据 %s 条；"
-                                    "盲区角色 %d 个: %s",
-                                    _ec_doc.get("exec_total", "?"), len(_blind),
-                                    ", ".join(_blind))
+                        LOGGER.info("eval_consistency 预检通过")
                 except Exception as _ec:
                     LOGGER.warning("eval_consistency 预检异常（不阻塞 eval 执行）: %s", _ec)
                 if _run_eval is None:

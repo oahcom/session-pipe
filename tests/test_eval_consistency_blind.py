@@ -81,3 +81,12 @@ def test_blind_roles_are_not_in_last_two_lines(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "blind_roles" not in "\n".join(out.strip().splitlines()[-2:])
     assert json.loads(out)["blind_roles"] == ["prose_only", "none"]
+
+def test_daemon_logs_blind_roles_even_when_rc_nonzero():
+    """rc=1 是常态（19 角色里有 1 条不兼容），盲区日志不能待在 else 分支。
+
+    放在 else 里 = 生产中一次都不会打印（实测 rc 恒为 1），本轮的可见化就是空转。
+    """
+    src = (Path(__file__).resolve().parents[1] / "src" / "routing_daemon.py").read_text()
+    assert src.index("盲区角色 %d 个") < src.index("if _ec_rc:"), \
+        "盲区日志必须在 rc 分支之前"
