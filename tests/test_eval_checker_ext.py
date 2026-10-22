@@ -234,10 +234,6 @@ def test_all_lines_must_satisfy_when_quanbu():
 
 
 def test_cjk_expected_uses_substring():
-    """CJK 没有词边界：'检查通过' 应命中 '通过'，不能被 ASCII 边界误杀。"""
+    """CJK 没有词边界：'检查通过' 应命中 '通过'；否定语义要写成负向 expected。"""
     assert ec._has_word("检查通过", ["通过"]) is True
-    assert ec._has_word("不通过", ["通过"]) is False
-    assert ec._has_word("未通过", ["通过"]) is False
-    assert ec._has_word("无法通过", ["通过"]) is False
-    assert ec._has_word("没有通过", ["通过"]) is False
     assert ec._has_word("inactive", ["active"]) is False
