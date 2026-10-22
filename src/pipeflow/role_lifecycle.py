@@ -789,8 +789,18 @@ class RoleLifecycleMixin:
             # 同一条拉起路径的两个入口（daemon/engine tick 走这里）：返回值曾整体
             # 丢弃，于是"角色起不来"只有 tmux 层的假象，没有原因（codex 20 维 P1）。
             if _start_failed(_st):
+                _err = _start_error_text(_st.stdout, _st.stderr)
                 LOGGER.warning("CCS %s: ccs start 失败 (rc=%s): %s", role, _st.returncode,
-                               " ".join(_start_error_text(_st.stdout, _st.stderr).split())[:200])
+                               " ".join(_err.split())[:200])
+                # blocker 是资源类启动失败（swap 0MB / 内存不足）唯一的外部产物：
+                # 只留 WARNING 时，两条拉起路径里只有 _wait_for_role_ready 那条写 blocker。
+                try:
+                    self._bb.write("blocker",
+                                   f"[workflow] 角色 {role} 启动失败 (rc={_st.returncode})，"
+                                   f"工作流无法投递",
+                                   evidence=_err, src="workflow_engine")
+                except Exception:
+                    LOGGER.warning("role-start blocker 写入失败: %s", role)
             for _ in range(30):
                 time.sleep(1)
                 if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
@@ -833,45 +843,11 @@ class RoleLifecycleMixin:
             if not alive:
                 # 拉起角色
                 LOGGER.info("_wait_for_role_ready: role %s not alive, starting...", role)
-                try:
-                    _env = _os.environ.copy()
-                    _env.pop("VIRTUAL_ENV", None)
-                    _env.pop("CONDA_PREFIX", None)
-                    _st = _engine_mod._sp.run(
-                        ["python3", str(_CCS_CLI), "start", role, "--no-attach",
-                         "--drive", "infinite", "--no-auto-send"],
-                        capture_output=True, timeout=60, env=_env
-                    )
-                    # ccs start 的失败是**静默**的：返回码非 0 且 stderr/stdout 说明
-                    # 原因（实测 writer：swap 仅剩 0MB，跳过启动），但原实现丢弃整个
-                    # 返回值 → 上层只能看到"tmux 没起来"，日志还错报 tmux alive
-                    # → 空转 90s → 排队 14 次 → 子链被回收 → 父链断链。
-                    # 这里把真实原因抬到日志与 blocker，使资源类阻断可被外部观测。
-                    # 判定用未截断的 stdout：证据只留 300 字符，协议 JSON 若在
-                    # 300 之后，按 _err 判会漏写 blocker（codex 20 维 P2）。
-                    _err = _start_error_text(_st.stdout, _st.stderr)
-                    if _start_failed(_st):
-                        LOGGER.error("_wait_for_role_ready: ccs start %s 失败 (rc=%s): %s",
-                                     role, _st.returncode, " ".join(_err.split())[:200])
-                        try:
-                            self._bb.write("blocker",
-                                f"[workflow] 角色 {role} 启动失败 (rc={_st.returncode})，"
-                                f"工作流无法投递",
-                                evidence=_err, src="workflow_engine")
-                        except Exception:
-                            # blocker 是唯一外部产物：写失败不能只留 DEBUG。
-                            LOGGER.warning("role-start blocker 写入失败: %s", role)
-                    # 等待 tmux session 启动
-                    for _ in range(10):
-                        time.sleep(1)
-                        if _engine_mod._sp.run(
-                            ["tmux", "has-session", "-t", f"ccs-{role}"],
-                            capture_output=True, timeout=5
-                        ).returncode == 0:
-                            time.sleep(3)
-                            break
-                except Exception as e:
-                    LOGGER.warning("Failed to start role %s: %s", role, e)
+                # 拉起只走 _check_and_start_role 一条路：这里原来内联复制了一份（约 40 行），
+                # 但没有 _RESTART_LOCK / 300s 冷却 / monitor_audit，于是 90s 窗口内对同一角色
+                # 连发 6 次 ccs start（实测 pg 08:16:30-08:18:08 每 15s 一次，全部因内存不足必败，
+                # 每次阻塞 60s），而审计计数看不见这些尝试（24h 记 36 次 = 低估）。
+                if not self._check_and_start_role(role):
                     time.sleep(check_interval)
                     continue
 

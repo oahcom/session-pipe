@@ -22,14 +22,18 @@ _SRC_FILE = Path(_SRC) / "pipeflow" / "role_lifecycle.py"
 
 
 def test_start_result_is_captured():
-    """ccs start 的 subprocess 返回值必须被接住（原为裸调用丢弃）。"""
+    """ccs start 的 subprocess 返回值必须被接住（原为裸调用丢弃）。
+
+    锚点已从 _wait_for_role_ready 的内联副本移到唯一拉起路径
+    _check_and_start_role（2026-10-22 去重）：两处各写一份时，只有一份接住返回值、
+    也只有一份写 blocker，另一份在 90s 内对同一角色连发 6 次必败启动。
+    """
     src = _SRC_FILE.read_text(encoding="utf-8")
-    m = re.search(r'"_wait_for_role_ready: role %s not alive, starting\.\.\.".*?'
-                  r'capture_output=True, timeout=60, env=_env\s*\n\s*\)',
-                  src, re.S)
-    assert m, "未找到启动角色的 subprocess 调用"
-    assert re.search(r'_st = _engine_mod\._sp\.run\(', m.group(0)), \
-        "ccs start 返回值未被接住（仍为裸调用，失败不可观测）"
+    m = re.search(r'def _check_and_start_role.*?(?=\n    def )', src, re.S)
+    assert m, "未找到 _check_and_start_role"
+    assert re.search(r'_st = _engine_mod\._sp\.run\(\s*\n\s*\["python3", str\(_CCS_CLI\), "start"',
+                     m.group(0)), "ccs start 返回值未被接住（仍为裸调用，失败不可观测）"
+    assert "_wait_for_role_ready" in src and "capture_output=True, timeout=60" in src
 
 
 def test_failure_writes_blocker():
@@ -37,7 +41,7 @@ def test_failure_writes_blocker():
     src = _SRC_FILE.read_text(encoding="utf-8")
     assert "启动失败 (rc=" in src and "工作流无法投递" in src, \
         "缺少角色启动失败的 blocker 文案（应含返回码）"
-    assert "ccs start %s 失败 (rc=%s)" in src, "缺少含返回码的 ERROR 日志"
+    assert "ccs start 失败 (rc=%s)" in src, "缺少含返回码的 ERROR 日志"
 
 
 def test_no_false_tmux_alive_claim():
