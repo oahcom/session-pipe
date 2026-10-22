@@ -118,6 +118,19 @@ _STARVE_FAIL_RETRY_INTERVAL = 60  # 未达阈值：失败后短退避 60s 重试
 _STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后切换退避策略
 
 
+# 优雅关闭的硬上限：超过就 os._exit，把「关不掉」变成「最多等这么久」。
+# ponytail: 不看事务边界，粗暴退出依赖 SQLite WAL 回滚；要更干净得让 run_once
+# 在循环里轮询 shutdown 标志（改动面大得多）。
+_SHUTDOWN_GRACE_SEC = 10
+
+
+def _force_exit_after(sec: float) -> None:
+    time.sleep(sec)
+    LOGGER.warning("优雅关闭超时 %.0fs，强制退出", sec)
+    logging.shutdown()
+    os._exit(0)
+
+
 def _starve_signal(eng: WorkflowEngine) -> None:
     """连续饥饿 → 拉起 scout session + 创建 food_chain_loop 工作流，冷却期内静默。"""
     now = time.time()
@@ -341,8 +354,15 @@ def daemon_loop(interval: int):
 
     def _handler(s, f):
         nonlocal shutdown
-        LOGGER.info("收到信号 %s，开始优雅关闭...", s)
+        LOGGER.info("收到信号 %s，开始优雅关闭（最多等 %ds）...", s, _SHUTDOWN_GRACE_SEC)
         shutdown = True
+        # 关闭只是置位：正在跑的那次 run_once 得自己走到 while 条件才看得到。
+        # 单次 tick 实测 190–317s（_scan_tasks 热点），systemd 会一直停在
+        # deactivating —— 2026-10-22 实测两次、最长 >4min，TimeoutStopSec=15 未生效。
+        # 到点强制退出，Restart=always 用新代码拉起。SQLite 走 WAL，未提交事务由
+        # journal 回滚，不会留半写状态。
+        threading.Thread(target=_force_exit_after, args=(_SHUTDOWN_GRACE_SEC,),
+                         daemon=True).start()
 
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _handler)
