@@ -1,5 +1,32 @@
 # CHANGES.md
 
+## 2026-10-22 — 文档引用改成可机器校验（doccheck v2）
+
+### 问题
+三仓 70 个 md 里唯一自动校验是行数声明；`file.py:NNN` 引用没人管，实测：pipeline
+`docs/collab-modes-implementation.md` 5 处行号整体偏移 64~102 行、launcher README 把
+`chain_state` 指到空行、roles ISSUES 引用的代码早已删除 —— 而 doccheck 输出 CLEAN。
+
+### 改动
+- `scripts/doccheck.py`：`_cite_check`（行号越界/空行）+ `_sym_check`（符号仍在）——
+  符号用 AST 收集（def/class/所有 Store 绑定/import 别名），不是正则（正则会命中注释与字符串）；
+  匹配前剥掉围栏代码块；解析失败跳过而不退回正则。
+- 定位规则：本仓路径 → 显式跨仓路径（`session-pipeline/src/x.py`）→ 兄弟仓唯一同名文件；
+  三仓都找不到就报错，只有 `~/`、绝对路径跳过（三仓之外）。"跨仓"不是免检通道。
+  `--root` 让另外两仓共用这一份检查器；`ISSUES.md`/`CHANGES.md` 作历史快照跳过。
+- `Makefile`：doccheck 只读，刷新拆 `docfix`；三仓 `doccheck` 都进 `all`，缺兄弟仓显式 SKIP。
+- `tests/test_doccheck_refs.py`：8 例（越界/空行/合法/围栏块/仓外跳过/显式跨仓/历史快照/AST vs 注释与解包）。
+- 随门禁修掉的历史烂引用：main 的 `db.py` 歧义、`REVIEW_R7_*` 两处行号、`collab-modes-to-workflow`
+  两处跨仓裸名、launcher 的 `manager.py`/`socket_server.py` 裸路径、roles 的 `router.py` 跨仓引用。
+
+### 验证
+`pytest tests/test_doccheck_refs.py` → 8 passed；dev / launcher / roles / main 四棵树 doccheck → CLEAN；
+roles `pytest tests/` → 49 passed、`validate_roles.py` 19 角色 0 错误。
+
+### 未做
+- 不把 doccheck 塞进 pre-commit：并发 session 多，钩子会互相阻塞；`make doccheck` 与 CI 才是入口。
+- 行号仍会平移（只校验"存在且非空"）；新写的引用一律 `file.py:符号`，符号只在改名时失效。
+
 ## 2026-10-22 — 空闲判死接活体门 + cancel_step 终态幂等 + 文档同源
 
 ### 问题（角色转录/日志实证）
