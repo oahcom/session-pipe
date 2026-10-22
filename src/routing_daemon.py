@@ -253,6 +253,12 @@ def _forget_eval_modules() -> None:
             del sys.modules[_k]
 
 
+def _eval_source_mtimes() -> tuple[float, ...]:
+    """eval_checker 依赖的两个源文件 mtime。只比 eval_checker 会漏掉 loader 的改动。"""
+    _d = Path(__file__).parent
+    return tuple(os.path.getmtime(str(_d / f)) for f in ("eval_checker.py", "eval_shared_loader.py"))
+
+
 def main():
     LOGGER.info("routing_daemon 启动 PID=%d", os.getpid())
     last_ccs = 0
@@ -277,7 +283,7 @@ def main():
 
     # 延迟导入 eval_checker（避免模块级循环引用）
     _run_eval = None
-    _eval_checker_mtime = 0.0
+    _eval_mtimes: tuple[float, ...] = ()
 
     try:
         error_backoff = 0
@@ -380,36 +386,23 @@ def main():
                     try:
                         from eval_checker import run_eval_check
                         _run_eval = run_eval_check
-                        _eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
+                        _eval_mtimes = _eval_source_mtimes()
                     except Exception:
                         _run_eval = lambda: {"checked": 0}
-                # ponytail: 检测 eval_checker.py 变更，热重载无需重启 daemon
-                eval_checker_mtime = os.path.getmtime(str(Path(__file__).parent / "eval_checker.py"))
-                if _eval_checker_mtime != eval_checker_mtime:
-                    _old_mtime = 0.0  # Fix: initialize to avoid UnboundLocalError on exception path
+                # ponytail: 两个源文件任一变更就热重载，无需重启 daemon。
+                # 只比 eval_checker.py 会漏掉 loader：预检用新 CRITERIA_WINDOW，而 _run_eval
+                # 的函数对象钉在旧模块 globals 上，运行期仍按旧口径判（实测 09:56/10:27）。
+                if _eval_mtimes != _eval_source_mtimes():
                     try:
-                        _forget_eval_modules()   # 见函数注释：只重载 eval_checker 会 ImportError
+                        _forget_eval_modules()
+                        # purge 后 import 已经重执行模块体；再 reload 会执行第二遍
+                        # （_LAST_SUBAGENT 去重表被清空重建，每角色最坏重发一条 bus）。
                         import eval_checker
-                        importlib.reload(eval_checker)
                         _run_eval = eval_checker.run_eval_check
-                        _old_mtime = _eval_checker_mtime
-                        _eval_checker_mtime = eval_checker_mtime
-                        LOGGER.info("eval_checker 热重载成功 (mtime %s→%s)",
-                                    _old_mtime, eval_checker_mtime)
+                        _old, _eval_mtimes = _eval_mtimes, _eval_source_mtimes()
+                        LOGGER.info("eval_checker 热重载成功 (mtime %s→%s)", _old, _eval_mtimes)
                     except Exception as _e:
-                        LOGGER.warning("eval_checker 热重载失败: %s", _e)
-                        # 热重载失败：尝试强制重新 import（兜底）
-                        try:
-                            _forget_eval_modules()
-                            import importlib as _il
-                            eval_checker = _il.import_module("eval_checker")
-                            _run_eval = eval_checker.run_eval_check
-                            _eval_checker_mtime = eval_checker_mtime
-                            LOGGER.info("eval_checker 强制重新 import 成功")
-                        except Exception as _e2:
-                            LOGGER.error("eval_checker 强制重新 import 也失败: %s", _e2)
-                        # Fix: ensure _old_mtime is defined even on fallback failure
-                        _old_mtime = 0.0
+                        LOGGER.error("eval_checker 热重载失败（继续用旧版本）: %s", _e)
                 try:
                     r = _run_eval()
                     if r.get("failed", 0):
