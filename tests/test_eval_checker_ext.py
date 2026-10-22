@@ -212,3 +212,14 @@ def test_weighted_sample_prefers_roles_with_criteria():
                if ec._weighted_role_sample([rich, blind], 1)[0]["name"] == "rich")
     assert hits >= 120, f"权重 3:1 时应抽到 rich ≥60%，实测 {hits}/200"
     assert ec._weighted_role_sample([rich, blind], 2) != [], "k=2 仍要返回两个不同角色"
+
+def test_systemctl_flags_before_subcommand_are_readonly():
+    """systemctl --user is-active X 是只读，但旧实现只看 parts[1] 就判成写操作。
+
+    maintainer 的判据 `systemctl --user is-active a b | grep -c` 因此永久「不兼容」，
+    daemon 每 600s 一条 WARNING（10:37 journal），该判据一天都没真跑过。
+    """
+    assert ec._cmd_is_readonly("systemctl", "systemctl --user is-active sister-agent-dkk.service")
+    assert ec._cmd_is_readonly("systemctl", "systemctl is-active x")
+    assert not ec._cmd_is_readonly("systemctl", "systemctl --user restart x"), "写操作仍须拒绝"
+    assert not ec._cmd_is_readonly("systemctl", "systemctl --now disable x")
