@@ -65,6 +65,15 @@ SCHEMA_SQL = """
         detail TEXT,
         ts REAL NOT NULL
     );
+    -- 审计不可绕过：workflow 实例行被删必须留痕。2026-10-22 三条子链实例从生产库
+    -- 直接消失、workflow_logs 里零记录，父链继续空等 60min（R138 取证）——
+    -- 唯一的删除入口 client.py:445 有日志但被绕过，说明靠调用点记账堵不住。
+    -- 触发器在 DB 边界生效，谁删都留痕。
+    CREATE TRIGGER IF NOT EXISTS wf_inst_audit AFTER DELETE ON workflow_instances BEGIN
+        INSERT INTO workflow_logs (workflow_instance_id, action, actor, detail, ts)
+        VALUES (old.instance_id, 'deleted', 'db_trigger',
+                'class=' || IFNULL(old.template_id,'') || ' status=' || IFNULL(old.status,''), strftime('%s','now'));
+    END;
     CREATE INDEX IF NOT EXISTS idx_instances_task ON workflow_instances(task_id);
     CREATE INDEX IF NOT EXISTS idx_instances_assignee ON workflow_instances(assignee);
     CREATE INDEX IF NOT EXISTS idx_instances_status ON workflow_instances(status);
