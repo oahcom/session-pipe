@@ -29,13 +29,13 @@ cd /home/administrator/session-pipeline && python3 -m pytest tests/test_engine_e
 
 ## 测试文件规模
 
-`find tests -name 'test_*.py' | wc -l` → 125 个文件。按主题分布（命名即职责，不再逐文件列表）：
+`find tests -name 'test_*.py' | wc -l` → 用这条命令现取文件数（别抄数字）。按主题分布（命名即职责，不再逐文件列表）：
 
 | 主题 | 代表文件 |
 |------|----------|
 | 引擎推进/退出 | `test_engine_e2e.py` `test_exit_condition.py` `test_tick_paths.py` |
 | 审批/驳回/返工 | `test_approval_channel_retired.py` `test_confirm_not_re_rejected.py` `test_r118_completion_integrity.py` |
-| 协作模式 | `test_collab_modes.py` `test_collab_regression.py`（合计 26 tests） |
+| 协作模式 | `test_collab_modes.py` `test_collab_regression.py`（条数不写死，跑起来看） |
 | 路由 | `test_router.py` `test_routes_unit.py` `test_consistency.py` |
 | 投递/存活 | `test_send_to_role_timeout.py` `test_liveness.py` `test_survival_monitor_unit.py` |
 | 模板/契约 | `test_contract_updater_*.py` `test_container_contract_satisfiable.py` |

@@ -1,6 +1,6 @@
 # session-pipeline Architecture
 
-> Updated: 2026-07-26 | Audience: Architects | Related: [SYSTEM_LANDSCAPE.md](SYSTEM_LANDSCAPE.md), [DOCS.md](DOCS.md)
+> Verified: 2026-10-22（本文件不含行数；模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`）| Audience: Architects | Related: [SYSTEM_LANDSCAPE.md](SYSTEM_LANDSCAPE.md), [DOCS.md](DOCS.md)
 
 Session ecosystem's **routing + execution layer** -- message routing (router), auto-dispatch (auto_route), workflow engine (workflow), lifecycle state machine, reliability infrastructure.
 
@@ -17,46 +17,43 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 ## Module inventory
 
-| Module | Lines | Responsibility |
-|--------|-------|----------------|
-| **pipeflow/engine.py** | 1852 | Data-driven workflow execution engine (core, imports mixins below) |
-| **pipeflow/step_handler.py** | 1681 | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 1197 | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
-| **pipeflow/task_generator.py** | 874 | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 1979 | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
-| **lifecycle/manager.py** | 1131 | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **template_registry.py** | 937 | 模板注册中心 |
-| **eval_checker.py** | 1459 | 安全白名单命令执行检查 |
-| **workflow/client.py** | 495 | High-level API for CCS roles to interact with workflow DB |
-| **reliability_core.py** | 465 | Core implementations of retry/circuit/heartbeat/TTL/metrics |
-| **reliability.py** | 434 | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | 612 | Dispatch logic: route_all, route_to_ccs, dispatch_investigator |
-| **routing/router.py** | 361 | Route table: derive produce/consume from roles_export.json, priority routing |
-| **routing/survival_monitor.py** | 640 | 存活监测 |
-| **routing/rdb.py** | 293 | Route table SQLite persistence + audit log |
-| **routing/auto.py** | 260 | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
-| **routing_daemon.py** | 591 | 路由守护进程 |
-| **task_evidence.py** | 448 | 任务证据链 |
-| **contract_updater.py** | 431 | 合约同步 |
-| **conversation_monitor.py** | 417 | 对话监控 |
-| **config_loader.py** | 167 | YAML config loading with env override and hot-reload |
-| **workflow/gateway.py** | 188 | 工作流网关门禁 |
-| **drift_detector.py** | 198 | 架构漂移检测 |
-| **cron_scheduler.py** | 128 | cron 调度器 |
-| **eval_consistency.py** | 70 | 评估一致性 |
-| **routing/consistency.py** | 105 | 路由一致性 |
-| **pipeflow/daemon.py** | 420 | Main loop: `while True: engine.run_once(); sleep(10)` |
-| **workflow_metrics.py** | 109 | 工作流指标 |
-| **workflow/db.py** | 96 | 工作流数据访问 |
-| **output_validator.py** | 93 | 输出格式验证 |
-| **routing/polling.py** | 88 | Message polling with cursor (dedup across restarts) |
-| **paths.py** | 105 | 路径常量 |
-| **workflow/sync.py** | 65 | 工作流同步 |
+| Module | Responsibility |
+|--------|----------------|
+| **pipeflow/engine.py** | Data-driven workflow execution engine (core, imports mixins below) |
+| **pipeflow/step_handler.py** | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
+| **pipeflow/role_lifecycle.py** | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
+| **pipeflow/task_generator.py** | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
+| **pipeflow/wf_lifecycle.py** | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
+| **lifecycle/manager.py** | Workflow state machine (5 step types, approval/rollback/escalation) |
+| **template_registry.py** | 模板注册中心 |
+| **eval_checker.py** | 安全白名单命令执行检查 |
+| **workflow/client.py** | High-level API for CCS roles to interact with workflow DB |
+| **reliability_core.py** | Core implementations of retry/circuit/heartbeat/TTL/metrics |
+| **reliability.py** | Init retry, circuit breaker, heartbeat, TTL pruner from config |
+| **routing/routes.py** | Dispatch logic: route_all, route_to_ccs |
+| **routing/router.py** | Route table: derive produce/consume from roles_export.json, priority routing |
+| **routing/survival_monitor.py** | 存活监测 |
+| **routing/rdb.py** | Route table SQLite persistence + audit log |
+| **routing/auto.py** | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
+| **routing_daemon.py** | 路由守护进程 |
+| **task_evidence.py** | 任务证据链 |
+| **contract_updater.py** | 合约同步 |
+| **conversation_monitor.py** | 对话监控 |
+| **config_loader.py** | YAML config loading with env override and hot-reload |
+| **workflow/gateway.py** | 工作流网关门禁 |
+| **drift_detector.py** | 架构漂移检测 |
+| **cron_scheduler.py** | cron 调度器 |
+| **eval_consistency.py** | 评估一致性 |
+| **routing/consistency.py** | 路由一致性 |
+| **pipeflow/daemon.py** | Main loop: `while True: engine.run_once(); sleep(10)` |
+| **workflow/db.py** | 工作流数据访问 |
+| **output_validator.py** | 输出格式验证 |
+| **routing/polling.py** | Message polling (dedup via bus consume records) |
+| **paths.py** | 路径常量 |
+| **workflow/sync.py** | 工作流同步 |
+| **p0_exemption.py** | P0 豁免通道 |
 
-| **pipeflow/db.py** | 327 | Three-layer SQLite: Template → Instance → Task |
-| **p0_exemption.py** | 496 | P0 豁免通道 |
-
-**模块与行数随树变化：以 `find src -name "*.py" | wc -l` 与 `wc -l src/**/*.py` 现场取值为准（2026-10-22 实测 39 个模块 / 20234 行，原写 38 / ~10700 已过期）**
+**本表只列主要模块，不是全集**：模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`（2026-10-22 为 37；表里没列 `liveness.py`/`review_gate.py`/`pipeflow/integrity.py`/`eval_shared_loader.py`）。`pipeflow/db.py` 已删，持久化在 `workflow/db.py`。
 
 ## Data flow
 
@@ -66,11 +63,12 @@ Bus new message (Blackboard)
     ▼
 polling.poll_unconsumed() ──→ router.get_consumers_prioritized()
     │                                │
-    │  with cursor dedup              │  from roles_export.json
+    │  with consume-record dedup      │  from roles_export.json
     ▼                                ▼
 routes.route_all() ──→ auto.consume_with_linkage()
     │                                │
     │  subprocess ccs.py send        │  mark_consumed for all consumers
+    │                                │  无消费者（@tag 过滤为空）也标记，否则视图只增不减
     ▼                                ▼
 CCS (tmux + claude) ←── Sister Bus (ACK/linkage)
     │
@@ -78,7 +76,7 @@ CCS (tmux + claude) ←── Sister Bus (ACK/linkage)
 pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
     │
     ├── _ensure_role_alive() ──→ subprocess ccs.py start
-    ├── SQLite scan workflow_instances (pending/running)
+    ├── SQLite scan workflow_instances (pending/running/step_done_ready；行级还可能是 delivery_blocked)
     ├── _send_to_role() ──→ subprocess ccs.py send
     └── _check_anomalies() ──→ timeout escalation
 ```
@@ -90,8 +88,7 @@ pipeflow.engine.run_once() ←── pipeflow.daemon.py (10s loop)
 - **CCS CLI** (`session-launcher/src/ccs.py`) -- message delivery via subprocess
 - **Sentinel files** (`~/.hermes/run/ccs-sentinels/`) -- CCS alive check
 - **Workflow templates** (`~/.hermes/workflows/*.json`)
-- **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `ack_tracker.db`) — `pipeline_cursor.db` 已随 cursor 机制一并退役（49a7b9d），别再引用
-- **Bus 保留与轮询**：`prune()` 只删有 `consume` 记录的事实（未读消息不按年龄/容量清掉）；`unconsumed(limit=N)` 的 LIMIT 下推到 SQL（带 `role` 过滤时不下推，role 白名单仍在 Python 侧）
+- **SQLite DBs** (`~/.hermes/state/workflows.db`, `routing.db`, `ack_tracker.db`) —— `pipeline_cursor.db` 已退役（0 行，无人读）
 
 ## Route table construction
 
@@ -112,30 +109,15 @@ This means: **modifying persona JSON requires `shared_loader.py --export` before
 
 ## Known issues
 
-### bus 的 `search()` 只做全文匹配
-
-`search()` 是 FTS5 全文检索：`role:`/`cat:`/`fid:` 这类限定符**不支持，也不报错**——
-2026-10-22 实测三者全部返回 0 条。照着它们写的检查会静默退化成 vacuous pass
-（`eval_checker.RequirementConfirmationChecker` 就这样假绿到当天才修）。要按字段筛，
-用 `unconsumed(cat=...)` / `consumed_by(fid)` 或直接 SQL。
-`facts.rc`（UPSERT 冲突时被清零）与 `hc`（旧 search 命中残留，实测单条 21,541）都不是消费判据，
-唯一真相是 `log(typ='consume', fid, cat=消费者)`。
-
 ### Engine bypasses LifecycleManager
 
-`engine.py` has 3 sites that bypass `lifecycle/manager.py` and write SQL directly:
+绕过 `lifecycle/manager.py` 直接写 SQL 的不止一处（`wf_lifecycle.py` 内 `conn.execute` 实测 21 处）。engine.py 拆分后，三个典型函数分散在 mixin 里：
 
-- `_advance_production_wf()` -- updates step_results via raw conn.execute
-- `_tick()` -- timeout detection writes directly via `_sync_step_results()`
-- `_scan_tasks()` -- sub-workflow completion pushes parent workflow
+- `wf_lifecycle.py:_advance_production_wf()` -- updates step_results via raw conn.execute
+- `step_handler.py:_tick()` -- timeout detection writes directly via `_sync_step_results()`
+- `task_generator.py:_scan_tasks()` -- sub-workflow completion pushes parent workflow
 
 These bypasses lose RLock protection and approval workflow.
-
-### `/loop` injection is a no-op
-
-`_ensure_role_alive()` injects `/loop` into the CCS, but `/loop` is NOT available in tmux environments. The CCS will not error, but it will also not enter a work loop -- it idles after processing each message.
-
-（2026-10-22 复核：这条建议已失效——`engine.py` 里 `--drive` 出现 0 次，真实注入点是 `role_lifecycle.py:671/729`，注入值是 `infinite`。原文保留为历史记录。）
 
 ### Cross-project call boundary
 
@@ -143,13 +125,13 @@ These bypasses lose RLock protection and approval workflow.
 
 ### Delivery prechecks
 
-`role_lifecycle._send_to_role` checks CLI busy (`liveness.pane_cli_busy`: bottom-bar `esc to interrupt` / `retrying`) before `ccs send`; busy returns `"busy"` for the next tick instead of starting a 30s child process that blocks the whole tick.
+`role_lifecycle._send_to_role` checks CLI busy (`liveness.pane_cli_busy`: bottom-bar `esc to interrupt` / `retrying`) before `ccs send`; busy returns `"busy"` for the next tick instead of starting a 30s child process that blocks the whole tick. Skipped on force=True (timeout re-push, dual-node, integrity reminder) or when wf_id is empty; a failed probe sends anyway. Only the bottom 6 lines are scanned, so marker words inside a role's own output do not pin it busy.
 
 ## Tests
 
-- Full suite: `python3 -m pytest tests/ -q` → 1218 passed (2026-10-22).
+- Full suite: `python3 -m pytest tests/ -q`（全 passed、skip 数固定；**条数不写死**，并发改动每天都会变）。跑法与判据见 [TEST_WORKFLOW.md](TEST_WORKFLOW.md)。
 - Per-file counts are not maintained; run the suite for current numbers.
-- `python3 scripts/doccheck.py` 校验本文件与 CLAUDE.md 声明的行数；无自动钩子，代码增删后跑一次 `--fix` 刷新。
+- 本文件**不写行数**（表格里的 Lines 列已删：没人维护，实测一轮就漂 6 处）。行数只在 CLAUDE.md 的代码布局树里，由 `python3 scripts/doccheck.py` 校验（`--fix` 就地刷新），pre-commit 不一致时打印 `DOC-DRIFT` 提示、不拦提交。
 
 ## Red lines
 

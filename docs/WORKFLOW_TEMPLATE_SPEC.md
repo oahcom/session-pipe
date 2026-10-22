@@ -1,6 +1,6 @@
 # 工作流模板规范
 
-> 版本: 2.0 | 更新: 2026-07-24 | 受众: 模板开发者
+> 版本: 2.1 | 更新: 2026-10-22 | 受众: 模板开发者
 > 本文件定义 `~/.hermes/workflows/*.json` 的编写规范。
 
 ---
@@ -68,30 +68,30 @@
 |------|----------|----------|
 | `single` | 自动推进（不阻塞） | 一次性操作：提交、通知、发现 |
 | `handoff` | 自动推进（交接，非审批闸门） | 交接给下游角色 |
-| `review` | 按评审结论三态推进（无结论不推进） | 代码审查、设计评审 |
-| `gate` | 条件检查（如文件是否存在） | 门禁、质量关卡 |
+| `review` | 等 target_role 用 bus 文本给结论（`CHANGES_REQUESTED`/`rejected`，判据 `src/review_gate.py`） | 代码审查、设计评审 |
+| `gate` | 校验 `completion_check` / `exit_schema` | 门禁、质量关卡 |
 | `notify` | 自动推进 | 通知下游、触发事件 |
+
+审批密钥已于 2026-10-22 退场（CHANGES.md）；驳回语义由 bus 文本承担，无需 token。
 
 ### 2.3 Prompt 模板规则
 
+校验器（`template_registry.py:339-363`）要求 `prompt_template` 含**三段式小标题**，且总长 ≥150B：
+
 ```markdown
 /goal
-## 任务
-请完成「{步骤标题}」。这是 {模板名} 的步骤之一，你的角色是 {角色}。
+## 你负责……（做什么：本轮要产出的东西）
 
-## 原始提示
-[这里直接写步骤特有的指令，不加通用操作要求]
+## 你要做的
+1. ……（怎么做：可执行的步骤）
+
+## 完成
+写 bus cat=XXX，title 含 s<N>-complete（验收标准：可二值判定）
 ```
 
-**禁止**出现以下段落：
-```
-## 操作要求          → 已剥离（之前的版本中已全局清除）
-## 产出物要求         → 已剥离
-## 质量门禁           → 已剥离（替代为 quality_standards）
-## 引用要求           → 已剥离
-```
+实测（2026-10-22，复算 `python3 src/template_registry.py validate-all`，模板总数用 `select count(*) from workflow_templates`）：少数模板通过 `validate-all`，失败项主要是缺"做什么/怎么做/验收标准"三段与 prompt 过短（如 `test_exit_schema.json` 138B < 150B）。
 
-如果步骤需要搜索、框架或引用，用内联方式融入指令中，不单独成节。
+**禁止**出现以下段落：`## 操作要求`、`## 产出物要求`、`## 质量门禁`、`## 引用要求`（已全局清除；需要搜索/引用时内联写进指令）。
 
 ### 2.4 Failure Patterns 规则
 
@@ -117,20 +117,21 @@
 
 ## 3. 三层架构与 subflow_template
 
-### 3.1 架构模型
+### 3.1 架构模型（2026-10-22 从模板 JSON 实测）
 
 ```
-编排层 (orchestrator)         领域层 (domain flow)
-  task_dispatch_execute       coordinator_dispatch
-  architect_adr               architect_full_design
-  code_review_chain           engineer_feature / reviewer_pr_review
-  deploy_canary               devops_deploy_execute
-  qa_test_plan                qa_test_execute
-  security_incident           security_audit_scan
+编排层（引用子链）                     子链（被引用）
+  architect_review        → qa_test_execute
+  coordinator_schedule    → coordinator_dispatch
+  dev_implement           → engineer_feature, reviewer_pr_review
+  food_chain_loop         → pm_requirements, architect_full_design, engineer_feature,
+                            qa_test_execute, reviewer_pr_review
+  full_dev_pipeline       → architect_full_design, engineer_feature, qa_test_execute,
+                            reviewer_pr_review, closer_close_loop
+  产品交付全流程          → pm_requirements, architect_full_design, reviewer_pr_review,
+                            engineer_feature, qa_test_execute
 
-原子层 (atomic) — 独立工作流，不依赖编排
-  closer_close_loop, investigator_analyze, lr_tech_decision,
-  maintainer_health_monitor, pm_requirements, scout_research_cycle, writer_document
+其余模板（清单见 `template_registry list`），含上面那些带子链的
 ```
 
 ### 3.2 subflow_template 使用规则
@@ -145,10 +146,7 @@
 
 校验：
 ```bash
-PYTHONPATH=src python3 -c "
-from template_registry import TemplateRegistry
-# 所有 subflow_template 引用的模板名必须能在 SQLite 或 JSON 文件中找到
-"
+PYTHONPATH=src python3 -m template_registry validate-all
 ```
 
 ---
@@ -179,14 +177,12 @@ PYTHONPATH=src python3 -m template_registry validate path/to/template.json
 |--------|------|
 | trigger_scene | 非空列表 |
 | allowed_initiators | 非空列表 |
-| allowed_executors | 非空列表 |
+| allowed_executors | 非空列表，覆盖全步骤 target_role |
 | max_duration_hours | ≥1 |
-| quality_standards | ≥8 字符，不写纯"通过 Codex" |
-| prompt 模板段落残留 | 不含"## 操作要求\n1. 理解任务背景" |
-| prompt 长度 | ≥150B |
+| prompt 三段式 | 含「你负责……/你要做的/完成」且 ≥150B |
+| prompt 模板段落残留 | 不含 `## 操作要求` / `## 原始提示` |
 | failure_patterns 泛化 | 不含"产出物为空或仅模板占位符"等 |
 | failure_patterns 回退模式 | 不含"执行步骤未达预期质量标准" |
-| quality_standards 领域化 | 不单独写"Codex" |
 
 ### 5.3 创建新模板流程
 
@@ -271,7 +267,7 @@ PYTHONPATH=src python3 -c "from pipeflow.engine import WorkflowEngine; WorkflowE
 | 情况 | 推荐分类 | 不要用 |
 |------|----------|--------|
 | 通知下游角色 | 业务相关分类 | `notice`（太泛） |
-| 状态更新 | 领域分类 | `architecture`（兜底分类，22/105 步在用） |
+| 状态更新 | 领域分类 | `architecture`（兜底分类；2026-10-22 实测各模板写入步骤的分类分布：`code_fix` 最多、`architecture` 次之——复算要真跑一次再统计，别抄这里的排名） |
 | 技术决策 | `tech_decision` | `architecture` |
 | 架构设计 | `system_design` 或 `architecture` | — |
 | 代码修复 | `code_fix` | `architecture` |

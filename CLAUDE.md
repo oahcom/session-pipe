@@ -36,8 +36,8 @@ pipeline **不直接调用** launcher 的 API，通过 `subprocess ccs.py send` 
 
 ### 验证命令
 ```bash
-# 测试路由规则
-python3 tests/test_router.py -x -q
+# 测试路由规则（10 个 pytest 用例；直接 python 跑只会执行 __main__ 自测块，收集不到它们）
+python3 -m pytest tests/test_router.py -q
 
 # 列出路由表（router CLI）
 PYTHONPATH=src python3 -m routing.router list
@@ -59,36 +59,35 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 src/
   routing/
     router.py         ── 路由表 + produce/consume 推导（361 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（612 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（643 行）
     auto.py           ── 自动路由消费 + investigator 分派（260 行）
-    polling.py        ── 消息轮询 + cursor（90 行）
+    polling.py        ── 消息轮询（99 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
     survival_monitor.py ── 三层存活监测 L1/L2/L3（640 行）
-    consistency.py    ── 路由一致性检查（124 行，生长接入 daemon）
+    consistency.py    ── 路由一致性检查（105 行，生长接入 daemon）
 
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（1851 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1691 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1309 行）
-    task_generator.py ── 任务生成（872 行）
-    wf_lifecycle.py   ── 工作流生命周期（2014 行）
-    daemon.py         ── 工作流守护 while 循环（476 行）
-    pipeflow/db.py    ── 工作流三层 SQLite 持久化（327 行）
+    engine.py         ── 编排 + CLI（2023 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（1719 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1211 行）
+    task_generator.py ── 任务生成（933 行）
+    wf_lifecycle.py   ── 工作流生命周期（2140 行）
+    daemon.py         ── 工作流守护 while 循环（483 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1146 行）
+    manager.py        ── 工作流状态机（1140 行）
 
   workflow/
-    client.py         ── CCS 角色工作流客户端（495 行）
+    client.py         ── CCS 角色工作流客户端（487 行）
     gateway.py        ── 工作流网关门禁（188 行）
-    workflow/db.py    ── 工作流数据访问（96 行）
-    sync.py           ── 工作流同步（65 行）
+    db.py             ── 工作流数据访问（96 行）
+    sync.py           ── 工作流同步（63 行）
 
   p0_exemption.py     ── P0 豁免通道（coordinator/lr/pm）
-  config_loader.py    ── 配置加载（YAML + env override + 热重载）
+  config_loader.py    ── 配置加载（YAML + env override；无热重载，改完重启）
   eval_checker.py     ── 安全白名单命令执行检查
   eval_consistency.py ── 评估一致性
   output_validator.py ── 输出格式验证
@@ -101,7 +100,6 @@ src/
   reliability_core.py ── 可靠性核心实现
   template_registry.py── 模板注册中心
   task_evidence.py    ── 任务证据链
-  workflow_metrics.py ── 工作流指标
   paths.py            ── 路径常量
 
 注：step 终态含 `delivery_blocked`（投递达上限暂停，engine.py close_wf 收敛行级 status）。
@@ -166,10 +164,10 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 
 - 冷却 `_OVERFLOW_COOLDOWN=300s`；时效 `_OVERFLOW_ERR_MAX_AGE=600s`
 - 回归守卫：`tests/test_context_overflow.py`（含 transcript 四例）
-- **改了本逻辑需重启 `session-pipeline-daemon.service`（跑 engine 的是 `workflow-engine.service`，两个单元都要看）** —— daemon 无热重载
+- **改了本逻辑需重启 `workflow-engine.service`**（`systemctl --user restart workflow-engine.service`，它跑 `src/pipeflow/daemon.py`，`_check_context_overflow` 在这条链上）；`session-pipeline-daemon.service` 跑的是 `routing_daemon.py`，与这段逻辑无关。系统单元 `session-pipeline.service` 存在但 inactive。
 
 ## SQLite 运维
-生产 DB 位于 `~/.hermes/data/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
+生产 DB 位于 `~/.hermes/state/workflows.db`。SQLite **不自动回收** DELETE/REPLACE 后的空闲页面——历史行删多了会积累 free 页，文件暴胀至 600MB+ 而表格仅数十行（实测 45 行 / 610MB，99.6% free 页）。
 
 - **监测阈值**：`freelist_count / page_count > 0.5` 或单一 DB > 50MB 视为膨胀。
 - **恢复**：`VACUUM;`（会新建事务写整个 DB，期间 daemon 应停。VACUUM 前 `cp` 备份）。
@@ -177,7 +175,7 @@ scout 实测在 `Prompt is too long` 终止后 1s 才被检测到，此时 agent
 ```bash
 python3 - <<'EOF'
 import sqlite3, os
-c=sqlite3.connect(os.path.expanduser("~/.hermes/data/state/workflows.db"))
+c=sqlite3.connect(os.path.expanduser("~/.hermes/state/workflows.db"))
 pc=c.execute("PRAGMA page_count").fetchone()[0]; fl=c.execute("PRAGMA freelist_count").fetchone()[0]
 print("freelist ratio=%.1f%%"%(fl/pc*100))
 EOF
