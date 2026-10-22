@@ -384,6 +384,7 @@ def daemon_loop(interval: int):
     except ValueError:
         _last_reload = 0.0
     _pending_mtime = 0.0  # 已看到但还没应用（受 _RELOAD_MIN_INTERVAL_SEC 限速）
+    _logged_pending = 0.0  # 只为抑制重复日志：排队期每 tick 都会探到同一个 mtime
 
 
     try:
@@ -427,9 +428,13 @@ def daemon_loop(interval: int):
                         _src_mtime(), _seen_mtime, _pending_mtime, _now_ts, _last_reload)
                     if _pending_mtime > _seen_mtime:
                         if not _do_reload:
-                            LOGGER.info(
-                                "源码已更新，距上次重执行 %.0fs < %ds → 排队等待",
-                                _now_ts - _last_reload, _RELOAD_MIN_INTERVAL_SEC)
+                            # 同一 mtime 只记一次：限速期内每 tick 都探到它，逐 tick 打印
+                            # 实测灌出 ~30 行/5min 的纯噪音，把真正的信号埋掉。
+                            if _pending_mtime != _logged_pending:
+                                _logged_pending = _pending_mtime
+                                LOGGER.info(
+                                    "源码已更新，距上次重执行 %.0fs < %ds → 排队等待",
+                                    _now_ts - _last_reload, _RELOAD_MIN_INTERVAL_SEC)
                         else:
                             time.sleep(2)  # 等编辑器落盘，半截保存不触发重启
                             if _src_mtime() == _pending_mtime:
