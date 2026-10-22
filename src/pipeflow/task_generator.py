@@ -107,7 +107,9 @@ _HARD_APPROVE = re.compile(
     r"(?<![A-Za-z0-9_-])(?:CONDITIONAL_)?APPROVED\b|验收通过|"
     r"判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
 # delta 段提到驳回时，出现这些词才算「返工记录」而非「本步驳回」。
-_FIX_MARK = re.compile(r"已修复|已处理|已合并|已关闭|fixed|resolved", re.I)
+# 只认中文标记：英文 fixed/resolved 会被 unfixed/unresolved/not fixed 反向命中
+# （生产消息是中文，加英文没有实证收益）。
+_FIX_MARK = re.compile(r"已修复|已处理|已合并|已关闭")
 # CONDITIONAL_APPROVED 也算通过：实测 47 个带该结论的步骤状态全是 completed /
 # step_done_ready（0 P0 的带条件通过），把它当叙述会让父步的更新结论永远压不过
 # 子链的旧驳回（#439027 那类 7h32m 卡死的成因）。

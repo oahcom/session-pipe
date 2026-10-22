@@ -272,6 +272,8 @@ def test_delta_with_hard_rejection_is_still_rejection():
     """
     from pipeflow.task_generator import _conclusion
     assert _conclusion("s4-complete — delta: CHANGES_REQUESTED 3 项未修复") is False
+    # 英文否定词不构成「已修复」（第 9 轮 P2：unfixed/unresolved 曾被当成 fixed）
+    assert _conclusion("s4-complete — delta: CHANGES_REQUESTED 3 items unfixed") is False
     assert _conclusion("s4-complete — delta: 已修复 CHANGES_REQUESTED 的 3 项") is None
     assert not _superseded_by_parent(
         _parent(("APPROVED", SUB_TS + 100),
