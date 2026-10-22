@@ -185,16 +185,18 @@ def _sym_check(text: str, root: Path, path: Path) -> int:
                 print(f"SYMBOL_MISSING_FILE {name}")
                 bad += 1
             continue
-        names = _symbols(p)
-        if names is not None:
-            ok = sym in names
-        else:
-            src = p.read_text(encoding="utf-8", errors="ignore")
-            pat = rf"^\s*(?:def|class)\s+{re.escape(sym)}\b|^\s*{re.escape(sym)}\s*[:=]"
-            ok = bool(re.search(pat, src, re.M))  # 解析不了才退回正则
-        if not ok:
-            print(f"SYMBOL_MISSING {name}:{sym}")
+        syms = _symbols(p)
+        if syms is None:
+            continue  # 解析不了（非 py 语法）就不下结论
+        public, every = syms
+        if sym in public:
+            continue
+        if sym in every:
+            print(f"SYMBOL_LOCAL_ONLY {name}:{sym}")  # 只在函数内绑定过：文档引用错了
             bad += 1
+            continue
+        print(f"SYMBOL_MISSING {name}:{sym}")
+        bad += 1
     return bad
 
 

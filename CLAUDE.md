@@ -72,7 +72,7 @@ src/
     engine.py         ── 编排 + CLI（2023 行，导入下方 mixin）
     step_handler.py   ── 步骤处理（1719 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1223 行）
-    task_generator.py ── 任务生成（984 行）
+    task_generator.py ── 任务生成（988 行）
     wf_lifecycle.py   ── 工作流生命周期（2147 行）
     daemon.py         ── 工作流守护 while 循环（483 行）
     integrity.py      ── 完整性提醒（旁路提醒）

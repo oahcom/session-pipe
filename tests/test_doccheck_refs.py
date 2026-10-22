@@ -83,3 +83,18 @@ def test_sym_uses_ast_not_regex(tmp_path, capsys):
     assert dc._sym_check("mod.py:Beta mod.py:GAMMA mod.py:delta mod.py:epsilon", root, Path("X.md")) == 0
     assert dc._sym_check("mod.py:eta", root, Path("X.md")) == 1
     assert "SYMBOL_MISSING mod.py:eta" in capsys.readouterr().out
+
+
+def test_local_only_binding_is_flagged(tmp_path, capsys):
+    """同名局部变量不能掩盖"模块级符号已被删" —— 文档引用局部变量几乎总是写错。"""
+    body = "def outer():\n    config = 1\n    return config\n\nCONFIG = 2\n"
+    root = _repo(tmp_path, body)
+    assert dc._sym_check("mod.py:CONFIG", root, Path("X.md")) == 0
+    assert dc._sym_check("mod.py:config", root, Path("X.md")) == 1
+    assert "SYMBOL_LOCAL_ONLY mod.py:config" in capsys.readouterr().out
+
+
+def test_class_methods_count_as_public(tmp_path):
+    body = "class LifecycleManager:\n    def confirm_step(self):\n        pass\n"
+    root = _repo(tmp_path, body)
+    assert dc._sym_check("mod.py:confirm_step", root, Path("X.md")) == 0
