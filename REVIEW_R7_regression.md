@@ -1,5 +1,8 @@
 # REVIEW_R7_regression — Round 7 stale-kill 回归审查
 
+> ⚠️ **2026-08 的单轮回归审查记录（只含当轮 diff 与自检），不是当前状态**。
+> 引用条件4/timeout_count 的现行语义请查 `src/pipeflow/wf_lifecycle.py` 与 `CHANGES.md`。
+
 ## 自检
 
 我声称完成的任务: 回归审查 Round 7 的 stale-kill 条件变更 (wf_lifecycle.py 条件4)

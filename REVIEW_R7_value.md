@@ -1,5 +1,12 @@
 # REVIEW_R7_value — coordinator_dispatch 死循环联合修复价值/正确性审查
 
+> ⚠️ **2026-08-23 的审查稿，描述的是当时的模板状态，别当现状引用**：实测
+> `~/.hermes/workflows/coordinator_dispatch.json` 现在 **steps 全都没有 `timeout_minutes`**
+> （取出来是 `[None, None, None, None]`），`loop` 只剩 `{'max_iterations': 0}` —— §1.1/§1.4
+> 写的 "35×4 超时 / loop.schedule */30" 已不存在。仍成立的只有一条：`rest_if_no_work`、
+> `idle_timeout_minutes`、`loop.schedule` 至今 **全仓 Python 零消费者**（2026-10-22 grep 复验），
+> "声明性死配置" 这个结论有效。现行事实以 `AGENTS.md`/`CHANGES.md` 为准。
+>
 > 审查者角色：价值/正确性审查者（只读）
 > 审查对象：R4（timeout 5/5/30/10→35, ≥loop 30min cadence）+ R7（stale-kill 墙钟误杀修复）
 > 代码基线：`src/pipeflow/wf_lifecycle.py`（85-95 条件4）、`src/pipeflow/step_handler.py:59`

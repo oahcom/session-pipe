@@ -1,5 +1,10 @@
 # Session Pipeline — Handoff Summary (Updated)
 
+> ⚠️ **2026-07-25 的交接快照，不再维护**。下面 "Remaining Issues" 列的 7 个失败用例
+> 现已全部通过（2026-10-22 实测 `pytest -k 'tick_advances or tick_completes or advance_finishes
+> or timeout_triggers_retry or timeout_escalates or run_persists_on_tick or workspace_summary_in_prompt'`
+> → **7 passed**；全量收集 1298 项）。当前状态以 `make test` 与 `CHANGES.md` 为准，别照本文件排障。
+>
 > 2026-07-25 10:30 CST | 4 commits ahead of origin/main
 
 ## Status Overview
