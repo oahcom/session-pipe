@@ -1,5 +1,41 @@
 # CHANGES.md
 
+## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效
+
+### 问题（可观测证据）
+1. `python3 -m pytest tests/ -q` 连续两次停在第 29 例（**28 个点**、15 分钟 0 前进、
+   `wchan=hrtimer_nanosleep`）。唯一可信的定位方式 `--timeout=25 --timeout-method=thread` 抓栈
+   （前两轮猜 `_wait_for_role_ready` / 派单用例都错）：
+   `run_once → _ensure_guard_roles → _ensure_role_alive → _check_and_start_role → ccs start(60s) + sleep(3)`。
+   测试用的 `test_role` 在注册表里不存在，一个 tick 烧 90s+。
+2. 跑到 ~94% 以 **EXIT=142** 结束、无 summary：用例自带 `signal.alarm(20)` 而 pytest 下没装 handler →
+   默认动作杀进程；`grep -c signal.alarm` 集中在 `test_workcycle_e2e.py`（17 处）。
+3. 生产侧：`_ensure_guard_roles(deadline)` 只在**角色之间**看预算，单个 `ccs start` 仍可独占 60s ——
+   「巡检不吃光 tick 预算」在单角色粒度上不成立（近 12h 日志 2 次「守护巡检超预算」）。
+4. 审批通知真发：`LifecycleManager._notify_result` 走真 `ccs send`，测试夹具 id 直接进了
+   product_architect 的上下文（2026-10-21 实测 13 条「工作流: wf_pull」）。
+
+### 改动
+- `tests/conftest.py`：4 个 autouse 桩 —— `_ensure_guard_roles`→`set()`、`_wait_for_role_ready`→True、
+  `_ensure_role_alive`→True、`_notify_result`→None；三张模块 allowlist（`_REAL_GUARD_MODULES` /
+  `_REAL_READY_MODULES` / `_REAL_ENSURE_ALIVE_MODULES`）给「被测的就是这一步」的用例留真实路径；
+  SIGALRM handler 抛 `pytest.fail.Exception`（BaseException，热路径的 `except Exception`/`OSError` 吞不掉）。
+- `src/pipeflow/role_lifecycle.py` + `engine.py`：`deadline` 透传到 `_check_and_start_role` ——
+  `ccs start` 的 timeout 取 `max(5, min(60, deadline-now))`、轮询超预算即 break；无 deadline 时行为不变（60s）。
+  预算耗尽时不盖 30min 冷却戳；`TimeoutExpired` 进 catch 元组。
+- 新增回归：`tests/test_guard_budget.py`（3 例）、`tests/test_no_live_notify.py`（全局 patch 必须
+  `try/finally` 恢复 —— 泄漏的 `subprocess.run` 桩会让 `eval_checker` 的 `stat -c %W` 拿到空串而 fail-open，
+  表现为 5 条与本文件无关的用例转红）。
+
+### 验证
+- `pytest tests/ -q` → **1318 passed, 2 subtests passed in 148s（exit 0）**，两次连续复现；
+  修前**从未拿到 summary**（卡在 5%）。
+- `test_chain_dispatch_contract.py` 90s+ → **1.08s**；`test_guard_budget.py` 3 passed。
+
+### 未做
+- 冷却/去重表（`_ALERT_TS` 等）仍是**进程级**：daemon 源码热重载后清空，最坏重发一次。
+- 5 条"单跑绿、全量红"的历史 flaky 只验到与本轮改动无关，未逐条修根因。
+
 ## 2026-10-22 — 文档引用改成可机器校验（doccheck v2）
 
 ### 问题

@@ -42,7 +42,7 @@ python3 -m pytest tests/ -q
 
 ```bash
 # 路由
-PYTHONPATH=src python3 -m routing.auto --status        # 队列状态（缺省行为同）
+PYTHONPATH=src python3 -m routing.auto --status        # 只查队列状态；不带任何 flag 就是分发一轮（poll_unconsumed → notify_consumers，真发消息）
 PYTHONPATH=src python3 -m routing.auto --route-all     # 路由所有
 PYTHONPATH=src python3 -m routing.auto --health        # 健康检查
 PYTHONPATH=src python3 -m routing.router list          # 路由表
