@@ -1,8 +1,8 @@
 """doccheck 的 xxx.py:NNN / xxx.py:符号 引用校验（R150 工具化）。
 
-覆盖的是"机器能确定"的判据：越界、空行、文件不存在、符号是否存在（按 AST，
-不是正则 —— 正则会把注释和字符串当成定义）。以及必须跳过的两类：历史快照
-（ISSUES.md/CHANGES.md）与跨仓引用（带目录但本仓没有）。
+判据只做机器能确定的事：行号越界、目标行空行、文件在三仓里都找不到、符号不存在（AST，
+不是正则）。跳过只有两类：历史快照（ISSUES.md/CHANGES.md）与三仓之外的文件（`~/`、绝对路径）。
+显式跨仓路径（`session-pipeline/src/x.py`）要真去兄弟仓里找 —— 不然"跨仓"就成了免检通道。
 """
 import importlib.util
 from pathlib import Path
@@ -20,10 +20,10 @@ dc = _load()
 
 
 def _repo(tmp_path: Path, body: str = "x = 1\n") -> Path:
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "mod.py").write_text(body, encoding="utf-8")
-    return tmp_path
+    root = tmp_path / "session-launcher"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "mod.py").write_text(body, encoding="utf-8")
+    return root
 
 
 def test_cite_past_eof_is_flagged(tmp_path, capsys):
@@ -51,11 +51,22 @@ def test_fenced_examples_are_ignored(tmp_path):
     assert dc._sym_check(text, root, Path("X.md")) == 0
 
 
-def test_bare_unknown_file_is_flagged_but_cross_repo_is_skipped(tmp_path, capsys):
+def test_missing_file_is_flagged_unless_outside_the_three_repos(tmp_path, capsys):
     root = _repo(tmp_path)
     assert dc._cite_check("见 nowhere.py:99", root, Path("X.md")) == 1
     assert "CITE_MISSING_FILE" in capsys.readouterr().out
-    assert dc._cite_check("见 other/repo/mod.py:99", root, Path("X.md")) == 0
+    assert dc._cite_check("见 other/repo/mod.py:99", root, Path("X.md")) == 1  # 拼错的相对路径
+    assert dc._cite_check("见 ~/.hermes/scripts/x.py:9", root, Path("X.md")) == 0  # 仓外，管不着
+
+
+def test_explicit_sibling_repo_path_is_resolved(tmp_path):
+    root = _repo(tmp_path)
+    sib = tmp_path / "session-pipeline" / "src" / "lifecycle"
+    sib.mkdir(parents=True)
+    (sib / "manager.py").write_text("def confirm_step():\n    pass\n", encoding="utf-8")
+    ref = "见 session-pipeline/src/lifecycle/manager.py:confirm_step"
+    assert dc._sym_check(ref, root, Path("X.md")) == 0
+    assert dc._sym_check("见 session-pipeline/src/lifecycle/manager.py:nope", root, Path("X.md")) == 1
 
 
 def test_history_files_are_skipped(tmp_path):
@@ -65,9 +76,10 @@ def test_history_files_are_skipped(tmp_path):
 
 
 def test_sym_uses_ast_not_regex(tmp_path, capsys):
-    """注释/字符串里的名字不算定义；re-export 的导入名算定义。"""
-    body = "# delta = 1\n\"delta = 2\"\n\nfrom os import path as delta\n\nclass Beta:\n    pass\n\nGAMMA = 1\n"
+    """注释/字符串里的名字不算定义；解包绑定、re-export 的导入名算定义。"""
+    body = ("# delta = 1\n\"delta = 2\"\n\nfrom os import path as delta\n\n"
+            "class Beta:\n    pass\n\nGAMMA = 1\n\nfor epsilon, zeta in []:\n    pass\n")
     root = _repo(tmp_path, body)
-    assert dc._sym_check("mod.py:Beta mod.py:GAMMA mod.py:delta", root, Path("X.md")) == 0
-    assert dc._sym_check("mod.py:epsilon", root, Path("X.md")) == 1
-    assert "SYMBOL_MISSING mod.py:epsilon" in capsys.readouterr().out
+    assert dc._sym_check("mod.py:Beta mod.py:GAMMA mod.py:delta mod.py:epsilon", root, Path("X.md")) == 0
+    assert dc._sym_check("mod.py:eta", root, Path("X.md")) == 1
+    assert "SYMBOL_MISSING mod.py:eta" in capsys.readouterr().out
