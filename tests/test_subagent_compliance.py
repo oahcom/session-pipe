@@ -137,6 +137,24 @@ def test_threshold_boundary_10_vs_11() -> None:
     assert run(11) == {"rounds": 1, "followed": 0, "hard_ignored": 1, "soft_ignored": 0}
 
 
+def test_round_does_not_cross_file_boundary() -> None:
+    """指令是文件最后一条 say 时，窗口不得吃掉下一个文件的工具调用。
+
+    calls 是跨 jsonl 按文件名拼接的（不是时间序）：实测 pa 的指令后跟着
+    下一个文件 1538 次调用，只因下一文件首行恰好是 say 才没误判。
+    """
+    head = _say(_DIRECTIVE, _ts(-60))
+    head["src"] = "a.jsonl"
+    tail = []
+    for _ in range(12):
+        u = _use("Bash")
+        u["src"] = "b.jsonl"
+        tail.append(u)
+    got = TrajectoryQualityChecker()._subagent_compliance([head] + tail + [_result()])
+    assert got == {"rounds": 1, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, \
+        "跨文件调用不是本轮自办，不能判 hard"
+
+
 def main() -> int:
     n = 0
     for name, fn in sorted(globals().items()):
