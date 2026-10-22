@@ -98,3 +98,19 @@ def test_class_methods_count_as_public(tmp_path):
     body = "class LifecycleManager:\n    def confirm_step(self):\n        pass\n"
     root = _repo(tmp_path, body)
     assert dc._sym_check("mod.py:confirm_step", root, Path("X.md")) == 0
+
+
+def test_ambiguous_bare_name_is_not_resolved_by_sibling(tmp_path):
+    """本仓有两个同名文件时判歧义，不许拿兄弟仓的唯一命中来消歧。"""
+    root = tmp_path / "session-launcher"
+    for d in ("a", "b"):
+        (root / d).mkdir(parents=True)
+        (root / d / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    assert dc._resolve("mod.py", root) is None  # 两个同名 → 歧义
+
+
+def test_absolute_path_inside_a_repo_is_checked(tmp_path):
+    root = _repo(tmp_path, "x = 1\ny = 2\n")
+    ref = f"见 {root}/src/mod.py:2"
+    assert dc._cite_check(ref, root, Path("X.md")) == 0
+    assert dc._cite_check(f"见 {root}/src/mod.py:99", root, Path("X.md")) == 1
