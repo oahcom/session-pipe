@@ -306,8 +306,8 @@ def _restore_process_globals() -> None:
             sys.modules[_name] = _mod
 
 
-# 需要真实 _wait_for_role_ready 的模块：它验的正是「ccs start 失败要可观测」，
-# 桩掉就把被测对象测空了。
+# 需要真实 _wait_for_role_ready 的模块：它验的正是「ccs start 失败要可观测」
+# 与「探测不可用不投递」，桩掉就把被测对象测空了。
 _REAL_READY_MODULES = {"test_role_start_error_text"}
 
 

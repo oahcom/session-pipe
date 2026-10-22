@@ -35,7 +35,7 @@ _KICK_COOLDOWN_SEC = 600
 # on_advance 回调，每个步骤推进都触发），且是 check-then-act 无锁 → 并发 tick
 # 各自判定"不存活"后同时拉起同一角色（实测 scout 建 116 个会话）。
 # 同一角色在冷却窗内不重复拉起。
-# 存活正向缓存（秒）：单次探测 4-5.6s（tmux has-session 2.4s + _is_agent_alive 2.4s）
+# 存活正向缓存（秒）：一次 pane 快照探测实测 0.1~2.4s，tmux 卡顿时顶到 5s 超时
 _ALIVE_CACHE_SEC = 120.0
 
 _RESTART_COOLDOWN_SEC = 300
@@ -723,7 +723,7 @@ class RoleLifecycleMixin:
     def _ensure_role_alive(self, role: str, deadline: float = 0.0) -> bool:
         """存活探测 + 拉起；正向结果缓存 _ALIVE_CACHE_SEC（实测单次探测 4-5.6s）。
 
-        实测 2026-10-22 03:3x：一次 tmux has-session 2.4s、_is_agent_alive 再 2.4s。
+        实测 2026-10-22 03:3x：has-session + _is_agent_alive 两次往返各 2.4s（现已合并为一次快照）。
         _ensure_guard_roles 每 tick 对活跃链的全部 guard/wait 角色各探一次，
         十几个角色就是 40-95s 的纯探测开销，与投递/推进争同一个 tick。
         角色死后最迟 120s 被发现；投递前 _wait_for_role_ready 仍独立复核，不靠这份缓存。
@@ -740,40 +740,21 @@ class RoleLifecycleMixin:
         return False
 
     def _check_and_start_role(self, role: str, deadline: float = 0.0) -> bool:
-        """检查角色的 CCS 是否存活（tmux + claude 进程），不存活则拉起。
+        """检查角色的 CCS 是否存活（pane 存在即算活），不存活则拉起。
 
         deadline：调用方（守护巡检）给的绝对时刻。拉起 `ccs start` 原本写死 60s
         超时 + 30×1s 轮询，单角色最坏 95s——巡检只在**角色之间**看预算，于是
         一个角色就能把整个 tick 预算吃光（实测 run_once 卡在 _ensure_guard_roles
         的 sleep(3) 里，全量套件第 29 例 15 分钟 0 前进）。
         """
-        try:
-            alive = _engine_mod._sp.run(
-                ["tmux", "has-session", "-t", f"ccs-{role}"],
-                capture_output=True, timeout=5,
-            ).returncode == 0
-        except (_engine_mod._sp.TimeoutExpired, OSError) as _pe:
-            # 探针本身卡住 ≠ 角色死亡：实测 has-session 常态 2.4s，内存高压下 >5s。
-            # 原实现让异常穿出去，调用方按"探测失败"记一条 warning 后什么都不做，
-            # 但每个角色每 tick 仍要再付 5s —— 十几个角色就是一整轮 tick。
-            # 按未知处理（返回 True）让上层缓存，避免在 tmux 卡顿时反复重探。
-            LOGGER.warning("存活探测异常 %s: %s（按未知处理，不重启）", role, _pe)
+        # 判据只有一条：pane 是否存在（_is_agent_alive）。原来先跑 has-session 再跑
+        # _is_agent_alive，是同一件事付两次往返（各 2.4s，卡顿时各 5s 超时）——19 个
+        # 角色 × 每 tick 就是整轮 tick（实测 2026-10-22 12:45 单次 has-session 101.8s，
+        # 巡检 480s）。None=探测不可用，不判死也不拉起；False 只意味着没有这个 pane，
+        # 没有东西可 kill —— 原来那套「二次确认 + kill-session」因此是空动作（每个死
+        # 角色白付 1s sleep + 一次绕过缓存的快照），删掉。
+        if self._is_agent_alive(role) is not False:
             return True
-        if alive:
-            agent = self._is_agent_alive(role)
-            if agent is None or agent:
-                # None=探测失败（不判死）；True=活。两种情况都不动它。
-                return True
-            # 二次确认：kill 是破坏性动作，首判可能因启动竞态假阴性
-            # （观测：scout 建 25+ 会话，含 1 秒即死实例）。
-            time.sleep(1)
-            if self._is_agent_alive(role, fresh=True) is not False:
-                return True
-            LOGGER.info("CCS %s: tmux alive but no claude, restarting", role)
-            _engine_mod._sp.run(["tmux", "kill-session", "-t", f"ccs-{role}"],
-                    capture_output=True, timeout=5)
-            _invalidate_tmux()      # 会话刚没，旧快照还会说它在
-            alive = False
 
         # 预算已耗尽就别拉起：拉起会先盖 300s 冷却戳（下面 _last_restart），
         # 掐断后既不在缓存里、又踩冷却，而巡检游标正好把它排到下一轮首位。
@@ -828,51 +809,47 @@ class RoleLifecycleMixin:
                     break
                 time.sleep(1)
                 _invalidate_tmux()   # 刚拉起，让下一次探针拿到新会话
-                if _engine_mod._sp.run(["tmux", "has-session", "-t", f"ccs-{role}"],
-                           capture_output=True, timeout=5).returncode == 0:
-                    time.sleep(3)  # 等 agent 进程启动
-                    if self._is_agent_alive(role):
-                        # 审计信号：记录角色被 workflow 引擎拉起（供 monitor_audit 查看）
-                        # 写失败不阻断拉起（审计是旁路，DB 锁/连接异常不应让角色拉起中断）
-                        try:
-                            # 带时刻：固定标题会把每次重启压成一行（#288618 写 21 次
-                            # 仍只显示"重启 1 次"），崩溃循环在审计里不可见。
-                            self._bb.write("monitor_audit",
-                                f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)"
-                                f" {time.strftime('%m-%d %H:%M:%S')}",
-                                src="workflow_engine")
-                        except Exception:
-                            LOGGER.debug("monitor_audit write failed for %s", role)
-                        return True
+                _s = self._is_agent_alive(role)
+                if _s is None:
+                    # tmux 卡死：别在 30×1s 里继续空转，交给下一轮巡检
+                    LOGGER.warning("CCS %s: 拉起后探测不可用，交给下一轮巡检", role)
+                    break
+                if _s is False:
+                    continue
+                time.sleep(3)        # 等 agent 进程启动
+                if self._is_agent_alive(role, fresh=True):
+                    # 审计信号：记录角色被 workflow 引擎拉起（供 monitor_audit 查看）
+                    # 写失败不阻断拉起（审计是旁路，DB 锁/连接异常不应让角色拉起中断）
+                    try:
+                        # 带时刻：固定标题会把每次重启压成一行（#288618 写 21 次
+                        # 仍只显示"重启 1 次"），崩溃循环在审计里不可见。
+                        self._bb.write("monitor_audit",
+                            f"决策: 角色拉起 → {role} CCS 已重启 (workflow 驱动)"
+                            f" {time.strftime('%m-%d %H:%M:%S')}",
+                            src="workflow_engine")
+                    except Exception:
+                        LOGGER.debug("monitor_audit write failed for %s", role)
+                    return True
         except (ValueError, KeyError, TypeError, _engine_mod._sp.TimeoutExpired):
             LOGGER.debug("CCS role alive check failed for %s", role)
         return False
 
     def _wait_for_role_ready(self, role: str, wf_id: str = "", step_id: str = "",
                               max_wait: int = 90, check_interval: int = 5) -> bool:
-        """等待角色真正就绪：tmux 存活 + claude 进程存活 + 不在 busy 状态。
+        """等待角色真正就绪：pane 存在（_is_agent_alive）+ 不在 busy 状态。
 
         这是 dispatch 前的关键检查，确保角色真正就绪才发送任务。
         """
         deadline = time.time() + max_wait
         while time.time() < deadline:
-            # 0. 探测不可用（tmux server 卡死，实测 2026-10-22 09:18 list-sessions 20s
-            # 无响应）≠ 角色死了：必须先于 has-session / ccs start 判断，否则整轮
-            # 先烧 has-session 5s + ccs start 60s + 10×1s 等待才轮到它。
-            # 此刻投递根本走不通，交给下一 tick 重试。
-            if (_probe := self._is_agent_alive(role)) is None:
+            # 探测不可用（tmux server 卡死，实测 2026-10-22 09:18 list-sessions 20s
+            # 无响应）≠ 角色死了：必须先于 ccs start 判断，否则整轮先烧
+            # ccs start 60s + 10×1s 等待才轮到它。此刻投递走不通，交给下一 tick。
+            if (_alive := self._is_agent_alive(role)) is None:
                 LOGGER.warning("_wait_for_role_ready %s: tmux 探测不可用，本轮不投递", role)
                 return False
-            # 1. tmux session 存活
-            try:
-                alive = _engine_mod._sp.run(
-                    ["tmux", "has-session", "-t", f"ccs-{role}"],
-                    capture_output=True, timeout=5
-                ).returncode == 0
-            except Exception:
-                alive = False
-
-            if not alive:
+            # 1. pane 存活（与上面同一次快照探测，不再逐角色付 has-session）
+            if not _alive:
                 # 拉起角色
                 LOGGER.info("_wait_for_role_ready: role %s not alive, starting...", role)
                 # 拉起只走 _check_and_start_role 一条路：这里原来内联复制了一份（约 40 行），
@@ -883,13 +860,7 @@ class RoleLifecycleMixin:
                     time.sleep(check_interval)
                     continue
 
-            # 2. 检查 claude 进程是否存活
-            if not _probe:
-                LOGGER.info("Role %s 无 claude 进程，等待就绪（若持续则角色未被拉起）", role)
-                time.sleep(5)
-                continue
-
-            # 3. 检查是否 busy（如果 busy 说明正在处理其他任务，这其实是好的）
+            # 2. 检查是否 busy（如果 busy 说明正在处理其他任务，这其实是好的）
             busy = self._is_role_busy(role, exclude_wf_id=wf_id, pane_fallback=True)
             if busy:
                 LOGGER.info("Role %s is busy (processing other work), ready to queue", role)

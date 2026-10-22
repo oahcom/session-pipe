@@ -27,7 +27,7 @@ class _Probe(rl.RoleLifecycleMixin):
         self._bb = MagicMock()
 
     def _is_agent_alive(self, role, fresh=False):
-        return True
+        return False   # 判死才会走 ccs start —— 本用例测的正是它的 timeout
 
 
 class _Clock:
@@ -42,7 +42,7 @@ def _record(monkeypatch):
     def run(args, **kw):
         seen.append((list(args), kw.get("timeout")))
         m = MagicMock()
-        m.returncode = 1 if "has-session" in args else 0   # has-session 失败 → 才会走 ccs start
+        m.returncode = 0   # 探针已被桩掉（_is_agent_alive=False）→ 直接走 ccs start
         m.stdout, m.stderr = b"", b""
         return m
 
