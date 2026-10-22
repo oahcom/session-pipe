@@ -231,3 +231,9 @@ def test_all_lines_must_satisfy_when_quanbu():
     bad = {"stdout": "active\ninactive\n", "stderr": "", "returncode": 0, "ok": True}
     assert ec._check_passed(ok, cmd + " 全部返回 active", "active")[0] is True
     assert ec._check_passed(bad, cmd + " 全部返回 active", "active")[0] is False
+
+
+def test_cjk_expected_uses_substring():
+    """CJK 没有词边界：'检查通过' 应命中 '通过'，不能被 ASCII 边界误杀。"""
+    assert ec._has_word("检查通过", ["通过"]) is True
+    assert ec._has_word("inactive", ["active"]) is False

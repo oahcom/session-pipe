@@ -452,13 +452,14 @@ def _is_tool_error(result: dict) -> bool:
 
 
 def _has_word(text: str, words) -> bool:
-    r"""text 里是否按**词边界**出现 words 中任意一个。
+    r"""text 里是否按**ASCII 词边界**出现 words 中任意一个。
 
     WHY 不用 `in`：`"active" in "inactive"` 为真 —— 维护者的「全部返回 active」
-    判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界同时排除 `-_`，
-    避免 `5xx-error` 这类被拆词误伤；中文/CJK 也算 \w，"不通过" 不会命中 "通过"。
+    判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界只认 ASCII 字母数字
+    和 `-_`：`5xx-error` 不会被 `error` 拆词误伤；CJK 没有词边界概念，"检查通过"
+    仍按子串命中 "通过"（"不通过" 同样命中，否定语义要写负向 expected 或改命令）。
     """
-    return any(w and re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text)
+    return any(w and re.search(rf"(?<![A-Za-z0-9_-]){re.escape(w)}(?![A-Za-z0-9_-])", text)
                for w in words)
 
 
@@ -514,8 +515,8 @@ def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, st
             detail = f"{val}{op}{ref} | stdout={stdout[:120]}"
             return (passed, detail)
 
-    # 简单文本包含检查（按词边界）：子串匹配会把 "active" 吃进 "inactive"、
-    # "OK" 吃进 "NOT OK"，是判据恒真最常见的来源。
+    # 简单文本包含检查（按 ASCII 词边界）：子串匹配会把 "active" 吃进 "inactive"，
+    # 是判据恒真最常见的来源；CJK 无词边界，仍按子串。
     passed = _has_word(stdout, [expected]) or _has_word(stderr, [expected])
     detail = f"expected={expected[:60]} | stdout={stdout[:120]} | exit={rc}"
     return (passed, detail)
