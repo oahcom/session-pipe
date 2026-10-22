@@ -13,7 +13,7 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
          └──→ launcher/ccs.py send ← 唯一跨项目调用（subprocess）
 ```
 
-**Pipeline and launcher do NOT communicate directly.** Pipeline discovers CCS status via sentinel files (`~/.hermes/run/ccs-sentinels/`) and dispatches messages via `subprocess.run([sys.executable, CCS_CLI, "send", ...])`.
+**Pipeline 不 import launcher**：只用 `subprocess.run([sys.executable, CCS_CLI, <子命令>, ...])` 调它（send / start / stop / status-role），角色状态读哨兵文件 `~/.hermes/run/ccs-sentinels/`。
 
 ## Module inventory
 

@@ -55,12 +55,12 @@ session-roles（定义层）
 | 路由表 | `~/.hermes/state/routing.db` | 路由表 + 变更审计 |
 | ~~Pipeline Cursor~~ | `~/.hermes/state/pipeline_cursor.db` | **已退役**（2026-10-22，去重改由 bus consume 记录承担；表 0 行） |
 
-## 哨兵文件（launcher 管，实测在 `~/.hermes/run/`）
+## 哨兵文件（实测在 `~/.hermes/run/`；两个目录写的不是同一份数据）
 
 | 目录 | 内容 |
 |------|------|
-| `~/.hermes/run/ccs-sentinels/` | CCS 运行状态（按角色 JSON） |
-| `~/.hermes/run/ccs-health/` | 进程健康数据（watchdog 状态） |
+| `~/.hermes/run/ccs-sentinels/` | CCS 运行状态（launcher `ops/sentinel.py` 写，含 `health.last_watchdog_check`） |
+| `~/.hermes/run/ccs-health/` | 存活探针（pipeline `survival_monitor.py` 写，键只有 `survival_*`；watchdog 字段**不在这里**） |
 | `~/.hermes/run/ccs-lifecycle-sentinels/` | ondemand 角色生命周期哨兵 |
 
 `/tmp/ccs-sentinels`、`/tmp/ccs-health`、`/tmp/cdx-sentinels` 均已不存在——旧文档里的 `/tmp` 路径是过期记录。

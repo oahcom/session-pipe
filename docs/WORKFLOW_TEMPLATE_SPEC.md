@@ -30,9 +30,9 @@
 
 | 字段 | 校验规则 | 常见错误 |
 |------|----------|----------|
-| `trigger_scene` | 非空列表，每条 ≥4 字符 | 写"通用XXX相关任务"这种泛化描述 |
+| `trigger_scene` | 非空字符串列表（**只判非空**；schema 的 minLength 4 未被执行） | 写"通用XXX相关任务"这种泛化描述 |
 | `allowed_initiators` | 非空列表，每项为有效角色 | 抄别的模板不核对 |
-| `allowed_executors` | 非空列表 | 遗漏步骤中的 target_role |
+| `allowed_executors` | 非空列表（**不校验**是否覆盖步骤的 target_role） | 抄别的模板不核对角色名是否存在 |
 | `max_duration_hours` | ≥1 的数字 | 对多步模板写 4h 明显不够 |
 | `quality_standards` | ≥8 字符，不写"通过 Codex 审查" | 使用泛化套话 |
 
@@ -159,8 +159,8 @@ PYTHONPATH=src python3 -m template_registry validate-all
 ## 4. 角色配置规则
 
 - `allowed_initiators`：包含该模板合理发起者的角色（通常为 `coordinator`、`pm` 等）
-- `allowed_executors`：**必须**包含所有步骤中 `target_role` 的去重集合
-- 如果有步骤角色不在 `allowed_executors` 中，则该角色无法被指派为此工作流的执行者，会导致运行时异常
+- `allowed_executors`：非空角色数组。校验器只判存在性，**不检查**是否覆盖各步骤 `target_role`
+  （`full_dev_pipeline` 现场就不覆盖：executors 是 claude/coordinator/workflow_engine，步骤角色是 6 个真实角色，`validate` 只报角色不存在）
 
 ---
 
@@ -182,7 +182,7 @@ PYTHONPATH=src python3 -m template_registry validate path/to/template.json
 |--------|------|
 | trigger_scene | 非空列表 |
 | allowed_initiators | 非空列表 |
-| allowed_executors | 非空列表，覆盖全步骤 target_role |
+| allowed_executors | 非空列表（不校验覆盖率） |
 | max_duration_hours | ≥1 |
 | prompt 三段式 | 含子串「做什么 / 怎么做 / 验收标准」三者且 ≥150B（`_validate_step_content`） |
 | prompt 完成标头 | 含 `## 完成` 标头（单独硬检，不在三段式里） |

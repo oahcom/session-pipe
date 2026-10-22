@@ -6,11 +6,7 @@
 
 Session 生态的**路由层**：自动感知 bus 新消息，按优先级分发给对应 CCS 消费；同时运行工作流引擎（pipeflow）。
 
-```
-roles (定义层 JSON) → launcher (执行层) → pipeline (路由层)
-                                              ↓
-                                         Sister Bus
-```
+架构图见 [AGENTS.md](../AGENTS.md) §整体架构（roles 是两个消费者，不是流水线的第一级）。
 
 ## 2. 代码布局（行数见 [CLAUDE.md](../CLAUDE.md)，由 `scripts/doccheck.py` 校验）
 
