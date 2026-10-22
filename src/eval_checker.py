@@ -1384,9 +1384,10 @@ class TrajectoryQualityChecker:
 
 
 def run_eval_check(role_filter: str | None = None) -> dict:
-    """主入口：加载角色 JSON，按权重轮询挑 1-2 个，对每个执行前 3 条 eval_criteria。
+    """主入口：加载角色 JSON，均匀无放回抽 1-2 个，对每个执行前 3 条 eval_criteria。
 
-    权重 = 该角色可执行 eval 数量（含"验证:"的 criterion 数），最少 1。
+    均匀而非按可执行判据数加权：13/19 个角色零可执行判据，但 4 个通用检查
+    （产出语义/需求确认/轨迹/杠杆）按角色跑，加权会把这些角色的检查饿死。
     参数 role_filter: 只检查指定角色名。
     返回 {checked, passed, failed, skipped, notices, blockers, avg_score}。
     avg_score 为 0-1 连续均分 (DeepEval 范式), 不影响 passed/failed 计数。
