@@ -65,23 +65,52 @@ def test_role_filter_nonexistent():
     assert s["checked"] == 0
 
 
-def test_weights_sampling():
-    """权重 = 含"验证:"的 criterion 数（最少 1），验证传给 random.choices。"""
+class _StubTrajectory:
+    """轨迹检查替身：真检查器读线上转录，结果与本用例无关且随时钟变化。"""
+
+    def check(self, *args, **kwargs):
+        return {"passed": True, "findings": [], "checked_traces": 0, "subagent": {}}
+
+
+class _Recorder:
+    """通用检查替身：只记录被抽到的角色，结果恒通过。"""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def check(self, role, *args, **kwargs):
+        self.sink.append(role)
+        return {"passed": True, "findings": [], "checked_traces": 0,
+                "checked_files": 0, "checked_requirements": 0,
+                "subagent": {}, "leverage_count": 0}
+
+
+def test_sampling_covers_roles_without_criteria():
+    """零判据角色也必须被抽到，且同一轮不能重复抽同一角色。
+
+    旧版 weights=可执行判据数 + 有放回：0 判据角色权重 1 被挤掉，同一角色
+    还可能占掉两个名额。这里断言行为（抽到了谁），不锁 random.sample 的签名
+    —— 签名断言既会误杀等价重构，也测不到「饿死」这个真问题。
+    """
+    picked: list[str] = []
+    seen: set[str] = set()
     with (
         patch.object(ec, "_load_roles", return_value=_ALL_ROLES),
         patch.object(ec, "_run",
                      return_value={"ok": True, "stdout": "active", "stderr": "", "returncode": 0}),
         patch.object(ec, "_write_bus"),
-        patch.object(ec.random, "choices") as mock_choices,
+        patch.object(ec, "OutputSemanticChecker", lambda: _Recorder(picked)),
+        patch.object(ec, "RequirementConfirmationChecker", lambda: _Recorder(picked)),
+        patch.object(ec, "TrajectoryQualityChecker", lambda: _Recorder(picked)),
+        # create=True：main 基线还没有这个检查器，副本/旧版上补丁也成立
+        patch.object(ec, "LeverageAccumulationChecker", lambda: _Recorder(picked), create=True),
     ):
-        ec.run_eval_check()
-
-    _args, kwargs = mock_choices.call_args
-    assert "weights" in kwargs
-    # 无命令角色: 0 条含"验证:" → max(1, 0) = 1
-    # 正常角色:  2 条 → 2
-    # 维护者:  1 条 → 1
-    assert kwargs["weights"] == [1, 2, 1]
+        for _ in range(20):
+            picked.clear()
+            ec.run_eval_check()
+            assert len(set(picked)) == 2, f"单轮应抽 2 个不同角色: {sorted(set(picked))}"
+            seen.update(picked)
+    assert "无命令角色" in seen, "零判据角色 20 轮都没被抽到 —— 加权饿死回归"
 
 
 def test_is_tool_error():
