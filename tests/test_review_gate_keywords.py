@@ -151,6 +151,18 @@ def test_explicit_pass_verdict_wins(text):
 
 
 @pytest.mark.parametrize("text", [
+    # 2026-10-22：全库 1318 条实测 10 条「通过指标在前、No-Go 在句末」被吞。
+    # `PASS`/`通过率` 先命中即返回 True，句末驳回词根本没机会被看到。
+    "wf_02192e3126/s4-complete — pass=9/fail=2/total=11 通过率81.8% <90% 验收未达标 No-Go",
+    "wf_sub_62469da4d13a/s1 — passed=17 failed=0 rate=100% ... 建议 No-Go",
+    "wf_sub_b02ef7bd7f5f/s1 — cleanup三件套 13/18 PASS(72.2%) ... No-Go",
+    "wf_dea5cd6891ea/s4 — 29用例 23 passed/6 failed (79.3%) ... No-Go：4×P1 未修",
+])
+def test_pass_metric_before_reject_verdict_is_rejection(text):
+    assert is_rejected(text), "通过指标在前的 No-Go 结论不得被第一个 PASS 命中吞掉"
+
+
+@pytest.mark.parametrize("text", [
     "审批=不通过/CHANGES_REQUESTED → @product_architect 需整改",
     "reviewer_pr_review/s1-complete [wf_sub_x] — 代码审查 REJECTED(链级): 0 P0 / 1 P1",
     "判定: 未通过",
