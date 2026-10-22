@@ -1,6 +1,7 @@
 """pytest conftest — 测试隔离配置。"""
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 
@@ -51,6 +52,7 @@ def pytest_runtest_setup(item):
         sys.modules["bus_protocol"] = _real_bus_protocol
     if _real_config_loader is not None and sys.modules.get("config_loader") is not _real_config_loader:
         sys.modules["config_loader"] = _real_config_loader
+    _restore_process_globals()
 
 
 def pytest_runtest_teardown(item, nextitem):
@@ -82,6 +84,12 @@ os.environ["SESSION_PIPELINE_WORKFLOWS_DB"] = os.path.join(_TEST_STATE_DIR, "wor
 # total=1 夹具行会插进 daemon 的 total=1042 序列，生产文件末行去重失效
 # （实测一轮全量测试后 60 行里 48 行是测试产物）。
 os.environ["SESSION_PIPELINE_METRICS_JSONL"] = os.path.join(_TEST_STATE_DIR, "workflow-metrics.jsonl")
+# 哨兵/健康目录同样是生产路径，且各读各的 env（liveness.py:35-36、paths.py:61）：
+# 不隔离时用例读的是 ~/.hermes/run/ccs-sentinels 里 12 个真哨兵与 ccs-health。
+# 补丁一旦打错模块（见文末 _restore_process_globals），"没有哨兵"的断言会拿到真数据
+# 而不是失效，红/绿取决于生产现场。
+os.environ["CCS_HEALTH_DIR"] = os.path.join(_TEST_STATE_DIR, "ccs-health")
+os.environ["CCS_SENTINEL_DIR"] = os.path.join(_TEST_STATE_DIR, "ccs-sentinels")
 
 # 2b. BUS_DB 的 env 版隔离：contract_updater 等通过 `python3 bus_client.py write`
 #     写 bus，子进程只认 HERMES_BLACKBOARD_DB，in-process 属性重绑管不到（实测
@@ -212,6 +220,52 @@ def _no_guard_role_start(request, monkeypatch):
         return
     from pipeflow import engine as _eng
     monkeypatch.setattr(_eng.WorkflowEngine, "_ensure_guard_roles", lambda self, *a, **k: set())
+
+# 7. 进程级全局还原：三个用例原地改写进程全局且不还原，把后续用例带红。
+#    - test_no_live_notify.py:38+60：@patch("pipeflow.engine._sp.run") 与
+#      monkeypatch.setattr(subprocess, "run") 收尾顺序相反 —— 装饰器先 stop，
+#      monkeypatch 后 undo，而 undo 写回的是它保存时的值（那个 MagicMock），
+#      真实现永久丢失。实测之后 eval_checker._birthtime（:955）拿到 "claude"
+#      → ValueError → fail-open → 预存文件不再判盲改（3 用例红）。
+#    - test_alert_cooldown_persist.py:43 把 role_lifecycle._engine_mod 换成
+#      SimpleNamespace(_sp.run → rc=7、无 stdout)：之后所有走 tmux 的用例
+#      （_ensure_role_alive / _send_to_role / _recover_rate_limited_roles）
+#      都拿到 rc=7 或 AttributeError（45 用例红）。
+#    - test_daemon_eval_import_cache.py:16-17 弹掉 sys.modules 里的 routing_daemon/
+#      eval_consistency 再重导：先收集的测试模块仍绑旧函数对象，而
+#      patch("routing_daemon.SENTINEL_DIR") 打在新模块上 → 旧函数读生产哨兵目录
+#      → "没有哨兵"用例恒 True（5 用例红）。
+# 只还原"被用例借走的"三个句柄，不拦被测行为：三条断言面都不受影响。
+# 还原放在**下一个用例的 setup**而不是上一个的 teardown：teardown 里写回会被
+# monkeypatch.undo 再覆盖一次（undo 在 fixture 收尾后跑，写回它当初保存的 MagicMock），
+# 泄漏照样成立；setup 侧还原与 fixture 收尾顺序无关。
+_WATCHED_MODULES = ("routing_daemon", "eval_consistency", "eval_shared_loader", "eval_checker")
+_PRISTINE = {}
+
+
+def _pristine():
+    """首次调用（第一个用例 setup）时抓一份"未被任何用例借走"的句柄。"""
+    if not _PRISTINE:
+        from pipeflow import role_lifecycle as _rl
+        _PRISTINE.update(
+            run=subprocess.run,
+            engine_mod=_rl._engine_mod,
+            mods={n: sys.modules[n] for n in _WATCHED_MODULES if n in sys.modules},
+        )
+    return _PRISTINE
+
+
+def _restore_process_globals() -> None:
+    from pipeflow import role_lifecycle as _rl
+    p = _pristine()
+    if subprocess.run is not p["run"]:
+        subprocess.run = p["run"]
+    if _rl._engine_mod is not p["engine_mod"]:
+        _rl._engine_mod = p["engine_mod"]
+    for _name, _mod in p["mods"].items():
+        if sys.modules.get(_name) is not _mod:
+            sys.modules[_name] = _mod
+
 
 # 需要真实 _wait_for_role_ready 的模块：它验的正是「ccs start 失败要可观测」，
 # 桩掉就把被测对象测空了。
