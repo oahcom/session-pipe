@@ -124,6 +124,27 @@ import paths as _paths_mod
 _paths_mod.WORKFLOWS_DB = Path(os.environ["SESSION_PIPELINE_WORKFLOWS_DB"])
 _paths_mod.METRICS_JSONL = Path(os.environ["SESSION_PIPELINE_METRICS_JSONL"])
 
+# 3d. 哨兵/健康目录：第 111 行的 env 只对**之后才 import** 的模块生效，而本文件第 50 行
+#     就已 import pipeflow（连带 liveness/paths），快照早是生产路径。实测（2026-10-22）：
+#     liveness.HEALTH_DIR / SENTINEL_DIR、paths.CCS_SENTINEL_DIR 全是 ~/.hermes/run/ccs-*，
+#     与 env 里的 /tmp 不一致 —— 按值拷贝这几个常量的模块（drift_detector:17、
+#     routing_daemon:31、survival_monitor:18）同样读生产哨兵，"没有哨兵"类断言
+#     红/绿取决于机器上有没有角色在跑。故 env 之外必须重绑属性。
+#     新模块按值拷贝这几个常量时，也要在此登记。
+_ISO_HEALTH = os.path.join(_TEST_STATE_DIR, "ccs-health")
+_ISO_SENTINEL = os.path.join(_TEST_STATE_DIR, "ccs-sentinels")
+_liveness_mod = sys.modules.get("liveness") or __import__("liveness")
+_liveness_mod.HEALTH_DIR = Path(_ISO_HEALTH)
+_liveness_mod.SENTINEL_DIR = Path(_ISO_SENTINEL)
+_paths_mod.CCS_SENTINEL_DIR = Path(_ISO_SENTINEL)
+for _m in ("drift_detector", "routing_daemon"):
+    _mod = sys.modules.get(_m)
+    if _mod is not None:
+        _mod.CCS_SENTINEL_DIR = Path(_ISO_SENTINEL)
+_survival = sys.modules.get("routing.survival_monitor")
+if _survival is not None:
+    _survival.SENTINEL_DIR = Path(_ISO_SENTINEL)
+
 # 3b. CCS_WORKSPACES 隔离：_send_to_role 会写 <workspace>/<role>/TASKS.md。
 #     不隔离则每个跑到的用例都写进生产 ~/ccs-workspaces/，实测已污染
 #     scout/engineer 的真实 TASKS.md（2026-10-16 16:22，fixture 的 "test"
@@ -147,8 +168,11 @@ try:
     from hermes_bus import config as _bb_config
     _bb_config.BLACKBOARD_DB = Path(_BLACKBOARD_DB_TEST)
 except Exception as _bbe:
-    import warnings
-    warnings.warn(f"conftest: bus DB 隔离失败（测试将写生产 bus）: {_bbe}", stacklevel=1)
+    # 硬失败，不是 warn：隔离没起来时测试照样绿，会把夹具事实写进生产 bus
+    # （2026-10-21 实测 3 条 WF-architect_review 链真实跑了 ~6h）。
+    raise RuntimeError(
+        f"conftest: bus DB 隔离失败，拒绝继续（否则测试将写生产 bus）: {_bbe}"
+    ) from _bbe
 
 
 # 4b. eval_checker 的转录根：trajectory 测试在模块顶层 `from eval_checker import
@@ -266,6 +290,11 @@ def _pristine():
 
 def _restore_process_globals() -> None:
     p = _pristine()
+    if not p['mods']:
+        # 首次还原时才抓模块快照（= 收集期结束、第一个用例开始前）。在 conftest
+        # 导入时抓是恒空的：四个模块要等收集期由测试模块 import，实测 {}。
+        # 空快照 → 还原循环永不触发 → 它声称修的 sys.modules 泄漏照旧。
+        p['mods'] = {n: sys.modules[n] for n in _WATCHED_MODULES if n in sys.modules}
     if subprocess.run is not p['run']:
         subprocess.run = p['run']
     _rl = sys.modules.get('pipeflow.role_lifecycle')
