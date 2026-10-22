@@ -73,11 +73,6 @@ def _resolve_value_gate_paths(vg_file: str, vg_ws: str) -> list:
 
 
 
-def _is_system_chain(row) -> bool:
-    """该链是否系统问题链（maintainer_health_monitor）。与 engine._is_system_rework 同口径。"""
-    return (row["template_id"] or "").replace("WF-", "") == SYSTEM_REWORK_TPL
-
-
 def _live_subflow(lm, step_sd: dict) -> bool:
     """当前步骤挂的子链/返工链是否还活着。
 
@@ -95,7 +90,7 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     # 活体用**活跃白名单**，不用"终态补集"：delivery_blocked 必须算死。
     # 它是投递连败/角色无响应的停滞态（生产 233 条），非 failed 也非 cancelled；
     # 当活会让父链在 2 倍阈值内一直悬空，而它要等 _recover_delivery_blocked 恢复
-    # （角色持续离线时永不恢复）——同文件 _subflow_takeover:914-919 踩过同一个坑。
+    # （角色持续离线时永不恢复）——同文件 _subflow_takeover:925-930 踩过同一个坑。
     from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
     _live = lambda _r: _r["status"] in _ACTIVE_WF_STATUSES
     _sf = step_sd.get("subflow_id") or ""
@@ -103,7 +98,7 @@ def _live_subflow(lm, step_sd: dict) -> bool:
         _rows = lm.query(
             "SELECT status, template_id FROM workflow_instances WHERE instance_id=?",
             (_sf,))
-        if _rows and _live(_rows[0]) and not _is_system_chain(_rows[0]):
+        if _rows and _live(_rows[0]) and not _engine_mod._is_system_rework(_rows[0]):
             return True
     # 返工链不记在 subflow_id 上，而是 rework_ids（list of wf id）。只认 subflow_id 时，
     # 等返工的父链被判死 → close_wf 级联把仍在跑的返工子链一起杀掉（2026-10-22 两例：
@@ -113,7 +108,7 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     # 产物，拿它续期会让父链陪着维护队列一路排到 24h（口径与 engine._blocking_rework_sts
     # 一致，实测维护队列 91 深、3 条主链被一条没投递过的维护链扣 8h+）。
     # 判据按模板名：评审写「【系统问题→engineer】」时该链被改派成 engineer_feature，
-    # 那时它确实会改产品代码，算活是对的（_create_rework_subflow:1328-1330）。
+    # 那时它确实会改产品代码，算活是对的（_create_rework_subflow:1339-1341）。
     _rids = step_sd.get("rework_ids") or []
     if not isinstance(_rids, (list, tuple)):
         _rids = [_rids]
@@ -123,7 +118,7 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     if not _rids:
         return False
     _ph = ",".join("?" * len(_rids))
-    return any(_live(r) and not _is_system_chain(r)
+    return any(_live(r) and not _engine_mod._is_system_rework(r)
                for r in lm.query(
                    f"SELECT status, template_id FROM workflow_instances "
                    f"WHERE instance_id IN ({_ph})", tuple(_rids)))
@@ -338,7 +333,8 @@ class WorkflowLifecycleMixin:
                 # → 子链对回收器不可见，父链没有第二个钟能关它（engine 称"永久孤儿"）。
                 # ponytail: 上限只看父龄，不看子链自己多大——父链 47h59m 时新建的
                 # 子链几乎零预算就被连坐。取舍是"宁可少给一个阈值，也不留永久孤儿"；
-                # 升级路径：给子链记 created_at，取 max(父 2 倍, 子 + 1 个阈值)。
+                # 升级路径：查询里带出 created_at，按子链年龄封顶——
+                # 取 max(父 2 倍, 子链创建时刻 + 1 个阈值)。
                 elif (_live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {})
                       and age_h <= _global_limit_h * 2):
                     pass
