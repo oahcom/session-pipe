@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-eval_checker 新增功能测试: 权重采样、report-unverified、role 过滤。
+eval_checker 新增功能测试: 抽样策略（判据加权 / 通用均匀）、report-unverified、role 过滤。
 
 运行: cd /home/administrator/session-pipeline && python3 -m pytest tests/test_eval_checker_ext.py -x -q
 """

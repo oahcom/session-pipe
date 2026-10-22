@@ -62,6 +62,15 @@ def test_criteria_outside_runtime_window_not_counted(monkeypatch, tmp_path, caps
     assert out["blind_roles"] == ["late_exec"], "第 5 条判据运行时跑不到，必须算盲区"
     assert out["exec_total"] == 0
 
+def test_json_details_before_summary(monkeypatch, tmp_path, capsys):
+    """daemon WARNING 只打前 400 字节：details 必须排在摘要字段之前（codex P2）。"""
+    monkeypatch.setattr(ec, "_load_roles", lambda d=None: _roles())
+    ec.main(["--json", "--personas", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert out.index('"details"') < out.index('"blind_roles"'), \
+        "摘要字段排在 details 前会把不兼容明细挤出截断点"
+
+
 
 def test_blind_roles_are_not_in_last_two_lines(monkeypatch, tmp_path, capsys):
     """反例锁：旧 daemon 取 splitlines()[-2:] 拿不到名单（实测恒为 details/}）。
