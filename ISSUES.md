@@ -22,6 +22,7 @@
 | G13 | 主循环按饥饿排序时 `assignee=''` 的实例被 `assignee < ?` 比较丢到队尾，默认角色实例饿了也不被推进 | 待修（本轮只取证，未改代码） | 判据：`wig` 排序键里空串参与比较；实测这条结论尚未用「同一 tick 内该类实例是否被扫到」的日志证实，**归因待验证** |
 | G14 | 额度退避的 attempt 计数行写盘后必被丢弃（`__rate_n__` 的值是计数不是时间戳，`_load_alert_ts` 的 TTL 过滤把它当 1970 年） | 未修（天花板已知） | `role_lifecycle.py:298` 读 `rows.get((role, "__rate_n__"))`，而 `:247` 的 `now - float(ts) < ttl` 对计数行恒假 → 重启后 attempt 恒 0、退避从 120s 重来。代价可控（每次重启多 1~2 次「继续」），升级路径：计数编码进 tag（`__rate_n__3`）或改存 `retry_at` 时间戳 |
 | G15 | 白名单二次校验把 `systemctl --user is-active X` 判成写操作（只看 `parts[1]`）→ maintainer 的判据永久「不兼容」，daemon 每 600s 一条 WARNING | 已修（2026-10-22 `f16bb34`） | `_cmd_is_readonly` 跳过选项再取子命令（取值型选项 fail-closed 仍拒绝）；`eval_consistency` 由 `incompatible_roles=1` 变 0、`exec_total` 8→9；`tests/test_eval_checker_ext.py::test_systemctl_flags_before_subcommand_are_readonly` 钉住四个方向 |
+| G16 | 工作树索引里残留 `f16bb34` 的回退 blob（`6beb7e7`）——`git commit -- src/eval_checker.py` 会把 `9ca49e2` 的 129 行修复整段写回旧版，24h 轨迹窗口 / 自有 workspace 盲改豁免 / 30s bus 超时再次消失 | 已修（2026-10-22，`git checkout HEAD -- src/eval_checker.py`） | `git status --porcelain=v2 -- src/eval_checker.py` 输出为空；`grep -n 'timeout=30' src/eval_checker.py` 命中 555 行；提交前先跑 `git diff --cached --numstat -- <file>`，非空就问一句“这是谁的 blob” |
 
 ## 未验证 / 不在本单
 

@@ -111,6 +111,13 @@ src/
 
 同一段里 `_check_cron_schedules()` 复用 `CCS_INTERVAL=300`（与 `route_all_to_ccs` 同分支，主循环 tick 是 60s），且 `_any_live_targets()` 为假时整轮 `sleep(300)` 跳过 —— 所以「每 300s」是常规路径，不是硬保证（journal 实测 +303~+308s，命令超时时到 +357s）。
 
+### 6.2 判据口径（改 `eval_checker.py` 前先读）
+
+- 轨迹判据只看近 24h（`_TRAJ_WINDOW_S`），按记录的 `timestamp` 过滤，不看 jsonl 文件 mtime；缺时间戳的记录按新鲜保留（不静默丢证据）。理由：一条历史 orphan 会让角色永久 FAIL，当轮改进翻不了绿。
+- 文本判据按词边界比对（`_has_word`）：`inactive` 不点亮 `active`，`NOT OK` 不点亮 `OK`；「全部返回 X」要求 stdout 每一行都满足。子串匹配会让判据恒真。
+- 盲改只豁免三类：本次写调用新建的文件（`created_by_call`）、角色自己 `ccs-workspaces/<role>` 下的 Write、同一 transcript 内先写后 Edit（`own_written`）。`/tmp` 草稿靠「本次新建」豁免，不按目录放过——覆盖预存脚本仍应报。
+- bus 写超时 30s：事务持锁实测 5~9.8s，15s 会周期性丢 blocker/notice。
+
 ## 7. 与 Sister Bus 的集成
 
 协议走 `bus_protocol.Blackboard` 直接 API（不 subprocess 解析字符串）：
