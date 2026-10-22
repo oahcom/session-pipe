@@ -125,7 +125,7 @@ _WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
 
 
 def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
-                                          step_id: str) -> bool:
+                                          step_id: str, siblings=()) -> bool:
     """完成消息是否"点名别的工作流实例，却声称完成了本模板本步骤"。
 
     这正是同模板并发链串味的指纹：兄弟实例 wf_sub_ad604 的 s2 完成消息把
@@ -166,10 +166,15 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     if re.search(r'(?<![\w-])(?:' + '|'.join(map(re.escape, sorted(foreign))) + r')/'
                  + _suffix, text or ""):
         return True
-    # 模板名形态：full_dev_pipeline/s2-complete 是本步的正常标题，只有当消息里
-    # **没有**本实例 id 时才是替别的实例报工。生产多实例合并报告形如
-    # 「full_dev_pipeline/s2-complete + engineer_feature/s1-complete …(父链 wf_8440/s2)」，
-    # 一刀切会把它们从所有实例上丢掉 → 步骤空等到超时（codex P1）。
+    # 同模板兄弟实例点名：两个同模板实例不可能共享同一份产出，而消息把两条
+    # 实例 id 并列后都会命中本模板/本步的完成声明 → 两边同时闭合（实测
+    # #441838：qa_test_execute/s1-complete wf_sub_02b1a + wf_sub_673fc 同时
+    # 闭合两条子链，其中一条的产出并不存在）。不能改成「多 id 一律拦」：
+    # 合法形态是父子两层记账（`qa_test_execute/s1-complete (wf_sub_x/s1,
+    # 父链 wf_y/s3)`）——父子模板不同，siblings 里查不到，仍放行（实测
+    # #413744/#415150）。siblings 由调用方给：同一父链下的同模板兄弟。
+    if wf_id in ids and siblings and ids & set(siblings):
+        return True
     if wf_id in ids:
         return False
     return bool(re.search(r'(?<![\w-])(?:WL-|WF-)?' + re.escape(_tpl) + r'/' + _suffix,
@@ -1626,6 +1631,21 @@ class StepHandlerMixin:
                     LOGGER.debug("birth-time lookup failed; falling back to facts.ts")
         earliest = 0.0
         matched = []
+        # 同模板兄弟实例：同一父链下跑同一模板的其它实例 id。给软归属守卫用，
+        # 判断「消息里并列的本实例 id 是不是同模板兄弟」。只查一次，失败则空集
+        # （守卫退化为旧行为：放行）。
+        _siblings: set = set()
+        if own_wf_id and not wf_id:
+            try:
+                for _r in self._lifecycle.query(
+                        "SELECT s.instance_id FROM workflow_instances s "
+                        "JOIN workflow_instances o ON o.instance_id=? "
+                        "WHERE s.template_id=o.template_id "
+                        "AND s.parent_wf_id IS o.parent_wf_id "
+                        "AND s.instance_id<>o.instance_id LIMIT 50", (own_wf_id,)):
+                    _siblings.add(_r["instance_id"])
+            except Exception as _e:
+                LOGGER.debug("sibling lookup failed %s: %s", str(own_wf_id)[:12], _e)
         for f in facts:
             # src 精确匹配；src=claude（bus 默认值）视为角色未设 src，不排除
             # wait_roles 协作门：协作角色的消息也放行（否则 src 过滤器拦死门控）
@@ -1655,7 +1675,8 @@ class StepHandlerMixin:
             # wf_sub_ad604 的 s2 完成消息闭合了 wf_sub_7afc1 的 s2，自有产出晚 7min）。
             # 不改成 require_wf=true 的原因：105/164 条历史裸匹配完成消息本就不带
             # 实例 id（no-op 巡检），硬校验会让它们全部超时。
-            if not wf_id and _claims_own_step_and_foreign_instance(f.t, own_wf_id, template, step_id):
+            if not wf_id and _claims_own_step_and_foreign_instance(
+                    f.t, own_wf_id, template, step_id, siblings=_siblings):
                 continue
 
             # evidence 必须一并带上：驳回分类段【系统问题→maintainer】写在 evidence 里，

@@ -703,10 +703,14 @@ class WorkflowLifecycleMixin:
                                     break
                                 # 超宽限期 → 一并关闭子链，不留孤儿 running
                                 # （codex P2：到期只关主链，子链继续通知角色/拉起 guard）
-                                conn.execute(
-                                    "UPDATE workflow_instances SET status='cancelled' "
-                                    "WHERE instance_id=? AND status NOT IN ('completed')",
-                                    (_sf,))
+                                # 走 close_wf 而非裸 UPDATE：后者不写 completed_at、
+                                # 不写 workflow_logs、不同步 task（7d 实测 cancelled 行
+                                # completed_at=NULL 130 条、无取消日志 77 条），事后
+                                # 无法把子链死亡归因到父链收尾。close_wf 在
+                                # _conn_tx 内复用外层事务，不会嵌套 BEGIN。
+                                self._lifecycle.close_wf(
+                                    _sf, status='cancelled',
+                                    reason=f"父链 {wf_id[:12]}/{_sid} 收尾超 5 分钟宽限强制取消")
                                 # 强制关闭子链 = 该步产出未达成的信号。原实现静默取消后
                                 # 父链照判 completed，导致「父链完成」不蕴含「产出存在」
                                 # （实测 wf_ae31fd1c4c11：4/6 产出物缺失仍算完成）。
@@ -2073,6 +2077,13 @@ class WorkflowLifecycleMixin:
                 f"同时另存一份带本实例 id 的副本。\n"
             ) + prompt
 
+        # 任务标题/描述可能自带未替换的 {title}/{description} 字面量：子链任务
+        # 的 description 是父模板正文的截断，而父模板本身就写着「标题: {title}」。
+        # 直接 replace 会把占位符**重新写回** prompt（值里含键 = 自污染）→
+        # _send_to_role 的守卫拦下 → blocker（实测 bus #441958；tasks 表里 8 条
+        # description 命中）。首步路径 engine.py:1238 已有此清洗，这里对齐。
+        task_title = _engine_mod.UNMATCHED_VAR_RE.sub("", task_title or "")
+        task_desc = _engine_mod.UNMATCHED_VAR_RE.sub("", task_desc or "")
         prompt = prompt.replace("{title}", task_title)
         prompt = prompt.replace("{description}", task_desc)
         prompt = prompt.replace("{assignee}", step.target_role)
