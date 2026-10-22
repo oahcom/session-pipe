@@ -227,6 +227,27 @@ def _fast_role_ready(request, monkeypatch):
     monkeypatch.setattr(_rl.RoleLifecycleMixin, "_wait_for_role_ready",
                         lambda self, *a, **k: True)
 
+# 直接被测的模块：桩掉就把对象测空了。
+_REAL_ENSURE_ALIVE_MODULES = {
+    "test_role_alive_cache",
+    "test_ensure_role_alive_race",
+    "test_pipeflow_error_paths",
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_live_role_restart(request, monkeypatch):
+    """`_ensure_role_alive` 也会经 on_advance 回调触发：tmux 活着但没有 claude 进程时走
+    `sleep(1)` + kill-session + 30×1s 重启循环——test_workcycle_e2e 因此超 20s 被自带
+    `signal.alarm(20)` 打断（全量此前直接 EXIT=142，看不到这条红）。默认桩成 True。
+    """
+    if (request.module.__name__ if request.module else "").split(".")[-1] in _REAL_ENSURE_ALIVE_MODULES:
+        return
+    from pipeflow import role_lifecycle as _rl
+    monkeypatch.setattr(_rl.RoleLifecycleMixin, "_ensure_role_alive",
+                        lambda self, role, deadline=0.0: True)
+
+
 def _alarm_handler(_signum, _frame):
     # 必须抛 BaseException 子类：TimeoutError 是 OSError→Exception 的子类，
     # 会被热路径的 except (TimeoutExpired, OSError) / except Exception 吞掉，
