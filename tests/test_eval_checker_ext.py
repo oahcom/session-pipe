@@ -120,7 +120,8 @@ def test_sampling_covers_roles_without_criteria():
         patch.object(ec, "OutputSemanticChecker", lambda: _Recorder(picked)),
         patch.object(ec, "RequirementConfirmationChecker", lambda: _Recorder(picked)),
         patch.object(ec, "TrajectoryQualityChecker", lambda: _Recorder(picked)),
-        patch.object(ec, "LeverageAccumulationChecker", lambda: _Recorder(picked)),
+        # create=True：main 基线还没有这个检查器，副本/旧版上补丁也成立
+        patch.object(ec, "LeverageAccumulationChecker", lambda: _Recorder(picked), create=True),
     ):
         for _ in range(20):
             picked.clear()
@@ -193,3 +194,24 @@ def test_is_tautology_normalizes_spaces():
     """空格不影响判定（`echo    PASS` 也应拒）。"""
     for cmd in ('echo    "PASS"', "python3 -c 'import sys; print(  \"PASS\"  )'"):
         assert ec._is_tautology(cmd) is True, f"应判为恒真: {cmd}"
+
+
+def test_reachable_criteria_counts_only_runtime_window():
+    """窗口外的可执行判据不算权数：运行时根本不跑（codex 20 维 F1/N1）。"""
+    late = {"name": "late", "eval_criteria": [
+        "叙述一", "叙述二", "叙述三", "验证: echo ok 输出 ok"]}
+    assert ec._reachable_criteria(late) == 0, "第 4 条判据在窗口外，不贡献权重"
+    early = {"name": "early", "eval_criteria": ["验证: echo ok 输出 ok", "叙述"]}
+    assert ec._reachable_criteria(early) == 1
+
+
+def test_weighted_sample_prefers_roles_with_criteria():
+    """持判据的角色不能被均匀抽样稀释（maintainer 曾从 31 次/天掉到 7.6 次/天）。"""
+    import random as _r
+    rich = {"name": "rich", "eval_criteria": ["验证: echo ok 输出 ok"] * 3}
+    blind = {"name": "blind", "eval_criteria": ["叙述一", "叙述二"]}
+    _r.seed(20261022)
+    hits = sum(1 for _ in range(200)
+               if ec._weighted_role_sample([rich, blind], 1)[0]["name"] == "rich")
+    assert hits >= 120, f"权重 3:1 时应抽到 rich ≥60%，实测 {hits}/200"
+    assert ec._weighted_role_sample([rich, blind], 2) != [], "k=2 仍要返回两个不同角色"

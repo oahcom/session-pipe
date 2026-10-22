@@ -547,7 +547,7 @@ def _is_critical(criterion: str) -> bool:
     return bool(re.search(r'severity[:\s=]*critical', criterion, re.IGNORECASE))
 
 
-from eval_shared_loader import _load_roles
+from eval_shared_loader import _load_roles, CRITERIA_WINDOW
 
 
 # 注：此处原有第二个 `run_eval_check` 定义（504-519，含完整 docstring），被 :1031 的
@@ -1383,11 +1383,38 @@ class TrajectoryQualityChecker:
                 "hard_ignored": hard, "soft_ignored": soft}
 
 
-def run_eval_check(role_filter: str | None = None) -> dict:
-    """主入口：加载角色 JSON，均匀无放回抽 1-2 个，对每个执行前 3 条 eval_criteria。
+def _reachable_criteria(role: dict) -> int:
+    """该角色在运行期窗口内**真能被执行**的判据数（抽样权重）。"""
+    cnt = 0
+    for c in role["eval_criteria"][:CRITERIA_WINDOW]:
+        _ex = _extract_cmd(c)
+        if _ex is not None and _is_shell_cmd(_ex[0]):
+            cnt += 1
+    return cnt
 
-    均匀而非按可执行判据数加权：13/19 个角色零可执行判据，但 4 个通用检查
-    （产出语义/需求确认/轨迹/杠杆）按角色跑，加权会把这些角色的检查饿死。
+
+def _weighted_role_sample(roles: list[dict], k: int) -> list[dict]:
+    """按可达判据数无放回抽 k 个；零判据角色权重保底 1（仍可能被抽到）。
+
+    判据检查必须加权：均匀抽样把"唯一持判据的角色"稀释了——按 600s/k=2 折算，
+    maintainer 的真判据执行从约 31 次/天降到 7.6 次/天（3.4-4.1 倍），而这两个
+    角色占运行期可达判据的 2/3（codex 20 维 N1）。通用检查另用均匀抽样。
+    """
+    pool = [r for r in roles for _ in range(max(1, _reachable_criteria(r)))]
+    picked: list[dict] = []
+    while len(picked) < k and pool:
+        r = random.choice(pool)
+        picked.append(r)
+        pool = [x for x in pool if x["name"] != r["name"]]
+    return picked
+
+
+def run_eval_check(role_filter: str | None = None) -> dict:
+    """主入口：判据检查按可达判据数加权抽、通用检查均匀抽，各 1-2 个角色。
+
+    两种抽样分开：通用检查（产出语义/需求确认/轨迹/杠杆）按角色跑、与判据数无关，
+    均匀才不饿死 14/19 个零可执行判据的角色；而判据检查必须加权，否则持判据的
+    两个角色被稀释 3.4-4.1 倍（见 _weighted_role_sample）。
     参数 role_filter: 只检查指定角色名。
     返回 {checked, passed, failed, skipped, notices, blockers, avg_score}。
     avg_score 为 0-1 连续均分 (DeepEval 范式), 不影响 passed/failed 计数。
@@ -1405,19 +1432,19 @@ def run_eval_check(role_filter: str | None = None) -> dict:
         roles = filtered
 
     n = min(2, len(roles))
-    # 均匀无放回：19 个角色里 13 个一条可执行判据都没有（2026-10-22 实测），
-    # 按判据数加权会让这 13 个角色的通用检查（产出语义/需求确认/轨迹）几乎饿死；
-    # 且 random.choices 有放回，同一角色可能被抽两次、另一角色整轮没检查。
-    # 通用检查按角色跑、与判据数无关 → 均匀才是对的。
+    # 通用检查：均匀无放回（19 个角色里 14 个零可执行判据，加权会把这 14 个的
+    # 通用检查饿死；random.choices 有放回会让同一角色被抽两次）。
     sampled = random.sample(roles, k=n)
+    # 判据检查：按可达判据数加权无放回。
+    crit_roles = _weighted_role_sample(roles, n)
 
     summary = {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
 
     score_sum, score_n = 0.0, 0  # 连续 0-1 分累加, 见 _pass_score (DeepEval 范式)
 
-    for role in sampled:
+    for role in crit_roles:
         name = role["name"]
-        for c in role["eval_criteria"][:3]:
+        for c in role["eval_criteria"][:CRITERIA_WINDOW]:
             extracted = _extract_cmd(c)
             if extracted is None:
                 summary["skipped"] += 1

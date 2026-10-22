@@ -46,6 +46,23 @@ def test_incompatible_criterion_not_counted_as_executable(monkeypatch, tmp_path,
     assert out["blind_roles"] == ["rejected"]
     assert out["incompatible_roles"] == 1
 
+def test_criteria_outside_runtime_window_not_counted(monkeypatch, tmp_path, capsys):
+    """窗口外的判据永远不执行：第 5 条才可执行 ≠ 非盲区（codex 20 维 F1）。
+
+    knowledge_curator 实测：5 条判据里唯一可执行的在第 4 条（exec_idx=[4]），
+    旧口径按全表统计 → 判它非盲区，运行时却零判据执行。
+    """
+    monkeypatch.setattr(ec, "_load_roles", lambda d=None: [
+        {"name": "late_exec",
+         "eval_criteria": ["叙述一", "叙述二", "叙述三", "叙述四", "验证: echo ok 输出 ok"],
+         "issues": []},
+    ])
+    ec.main(["--json", "--personas", str(tmp_path)])
+    out = json.loads(capsys.readouterr().out)
+    assert out["blind_roles"] == ["late_exec"], "第 5 条判据运行时跑不到，必须算盲区"
+    assert out["exec_total"] == 0
+
+
 def test_blind_roles_are_not_in_last_two_lines(monkeypatch, tmp_path, capsys):
     """反例锁：旧 daemon 取 splitlines()[-2:] 拿不到名单（实测恒为 details/}）。
 
