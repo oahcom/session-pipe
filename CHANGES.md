@@ -22,13 +22,14 @@
   SIGALRM handler 抛 `pytest.fail.Exception`（BaseException，热路径的 `except Exception`/`OSError` 吞不掉）。
 - `src/pipeflow/role_lifecycle.py` + `engine.py`：`deadline` 透传到 `_check_and_start_role` ——
   `ccs start` 的 timeout 取 `max(5, min(60, deadline-now))`、轮询超预算即 break；无 deadline 时行为不变（60s）。
-  预算耗尽时不盖 30min 冷却戳；`TimeoutExpired` 进 catch 元组。
+  预算耗尽时不盖 300s 重启冷却戳（`_RESTART_COOLDOWN_SEC`；30min 是 `_ALERT_COOLDOWN_S`，别混）；`TimeoutExpired` 进 catch 元组。
 - 新增回归：`tests/test_guard_budget.py`（3 例）、`tests/test_no_live_notify.py`（全局 patch 必须
   `try/finally` 恢复 —— 泄漏的 `subprocess.run` 桩会让 `eval_checker` 的 `stat -c %W` 拿到空串而 fail-open，
   表现为 5 条与本文件无关的用例转红）。
 
 ### 验证
-- `pytest tests/ -q` → **1318 passed, 2 subtests passed in 148s（exit 0）**，两次连续复现；
+- `pytest tests/ -q` → **1318 passed, 2 subtests passed in 148s（exit 0）**，两次连续复现（当次快照，commit fdddcf6）；
+  同日 11:40 复跑 **1321 passed / 154s**（条数随并发改动变化，门禁看 0 failed 不看条数）。
   修前**从未拿到 summary**（卡在 5%）。
 - `test_chain_dispatch_contract.py` 90s+ → **1.08s**；`test_guard_budget.py` 3 passed。
 
