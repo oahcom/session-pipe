@@ -242,6 +242,17 @@ def _check_cron_schedules() -> int:
         LOGGER.info("cron_schedule: 本次触发 %d 个角色", triggered_count)
     return triggered_count
 
+def _forget_eval_modules() -> None:
+    """清掉 eval_checker / eval_consistency / eval_shared_loader 的模块缓存。
+
+    常驻进程会一直持有旧版模块对象：新加的跨模块常量（CRITERIA_WINDOW）在首轮导入时
+    直接 ImportError，预检与热重载整段被跳过（2026-10-22 10:27 journal 实测）。
+    """
+    for _name in ("eval_checker", "eval_consistency", "eval_shared_loader"):
+        for _k in [k for k in sys.modules if k == _name or k.startswith(_name + ".")]:
+            del sys.modules[_k]
+
+
 def main():
     LOGGER.info("routing_daemon 启动 PID=%d", os.getpid())
     last_ccs = 0
@@ -335,6 +346,7 @@ def main():
                 # D6 生长接入: eval_consistency 预检 persona eval_criteria 与白名单一致性，
                 # 防止运行时 exit=-3 静默跳过（2026-08-11 白名单漂移事故根因）
                 try:
+                    _forget_eval_modules()   # 首轮导入就撞旧模块：见函数注释
                     from eval_consistency import main as _ec_main
                     import io, contextlib
                     _ec_buf = io.StringIO()
@@ -376,14 +388,7 @@ def main():
                 if _eval_checker_mtime != eval_checker_mtime:
                     _old_mtime = 0.0  # Fix: initialize to avoid UnboundLocalError on exception path
                     try:
-                        # 先清 sys.modules 缓存，强制 reimport（防止 importlib.reload 重用旧闭包）。
-                        # eval_shared_loader 必须一起清：eval_checker 依赖它导出的
-                        # CRITERIA_WINDOW，只重载 eval_checker 会 ImportError（实测
-                        # 09:56 "cannot import name 'CRITERIA_WINDOW'"），热重载静默退化。
-                        for _key in list(sys.modules):
-                            if (_key == "eval_checker" or _key.startswith("eval_checker.")
-                                    or _key == "eval_shared_loader"):
-                                del sys.modules[_key]
+                        _forget_eval_modules()   # 见函数注释：只重载 eval_checker 会 ImportError
                         import eval_checker
                         importlib.reload(eval_checker)
                         _run_eval = eval_checker.run_eval_check
@@ -395,10 +400,7 @@ def main():
                         LOGGER.warning("eval_checker 热重载失败: %s", _e)
                         # 热重载失败：尝试强制重新 import（兜底）
                         try:
-                            for _key in list(sys.modules):
-                                if (_key == "eval_checker" or _key.startswith("eval_checker.")
-                                        or _key == "eval_shared_loader"):
-                                    del sys.modules[_key]
+                            _forget_eval_modules()
                             import importlib as _il
                             eval_checker = _il.import_module("eval_checker")
                             _run_eval = eval_checker.run_eval_check

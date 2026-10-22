@@ -99,6 +99,13 @@ src/
 
 `config_loader.py` 只有 `get_config()`（懒加载缓存读，:158）——**没有** `reload_config`，也没有 mtime 热重载；`reconfigure()` 在 `src/reliability.py:reconfigure`（重建 CIRCUIT_BREAKER/HEARTBEAT/TTL_PRUNER/DEFAULT_RETRY/GRACEFUL_SHUTDOWN 单例）。改 `config.yaml` 需重启进程。
 
+### 6.1 eval 模块的热重载契约
+
+只有 `eval_checker.py` 走热重载（600s 比对 mtime）；`eval_consistency.py` / `routing_daemon.py` 的改动要重启进程。两条规则：
+
+- 新增**跨模块常量**（如 `eval_shared_loader.CRITERIA_WINDOW`）时，热重载与预检都必须先调用 `routing_daemon._forget_eval_modules()`。常驻进程缓存着旧模块对象，只重载 `eval_checker` 会在首轮导入撞 `ImportError`（2026-10-22 09:56 与 10:27 各一次，都是这段代码静默退化）。
+- 预检失败只记 WARNING、不阻塞 eval —— 所以它静默退化的样子和"通过"一样。改这块必须看 journal 里有没有 `可执行判据` 那一行，而不是只看进程没报错。
+
 ## 7. 与 Sister Bus 的集成
 
 协议走 `bus_protocol.Blackboard` 直接 API（不 subprocess 解析字符串）：
