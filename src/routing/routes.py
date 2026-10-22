@@ -216,9 +216,19 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 continue
             consumers = msg.get("consumers", [])
             # @role 定向路由：@target 的消息只给 target，其他角色跳过
-            _tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", msg.get("text", ""))
+            _text = msg.get("text", "")
+            _tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", _text)
             if _tags:
                 consumers = [c for c in consumers if c in _tags]
+            # 定向派单只认**首行**的 @tag：正文里顺带提到的角色（"见 @engineer 的回复"）
+            # 不该被拉进派发。首行 tag 是派单约定（[@devops] / [@devops @ccs-monitor]）。
+            _head_tags = [t for t in _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)",
+                                                 _text.split("\n")[0])
+                          if t in router.routing]
+            if _head_tags:
+                # 定向接收者未必订阅该分类（devops 不订阅 code_review），
+                # 只按分类求交会把定向派单整条丢掉 —— 实测 #439736。
+                consumers = list(dict.fromkeys(list(consumers) + _head_tags))
             # 回声抑制：消息由某角色自己写 → 不派回给该角色（RFC 3834）。
             # 回执/完成汇报是状态而非任务，派回自己只会自激放大。
             ordered = (
@@ -256,6 +266,11 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 "priority": msg["priority"],
                 "src": msg.get("src", ""),
                 "consumers": ordered,
+                # 定向派单不在这里记 consume：consume 正是 route_to_ccs 的可见性判据
+                # （poll 用 NOT EXISTS consume），记了 = 接收者永远看不到。
+                # 实测 2026-10-22：4/5 条 @devops 派单在系统分类分支被 4 秒内 claim 掉，
+                # devops pane 已死 10.5h，消息永久消失（bus #442309）。
+                "directed": bool(_head_tags),
             })
 
         if dry_run:
@@ -275,7 +290,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 results = []
                 for role in assignment["consumers"]:
                     try:
-                        if cat not in _SYSTEM_CATEGORIES:
+                        if cat not in _SYSTEM_CATEGORIES or assignment.get("directed"):
                             # 可投递类不在这里消费：consume 会把该 (fact, role) 从
                             # route_to_ccs 的候选集里删掉（poll 用 NOT EXISTS consume），
                             # 它那句「忙 → 消息留 bus 下轮再试」就永远轮不到。
@@ -491,6 +506,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                 except Exception:
                     pass  # 关闭失败不掩盖主逻辑
     body_facts: list[dict] = []
+    _noted_dead = False
 
     for msg in messages:
         if "error" in msg:
@@ -519,6 +535,12 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         if not running:
             details.append({"id": msg["id"], "category": msg["category"],
                             "action": "skipped", "reason": f"CCS {role_name} 未启动"})
+            # 未运行过去只进 details（journal 零痕迹），pane 死了 10.5 小时没人发现。
+            # 每次调用只记一条，别按消息条数刷屏。
+            if not _noted_dead:
+                _noted_dead = True
+                LOGGER.warning("route_to_ccs: %s 未运行，%d 条消息滞留（不拉起 pane 就永远投不到）",
+                               role_name, len(messages))
             continue
 
         # 忙检测：角色有活跃工作流 → 跳过推送（消息留 bus 下轮再试）

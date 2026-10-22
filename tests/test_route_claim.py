@@ -12,7 +12,9 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-_SRC = str(Path.home() / "session-pipeline" / "src")
+# 仓库相对：写死 ~/session-pipeline/src 会让本文件在 wt-pipeline 里跑时
+# 测到**另一棵树**（实测 2026-10-22：改了本仓 routes.py，用例仍全绿）。
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
@@ -132,3 +134,51 @@ def test_orphan_fact_is_claimed_so_view_can_drain():
         route_all(consumer="pipeline", dry_run=False)
     assert any(c.args == (4343, "pipeline") for c in bb.mark_consumed.call_args_list), \
         bb.mark_consumed.call_args_list
+
+# ── 定向派单不能被「广播分类」吞掉（2026-10-22 生产取证，bus #442309）──
+# 系统类（architecture/code_review/code_fix…）走 safe_consume 写 per-role consume，
+# 而 consume 正是 route_to_ccs 的可见性判据 → 接收者永远看不到这条消息。
+# 实测 4/5 条 @devops 派单就这样消失（#440553 写入后 4 秒被 claim，devops pane 死 10.5h）。
+
+def _run_directed(cat, title, routing):
+    """跑一次 route_all，返回 (result, safe_consume mock, bb)。"""
+    from routing.routes import route_all
+    bb = MagicMock()
+    _rt = MagicMock()
+    _rt.get_router.return_value.routing = routing
+    msg = {"id": 4545, "category": cat, "text": title + "\n证据 y",
+           "src": "claude", "evidence": "", "priority": 1, "consumers": ["engineer"]}
+    with patch("routing.auto.poll_unconsumed", return_value=[msg]), \
+            patch("routing.routes._rt_mod", _rt), \
+            patch("bus_protocol.Blackboard", return_value=bb), \
+            patch("routing.routes.HEARTBEAT"), \
+            patch("routing.routes.METRICS"):
+        import routing.routes as routes
+        with patch.object(routes.IDEMPOTENT_CONSUME, "safe_consume",
+                          return_value={"status": "consumed"}) as sc:
+            res = route_all(consumer="pipeline", dry_run=False)
+    return res, sc, bb
+
+
+def test_directed_system_fact_is_not_role_claimed():
+    """[@devops] + 系统类：不写 per-role consume，留给 route_to_ccs 投递。
+
+    改前：devops 订阅 architecture → 进入 consume 分支 → 记 consume → 永久不可见。
+    """
+    res, sc, _bb = _run_directed("architecture", "[@devops] 复核路由缺陷",
+                                 {"engineer": {"consume": ["architecture"]},
+                                  "devops": {"consume": ["architecture"]}})
+    claimed = [c.args[1] for c in sc.call_args_list]
+    assert "devops" not in claimed, claimed
+    assert any(a.get("role") == "devops" and a.get("status") == "delegated"
+               for d in res["details"] for a in (d.get("assigned") or [])), res["details"]
+
+
+def test_directed_tag_extends_consumers_beyond_subscription():
+    """@tag 指向未订阅该分类的角色：仍要进消费者（否则 @tag 被分类求交整条丢掉）。"""
+    res, sc, _bb = _run_directed("code_review", "[@devops] 工具通道复核",
+                                 {"engineer": {"consume": ["code_review"]},
+                                  "devops": {"consume": ["architecture"]}})
+    assigned = [a.get("role") for d in res["details"] for a in (d.get("assigned") or [])]
+    assert "devops" in assigned, res["details"]
+    assert "devops" not in [c.args[1] for c in sc.call_args_list]
