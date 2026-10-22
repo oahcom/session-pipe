@@ -913,6 +913,12 @@ class TaskGeneratorMixin:
             # 去重要按 title 比对，先读后写会 UnboundLocalError，
             # 且被下面的 except 吞掉 → 去重静默失效）
             _title = f"[auto] {_wf.title or _wf_name}: {_wf.description[:40]}" if _wf.description else f"[auto] 执行 {_wf_name} 工作流"
+            # 无 title 的模板，标题只能是「模板名 + 描述前40字」的机械拼接，不含任何需求信号。
+            # 实测完成率：无 title 组 5.5%~20%（技术实现/WL-01 182 实例 10 完成、
+            # product_delivery 20%、WL-09 13.3%）对带 title 组 40.7%~70.5%。
+            if not _wf.title:
+                LOGGER.debug("auto-task: %s 跳过（模板无 title，标题无需求信号）", _wf_name)
+                continue
             if len(_title) < 12:
                 continue  # 跳过标题过短
             # S1 事件去重（DESIGN §2.1）：同标题同角色 24h 内已 mint 过 task → 跳过。
