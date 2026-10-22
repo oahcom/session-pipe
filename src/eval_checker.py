@@ -1353,6 +1353,7 @@ class TrajectoryQualityChecker:
         cutoff = time.time() - _SUBAGENT_WINDOW_S
         rounds = 0
         followed = 0
+        ignored_tools: list[int] = []
         for i, c in enumerate(calls):
             if c["kind"] != "say" or mark not in (c.get("text") or ""):
                 continue
@@ -1360,13 +1361,26 @@ class TrajectoryQualityChecker:
                 continue
             rounds += 1
             # 本轮到下一次输入之间的工具调用即该轮的响应窗口。
+            used = 0
+            has_agent = False
             for nxt in calls[i + 1:]:
                 if nxt["kind"] == "say":
                     break
-                if nxt["kind"] == "use" and nxt["name"] == "Agent":
-                    followed += 1
-                    break
-        return {"rounds": rounds, "followed": followed}
+                if nxt["kind"] == "use":
+                    used += 1
+                    has_agent = has_agent or nxt["name"] == "Agent"
+            if has_agent:
+                followed += 1
+            else:
+                ignored_tools.append(used)
+        # 违规分层（#440568 的建议）：例外条款允许「1-2 条命令可得结论」自办，
+        # 所以 <=2 不计；3-10 是灰区；>10 是几十次工具调用仍不派 —— 那不是顺手
+        # 办完，是明确的指令忽略。只做可见化，不改行为（硬门会重演恒真判据的反向
+        # 错误：用未定论的判据否决算得对的角色）。
+        hard = sum(1 for n in ignored_tools if n > 10)
+        soft = sum(1 for n in ignored_tools if 3 <= n <= 10)
+        return {"rounds": rounds, "followed": followed,
+                "hard_ignored": hard, "soft_ignored": soft}
 
 
 def run_eval_check(role_filter: str | None = None) -> dict:
@@ -1389,9 +1403,12 @@ def run_eval_check(role_filter: str | None = None) -> dict:
             return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
         roles = filtered
 
-    weights = [max(1, sum(1 for c in r["eval_criteria"] if "验证:" in c)) for r in roles]
     n = min(2, len(roles))
-    sampled = random.choices(roles, weights=weights, k=n)
+    # 均匀无放回：19 个角色里 13 个一条可执行判据都没有（2026-10-22 实测），
+    # 按判据数加权会让这 13 个角色的通用检查（产出语义/需求确认/轨迹）几乎饿死；
+    # 且 random.choices 有放回，同一角色可能被抽两次、另一角色整轮没检查。
+    # 通用检查按角色跑、与判据数无关 → 均匀才是对的。
+    sampled = random.sample(roles, k=n)
 
     summary = {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
 
@@ -1446,12 +1463,10 @@ def run_eval_check(role_filter: str | None = None) -> dict:
 
         # ── 真实评估检查器（替代已删除的恒真验证） ──
         # OutputSemanticChecker: 检查产出文件语义质量（非模板桩、语法、结构）
-        # ── 真实评估检查器（替代已删除的恒真验证） ──
-        # OutputSemanticChecker: 检查产出文件语义质量（非模板桩、语法、结构）
         try:
             osem = OutputSemanticChecker()
             for role in sampled:
-                osem_result = osem.check(role["name"], f"eval_{name}")
+                osem_result = osem.check(role["name"], f"eval_{role['name']}")
                 # 只有当有文件被检查且发现问题时才算失败；无文件/无问题=不计入统计
                 if not osem_result["passed"] and osem_result.get("checked_files", 0) > 0:
                     summary["failed"] += 1
@@ -1502,7 +1517,8 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                 # ponytail: 去重按进程内存，跨角色互不影响；天花板是重启后每人多发
                 # 一条，升级路径 = 落 DB 去重表（当前不值得）。
                 _sub = traj_result.get("subagent") or {}
-                _cur = (_sub.get("followed", 0), _sub.get("rounds", 0))
+                _cur = (_sub.get("followed", 0), _sub.get("rounds", 0),
+                        _sub.get("hard_ignored", 0), _sub.get("soft_ignored", 0))
                 # 只在数字变化时写。daemon 每 600s 抽样一轮，无条件写会让同一组
                 # 数字反复落到 bus：facts.t 是 UNIQUE + UPSERT，同文本会抬高 ts，
                 # 而 created_after 屏障读的正是这个可变列（旧消息因此复活）。
@@ -1516,8 +1532,9 @@ def run_eval_check(role_filter: str | None = None) -> dict:
                             f"role={role['name']} 近 {_SUBAGENT_WINDOW_S // 3600}h "
                             f"收到引擎强制子代理指令 {_sub['rounds']} 轮，"
                             f"其中派了 Agent 的 {_sub['followed']} 轮。"
-                            f"例外条款（1-2 条命令可得结论可自办）无法自动判定，"
-                            f"此值仅作观察，不判角色对错。"
+                            f"违规分层：>10 次工具调用仍自办 {_sub.get('hard_ignored', 0)} 轮、"
+                            f"3-10 次 {_sub.get('soft_ignored', 0)} 轮（1-2 次按例外条款豁免）。"
+                            f"分层只做可见化，不判角色对错。"
                         ),
                     )
                 if not traj_result["passed"] and traj_result.get("checked_traces", 0) > 0:

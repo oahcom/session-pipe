@@ -81,23 +81,26 @@ def test_role_filter_nonexistent():
     assert s["checked"] == 0
 
 
-def test_weights_sampling():
-    """权重 = 含"验证:"的 criterion 数（最少 1），验证传给 random.choices。"""
+def test_sampling_is_uniform_without_replacement():
+    """抽样必须均匀且无放回。
+
+    旧版 random.choices(weights=按可执行判据数)：19 个角色里 13 个零判据
+    （2026-10-22 实测），加权让它们的通用检查（语义/需求/轨迹）几乎饿死；
+    有放回还会在同一轮抽到同一角色两次，另一个角色整轮没检查。
+    """
     with (
         patch.object(ec, "_load_roles", return_value=_ALL_ROLES),
         patch.object(ec, "_run",
                      return_value={"ok": True, "stdout": "active", "stderr": "", "returncode": 0}),
         patch.object(ec, "_write_bus"),
-        patch.object(ec.random, "choices") as mock_choices,
+        patch.object(ec, "TrajectoryQualityChecker", _BenignTrajectory),
+        patch.object(ec.random, "sample", wraps=ec.random.sample) as mock_sample,
     ):
         ec.run_eval_check()
 
-    _args, kwargs = mock_choices.call_args
-    assert "weights" in kwargs
-    # 无命令角色: 0 条含"验证:" → max(1, 0) = 1
-    # 正常角色:  2 条 → 2
-    # 维护者:  1 条 → 1
-    assert kwargs["weights"] == [1, 2, 1]
+    args, kwargs = mock_sample.call_args
+    assert list(args[0]) == _ALL_ROLES, "抽样池应是全部角色"
+    assert kwargs == {"k": 2}, "不得再传 weights（会退回按判据数加权）"
 
 
 def test_is_tool_error():

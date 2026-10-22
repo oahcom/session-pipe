@@ -43,20 +43,20 @@ def _result() -> dict:
 def test_followed_round_counts() -> None:
     calls = [_say(_DIRECTIVE, _ts(-60)), _use("Agent"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 1, "followed": 1}, "派了 Agent 应记 1/1"
+        {"rounds": 1, "followed": 1, "hard_ignored": 0, "soft_ignored": 0}, "派了 Agent 应记 1/1"
 
 
 def test_ignored_round_counts() -> None:
     calls = [_say(_DIRECTIVE, _ts(-60)), _use("Bash"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 1, "followed": 0}, "只跑 Bash 应记 1 轮 0 遵从"
+        {"rounds": 1, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, "只跑 Bash 应记 1 轮 0 遵从"
 
 
 def test_agent_before_directive_not_counted() -> None:
     """上一轮的 Agent 不能算到这一轮头上。"""
     calls = [_use("Agent"), _result(), _say(_DIRECTIVE, _ts(-60)), _use("Bash"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 1, "followed": 0}, "指令前的 Agent 不得计入"
+        {"rounds": 1, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, "指令前的 Agent 不得计入"
 
 
 def test_round_stops_at_next_input() -> None:
@@ -64,26 +64,26 @@ def test_round_stops_at_next_input() -> None:
     calls = [_say(_DIRECTIVE, _ts(-60)), _use("Bash"), _say("别的派单", _ts(-30)),
              _use("Agent"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 1, "followed": 0}, "跨轮次不应串味"
+        {"rounds": 1, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, "跨轮次不应串味"
 
 
 def test_stale_directive_excluded() -> None:
     """窗口外的旧指令不计入，避免一次旧轮次永久拉低比例。"""
     calls = [_say(_DIRECTIVE, _ts(-48 * 3600)), _use("Bash"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 0, "followed": 0}, "窗口外指令应被排除"
+        {"rounds": 0, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, "窗口外指令应被排除"
 
 
 def test_unparseable_ts_treated_as_stale() -> None:
     calls = [_say(_DIRECTIVE, "not-a-timestamp"), _use("Agent"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 0, "followed": 0}, "时间不可定的不计入"
+        {"rounds": 0, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, "时间不可定的不计入"
 
 
 def test_non_directive_input_ignored() -> None:
     calls = [_say("普通消息", _ts(-60)), _use("Bash"), _result()]
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 0, "followed": 0}, "非指令轮次不计入"
+        {"rounds": 0, "followed": 0, "hard_ignored": 0, "soft_ignored": 0}, "非指令轮次不计入"
 
 
 def test_end_to_end_transcript(tmp_path: Path) -> None:
@@ -103,7 +103,26 @@ def test_end_to_end_transcript(tmp_path: Path) -> None:
     jf.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     calls = TrajectoryQualityChecker()._load_tool_calls([tmp_path])
     assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
-        {"rounds": 1, "followed": 1}, "端到端应识别字符串输入里的指令并计到 Agent"
+        {"rounds": 1, "followed": 1, "hard_ignored": 0, "soft_ignored": 0}, "端到端应识别字符串输入里的指令并计到 Agent"
+
+
+def test_ignored_many_tools_is_hard_violation() -> None:
+    """>10 次工具调用仍不派子代理 = 硬忽略（#440568：25% 的指令轮次是这种情况）。"""
+    calls = [_say(_DIRECTIVE, _ts(-60))] + [_use("Bash") for _ in range(12)] + [_result()]
+    assert TrajectoryQualityChecker()._subagent_compliance(calls) == \
+        {"rounds": 1, "followed": 0, "hard_ignored": 1, "soft_ignored": 0}, \
+        "12 次工具调用仍自办应记硬忽略"
+
+
+def test_ignored_few_tools_exempt_or_soft() -> None:
+    """1-2 条命令按例外条款豁免；3-10 条是灰区。"""
+    few = [_say(_DIRECTIVE, _ts(-60)), _use("Bash"), _use("Read"), _result()]
+    assert TrajectoryQualityChecker()._subagent_compliance(few)["soft_ignored"] == 0, \
+        "2 条命令可自办，不算违规"
+    mid = [_say(_DIRECTIVE, _ts(-60))] + [_use("Bash") for _ in range(5)] + [_result()]
+    assert TrajectoryQualityChecker()._subagent_compliance(mid) == \
+        {"rounds": 1, "followed": 0, "hard_ignored": 0, "soft_ignored": 1}, \
+        "5 次工具调用应记灰区"
 
 
 def main() -> int:
