@@ -79,22 +79,59 @@ def _strip_fences(text: str) -> str:
     return "\n".join(out)
 
 
-def _symbols(path: Path) -> set[str] | None:
-    """文件里定义/绑定/导入的名字。用 AST 而不是正则：正则会把注释、字符串当成定义。
-    解析失败返回 None，由调用方跳过（不拿正则兜底，否则又回到误判）。"""
+def _symbols(path: Path) -> tuple[set[str], set[str]] | None:
+    """文件里的名字，分两层：
+
+    public —— 模块级 def/class/赋值/import，以及类里的方法与类属性（文档引用的都是这层）；
+    every  —— 全部绑定，含函数内的局部变量。
+
+    为什么要分两层：局部变量同名会掩盖"模块级符号已被删"。文档引用局部变量几乎总是写错了，
+    所以只出现在 every 里时要单独报出来（SYMBOL_LOCAL_ONLY），不能当通过。
+
+    用 AST 而不是正则：正则会把注释、字符串当成定义。解析失败返回 None，调用方跳过
+    （不拿正则兜底，否则又回到误判）。
+    """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
     except SyntaxError:
         return None
-    names: set[str] = set()
+    public: set[str] = set()
+    every: set[str] = set()
+
+    def binds(target) -> set[str]:
+        return {n.id for n in ast.walk(target)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
+            every.add(node.name)
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)  # 赋值/元组解包/for/with/except/海象 都算绑定
+            every.add(node.id)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update((a.asname or a.name.split(".")[0]) for a in node.names)
-    return names
+            every.update((a.asname or a.name.split(".")[0]) for a in node.names)
+
+    for node in tree.body:  # 模块级
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            public.add(node.name)
+        elif isinstance(node, ast.Assign):
+            public.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            public.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            public.update((a.asname or a.name.split(".")[0]) for a in node.names)
+        elif isinstance(node, (ast.For, ast.With)):
+            public.update(binds(node.target))
+
+    for node in ast.walk(tree):  # 类体里的方法与类属性
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    public.add(item.name)
+                elif isinstance(item, ast.Assign):
+                    public.update(t.id for t in item.targets if isinstance(t, ast.Name))
+                elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    public.add(item.target.id)
+    return public, every
 
 
 CITE = re.compile(r"([~\w./-]+\.py):(\d+)")
