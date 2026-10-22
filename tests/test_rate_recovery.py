@@ -444,6 +444,9 @@ def test_nudge_carries_what_to_retry(tmp_path, monkeypatch):
     sent = _run_recovery(_engine(), {"qa": "❯ \n"})
     body = [c for c in sent if "继续" in " ".join(c)][0][-2]
     assert "重发" in body and "不要重新规划" in body, body
+    # 反向断言：旧文案断言"0 产出"，而 6h 内 11 次中断里 10 次被杀前已调 7~92 次工具
+    # → 角色据此重做已做过的动作（本轮实测）。文案不许再声称零产出。
+    assert "0 产出" not in body, body
 
 
 def test_reset_predicate_ignores_error_turn_age():
