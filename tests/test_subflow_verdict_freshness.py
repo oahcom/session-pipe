@@ -154,5 +154,17 @@ def test_call_site_actually_uses_the_guard():
     assert "and not _superseded_by_parent(" in src, "调用点已不在，时效守卫等于没接"
 
 
+def test_malformed_exit_messages_does_not_break_earlier_guard():
+    """_subflow_verdict_rejected 在守卫之前执行：它崩了守卫永远跑不到。
+
+    生产实测 408 行 step_results 形状非法（exit_messages 为 int/str）。
+    """
+    from pipeflow.task_generator import _subflow_verdict_rejected
+    assert _subflow_verdict_rejected({"s1": {"exit_messages": 17}}) is False
+    assert _subflow_verdict_rejected({"s1": {"exit_messages": "x"}}) is False
+    assert _subflow_verdict_rejected(
+        {"s1": {"exit_messages": [{"text": "CHANGES_REQUESTED"}]}}) is True
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

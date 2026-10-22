@@ -85,10 +85,14 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
     审批确认不会清除它 → 同一份文本会被二次判成驳回（ADR-APPROVAL-AUTHORITY）。
     父步一旦被压回 rejected，这里误判的就是**真的阻断**，不再是纯噪音。
     """
+    # exit_messages 可能是畸形值（生产实测 408 行 step_results 形状非法）：
+    # 直接在 int 上迭代会 TypeError 冒泡，把整轮调度打断——而它是守卫之前
+    # 先执行的判据，崩在这里等于 _superseded_by_parent 永远跑不到。
     _txt = " ".join(
         str(m.get("text", ""))
         for _sd in sr.values() if isinstance(_sd, dict) and not _sd.get("confirmed_at")
-        for m in (_sd.get("exit_messages") or []) if isinstance(m, dict)
+        for m in (_sd.get("exit_messages") if isinstance(_sd.get("exit_messages"), list) else [])
+        if isinstance(m, dict)
     )
     return _review_gate.is_rejected(_txt)
 
