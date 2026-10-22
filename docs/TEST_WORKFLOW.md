@@ -39,5 +39,5 @@ python3 -m pytest tests/test_engine_e2e.py -q
 
 ## 已知缺口
 
-- `_cleanup_stale_workflows` 条件 4（超时/排队/子链/证据门组合）无专门单测，行为靠 e2e 间接覆盖。
+- `_cleanup_stale_workflows` 条件 3/4 已有专门回归：`test_stale_reclaim_pane_gate.py`（pane 活体、全局阈值双预算、子链与返工链活体、主查询必带 assignee）。仍无覆盖：`step_handler._has_live_subflow` 的 tmux 空闲取消路径（只看 `subflow_id`，不看 `rework_ids`）。
 - 手工验证 `SurvivalMonitor().tick()` 会写生产 bus/哨兵，必须按 [CLAUDE.md](../CLAUDE.md) 三重 env 隔离后再跑。
