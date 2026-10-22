@@ -1,6 +1,92 @@
 # CHANGES.md
 
+<<<<<<< HEAD
 ## 2026-10-22 — 闸门提示标题改为稳定去重键（747fefa）
+=======
+## 2026-10-22 — 空闲判死接活体门 + cancel_step 终态幂等 + 文档同源
+
+### 问题（角色转录/日志实证）
+1. tmux 空闲分支 `idle_count>=5`（约 50s）直接取消步骤，而角色长思考时 pane 静默是正常态。
+   两个实例的完成消息在 cancel **之后**才落 bus：`wf_e688c4fafc/s4` +27.6s、
+   `wf_sub_c5620e70dd31/s1` +235s —— 产出已写好被丢弃，父链重建子链多花 35.6 分钟。
+   同仓排队分支（`_queued>=10`）早有 `not _role_producing_recently(_eff)` 活体门，两条判死路径口径不一致。
+2. `cancel_step` 不判终态：`wf_ae31fd1c4c11` 一条链 31.3 分钟落 49 行 `step_cancelled`
+   （中位间隔 10.7s，正好一 tick 一行）。**注意时效**：该实测是 10-16 的数据，近 24h 全库仅
+   1 行 —— 故幂等属预防性不变量，不是当下止血。
+3. `cancel_step` 的幂等判断一度放在 `current_step_id` 校验之前，已终态实例收到错步骤会被
+   静默吞成 `False`，掩盖调用方 bug（codex 一轮 P1）。
+
+### 改动
+- `step_handler.py`：空闲判死加活体门；按 `cancel_step` 返回值记 info「取消」/ debug「空操作」。
+- `manager.py`：先校验 `current_step_id`（错步骤仍 raise）→ 终态 `cancelled/completed/failed`
+  短路（`rollback` 后 `return False`，不得裸 return，否则事务挂连接）。
+- `tests/`：新增 `test_cancel_step_idempotent.py`（3 例 + 三终态 subTest）、
+  `test_tick_paths.py` 增 2 例；4 个既有 idle 用例显式 patch `_role_producing_recently`
+  （原先隐式依赖 scout 真实转录 mtime，角色一跑就可能翻红）。反向验证：去掉活体门、
+  恢复无条件 info 日志、去掉终态守卫，对应用例分别失败。
+- 文档：`PUBLIC_API.md` 补 `cancel_step` 契约；`docs/TEST_WORKFLOW.md` 把"空闲取消"改为
+  两道门并写明 rework_ids 缺口的实测未触发率（6 天 249 例里 1 例 = 0.4%，且该子链自身已死）。
+
+### 验证
+`1253 passed, 1 deselected, 2 subtests`；`scripts/doccheck.py` → CLEAN；
+生效：daemon 就地重执行 `源码已更新 (mtime=1792625695)` = 07:34:55 > 文件 mtime 07:32:48。
+
+### 未做
+- `_has_live_subflow` 仍未看 `rework_ids`：实测 0.4% 且子链已死，属"可修但无需求"，
+  要修就复用 `engine._derive_rework_ids` / `_rework_alive`，别新写判定。
+
+## 2026-10-22 — 归属更正（9042df0 / a5f7c45）
+
+- `9042df0` 真实 subject：`fix(routing): 文档/注释跟上 cursor 退役 + limit 契约在函数内
+  兑现 + 删死 import`。`--stat` = 4 文件、+117/−380（ARCHITECTURE 4/4、SYSTEM_LANDSCAPE
+  +48/−110、TECHNICAL_DEEP_DIVE +65/−264、`reliability_core.py` −2）——**没有 .py 逻辑改动**。
+  `git blame` 会把两份文档的 47/63 行指向它，但**谁改的无法从 git 判定**（作者字段是
+  `hermes-session`，与相邻提交同作者，无 session 标记），仅记"归属提交在此"。
+- 一并更正我先前在本文件与文档里的三处口径错误（只读子代理逐条复核后）：
+  ① 引文"文档与死码收敛"是**编造**，9042df0 从未有过该 subject；
+  ② "480+ 行文档改写"应为 **487 行 diff 触达（+113/−380）**，158/329 是增删合计不是新增；
+  ③ `555c3ac` 当时 `43 passed` 是**正确的**（该提交下恰 43 个 test def），49 是后续
+  加用例后的现值；当时错的是"13 个常量 / 60→24 行"（实为 14 个 / 60→20）。
+  详见 `~/hermes/workspace/R144-删除重复路径常量/验证与待办.md`。
+- `a5f7c45` 删 6 行零引用常量（`HERMES_TEMPLATES` / `WORKFLOW_GUIDE` /
+  `CODEX_SENTINEL_DIR` / `_CONTROL_WORDS`），四仓 grep 零引用 + 12 passed + 463 passed。
+
+
+## 2026-10-22 — 投递预检判据收口（底栏 6 行 + 测试锁真）
+
+### 问题（5 个只读子代理审查 eda4a38/4f02450 后实证）
+1. `pane_cli_busy` 扫整块 pane 末 2000 字符：角色正文里讨论 "esc to interrupt"、贴日志里的
+   "Retrying … attempt" 会被当忙态，该角色所有投递恒返 busy → queued 累加 → 队列预算到期被回收。
+2. 预检用例并不锁预检：同文件前一个用例已把同一 (role,wf,step,prompt) 写进进程级
+   `_LAST_SEND`，删掉预检后同 prompt 去重分支照样返回 busy，三条断言全绿。
+3. 无用例覆盖「预检在 goal 校验之后」与「force 旁路」：把顺序改回去、去掉 force 条件，测试仍全绿。
+4. 首步补 `wf_id` 也没有断言：链路契约用例的 _record 丢掉了 wf_id。
+
+### 修复
+- `liveness`：判据只看底部 6 行（`_PANE_TAIL_LINES`）；拆出 `_pane_busy_markers`，
+  `tmux_pane_active` 走内部函数，测试打桩 `pane_cli_busy` 不影响活跃判定。
+- `tests/conftest.py`：autouse 夹具默认把探针桩成 None，并清 `_LAST_SEND` / `_ALERT_TS`，
+  进程级冷却不再跨用例泄漏；单个用例要忙态自己 patch。
+- 用例：defers/proceeds 断言探针被调用；新增「非法 prompt 不被忙吞」与「force 不被拦」；
+  链路契约记录并断言首跳 wf_id。
+- 闸门退避：文本规范化、闸门通过即清零、4h 裁剪（见上一节）。
+
+### 验证
+- 8 个相关测试文件 → 150 passed
+- 变异验证：把 `if wf_id and not force:` 改成 `if False:` 后 proceeds 用例变红
+  （pane_cli_busy 未被调用），恢复后转绿。
+- `python3 scripts/doccheck.py` → CLEAN（TREE 现在也校验「（N 行，…」形态；TABLE 要求反引号成对）。
+
+### 未采纳（附理由）
+- 删 `wf_id and` 并回退首步 wf_id：该条件在测试/直调路径上仍是有效闸门；
+  首步写 TASKS.md 与其他派单一致，未观察到害处。
+- 删预检的 try/except：`pane_cli_busy` 未捕获 UnicodeDecodeError 等非常规异常，
+  投递失败的代价高于保留 4 行。
+- 给 step_results 的 COALESCE 加 NULLIF：生产库该列为空串的行数为 0（实测），无证据，
+  且文件正被其他 session 改，先不动。
+
+## 2026-10-22 — 审批密钥通道全链路退场（841e545 + 2a8a016）
+>>>>>>> 3242a64 (docs+test: 补 cancel_step 契约 / 空闲取消两道门口径 / CHANGES 条目 / 修掉 4 个 idle 用例的隐式依赖)
 
 ### 问题
 `_gate_prompt` 把失败详情（缺失文件名 / verify 报错原文）拼进标题，而 `_notify_role` 的

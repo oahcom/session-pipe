@@ -283,7 +283,8 @@ def test_idle_cancel_deferred_when_subflow_live():
     eng = _build_eng()
     eng._lm.query_one.return_value = {"status": "running"}
     with patch("pipeflow.step_handler.get_conversation_signal",
-               return_value=_fake_sig_idle()):
+               return_value=_fake_sig_idle()), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
         eng._tick(_idle_run(), _make_step())
     eng._lm.cancel_step.assert_not_called()
 
@@ -296,7 +297,8 @@ def test_idle_cancel_uses_parent_link_when_subflow_id_gone():
     run = _make_run(step_results={"s1": {"status": "notified", "ts": time.time(),
                                          "tmux_signals": {"idle_count": 4}}})
     with patch("pipeflow.step_handler.get_conversation_signal",
-               return_value=_fake_sig_idle()):
+               return_value=_fake_sig_idle()), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
         eng._tick(run, _make_step())
     eng._lm.cancel_step.assert_not_called()
 
@@ -306,7 +308,8 @@ def test_idle_cancel_when_subflow_dead():
     eng = _build_eng()
     eng._lm.query_one.return_value = {"status": "cancelled"}
     with patch("pipeflow.step_handler.get_conversation_signal",
-               return_value=_fake_sig_idle()):
+               return_value=_fake_sig_idle()), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
         eng._tick(_idle_run(), _make_step())
     eng._lm.cancel_step.assert_called_once()
 
@@ -318,7 +321,8 @@ def test_idle_cancel_no_subflow_unchanged():
     run = _make_run(step_results={"s1": {"status": "notified", "ts": time.time(),
                                          "tmux_signals": {"idle_count": 4}}})
     with patch("pipeflow.step_handler.get_conversation_signal",
-               return_value=_fake_sig_idle()):
+               return_value=_fake_sig_idle()), \
+         patch("pipeflow.step_handler._role_producing_recently", return_value=False):
         eng._tick(run, _make_step())
     eng._lm.cancel_step.assert_called_once()
 
@@ -336,9 +340,10 @@ def test_idle_cancel_blocked_when_role_still_producing():
     eng._lm.query_one.return_value = {"status": "cancelled"}  # 子链已死 → 会走取消分支
     with patch("pipeflow.step_handler.get_conversation_signal",
                return_value=_fake_sig_idle()), \
-         patch("pipeflow.step_handler._role_producing_recently", return_value=True):
+         patch("pipeflow.step_handler._role_producing_recently", return_value=True) as live:
         eng._tick(_idle_run(), _make_step())
     eng._lm.cancel_step.assert_not_called()
+    live.assert_called_with("scout")  # 必须是"生效角色"，传错角色等于门开错人
 
 
 def test_idle_cancel_noop_logs_debug_not_info():
