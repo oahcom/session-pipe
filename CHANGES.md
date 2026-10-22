@@ -24,10 +24,11 @@
   改为直接调 `_classify_outputs`；`tests/test_task_evidence_scoring.py` 11 条（顺序/边界/取样）。
 
 ### 验证
-- `pytest tests/test_task_evidence_scoring.py tests/test_task_evidence_quality_gate.py` → 13 passed。
+- `pytest tests/test_task_evidence_scoring.py tests/test_task_evidence_quality_gate.py` → 15 passed。
 - `pytest tests/` 全量 → 1391 passed / 0 failed（`--junit-xml` 记录）。
 - `python3 scripts/doccheck.py` → CLEAN（exit 0）。
-- 回填实测：`--hours 24` → 51 条重算（48 positive / 3 neutral），bus 442338..442388。
+- 回填实测：`--hours 24` → 51 条重算。宽松取样时 48 positive / 3 neutral；
+  收紧取样后 32 positive / 15 neutral / 4 negative（`_DETAIL_VERSION` 让同一 task 的 fact 被重写而非并存）。
 
 ### 已知边界
 - 历史 bus 里已写的假中性 fact 不会被删除：消费方取最近一条；判据/文案再次变更时靠
