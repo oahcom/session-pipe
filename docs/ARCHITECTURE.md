@@ -1,6 +1,6 @@
 # session-pipeline Architecture
 
-> Verified: 2026-10-22（行数漂移由 `scripts/doccheck.py` 在 pre-commit 预警，不阻断提交）| Audience: Architects | Related: [SYSTEM_LANDSCAPE.md](SYSTEM_LANDSCAPE.md), [DOCS.md](DOCS.md)
+> Verified: 2026-10-22（本文件不含行数；模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`）| Audience: Architects | Related: [SYSTEM_LANDSCAPE.md](SYSTEM_LANDSCAPE.md), [DOCS.md](DOCS.md)
 
 Session ecosystem's **routing + execution layer** -- message routing (router), auto-dispatch (auto_route), workflow engine (workflow), lifecycle state machine, reliability infrastructure.
 
@@ -131,7 +131,7 @@ These bypasses lose RLock protection and approval workflow.
 
 - Full suite: `python3 -m pytest tests/ -q`（全 passed、skip 数固定；**条数不写死**，并发改动每天都会变）。跑法与判据见 [TEST_WORKFLOW.md](TEST_WORKFLOW.md)。
 - Per-file counts are not maintained; run the suite for current numbers.
-- `python3 scripts/doccheck.py` 校验本文件与 CLAUDE.md 声明的行数；`--fix` 就地刷新。pre-commit 会跑它，不一致时打印 `DOC-DRIFT` 提示（不拦提交）。
+- 本文件**不写行数**（表格里的 Lines 列已删：没人维护，实测一轮就漂 6 处）。行数只在 CLAUDE.md 的代码布局树里，由 `python3 scripts/doccheck.py` 校验（`--fix` 就地刷新），pre-commit 不一致时打印 `DOC-DRIFT` 提示、不拦提交。
 
 ## Red lines
 
