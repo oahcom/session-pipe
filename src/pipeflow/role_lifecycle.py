@@ -201,6 +201,39 @@ def _transcript_stalled(role: str, max_age: float = _STOPPED_PROGRESS_SEC) -> bo
         return False
 
 
+def _tool_use_within(role: str, sec: float = 60) -> bool:
+    """转录里最近一条 tool_use 是否在 sec 秒内 = 角色正在跑工具。
+
+    正在跑工具时注入会被 CLI 吞掉（C-u 与工具输出撞车）：实测 6h 12 次注入有 1 次
+    转录里完全没有落地，而 tmux rc=0 → audit 仍写「已发继续」= 假审计。而且角色
+    在推进时本来也不需要「继续」。取不到转录按 False（宁可多等一轮，不打断）。
+    """
+    import glob as _glob
+    from datetime import datetime as _dt
+    try:
+        _d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+        files = sorted(_glob.glob(str(_d / "*.jsonl")), key=_os.path.getmtime, reverse=True)
+        if not files:
+            return False
+        with open(files[0], "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 65536))
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    cut = time.time() - sec
+    for line in reversed(tail.splitlines()):
+        if '"tool_use"' not in line.replace(" ", ""):
+            continue
+        try:
+            _ts = json.loads(line).get("timestamp") or ""
+            t = _dt.fromisoformat(_ts.replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError):
+            continue
+        return t >= cut
+    return False
+
+
 def _as_bytes(v) -> bytes:
     """子进程输出归一：生产是 bytes，测试/未来 text=True 可能是 str。"""
     return v.encode("utf-8", "replace") if isinstance(v, str) else (v or b"")
@@ -464,6 +497,10 @@ class RoleLifecycleMixin:
                                     self._ALERT_TTL_S, delete_roles=(role,))
                 # 清完直接跳过本轮，不再落到下面的发送分支
                 # （健康角色每个 tick 被敲一句「继续」）。
+                continue
+            # 正在跑工具时不发：C-u 会与工具输出撞车，文本被吞但 tmux rc=0 →
+            # 写出「已发继续」假审计（实测 6h 12 次注入中 1 次转录无落地）。
+            if _tool_use_within(role):
                 continue
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt

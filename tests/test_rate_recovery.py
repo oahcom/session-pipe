@@ -482,3 +482,30 @@ def test_reset_predicate_ignores_error_turn_age():
         f"重置判据仍在用时效窗口 {seen}：错误轮过期会被当成已恢复"
     assert "curator" in eng._last_rate_recover, "错误轮未变老就清掉了退避状态"
     assert eng._last_rate_recover["curator"][1] >= 3, "attempt 被重置，退避曲线失效"
+
+
+def test_recent_tool_use_suppresses_nudge(tmp_path, monkeypatch):
+    """角色正在跑工具时不注入：C-u 会与工具输出撞车，文本被吞但 tmux rc=0 →
+    写出「已发继续」假审计（6h 12 次注入中 1 次转录里没有落地）。"""
+    import json as _json
+    from datetime import datetime, timezone, timedelta
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    d = tmp_path / "-home-administrator-ccs-workspaces-qa"
+    d.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+
+    def _rec(kind, age, content, err=False):
+        rec = {"type": "assistant",
+               "timestamp": (now - timedelta(seconds=age)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+               "message": {"role": "assistant", "content": content}}
+        if err:
+            rec["isApiErrorMessage"] = True
+        return rec
+
+    with open(d / "sess.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(_rec("text", 30, [{"type": "text", "text": "API Error: 429"}], err=True)) + "\n")
+        fh.write(_json.dumps(_rec("tool", 5, [{"type": "tool_use", "id": "t1",
+                                               "name": "Bash", "input": {}}])) + "\n")
+    sent = _run_recovery(_engine(), {"qa": "❯ \nPlease run /login · API Error: 429\n"})
+    assert not any("继续" in " ".join(c) for c in sent), f"角色正在跑工具却被注入: {sent}"
