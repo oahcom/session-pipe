@@ -147,6 +147,13 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     # engine 生成 id 时加，不进提示词）。旧实现按全名精确匹配恒不命中 → 守卫
     # 恒失效 → 8.7 小时前、属兄弟实例 wf_sub_61581e191d0a 的消息把本步闭合。
     _tpl = re.sub(r'^(?:WL-|WF-)', '', str(template))
+    # 登记名里的纯数字模板（WL-01/WL-02/WL-09）没有可读名：显示名长在另一行模板上
+    # （WL-02 与「需求流转」的 steps_json 逐字相同），剥前缀只剩 '02'，与角色标题
+    # 里的显示名永远对不上 → 模板名分支恒失效（实测 40 条显示名完成标题 0 条命中）。
+    # 这类退化为匹配任意模板名：能走到最后一行时 foreign 非空、本实例 id 缺席，
+    # 本就不需要模板名再收窄一步。
+    _tpl_pat = (r'[^\s/]+' if _tpl.isdigit()
+                else r'(?:WL-|WF-)?' + re.escape(_tpl))
     # 尾部断言用 (?![\\w]) 不用 (?![\\w-])：角色完成标题固定写 `s4-complete`，
     # 紧邻的连字符会被 (?![\\w-]) 拒掉 → 即便前缀修好也恒不命中；step_id=s4 仍不会误匹配 s40。
     # 前缀认两种形态：模板名（`pm_requirements/s1-complete`）与实例 id
@@ -156,15 +163,22 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
     # 只匹配**别的**实例：消息里出现本实例 id 不等于它没有同时替别的实例报工，
     # `wf_sub_other/s1-complete 交付给 wf_sub_mine` 必须仍判串味。
     # 后缀认两种真实完成形态：`-complete`（模板要求的标题格式，#439707）与
-    # 中文「完成」（角色自发通知写 `wf_xxx/s2 完成`，全库 960 条完成类消息中
-    # 26 条是该形态；只认 -complete 会让这 26 条串味消息逃过守卫，既有
-    # TestSoftAttribution 用例锁的正是它）。两种都不要求时，`wf_sub_other/
-    # s1/README 已更新` 这种路径引用会被当成完成声明，守卫就从拦截变成误伤。
-    _suffix = (re.escape(step_id) + r'(?:-complete|\s*完成)(?![\w])')
+    # 中文「完成」（角色自发通知写 `wf_xxx/s2 完成`；2026-10-22 全库 1291 条
+    # 完成类标题中 26 条是该形态 —— 只认 -complete 会让这 26 条串味消息逃过
+    # 守卫，既有 TestSoftAttribution 用例锁的正是它）。中文形态还要认
+    # 已/了/于时间 三种收尾：`wf_other/s1 已完成`、`s1 完成了`、`s1 完成于 10:00`
+    # 都是真实写法，旧后缀一条都不拦（reviewer 返工 s6）。
+    # 两种都不要求时，`wf_sub_other/s1/README 已更新` 这种路径引用会被当成
+    # 完成声明，守卫就从拦截变成误伤，所以「完成」后仍要求词边界。
+    _suffix = (re.escape(step_id)
+               + r'(?:-complete|\s*已?完成(?:了|于\s*\d[\d:]*)?)(?![\w])')
+    # 斜杠两侧允许空格：`wf_other / s1 完成` 这种排版绕过了旧的字面 `id/sN`
+    # 匹配（reviewer 返工 s6 实测为 False）。
+    _sep = r'\s*/\s*'
     # 别的**实例**点名本步：即便消息里也有本实例 id，也算替别人报工
     # （wf_sub_other/s1-complete 交付给 wf_sub_mine）。
-    if re.search(r'(?<![\w-])(?:' + '|'.join(map(re.escape, sorted(foreign))) + r')/'
-                 + _suffix, text or ""):
+    if re.search(r'(?<![\w-])(?:' + '|'.join(map(re.escape, sorted(foreign))) + r')'
+                 + _sep + _suffix, text or ""):
         return True
     # 同模板兄弟实例点名：两个同模板实例不可能共享同一份产出，而消息把两条
     # 实例 id 并列后都会命中本模板/本步的完成声明 → 两边同时闭合（实测
@@ -177,8 +191,7 @@ def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
         return True
     if wf_id in ids:
         return False
-    return bool(re.search(r'(?<![\w-])(?:WL-|WF-)?' + re.escape(_tpl) + r'/' + _suffix,
-                          text or ""))
+    return bool(re.search(r'(?<![\w-])' + _tpl_pat + _sep + _suffix, text or ""))
 
 
 def _stop_tmux_violation(run, step, commands: list[str], role: str, send_to_role) -> None:
@@ -1675,6 +1688,10 @@ class StepHandlerMixin:
             # wf_sub_ad604 的 s2 完成消息闭合了 wf_sub_7afc1 的 s2，自有产出晚 7min）。
             # 不改成 require_wf=true 的原因：105/164 条历史裸匹配完成消息本就不带
             # 实例 id（no-op 巡检），硬校验会让它们全部超时。
+            # 只读标题（f.t）不读 evidence：实测改读正文会新拦 47 条真实完成消息
+            # （reviewer 30 / product_architect 6 / engineer 4 / devops 2 / writer 2 /
+            # security_auditor 2 / knowledge_curator 1），它们的正文提到别实例 id 是
+            # 记账不是串味 → 那些步骤会全卡到超时。判据边界待 product_architect 裁定。
             if not wf_id and _claims_own_step_and_foreign_instance(
                     f.t, own_wf_id, template, step_id, siblings=_siblings):
                 continue
