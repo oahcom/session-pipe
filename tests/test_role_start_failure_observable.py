@@ -31,17 +31,31 @@ def test_start_result_is_captured():
     src = _SRC_FILE.read_text(encoding="utf-8")
     m = re.search(r'def _check_and_start_role.*?(?=\n    def )', src, re.S)
     assert m, "未找到 _check_and_start_role"
+    body = m.group(0)
     assert re.search(r'_st = _engine_mod\._sp\.run\(\s*\n\s*\["python3", str\(_CCS_CLI\), "start"',
-                     m.group(0)), "ccs start 返回值未被接住（仍为裸调用，失败不可观测）"
-    assert "_wait_for_role_ready" in src and "capture_output=True, timeout=60" in src
+                     body), "ccs start 返回值未被接住（仍为裸调用，失败不可观测）"
+    # 拉起只允许**一条**路径：_wait_for_role_ready 必须委托，不许再内联一份
+    # （内联副本没有锁/冷却/审计，实测 pg 90s 内被连启 6 次必败）。
+    w = re.search(r'def _wait_for_role_ready.*?(?=\n    def )', src, re.S)
+    assert w, "未找到 _wait_for_role_ready"
+    assert "self._check_and_start_role(role)" in w.group(0), \
+        "_wait_for_role_ready 不再委托共用拉起路径（副本回归）"
+    # tmux 探活仍会用 _sp.run，所以只禁"拉起角色的那一次调用"的指纹
+    assert '"start", role' not in w.group(0) and "--drive" not in w.group(0), \
+        "_wait_for_role_ready 里又出现了直接 ccs start（第二份副本回归）"
 
 
 def test_failure_writes_blocker():
     """失败路径必须写 blocker（外部可观测），不能只 LOGGER。"""
     src = _SRC_FILE.read_text(encoding="utf-8")
-    assert "启动失败 (rc=" in src and "工作流无法投递" in src, \
-        "缺少角色启动失败的 blocker 文案（应含返回码）"
-    assert "ccs start 失败 (rc=%s)" in src, "缺少含返回码的 ERROR 日志"
+    m = re.search(r'def _check_and_start_role.*?(?=\n    def )', src, re.S)
+    assert m, "未找到 _check_and_start_role"
+    body = m.group(0)
+    assert "启动失败 (rc=" in body and "工作流无法投递" in body, \
+        "拉起路径里缺少 blocker 文案（应含返回码）"
+    # 文案在不算数：必须真的写 blocker（只留字符串时，删掉写库也能全绿）
+    assert 'self._bb.write("blocker"' in body, "拉起失败没有写 blocker（外部不可观测）"
+    assert "ccs start 失败 (rc=%s)" in body, "缺少含返回码的 ERROR 日志"
 
 
 def test_no_false_tmux_alive_claim():
