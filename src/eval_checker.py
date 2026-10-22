@@ -456,11 +456,18 @@ def _has_word(text: str, words) -> bool:
 
     WHY 不用 `in`：`"active" in "inactive"` 为真 —— 维护者的「全部返回 active」
     判据实测在 inactive/inactive 下也 PASS（2026-10-22）。边界只认 ASCII 字母数字
-    和 `-_`：`5xx-error` 不会被 `error` 拆词误伤；CJK 没有词边界概念，"检查通过"
-    仍按子串命中 "通过"（"不通过" 同样命中，否定语义要写负向 expected 或改命令）。
+    和 `-_`：`5xx-error` 不会被 `error` 拆词误伤；CJK 没有词边界，"检查通过"
+    按子串命中 "通过"，但紧跟中文否定前缀（不/未/没/无/非）的命中不算。
+    多字否定（"没有通过"）覆盖不到，这种判据要写负向 expected 或改命令。
     """
-    return any(w and re.search(rf"(?<![A-Za-z0-9_-]){re.escape(w)}(?![A-Za-z0-9_-])", text)
-               for w in words)
+    for w in words:
+        if not w:
+            continue
+        for m in re.finditer(rf"(?<![A-Za-z0-9_-]){re.escape(w)}(?![A-Za-z0-9_-])", text):
+            if m.start() and text[m.start() - 1] in "不未没无非":
+                continue
+            return True
+    return False
 
 
 def _check_passed(result: dict, cmd_raw: str, expected: str | None) -> (bool, str):
