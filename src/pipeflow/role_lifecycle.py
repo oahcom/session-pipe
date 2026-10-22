@@ -780,6 +780,7 @@ class RoleLifecycleMixin:
                             # blocker 是唯一外部产物：写失败不能只留 DEBUG。
                             LOGGER.warning("role-start blocker 写入失败: %s", role)
                     # 等待 tmux session 启动
+                    _invalidate_tmux()  # 刚拉起：旧快照里没有它，下一步会被判死
                     for _ in range(10):
                         time.sleep(1)
                         if _engine_mod._sp.run(
