@@ -24,6 +24,12 @@ _run_dir = tempfile.mkdtemp(prefix="pytest-hermes-run-")
 os.environ["HERMES_RUN_DIR"] = _run_dir
 os.environ["ROUTING_DB_PATH"] = os.path.join(_run_dir, "routing.db")
 os.environ["SESSION_PIPELINE_ACK_DB"] = os.path.join(_run_dir, "ack_tracker.db")
+# CCS_WORKSPACES 的 env 必须在这里设，不能等第 3b 节：step_handler / wf_lifecycle 用
+# `from paths import CCS_WORKSPACES` 拷了值（模块级 alias），谁先 import 谁固化。
+# 分支上两者都晚于本文件，看不出问题；一旦合进 main（conftest 顶部就 import pipeflow
+# 做 _PRISTINE 快照），测试写临时目录、引擎读生产目录 → 15 个用例假红（2026-10-22 实测）。
+_TEST_WS_DIR = os.path.join(_run_dir, "ccs-workspaces")
+os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
 
 # 0. 保存真实 bus_protocol/config_loader 引用（test_reliability_unit 会篡改
 #    sys.modules 为 MagicMock，后续模块需恢复真实版本）
@@ -100,8 +106,6 @@ _paths_mod.METRICS_JSONL = Path(os.environ["SESSION_PIPELINE_METRICS_JSONL"])
 #     不隔离则每个跑到的用例都写进生产 ~/ccs-workspaces/，实测已污染
 #     scout/engineer 的真实 TASKS.md（2026-10-16 16:22，fixture 的 "test"
 #     任务覆盖真实任务）。同 WORKFLOWS_DB 走 env + 属性重绑双保险。
-_TEST_WS_DIR = os.path.join(_TEST_STATE_DIR, "ccs-workspaces")
-os.environ["SESSION_PIPELINE_CCS_WORKSPACES"] = _TEST_WS_DIR
 _paths_mod.CCS_WORKSPACES = Path(_TEST_WS_DIR)
 
 # 3c. ITERATION_WORKSPACES 隔离：_write_step_prompt 读 <根>/<project_name>/PRD.md

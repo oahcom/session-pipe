@@ -999,10 +999,17 @@ class LifecycleManager:
         # 判成驳回，把刚落的 completed 当场改写回 rejected。步骤一旦被驳回过就
         # 永远无法通过审批：实测 wf_256be862ea86/s3 17:36 确认落库后卡死 5h，
         # DB 内 confirmed_at 与 status=rejected 并存。审批比文本更权威。
-        # 子链接管本步时父步文案不再能否决（与 wf_lifecycle._advance_production_wf
-        # 同款，两条推进路径判定必须一致）。
+        # 子链终结后父步文案不再能否决（与 wf_lifecycle._advance_production_wf 同款，
+        # 两条推进路径判定必须一致）。子链还在跑时驳回仍有效——只放行「已交付」那半边。
         _confirmed = bool(_cur_sr.get("confirmed_at"))
-        if not _confirmed and not _cur_sr.get("subflow_id") and is_rejected(_msgs):
+        _subflow_done = False
+        _sf_id = str(_cur_sr.get("subflow_id") or "")
+        if _sf_id:
+            from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
+            _sf_row = self._conn.execute(
+                "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf_id,)).fetchone()
+            _subflow_done = not _sf_row or _sf_row["status"] not in _ACTIVE_WF_STATUSES
+        if not _confirmed and not _subflow_done and is_rejected(_msgs):
             _sr.setdefault(current, {})["status"] = "rejected"
             self._conn.execute(
                 "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",

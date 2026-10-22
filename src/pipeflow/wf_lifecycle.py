@@ -583,9 +583,12 @@ class WorkflowLifecycleMixin:
             # （task_generator 按子链末步判词压 rejected）。不带这道门时，软归属早先
             # 塞进来的兄弟实例驳回原文会每 tick 否掉一次「子链判通过 → completed」，
             # 与完成写入互抵——实测 wf_1ecc8/s3 完成↔驳回 13h 自旋 217 次。
+            # 只在子链**已终结**时让位：子链还在跑说明该步尚未交付，父步此时收到的
+            # 驳回仍是有效否决（codex 第 3 轮 Q1）——活体判据复用 _live_subflow，
+            # 不另立口径。
             _confirmed = bool(_step_sr.get("confirmed_at"))
-            _subflow_owned = bool(_step_sr.get("subflow_id"))
-            if not _confirmed and not _subflow_owned and _review_gate.is_rejected(_msgs):
+            _subflow_done = bool(_step_sr.get("subflow_id")) and not _live_subflow(lm, _step_sr)
+            if not _confirmed and not _subflow_done and _review_gate.is_rejected(_msgs):
                 LOGGER.warning("review rejected: %s/%s → 返工门禁触发，不推进",
                                wf_id[:8], step_id)
                 # 无条件落库 rejected，不再按「有无问题分类」fail-open 放行。
