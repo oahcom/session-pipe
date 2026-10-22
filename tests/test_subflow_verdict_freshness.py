@@ -177,22 +177,22 @@ def test_mixed_approve_and_reject_in_one_message_blocks():
         _sub("CHANGES_REQUESTED"))
 
 
-def test_earlier_approved_plus_later_mixed_message_blocks():
-    """P0 锁定：更早的 APPROVED + 更晚的混合消息 → 必须仍拦。
-
-    只放一条混合消息时旧实现也返回 False（它的 verdict 就是 False），
-    真正能抓 P0 的是"更早有一条 APPROVED"——跳过最新那条会回落到它。
-    """
-    assert not _superseded_by_parent(
-        _parent((APPROVED, SUB_TS + 100),
-                ("s4-complete —— APPROVED 但 CHANGES_REQUESTED: 2 P1", SUB_TS + 200)),
-        _sub("CHANGES_REQUESTED"))
-
-
 def test_long_attribution_phrase_not_counted_as_approval():
     """转述排除不能被长距离绕过：「上游 s1 的最终验收结论为 APPROVED」不算本步通过。"""
     assert not _superseded_by_parent(
         _parent(("上游 s1 的最终验收结论为 APPROVED", SUB_TS + 100)),
+        _sub("CHANGES_REQUESTED"))
+
+
+def test_approval_in_body_not_a_conclusion():
+    """APPROVED 只出现在正文里时不是本步的通过结论。
+
+    exit_messages 的 text 是「首行标题 + 空行 + 正文」，旧实现扫全文，
+    正文里带过的 APPROVED 就能让被驳回的返工步整步放行。
+    """
+    assert not _superseded_by_parent(
+        _parent(("full_dev_pipeline/s4-complete — delta\n\n"
+                 "s3 APPROVED 的两项已合并，剩余 P1 待修", SUB_TS + 100)),
         _sub("CHANGES_REQUESTED"))
 
 

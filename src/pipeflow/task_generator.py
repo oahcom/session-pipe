@@ -101,23 +101,30 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 # （「构建通过」「产出已就绪」实测 verdict 均 True，codex P0）。
 _HARD_APPROVE = re.compile(
     r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
-# 转述他人的通过（「上游 s3 APPROVED」）不是本步结论：左邻这些词时不算。
-_APPROVE_ATTRIB = re.compile(
-    r"(上游|下游|前序|前置|父步|前一步|前步|上一步|上次|此前|参照|参考|"
-    r"其他步骤|兄弟步骤|子链|子流程|子步骤|如同)[^。\n]{0,24}$")
+# 首行以转述开头（「上游 s3 APPROVED…」）：不是本步结论。
+_ATTRIB_HEAD = re.compile(
+    r"^\s*(上游|下游|前序|前置|父步|子链|子流程|子步骤|兄弟步骤|其他步骤)", re.I)
 
 
-def _any_hard_approve(text: str) -> bool:
-    """文本里有没有「本步的通过结论」。
+def _conclusion(text: str) -> bool | None:
+    """一条完成消息**自己**的结论：True=通过 / False=驳回 / None=叙述。
 
-    硬通过词存在，且**不是转述别人**：左邻「上游/参照/上次」等词的命中是复述
-    （实测「上游 s3 APPROVED」verdict=True，但本步并未通过）。
+    只看**首行**：生产完成消息是 "<模板>/sN-complete … — APPROVED …" 一行，
+    正文接在空行之后；delta 叙述同样带标题，但首行含 "delta"，正文里引用的
+    「上游 s3 APPROVED」不是本步结论。
+
+    ponytail: 代价不对称——漏放行只是让返工继续（保守），误放行会把被驳回的
+    步推成 completed。升级路径：step_handler 写 exit_messages 时把 verdict
+    一起落库，不再事后从文本反推。
     """
-    for _m in _HARD_APPROVE.finditer(text or ""):
-        _left = text[max(0, _m.start() - 24):_m.start()]
-        if not _APPROVE_ATTRIB.search(_left):
-            return True
-    return False
+    head = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    if not head:
+        return None
+    if _review_gate.is_rejected(head):
+        return False
+    if "delta" in head.lower() or _ATTRIB_HEAD.match(head):
+        return None
+    return True if _HARD_APPROVE.search(head) else None
 
 
 def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
@@ -168,18 +175,7 @@ def _superseded_by_parent(parent_step: dict, sub_last: dict) -> bool:
         _ts = _m.get("ts")
         if type(_ts) not in (int, float) or _ts <= _cutoff:
             continue
-        _txt = str(_m.get("text", ""))
-        # verdict() 是词表信号，不是结论检测器：「构建通过」「产出已就绪」
-        # 「上游 s3 APPROVED」「没有通过审核，需返工」实测都返回 True
-        # （codex P0）。判序：先看有没有驳回信号（一票否决 → False，不能置 None，
-        # 否则会回落到更早的 APPROVED 上，等于把最新驳回吞掉）；再看通过是否
-        # 带硬通过词（没有就是过程叙述 → 无结论）。
-        if _review_gate.is_rejected(_txt):
-            _v = False
-        elif _review_gate.verdict(_txt) is True and not _any_hard_approve(_txt):
-            _v = None
-        else:
-            _v = _review_gate.verdict(_txt)
+        _v = _conclusion(str(_m.get("text", "")))
         if _v is None:
             continue
         if _latest is None or _ts > _latest[0] or (_ts == _latest[0] and _v is False):
