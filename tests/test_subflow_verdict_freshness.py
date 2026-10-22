@@ -206,6 +206,36 @@ def test_later_rejection_in_body_blocks():
         _sub("CHANGES_REQUESTED"))
 
 
+def test_long_attribution_phrase_with_timestamp_not_approval():
+    """转述句再长也不算本步通过：加 24 字上限会被时间戳绕开（codex P1）。
+
+    实测旧窗口对该句返回 True：前缀 30 字，超出 24 字窗口。
+    """
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion(
+        "上游 s1 的最终验收结论已在 10:20 复核之后确认为 APPROVED") is None
+    assert not _superseded_by_parent(
+        _parent(("上游 s1 的最终验收结论已在 10:20 复核之后确认为 APPROVED",
+                 SUB_TS + 100)),
+        _sub("CHANGES_REQUESTED"))
+
+
+def test_delta_mentioning_rejection_is_still_narrative():
+    """delta 正文提到的旧驳回是返工记录，不是本步驳回（codex P2）。
+
+    若先判全文驳回，返工后的 delta 会成为「最新的结论=驳回」，
+    父步更晚的 APPROVED 永远压不过它（#439027 的陈旧驳回复现）。
+    """
+    from pipeflow.task_generator import _conclusion
+    assert _conclusion("full_dev_pipeline/s4-complete — delta\n\n"
+                       "已修复 CHANGES_REQUESTED 的 3 项") is None
+    assert _superseded_by_parent(
+        _parent(("full_dev_pipeline/s4-complete — delta\n\n已修复 CHANGES_REQUESTED 的 3 项",
+                 SUB_TS + 50),
+                ("full_dev_pipeline/s4-complete — APPROVED", SUB_TS + 100)),
+        _sub("CHANGES_REQUESTED"))
+
+
 def test_quoted_approval_in_title_not_superseding():
     """标题形态（模板前缀）里转述上游的通过不算本步结论（codex P2）。"""
     assert not _superseded_by_parent(

@@ -101,10 +101,11 @@ def _subflow_verdict_rejected(sr: dict) -> bool:
 # （「构建通过」「产出已就绪」实测 verdict 均 True，codex P0）。
 _HARD_APPROVE = re.compile(
     r"\bAPPROVED\b|验收通过|判定\s*[:：]\s*通过|结论\s*[:：]\s*通过", re.I)
-# 通过词左侧 24 字内出现这些词 = 转述别人的结论（「上游 s3 APPROVED」）。
+# 通过词**同句内**左侧出现这些词 = 转述别人的结论（「上游 s1 的最终验收
+# 结论已在 10:20 复核之后确认为 APPROVED」前缀 30 字，加长度上限会漏判）。
 _ATTRIB_LEFT = re.compile(
     r"(上游|下游|前序|前置|父步|子链|子流程|子步骤|兄弟步骤|其他步骤|"
-    r"参照|参考|如同|上次|此前|上一步|前步)[^。\n]{0,24}$")
+    r"参照|参考|如同|上次|此前|上一步|前步)[^。\n]*$")
 
 
 def _conclusion(text: str) -> bool | None:
@@ -121,14 +122,18 @@ def _conclusion(text: str) -> bool | None:
     一起落库，不再事后从文本反推。
     """
     text = text or ""
-    if _review_gate.is_rejected(text):
-        return False
     _lines = text.strip().splitlines()
     head = _lines[0] if _lines else ""
-    if not head or "delta" in head.lower():
+    if not head:
         return None
+    if "delta" in head.lower():
+        # delta 是状态叙述：正文里「已修复 CHANGES_REQUESTED 的 3 项」是返工
+        # 记录，不是本步驳回；只有首行自带锚点结论才算结论。
+        return _review_gate.verdict(head)
+    if _review_gate.is_rejected(text):
+        return False
     for _m in _HARD_APPROVE.finditer(head):
-        if not _ATTRIB_LEFT.search(head[max(0, _m.start() - 24):_m.start()]):
+        if not _ATTRIB_LEFT.search(head[:_m.start()]):
             return True
     return None
 
