@@ -4,7 +4,7 @@
 生产证据（2026-10-22 隔离探针，DB 副本 + faulthandler 打栈）：
 - 单 tick 399s，绝大部分是 subprocess.run 等 tmux/ccs 返回（_scan_tasks 逐角色
   liveness._tmux_has_session 5s 超时 × N 角色，_send_to_role 60s 超时）；
-- 推进排在这些阶段后面，服务 TimeoutStopSec=90 的重启每次把整轮打断
+- 推进排在这些阶段后面，服务 TimeoutStopSec=15 的重启每次把整轮打断
   → 实测 4 个实例卡在 step_done_ready 1.5~2.4h，一步都推不动。
 本用例锁住两条：① 预推进发生在 _scan_tasks 之前；② 预算恒超时恰好推进一条
 （防止把"预算"写成恒真/恒假，也防退回到"一条都不推进"的整体饥饿）。
@@ -149,3 +149,48 @@ if __name__ == "__main__":
     test_zero_budget_advances_exactly_one()
     test_zero_budget_also_advances_prepass()
     print("ok")
+
+# ── 巡检预算与忙时重投退避（2026-10-22：单 tick 563s 的两个来源）─────────────
+
+def _queued(eng, rid, step="s1"):
+    row = eng._lifecycle.query(
+        "SELECT step_results FROM workflow_instances WHERE instance_id=?", (rid,))[0]
+    return (json.loads(row["step_results"] or "{}").get(step) or {}).get("queued", 0)
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0, stdout="claude\n", stderr=""))
+def test_guard_sweep_is_bounded_and_rotates(_sp):
+    """巡检必须有时间上限，且超预算时停在角色之间、下轮从游标续（不饿死固定前缀）。"""
+    d = _env()
+    _wf(d, "tbflow", ["s1", "s2"])
+    eng = _fast(WorkflowEngine(d))
+    seen = []
+
+    def _slow(role):
+        seen.append(role)
+        time.sleep(0.02)
+        return True
+
+    eng._ensure_role_alive = _slow
+    eng._collect_guard_roles = lambda: {"r1", "r2", "r3"}
+    del eng._ensure_guard_roles      # 撤掉 _fast 的桩，测真实实现
+
+    eng._ensure_guard_roles(deadline=time.time() + 0.005)   # 时间只够 1 个角色
+    assert len(seen) == 1, f"预算内应只巡视 1 个角色: {seen}"
+    eng._ensure_guard_roles(deadline=time.time() + 0.005)
+    assert seen[1] != seen[0], f"第二轮必须换角色，否则固定前缀永久饿死: {seen}"
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(returncode=0, stdout="claude\n", stderr=""))
+def test_busy_delivery_backs_off(_sp):
+    """角色忙时不得每个 tick 都重投：实测 s2 重投 208 次、67 分钟才送达。"""
+    d = _env()
+    _wf(d, "tbflow", ["s1", "s2"])
+    eng = _fast(WorkflowEngine(d))
+    rid = eng.start("tbflow", {})
+    eng._send_to_role = lambda *a, **k: "busy"
+
+    eng.run_once()
+    assert _queued(eng, rid) == 1, "首投忙应记 1 次排队"
+    eng.run_once()          # 紧接着一轮：退避期内
+    assert _queued(eng, rid) == 1, "退避期内不得再投（否则就是每 tick 一次 ccs send）"

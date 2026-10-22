@@ -319,10 +319,15 @@ from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
 
 
 # 单 tick 预算：实测 16 个实例一轮 run_once 耗时 399s（2026-10-22 03:31 隔离探针），
-# 主因是 tmux/ccs 调用在内存压力下各自吃满 5~60s 超时。服务重启（TimeoutStopSec=90）
+# 主因是 tmux/ccs 调用在内存压力下各自吃满 5~60s 超时。服务重启（TimeoutStopSec=15）
 # 一来就打断整轮 → 一步都推不动。超预算只中止本轮的**剩余实例**，状态在 DB 里，
 # 下一轮接着跑（每实例的处理本身幂等）。
 _TICK_BUDGET_SEC = 60
+# 守护巡检（_ensure_guard_roles）的时间上限，从巡检自身开始计时。实测无门时
+# 每 tick 480s（19 角色 × 探针/拉起，单角色最坏 250s），把预算吃光 → 主循环
+# 只剩 1 条实例（tick 563s）。按自身预算而不是 tick 预算：前置阶段一旦超支，
+# 按 tick 预算算会让巡检永久跳过 → 角色再也不会被救活。
+_GUARD_BUDGET_SEC = 30
 
 # 主循环轮转断点：本轮在预算处 break，下一轮从断点**之后**接着走。
 # WHY：tick 预算 60s 超限即 break 本轮剩余实例，而查询无 ORDER BY → SQLite 按
@@ -956,7 +961,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.warning("advance pre-pass failed: %s", _pr_e)
 
         # 确保工作流涉及的角色存活（assignee + target_role + guard.watch）
-        self._ensure_guard_roles()
+        self._ensure_guard_roles(deadline=time.time() + _GUARD_BUDGET_SEC)
         # 子链回流先于实例循环：_scan_tasks 写的 subflow_retry/subflow_failed_*
         # 会被下面循环里基于旧快照的整字典回写覆盖（实测 3 次子链死亡只记到 2），
         # 把重建上限从 3 放大到 6。先扫一遍让账本落在内存快照之前。
@@ -1157,6 +1162,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 门控 / exit_schema 的 workspace / codex cwd）都读 effective_roles，
                     # 若先投递后落库，本轮 tick 内下游仍按模板角色判 → 产出不被认可。
                     _eff = self._resolve_effective_role(inst, step, results)
+                    # 忙时重投退避：角色正忙不是故障，不必每个 tick 都去投一次。
+                    # 实测 wf_1ecc8e78645a 的 s2（架构师）排队 208 次、67 分钟后才送达，
+                    # 每次重投都是一次 60s 级 ccs send → tick 预算被吃光、别的实例排不上。
+                    # 间隔随排队次数递增（10s→60s 封顶）；角色一空闲，下一轮到期即投。
+                    _q_prev = results.get(step_id) or {}
+                    _q_n0 = _q_prev.get("queued", 0) or 0
+                    _q_last = _q_prev.get("last_try") or _q_prev.get("queued_since") or 0
+                    if _q_n0 and time.time() - _q_last < min(60, 10 * _q_n0):
+                        continue
                     _delivered = self._send_to_role(_eff, prompt, wf_id=inst["instance_id"], step_id=step_id)
                     # 仅当真实投递成功才盖戳 notified；投递被并发守卫/变量校验拦截时
                     # 不盖戳，让 step 保持空 sr 状态，引擎下一 tick 会重试而非误判为"已通知"
@@ -1182,6 +1196,9 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         results[step_id] = {
                             **_q_sr,
                             "queued": _q_n,
+                            # last_try：每次重投都刷新，退避按它算（queued_since 是
+                            # 首次排队时刻，只增不减，拿它算退避等于永远不过期）
+                            "last_try": time.time(),
                             # queued_since 只在首次排队写入：回收器据它算真实停滞起点，
                             # 随 ts 刷新会让回收判据永远看到"刚排队"
                             "queued_since": _q_sr.get("queued_since") or time.time(),
@@ -1691,10 +1708,26 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
             LOGGER.debug("guard 收集异常（非致命，返回已收集的角色）: %s", e)
         return _alive_roles
 
-    def _ensure_guard_roles(self) -> set[str]:
-        """收集并拉起所有活跃工作流的守护角色。"""
+    def _ensure_guard_roles(self, deadline: float = 0.0) -> set[str]:
+        """收集并拉起所有活跃工作流的守护角色。
+
+        deadline：本次巡检的时间上限（绝对时刻）。巡检是维护动作，不能把 tick
+        预算吃光——实测无门时单 tick 480s（19 角色逐个探针/拉起），主循环只剩
+        1 条实例可推进。超预算就停在下一个角色之前，游标记下位置，下轮接着走，
+        所以没有角色会被永久跳过（与主循环的断点轮转同一思路）。
+        """
         _alive_roles = self._collect_guard_roles()
-        for _role in _alive_roles:
+        _roles = sorted(_alive_roles)
+        if not _roles:
+            return _alive_roles
+        _start = getattr(self, "_guard_cursor", 0) % len(_roles)
+        for _k in range(len(_roles)):
+            if deadline and time.time() > deadline:
+                self._guard_cursor = (_start + _k) % len(_roles)
+                LOGGER.warning("守护巡检超预算，本轮走到第 %d/%d 个角色，下轮从 %s 续",
+                               _k, len(_roles), _roles[self._guard_cursor])
+                break
+            _role = _roles[(_start + _k) % len(_roles)]
             # 单角色异常不得中断整轮：本函数在 run_once 里无 try 保护，
             # 一处抛错则同 tick 的其它角色全部不被拉起。
             try:
