@@ -108,7 +108,7 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     # 产物，拿它续期会让父链陪着维护队列一路排到 24h（口径与 engine._blocking_rework_sts
     # 一致，实测维护队列 91 深、3 条主链被一条没投递过的维护链扣 8h+）。
     # 判据按模板名：评审写「【系统问题→engineer】」时该链被改派成 engineer_feature，
-    # 那时它确实会改产品代码，算活是对的（_create_rework_subflow:1339-1341）。
+    # 那时它确实会改产品代码，算活是对的（_create_rework_subflow:1331-1337 的改派块）。
     _rids = step_sd.get("rework_ids") or []
     if not isinstance(_rids, (list, tuple)):
         _rids = [_rids]
