@@ -248,6 +248,17 @@ def test_malformed_rework_ids_are_ignored():
     for bad in ({}, {"wf_rw_x": 1}, 1, 0, "", [None, 3, ""], None):
         assert wf_lifecycle._live_subflow(_NoQuery(), {"rework_ids": bad}) is False, bad
 
+def test_live_child_does_not_exempt_beyond_double_budget():
+    """活子链的豁免也要 2 倍封顶：否则父链寿命 = 父龄 + 子链寿命，没有上限。
+
+    pending 子链对回收器不可见（清理器只扫 running/step_done_ready），
+    无限陪等就是"永久孤儿"。
+    """
+    sd = {"subflow_id": "wf_sub_live3", "queued": 20,
+          "queued_since": time.time() - 7200, "ts": time.time() - 10}
+    assert _run_with_subflow(sd, "running", False, age_h=50), \
+        "活子链把父链豁免到 50h（> 2×24h）：2 倍硬兜底被短路，父链可永驻"
+
 def test_live_subflow_blocks_global_24h_reclaim():
     """24h 兜底 + 级联会杀掉仍在产出的子链 → 子链活着时条件3 也必须放行。"""
     sd = {"subflow_id": "wf_sub_live2", "ts": time.time() - 10}
@@ -293,6 +304,7 @@ if __name__ == "__main__":
             test_live_rework_child_blocks_parent_reclaim,
             test_system_rework_child_does_not_block_reclaim,
             test_malformed_rework_ids_are_ignored,
+            test_live_child_does_not_exempt_beyond_double_budget,
             test_live_subflow_blocks_global_24h_reclaim,
             test_select_includes_assignee)
     _fails = 0

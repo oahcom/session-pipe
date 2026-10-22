@@ -116,7 +116,8 @@ _REJECTED_WAIT_MAX = 3600
 # 升级送达后再给 2h：仍无进展则按 failed 收口，理由落在 wf_logs 里可归因。
 # 返工链仍活则续期（_rework_alive），避免级联取消在飞写操作留下半成品。
 # ponytail: 续期按「链非终态」判而不看它是否真的在推进；链内卡死时最多续到
-# 24h 全局回收。升级路径：给子链记账最后进展时间戳，停滞才判死。
+# 2 倍全局阈值（wf_lifecycle 的活子链豁免同样以 2 倍为上限，2026-10-22 起）。
+# 升级路径：给子链记账最后进展时间戳，停滞才判死。
 _REJECTED_ESCALATED_MAX = 7200
 
 _REWORK_TERMINAL = ("completed", "failed", "cancelled")

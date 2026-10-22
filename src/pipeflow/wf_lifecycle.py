@@ -74,25 +74,34 @@ def _resolve_value_gate_paths(vg_file: str, vg_ws: str) -> list:
 
 
 def _live_subflow(lm, step_sd: dict) -> bool:
-    """当前步骤挂的子链是否还活着。
+    """当前步骤挂的子链/返工链是否还活着。
 
     父步的活由子链承担：子链运行期间父步没有新产出是正常态，不是卡死。
     缺此判据时，子链结束的瞬间冻结的 queued_since 让父步「停滞 = 从建
     子链至今」，整条父链被回收（实测 8 例，138min 子链工时无接收方）。
+
+    返工链记在 rework_ids（不写 subflow_id），两条路径共用同一套活体口径。
+    调用方必须自带 2 倍年龄上限：本函数只回答"子链还活着"，不回答"父链该
+    陪着等多久"——无限陪等的父链没有自己的钟（子链可能是对回收器不可见的
+    pending 行），那正是"永久孤儿"的成因。
     """
     # ponytail: 每候选最多 2 次主键查询（subflow_id 一次 + 返工链一次；当轮 running
     # 实例 <100），量级上升时改主 SELECT LEFT JOIN 子链一行带出 status。
-    from pipeflow.role_lifecycle import _ACTIVE_WF_STATUSES
+    # 活体口径直接复用 engine._REWORK_TERMINAL 的补集（递归 import 兜在函数内）：
+    # 不另立 _ACTIVE_WF_STATUSES 那套"引擎会不会推进"的集合——将来出现新状态时
+    # 两边一宽一窄，正在跑的子链会被判成死的（codex P3）。
+    from pipeflow.engine import _REWORK_TERMINAL
+    _live = lambda _r: _r["status"] not in _REWORK_TERMINAL
     _sf = step_sd.get("subflow_id") or ""
     if _sf:
         _rows = lm.query(
             "SELECT status FROM workflow_instances WHERE instance_id=?", (_sf,))
-        if _rows and _rows[0]["status"] in _ACTIVE_WF_STATUSES:
+        if _rows and _live(_rows[0]):
             return True
     # 返工链不记在 subflow_id 上，而是 rework_ids（list of wf id）。只认 subflow_id 时，
     # 等返工的父链被判死 → close_wf 级联把仍在跑的返工子链一起杀掉（2026-10-22 两例：
     # wf_85faf589be90/s3、wf_b808ff2f3611/s3，子链 wf_rw_2664ec3aada3/80322df51ab0）。
-    # 活体判据与子链同源（_ACTIVE_WF_STATUSES）；查不到行 = 链已删，不豁免。
+    # 活体判据与子链同源（终态以外都算活）；查不到行 = 链已删，不豁免。
     # 系统问题链不算"还在写"：maintainer_health_monitor 修的是引擎/模板债，不动产品
     # 产物，拿它续期会让父链陪着维护队列一路排到 24h（口径与 engine._blocking_rework_sts
     # 一致，实测维护队列 91 深、3 条主链被一条没投递过的维护链扣 8h+）。
@@ -105,7 +114,7 @@ def _live_subflow(lm, step_sd: dict) -> bool:
     if not _rids:
         return False
     _ph = ",".join("?" * len(_rids))
-    return any(r["status"] in _ACTIVE_WF_STATUSES
+    return any(_live(r)
                and (r["template_id"] or "").replace("WF-", "") != SYSTEM_REWORK_TPL
                for r in lm.query(
                    f"SELECT status, template_id FROM workflow_instances "
@@ -314,7 +323,13 @@ class WorkflowLifecycleMixin:
                 # 子链活着 → 父步没有新产出是正常态，条件 1-4 一律不判死。
                 # 条件 0 例外：步骤自身已终态，子链本就该随之终止。缺这道门时
                 # 24h 兜底会连同活着的子链一起被级联杀掉（在途产出直接丢失）。
-                elif _live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {}):
+                # 2 倍阈值是**含活子链在内**的硬上限：条件 3 自身的 2 倍兜底排在
+                # 这道门之后，不在这里封顶等于活子链把父链的钟整个停掉。实测
+                # wf_0c5e3d807ede 14.4h、wf_175751a92033 10h 都靠活子链豁免，
+                # 而它们的返工子链以 pending 建行（回收器只扫 running/step_done_ready）
+                # → 子链对回收器不可见，父链没有第二个钟能关它（engine 称"永久孤儿"）。
+                elif (_live_subflow(lm, _cur_step if isinstance(_cur_step, dict) else {})
+                      and age_h <= _global_limit_h * 2):
                     pass
                 # 条件1: 超时重试耗尽（对 step_done_ready 无意义——等待审批期间
                 # 角色已产出，timeout_count 不会递增；保留该分支对二者都无害）
@@ -327,8 +342,10 @@ class WorkflowLifecycleMixin:
                     reason = f"测试模板 {tpl} 运行{age_h:.0f}h > 2h阈值"
                 # 条件3: 全局阈值（running=24h，step_done_ready=72h）
                 # 硬上限也必须过活体门：条件4 早就有 _role_producing_recently，条件3 没有。
-                # 实测 2026-10-22：24h 内 5 条触到全局阈值，5/5 的角色在判死前 11~31s
-                # 仍在写转录/调工具 —— 硬砍等于丢弃在途产出，且子链会被级联陪葬。
+                # 实测 2026-10-22（state/workflows.db 的 workflow_logs.action='cancelled'
+                # 取 detail 含"全局阈值"者，再比对该 assignee 转录 mtime）：24h 内 5 条触到
+                # 全局阈值，5/5 的角色在判死前 11~31s 仍在写转录/调工具 —— 硬砍等于丢弃
+                # 在途产出，且子链会被级联陪葬。
                 # 上限取 2 倍阈值兜底：真卡住的角色仍会死，只是多给它一个阈值窗口。
                 elif age_h > _global_limit_h and not (
                         age_h <= _global_limit_h * 2
