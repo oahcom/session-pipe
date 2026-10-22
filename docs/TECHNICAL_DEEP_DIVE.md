@@ -101,10 +101,15 @@ src/
 
 ### 6.1 eval 模块的热重载契约
 
-只有 `eval_checker.py` 走热重载（600s 比对 mtime）；`eval_consistency.py` / `routing_daemon.py` 的改动要重启进程。两条规则：
+热重载覆盖两个文件、一个副作用：
+
+- `eval_checker.py` **和** `eval_shared_loader.py` 任一 mtime 变化（600s 比对）就清缓存重新 import；`routing_daemon.py` 自身改动只认重启。
+- `eval_consistency.py` 每 600s 预检前都会被 `_forget_eval_modules()` 清掉再导入，改它下一周期即生效——但它只在**预检**里被刷新，运行期判据仍由 `_run_eval` 执行。
 
 - 新增**跨模块常量**（如 `eval_shared_loader.CRITERIA_WINDOW`）时，热重载与预检都必须先调用 `routing_daemon._forget_eval_modules()`。常驻进程缓存着旧模块对象，只重载 `eval_checker` 会在首轮导入撞 `ImportError`（2026-10-22 09:56 与 10:27 各一次，都是这段代码静默退化）。
 - 预检失败只记 WARNING、不阻塞 eval —— 所以它静默退化的样子和"通过"一样。改这块必须看 journal 里有没有 `可执行判据` 那一行，而不是只看进程没报错。
+
+同一段里 `_check_cron_schedules()` 复用 `CCS_INTERVAL=300`（与 `route_all_to_ccs` 同分支，主循环 tick 是 60s），且 `_any_live_targets()` 为假时整轮 `sleep(300)` 跳过 —— 所以「每 300s」是常规路径，不是硬保证（journal 实测 +303~+308s，命令超时时到 +357s）。
 
 ## 7. 与 Sister Bus 的集成
 

@@ -131,7 +131,7 @@ def _any_live_targets() -> bool:
 def _check_cron_schedules() -> int:
     """检查角色 JSON 的 cron_schedule，到期角色执行 ccs.py send。
 
-    使用 croniter 做时间匹配，/tmp/cron_schedule_triggered.json 做去重。
+    使用 croniter 做时间匹配，~/.hermes/run/cron_schedule_triggered.json 做去重。
     返回触发次数。各 daemon 调用：routing_daemon 每 300s。
     
     增强版：增加死角色检测，防止盲发导致 ccs_send_fallback 风暴。
