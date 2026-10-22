@@ -55,7 +55,7 @@ _SUBAGENT_DIRECTIVE_MARK = "本步必须使用子代理（引擎强制）"
 
 # 上轮已落 bus 的 (followed, rounds)，按角色。进程级即可：daemon 重启后重发
 # 一次无害，而持久化去重表要多一张表、多一处清理。
-_LAST_SUBAGENT: dict[str, tuple[int, int]] = {}
+_LAST_SUBAGENT: dict[str, tuple[int, int, int, int]] = {}
 
 # ── extract "验证:" from criterion ──
 
@@ -1142,6 +1142,11 @@ class TrajectoryQualityChecker:
             has_agent = False
             for nxt in calls[i + 1:]:
                 if nxt["kind"] == "say":
+                    break
+                # calls 是跨 jsonl 按文件名拼接的，不是时间序：指令若是文件最后
+                # 一条 say，窗口会越界吞掉下一个文件的上千次调用（实测 pa 1538、
+                # pg 1062），产生假 hard。文件边界即轮次边界。
+                if nxt.get("src") != c.get("src"):
                     break
                 if nxt["kind"] == "use":
                     used += 1
