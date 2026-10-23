@@ -116,10 +116,16 @@ def test_failed_delivery_retries_soon(state):
 # ── 额度拒绝退避（_last_rate_recover）落盘：同一套文件与锁 ──────────────
 
 def test_rate_state_survives_restart(state):
-    """attempt 必须跨重启保留，否则退避曲线每次从 120s 首档重来。"""
-    rl._save_rate_state(state / "alert_cooldowns.json", {"qa": (1000.0, 3)}, 1001.0, ttl=10_000)
-    got = rl._load_rate_state(state / "alert_cooldowns.json", 1001.0, ttl=10_000)
-    assert got["qa"] == (1000.0, 3), f"attempt 丢了：{got}"
+    """attempt 必须跨重启保留，否则退避曲线每次从 120s 首档重来。
+
+    时间戳必须用真实量级：旧版写 1000.0，now-3 < ttl 恒真，把「计数行被当成
+    1970 年条目裁掉」的缺陷测成了通过（生产 now≈1.79e9、ttl=3600）。
+    """
+    now = time.time()
+    rl._save_rate_state(state / "alert_cooldowns.json", {"qa": (now, 3)}, now, ttl=3600)
+    got = rl._load_rate_state(state / "alert_cooldowns.json", now + 1, ttl=3600)
+    assert got["qa"][1] == 3, f"attempt 丢了：{got}"
+    assert now <= got["qa"][0] <= now + 1
 
 
 def test_rate_recovery_clears_disk_entry(state):

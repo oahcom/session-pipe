@@ -269,6 +269,12 @@ _ALERT_STATE = Path(_os.environ.get("HERMES_RUN_DIR")
                     or Path.home() / ".hermes" / "run") / "alert_cooldowns.json"
 _ALERT_MAX_ENTRIES = 200      # 表的上限：超出按时间留最新的，别让文件无限长
 
+# 额度拒绝退避复用同一张表：__rate_ts__ 存最近一次发「继续」的时间，__rate_n__ 存
+# attempt 计数。计数行**不受 TTL 裁剪**——它的值是 1、2、3，按时间裁会被当成 1970 年
+# 条目整行丢掉（G14：落盘了但永远读回 0，退避每次重启从 120s 首档重来）。
+_RATE_TS_TAG = "__rate_ts__"
+_RATE_N_TAG = "__rate_n__"
+
 
 def _load_alert_ts(path: Path, now: float, ttl: float) -> dict:
     """读冷却表；坏文件/读失败当空表——限流失效不等于告警丢失。"""
@@ -280,7 +286,7 @@ def _load_alert_ts(path: Path, now: float, ttl: float) -> dict:
     for row in rows:
         try:
             role, title, ts = row
-            if now - float(ts) < ttl:      # 过期条目直接丢
+            if title == _RATE_N_TAG or now - float(ts) < ttl:   # 过期条目直接丢
                 out[(role, title)] = float(ts)
         except (TypeError, ValueError):
             continue
@@ -311,8 +317,11 @@ def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float,
                 merged.pop(key, None)
             # 内存表跟着裁剪：长驻 daemon 的 _ts 否则只增不减（codex 20 维 P1）
             ts.clear()
-            ts.update({k: v for k, v in merged.items() if now - v < ttl})
-            rows = sorted(ts.items(), key=lambda kv: kv[1], reverse=True)[:_ALERT_MAX_ENTRIES]
+            ts.update({k: v for k, v in merged.items()
+                       if k[1] == _RATE_N_TAG or now - v < ttl})
+            # 计数行排最前：它的值只有个位数，按值排序会被 200 条上限最先裁掉
+            rows = sorted(ts.items(), key=lambda kv: (kv[0][1] == _RATE_N_TAG, kv[1]),
+                          reverse=True)[:_ALERT_MAX_ENTRIES]
             tmp = path.with_name(f"{path.name}.{_os.getpid()}.tmp")
             tmp.write_text(json.dumps([[r, t, v] for (r, t), v in rows]))
             tmp.replace(path)
@@ -323,9 +332,7 @@ def _save_alert_ts(path: Path, ts: dict, now: float, ttl: float,
 # 额度拒绝的退避（_last_rate_recover）是同一类缺陷：也是进程内字典，daemon 一重启
 # 就从 120s 首档重来。实测 2h 内「上一轮 API 错误中断（0 产出）」注入 29 次、
 # 跨 13 角色 22 个 session（qa 15 分钟 4 次）。用两个 tag 复用上面的读写与文件锁，
-# 不再另开一套。
-_RATE_TS_TAG = "__rate_ts__"
-_RATE_N_TAG = "__rate_n__"
+# 不再另开一套（tag 定义见 _ALERT_MAX_ENTRIES 处）。
 
 
 def _load_rate_state(path: Path, now: float, ttl: float) -> dict:
