@@ -590,10 +590,10 @@ def main():
                     if _sm is None:
                         _sm = SurvivalMonitor()
                         main._survival_monitor = _sm
-                    result = _sm.tick()
-                    stalled = [r for r, h in result.items() if h.get('overall') in ('stale', 'dead')]
-                    if stalled:
-                        LOGGER.warning("存活告警: %s", stalled)
+                    # 告警由 tick() 自己发（stale/dead 与 idle 各 600s 节流一次）。
+                    # 这里再打一遍是无节流复制：实测 6h 内这句 180 条、
+                    # tick 的节流版 36 条，内容完全相同。
+                    _sm.tick()
                 except ImportError:
                     pass  # must-silent: survival_monitor optional component
                 except Exception as e:

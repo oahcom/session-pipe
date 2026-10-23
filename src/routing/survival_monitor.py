@@ -109,15 +109,12 @@ class SurvivalMonitor:
     # ── L1: 进程存活 ──
 
     def _l1_check(self, role: str) -> dict:
-        """L1: 进程存活 —— tmux 快照里有没有 `ccs-<role>` 这个 pane。
+        """L1: 进程存活 —— liveness 快照里有没有 `ccs-<role>` 这个 pane。
 
-        旧实现每角色一次 `tmux has-session`（3s 超时），再用「连续 3 次失败才翻态」
-        （红线3）兜住超时。但那份计数读 cache 顶层，而 tick() 写的是 `{"l1": {...}}`
-        → `prev.get("tmux_alive")` 恒 None，计数从未累加（单测也照抄了扁平形状），
-        一次探针超时就直判 ORPHAN/DEAD，红线 3 的连击护栏实际从未生效。
-        现在复用 liveness 的单次快照（一次 `list-panes -a` 服务全部角色）：
-        `None`=探针不可用 → UNKNOWN，不判死、不进 orphan 清理、不进恢复队列；
-        有答案就直接定态。fail-streak 记账整段删除。
+        `None`=探针不可用 → UNKNOWN：不判死、不进 orphan 清理、不进恢复队列。
+        旧实现每角色一次 `tmux has-session` + 「连续 3 次失败才翻态」，但计数读
+        cache 顶层而 tick() 写 `{"l1": {...}}` → 阈值从未累加，一次超时即判
+        ORPHAN；经过与取舍见 docs/TECHNICAL_DEEP_DIVE.md §8。
         """
         has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
         snap = tmux_snapshot()
