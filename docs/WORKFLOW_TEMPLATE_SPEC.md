@@ -31,10 +31,10 @@
 | 字段 | 校验规则 | 常见错误 |
 |------|----------|----------|
 | `trigger_scene` | 非空字符串列表（**只判非空**；schema 的 minLength 4 未被执行） | 写"通用XXX相关任务"这种泛化描述 |
-| `allowed_initiators` | 非空列表，每项为有效角色 | 抄别的模板不核对 |
+| `allowed_initiators` | 非空列表（**不**校验每项是否为真实角色） | 抄别的模板不核对 |
 | `allowed_executors` | 非空列表（**不校验**是否覆盖步骤的 target_role） | 抄别的模板不核对角色名是否存在 |
 | `max_duration_hours` | ≥1 的数字 | 对多步模板写 4h 明显不够 |
-| `quality_standards` | ≥8 字符，不写"通过 Codex 审查" | 使用泛化套话 |
+| `quality_standards` | 非空字符串（schema 字面量 minLength 8 未执行，`validate_template` 实际门槛 `≥4`），不写"通过 Codex 审查" | 使用泛化套话 |
 
 ---
 
@@ -46,7 +46,7 @@
 {
   "id": "s1",
   "title": "编码实现",
-  "type": "handoff",                   // handoff | review | single | gate | notify
+  "type": "handoff",                   // handoff | review | single | gate | notify | subflow
   "target_role": "engineer",           // 该步骤的执行角色
   "prompt_template": "/goal\n## 任务\n请完成「编码实现」...", // 见 2.3
   "exit_condition": {
