@@ -1052,12 +1052,6 @@ class RoleLifecycleMixin:
             path = _CCS_WORKSPACES / role / "TASKS.md"
             path.parent.mkdir(parents=True, exist_ok=True)
             old = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
-            # 评分回写要活下来：task_evidence 把 negative 教训 append 进 TASKS.md，
-            # 而每次投递整体重写会把它抹掉（实测 17 个 TASKS.md 里 0 个存活）——
-            # 闭环收集了反馈却从不进角色上下文。只保留最近 10 条防无界增长。
-            lessons = [l for l in old.splitlines() if l.startswith("- [negative] ")][-10:]
-            if lessons:
-                body += "\n## 历史教训\n" + "\n".join(lessons) + "\n"
             if old == body:
                 return  # 同内容不重写：避免每 tick 刷新 mtime
             path.write_text(body, encoding="utf-8")

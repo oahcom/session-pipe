@@ -45,7 +45,7 @@ def _is_system_file(name: str) -> bool:
 # optimizer/pm），6h 133 行。故按本文件预留的方案落库（action='evidence_assessed'）。
 _LAST_ASSESSMENT: dict[str, str] = {}
 # 评语文案版本：进签名用。改 detail 文案时 +1，让历史 fact 在回填时能重写（codex 第 3 轮 P2）
-_DETAIL_VERSION = 3
+_DETAIL_VERSION = 4
 _SEEN_LOADED = False
 
 
@@ -265,7 +265,7 @@ def _evaluate_with(db, hours: float = 1):
         })
 
     # 汇总写 bus：一轮评估里所有写入**都成功**才落账签名（codex P1-1）。
-    # 否则下轮被 _already_reported 跳过，失败的那条永不重试（混合成败：feedback
+    # 否则下轮命中同一签名直接 continue，失败的那条永不重试（混合成败：feedback
     # 成功会先落账，blocker 失败就被吞掉）。
     _bus = BUS_CLIENT
 

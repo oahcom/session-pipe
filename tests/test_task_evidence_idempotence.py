@@ -80,11 +80,13 @@ def _run_once(env, role="pm"):
 def test_negative_task_writes_once_then_skips(env):
     """negative 任务首次写 feedback + blocker 共 2 条，同签名重评估全跳过。"""
     _run_once(env)
-    first = len(env["writes"])
+    first = list(env["writes"])
     _run_once(env)
-    second = len(env["writes"]) - first
-    assert first == 2, f"首次应写 feedback + blocker，实际 {first}"
-    assert second == 0, f"同签名重评估应跳过，实际 {second}"
+    second = len(env["writes"]) - len(first)
+    assert len(first) == 2, f"首次应写 feedback + blocker，实际 {first}"
+    assert any("质量: negative" in w for w in first), first
+    assert any("零回话零产出" in w for w in first), first
+    assert second == 0, f"同签名重评估应跳过，实际多写 {second} 条"
 
 
 def test_changed_signature_rewrites(env):
@@ -137,10 +139,15 @@ def test_silent_completion_reports_blocker_not_tasks_md(env):
     去惩罚角色 —— 实测 7 天 1120 个 completed 步骤里 349 个（31.2%）角色一句话没说，
     且 engineer/maintainer 的产出在代码仓库，按 workspace 目录判结构性恒为 0 文件。
     """
+    ws = env["root"] / "ccs-workspaces" / "pm"
+    ws.mkdir(parents=True, exist_ok=True)
+    seeded = "# 工作流任务\n\n## 标题\n旧任务\n"
+    (ws / "TASKS.md").write_text(seeded, encoding="utf-8")
     _run_once(env)
     assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
     assert not any("[self-reflect]" in w for w in env["writes"]), env["writes"]
-    assert not (env["root"] / "ccs-workspaces" / "pm" / "TASKS.md").exists()
+    assert (ws / "TASKS.md").read_text(encoding="utf-8") == seeded, \
+        "静默完成不得往 TASKS.md 写教训"
 
 
 def test_role_bus_fact_counts_as_spoken(env):
