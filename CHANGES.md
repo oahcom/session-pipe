@@ -65,7 +65,8 @@
 - **删掉不可达分支**：`_classify_outputs` 里 n>=1 即判 neutral，所以 negative ⇒ 必无回话
   （反之不然：小于 2KB 的单文件产出也是 `role_spoke=False` 的 neutral），原 `elif quality=="negative"`
   （self-reflect + TASKS.md 回写）恒不执行 ——
-  连同唯一调用点 `_append_role_feedback` 一并删除（净 -60 行），R161 的结论也从
+  连同唯一调用点 `_append_role_feedback` 一并删除（本轮 src/task_evidence.py 净 -66 行，
+  `git diff --numstat 5b07873..HEAD` 实测 +58/−124），R161 的结论也从
   「negative 分两路」简化为「negative == 引擎空推进，只发 blocker」。
 - **签名单点落账**（codex 第 6 轮 important）：原实现 feedback 成功即落账，blocker 失败时
   下轮被 `_already_reported` 跳过、永不重试 → 改为一轮内所有 bus 写入都成功才落账
