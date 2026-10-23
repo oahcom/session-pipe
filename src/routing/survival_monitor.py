@@ -111,9 +111,9 @@ class SurvivalMonitor:
     def _l1_check(self, role: str) -> dict:
         """L1: 进程存活 —— liveness 快照里有没有 `ccs-<role>` 这个 pane。
 
-        `None`=探针不可用 → UNKNOWN：不判死、不进 orphan 清理、不进恢复队列。
-        旧实现用 `tmux has-session` + fail-streak 计数，阈值从未生效；来龙去脉见
-        docs/TECHNICAL_DEEP_DIVE.md §8（本节不复述细节）。
+        返回的 status：ALIVE(有 pane 有哨兵) / ORPHAN(只剩哨兵) / DEAD(只剩 pane) /
+        UNKNOWN(探针不可用，或 pane 与哨兵俱无)。UNKNOWN 不判死、不进 orphan 清理、
+        不进恢复队列 —— 把「探不到」当成「死了」会误杀（历史见 TECHNICAL_DEEP_DIVE §8）。
         """
         has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
         snap = tmux_snapshot()
