@@ -425,7 +425,6 @@ def _extract_with(db):
 
 
 if __name__ == "__main__":
-    import sys
     if "--feedback" in sys.argv:
         # --hours N：回填窗口（默认 1h = 正常 tick 口径）
         _h = 1.0
