@@ -169,3 +169,11 @@ def test_other_role_fact_is_not_evidence(env):
     env["fake"].search_facts = [{"src": "coordinator", "t": "P0 超时 violation: task_x"}]
     _run_once(env)
     assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
+
+
+def test_old_signature_version_is_reassessed(env):
+    """旧版本签名的历史记录不能再挡住重评估（版本 3→4 的目的）。"""
+    te._LAST_ASSESSMENT["t1"] = "negative||3"
+    _run_once(env)
+    assert env["writes"], "旧版本签名应被当作未评估"
+    assert te._LAST_ASSESSMENT["t1"].endswith("|4"), te._LAST_ASSESSMENT
