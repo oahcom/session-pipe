@@ -112,9 +112,8 @@ class SurvivalMonitor:
         """L1: 进程存活 —— liveness 快照里有没有 `ccs-<role>` 这个 pane。
 
         `None`=探针不可用 → UNKNOWN：不判死、不进 orphan 清理、不进恢复队列。
-        旧实现每角色一次 `tmux has-session` + 「连续 3 次失败才翻态」，但计数读
-        cache 顶层而 tick() 写 `{"l1": {...}}` → 阈值从未累加，一次超时即判
-        ORPHAN；经过与取舍见 docs/TECHNICAL_DEEP_DIVE.md §8。
+        旧实现用 `tmux has-session` + fail-streak 计数，阈值从未生效；来龙去脉见
+        docs/TECHNICAL_DEEP_DIVE.md §8（本节不复述细节）。
         """
         has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
         snap = tmux_snapshot()

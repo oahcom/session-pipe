@@ -14,7 +14,7 @@
 | **PUBLIC_API.md** | API 消费者 | 函数签名、参数、返回值 |
 | **ISSUES.md** | 排障者 | 历史问题单（已复核状态表） |
 | **CHANGES.md** | 维护者 | 按日期的变更记录（含验证命令与实测输出） |
-| **docs/ARCHITECTURE.md** | 架构师 | 模块清单、数据流、已知缺陷（**不写行数**；行数在 CLAUDE.md，由 `scripts/doccheck.py` 校验） |
+| **docs/ARCHITECTURE.md** | 架构师 | 数据流、已知缺陷（**不写模块清单、不写行数**：两者只在 CLAUDE.md，行数由 `scripts/doccheck.py` 校验） |
 | **docs/TECHNICAL_DEEP_DIVE.md** | 高级开发者 | 实现原理、配置加载、可靠性机制、对话监控、状态同步 |
 | **docs/SYSTEM_LANDSCAPE.md** | 全栈工程师 | 三项目全景、端口、DB、角色矩阵 |
 | **docs/TEST_WORKFLOW.md** | 测试工程师 | 测试命令、实测通过数、已知缺口 |
