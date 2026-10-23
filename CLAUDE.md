@@ -92,7 +92,7 @@ src/
   reliability.py      ── 熔断/重试/心跳/TTL/Metrics
   reliability_core.py ── 可靠性核心实现
   template_registry.py── 模板注册中心
-  task_evidence.py    ── 任务证据链
+  task_evidence.py    ── 任务评分（真实产物优先；零产出零回话=发 blocker 不罚角色）
   paths.py            ── 路径常量
 
 注：step 终态含 `delivery_blocked`（投递达上限暂停，engine.py close_wf 收敛行级 status）。
