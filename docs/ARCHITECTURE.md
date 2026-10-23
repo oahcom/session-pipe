@@ -17,43 +17,9 @@ hermes-session-roles (定义层)      ← 角色 JSON + roles_export.json
 
 ## Module inventory
 
-| Module | Responsibility |
-|--------|----------------|
-| **pipeflow/engine.py** | Data-driven workflow execution engine (core, imports mixins below) |
-| **pipeflow/step_handler.py** | 步骤处理 mixin：超时/排队/升级/完成 (from engine.py split) |
-| **pipeflow/role_lifecycle.py** | 角色生命周期 mixin：存活检查/通知/发送 + _send_to_role (from engine.py split) |
-| **pipeflow/task_generator.py** | 任务生成 mixin：任务扫描/异常检测/自动任务 (from engine.py split) |
-| **pipeflow/wf_lifecycle.py** | 工作流生命周期 mixin：推进/回收/loop/部署 (from engine.py split) |
-| **lifecycle/manager.py** | Workflow state machine (5 step types, approval/rollback/escalation) |
-| **template_registry.py** | 模板注册中心 |
-| **eval_checker.py** | 安全白名单命令执行检查 |
-| **workflow/client.py** | High-level API for CCS roles to interact with workflow DB |
-| **reliability_core.py** | Core implementations of retry/circuit/heartbeat/TTL/metrics |
-| **reliability.py** | Init retry, circuit breaker, heartbeat, TTL pruner from config |
-| **routing/routes.py** | Dispatch logic: route_all, route_to_ccs |
-| **routing/router.py** | Route table: derive produce/consume from roles_export.json, priority routing |
-| **routing/survival_monitor.py** | 存活监测 |
-| **routing/rdb.py** | Route table SQLite persistence + audit log |
-| **routing/auto.py** | Auto-consumption: poll bus, prioritize, dispatch with circuit breaker |
-| **routing_daemon.py** | 路由守护进程 |
-| **task_evidence.py** | 任务证据链 |
-| **contract_updater.py** | 合约同步 |
-| **conversation_monitor.py** | 对话监控 |
-| **config_loader.py** | YAML config loading with env override（**无热重载**：改 config.yaml 需重启进程） |
-| **workflow/gateway.py** | 工作流网关门禁 |
-| **drift_detector.py** | 架构漂移检测 |
-| **cron_scheduler.py** | cron 调度器 |
-| **eval_consistency.py** | 评估一致性 |
-| **routing/consistency.py** | 路由一致性 |
-| **pipeflow/daemon.py** | Main loop: `while True: engine.run_once(); sleep(10)` |
-| **workflow/db.py** | 工作流数据访问 |
-| **output_validator.py** | 输出格式验证 |
-| **routing/polling.py** | Message polling (dedup via bus consume records) |
-| **paths.py** | 路径常量 |
-| **workflow/sync.py** | 工作流同步 |
-| **p0_exemption.py** | P0 豁免通道 |
-
-**本表只列主要模块，不是全集**：模块数用 `find src -name '*.py' -not -name '__init__.py' | wc -l`（2026-10-22 为 37；表里没列 `liveness.py`/`review_gate.py`/`pipeflow/integrity.py`/`eval_shared_loader.py`）。`pipeflow/db.py` 已删，持久化在 `workflow/db.py`。
+模块清单与行数只在 [CLAUDE.md](../CLAUDE.md) 维护（`scripts/doccheck.py` 校验行数），本文件不复制一份：
+一份清单两处维护，必然一处先烂（2026-10-23 删掉本表时已有 33 行、其中"主要模块/不是全集"的边界要额外解释）。
+需要「哪个文件干什么」就读 CLAUDE.md 的目录树；需要「数据怎么流」读下面的 Data flow。
 
 ## Data flow
 
