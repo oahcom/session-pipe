@@ -54,7 +54,7 @@ src/
     auto.py           ── 自动路由消费 + investigator 分派（260 行）
     polling.py        ── 消息轮询（104 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
-    survival_monitor.py ── 三层存活监测 L1/L2/L3（623 行）
+    survival_monitor.py ── 三层存活监测 L1/L2/L3（620 行）
     consistency.py    ── 路由一致性检查（105 行，生长接入 daemon）
 
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
@@ -62,7 +62,7 @@ src/
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
     engine.py         ── 编排 + CLI（2103 行，导入下方 mixin）
     step_handler.py   ── 步骤处理（1739 行）
-    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1329 行）
+    role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1323 行）
     task_generator.py ── 任务生成（1022 行）
     wf_lifecycle.py   ── 工作流生命周期（2214 行）
     daemon.py         ── 工作流守护 while 循环（501 行）
