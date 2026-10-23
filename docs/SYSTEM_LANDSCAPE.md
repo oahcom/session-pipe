@@ -1,14 +1,14 @@
 # Session 三项目架构全景图
 
-> Updated: 2026-10-22 | Audience: Full-stack engineers | Related: [ARCHITECTURE.md](ARCHITECTURE.md), [DOCS.md](DOCS.md)
+> Updated: 2026-10-23 | Audience: Full-stack engineers | Related: [ARCHITECTURE.md](ARCHITECTURE.md), [DOCS.md](DOCS.md)
 > 数字均为 2026-10-22 实测（`glob('**/*.py')` 计行，**含 tests**，排除 `__pycache__`），不是估算。
 
 ## 三个项目一句话
 
 | 项目 | 类比 | 职责 | 实测规模 |
 |------|------|------|----------|
-| **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个角色（`roles_export.json`）+ 19 个 persona JSON（`ls personas/session-roles/*.json`）+ prompt 模板 | ≈2.5k 行（14 个 `.py`，src 7） |
-| **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | ≈16.7k 行（71 个 `.py`，src 31） |
+| **hermes-session-roles** | `/etc/passwd` | 角色定义：19 个 persona JSON（`ls personas/session-roles/*.json`，源）；运行期读 `~/.hermes/data/roles_export.json`（导出物，会落后）+ prompt 模板 | 2499 行（14 个 `.py`，src 7） |
+| **session-launcher** | `systemd` | CCS 进程管理：tmux 创建/哨兵/看门狗/CLI 入口 | 17121 行（73 个 `.py`，src 32） |
 | **session-pipeline** | 消息队列 + 状态机 | 消息路由 + 工作流引擎 + 生命周期状态机 + 可靠性 | 现算：`git ls-files '*.py' | wc -l`；`git ls-files 'src/*.py' | xargs wc -l` 取 src 总行数；`ls tests/test_*.py | wc -l` 取测试文件数（不写死，随改动变化） |
 
 **实际关系不是三层流水线，而是两消费者并行：**
@@ -20,11 +20,23 @@ session-roles（定义层）
          └──→ launcher/ccs.py send  ← 唯一跨项目调用（subprocess）
 ```
 
+## 运行中的代码来自哪里（2026-10-23 实测）
+
+两个 systemd 单元的 `WorkingDirectory` 都是 `~/session-pipeline`（分支 `temp-pr-branch`），**不是** `~/wt-pipeline` 的 `main`。合到 main 的提交不会自己生效，要在该 checkout 合入并重启单元：
+
+```bash
+systemctl --user show workflow-engine.service session-pipeline-daemon.service -p WorkingDirectory
+git -C ~/session-pipeline rev-parse --abbrev-ref HEAD
+git -C ~/session-pipeline merge-base --is-ancestor <commit> HEAD && echo live || echo "未上线"
+```
+
+实测 2026-10-23 19:40：两边 merge-base 停在 `5311cf1`（10-22 16:54），main 独有 138 个补丁未进运行分支——「已合并」与「已生效」是两件事，判断上线只能看上面第三条命令。
+
 ## 系统入口
 
 | 项目 | 入口 | 调用方式 |
 |------|------|----------|
-| session-roles | `python3 src/shared_loader.py --export` | CLI（生成 roles_export.json） |
+| session-roles | `python3 src/shared_loader.py --export` | CLI（生成 `~/.hermes/data/roles_export.json`，无 daemon 定时跑） |
 | session-roles | `python3 src/validate_roles.py` | CLI（全量校验） |
 | session-roles | `python3 src/role_assembler.py <role>` | CLI（组装 prompt） |
 | session-launcher | `python3 src/ccs.py start/stop/send/output` | CLI 或 subprocess（被 pipeline 调） |
