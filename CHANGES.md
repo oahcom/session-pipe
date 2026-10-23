@@ -74,6 +74,14 @@
 - **codex nit 驳回（有据）**：点文件排除会漏掉 `.gitignore`/`.env.example` —— 全量 workspace 实测
   ≥1KB 的点文件仅 14 个，全是 `.coverage`/`*.log`/`*.sh` 临时物，无一为交付物。
 
+### 2026-10-23 追加二：bus 证据判据自上线起恒为 False
+- `_bus_evidence` 调 `bus_client search` **没带 `--json`**，拿到的是人读的 `🔍 N results`，
+  `startswith("{")` 立刻返回 False —— 「角色在 bus 说过话」这条判据从未生效（负例被当作唯一真相）。
+- 补 `--json` 后又暴露第二层：本模块自己的 `[task_evidence]` fact 也带 task_id，下一 tick 被当
+  「角色说过话」→ negative 翻 neutral，自己给自己作证；换成「只认 `src == 该角色`」（实测
+  facts 表的 src 就是角色名，engineer 229 / qa 250 / pm 196…），自动方与别的角色一概不算。
+- 新增 3 条用例：角色自己的 fact → 不算 blocker；自评 fact → 仍 blocker；其他角色 fact → 仍 blocker。
+
 ## 2026-10-22 — temp-pr-branch 合入 main（漂移收敛，35 文件 / 4 处 modify-delete）## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效
 
 ### 问题（可观测证据）

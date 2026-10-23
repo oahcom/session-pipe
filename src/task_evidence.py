@@ -179,17 +179,26 @@ def _evaluate_with(db, hours: float = 1):
         return {"evaluated": 0, "assessments": []}
 
     # 每任务的独立 bus 证据：按 task_id 搜索（不再用全局 'task' 搜索）
-    def _bus_evidence(tid):
+    def _bus_evidence(tid, role):
+        """角色自己写的 bus 证据。
+
+        两个坑（实测 2026-10-23）：
+        1. 不带 --json 时 bus_client 输出的是人读的 "🔍 N results"，json.loads 必失败，
+           该判据自上线起恒为 False（"有价值的逻辑从没生效"）。
+        2. 本模块自己的 [task_evidence] fact 也带 task_id，下一 tick 会被当成"角色说过话"
+           → negative 翻成 neutral，自己给自己作证。故只认 src == 该角色 的 fact。
+        """
         try:
             _r = subprocess.run(
-                [str(BUS_CLIENT), "search", tid, "--limit", "20"],
+                [str(BUS_CLIENT), "search", tid, "--limit", "20", "--json"],
                 capture_output=True, text=True, timeout=15)
-            if not _r.stdout.strip().startswith("{"):
-                return False
             _data = json.loads(_r.stdout)
-            return bool(_data.get("results") or _data.get("facts") or _data.get("items"))
         except Exception:
             return False
+        _facts = _data.get("facts") or _data.get("results") or _data.get("items") or []
+        # 只有"角色自己说的"才算回话：自评模块/引擎/巡检/其他角色都按 task_id 写 fact，
+        # 算进来等于让别人替角色作证（negative → neutral）。
+        return any((f.get("src") or "") == role for f in _facts)
 
     # 预查: 每个任务关联的 workflow_instances 中 exit_messages 或 summary 写入情况
     _wf_evidence = {}
@@ -221,7 +230,7 @@ def _evaluate_with(db, hours: float = 1):
         # 时间窗口：任务创建前后 1h ~ 更新后 1h，避免跨任务文件重复计数
         _files = _output_files(_role, t["created_at"], t["updated_at"])
         _n, _size, _names = _output_summary(_files)
-        _bus = _bus_evidence(_tid)
+        _bus = _bus_evidence(_tid, _role)
         _evidence = _wf_evidence.get(_tid, "")
 
         _quality = _classify_outputs(_n, _size, _evidence, _bus)

@@ -7,6 +7,7 @@
 
 测试完全封闭：DB 用内存库、workspace 用临时目录、bus 写入用假 subprocess。
 """
+import json
 import sqlite3
 import sys
 import time
@@ -26,6 +27,7 @@ class _FakeRun:
         self.writes = []
         self.returncode = 0
         self.fail_substrings = []
+        self.search_facts = []
 
     def __call__(self, cmd, **kwargs):
         if len(cmd) > 3 and cmd[1] == "write":
@@ -35,6 +37,10 @@ class _FakeRun:
             pass
 
         r = _R()
+        if len(cmd) > 2 and cmd[1] == "search":
+            r.stdout = json.dumps({"facts": self.search_facts})
+            r.returncode = 0
+            return r
         bad = self.returncode or any(s in cmd[3] for s in self.fail_substrings)
         r.returncode = 1 if bad else 0
         r.stdout = ""
@@ -135,3 +141,24 @@ def test_silent_completion_reports_blocker_not_tasks_md(env):
     assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
     assert not any("[self-reflect]" in w for w in env["writes"]), env["writes"]
     assert not (env["root"] / "ccs-workspaces" / "pm" / "TASKS.md").exists()
+
+
+def test_role_bus_fact_counts_as_spoken(env):
+    """角色自己在 bus 写的 fact（src == 角色名）算回话 → neutral，不发 blocker。"""
+    env["fake"].search_facts = [{"src": "pm", "t": "pm 的进度"}]
+    _run_once(env)
+    assert not any("零回话零产出" in w for w in env["writes"]), env["writes"]
+
+
+def test_own_assessment_fact_is_not_evidence(env):
+    """本模块自评 fact 不能被当成"角色说过话"，否则 negative 自己翻成 neutral。"""
+    env["fake"].search_facts = [{"src": "task_evidence", "t": "[task_evidence] x 质量: negative"}]
+    _run_once(env)
+    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
+
+
+def test_other_role_fact_is_not_evidence(env):
+    """别的角色/巡检替该任务写的 fact 不算回话（工程上常这样串味）。"""
+    env["fake"].search_facts = [{"src": "coordinator", "t": "P0 超时 violation: task_x"}]
+    _run_once(env)
+    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
