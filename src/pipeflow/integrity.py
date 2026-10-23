@@ -236,7 +236,10 @@ def send_bypass_reminder(run, step, path: str, send_to_role: callable,
         ("{acceptance_criteria}", _ctx.get("description") or _title_fb),
     ):
         if _var in goal_text:
-            goal_text = goal_text.replace(_var, str(_val))
+            # 值本身可能带 {title}/{description} 字面量（子链 description 是父模板
+            # 正文的截断）→ 替换等于把占位符写回，提醒被 _UNMATCHED_VAR_RE 拦下。
+            goal_text = goal_text.replace(
+                _var, _re.sub(r"\{[a-z_]+\}", "", str(_val)))
     if not goal_text:
         goal_text = getattr(step, 'title', '') or ''
     # 复用 CORE_QUESTIONS（与 DIMENSIONS 前两条同源，P1-1 统一）

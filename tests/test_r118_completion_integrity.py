@@ -99,7 +99,7 @@ def test_claim_requires_completion_suffix_and_ignores_own_id():
 
 
 def test_claim_recognizes_chinese_completion_suffix():
-    """角色自发通知写 `wf_xxx/sN 完成`（全库 960 条完成类消息中 26 条该形态），
+    """角色自发通知写 `wf_xxx/sN 完成`（全库 1291 条完成类标题中 26 条该形态），
     模板名与实例 id 两种前缀都要认；只认 -complete 时守卫对这批消息失效
     （2026-10-22 回归：收紧 -complete 打挂 TestSoftAttribution，bus #440248）。"""
     f = _claims_own_step_and_foreign_instance
@@ -112,6 +112,38 @@ def test_claim_recognizes_chinese_completion_suffix():
              "wf_sub_mine00000001", "pm_requirements", "s1") is False
     assert f("wf_sub_other/s1.5-complete 完成",
              "wf_sub_mine", "pm_requirements", "s1") is False
+
+
+def test_claim_recognizes_chinese_completion_variants():
+    """返工 s6 P2 实测漏拦 4 类：已/了/于时间 收尾，以及斜杠两侧带空格。
+
+    这 4 条在旧后缀下全部 False —— 角色写「已完成」「完成了」「完成于 10:00」
+    都是真实写法，漏拦等于给同模板并发链留同一个口子。
+    """
+    f = _claims_own_step_and_foreign_instance
+    args = ("wf_sub_mine00000001", "pm_requirements", "s1")
+    for text in ("wf_other/s1 已完成",
+                 "wf_other/s1 完成了",
+                 "wf_other/s1 完成于 10:00",
+                 "wf_other / s1 完成"):
+        assert f(text, *args) is True, f"漏拦: {text}"
+
+
+def test_claim_matches_display_name_when_template_is_registered_number():
+    """登记名是纯数字（WL-02）时剥前缀只剩 '02'，与角色标题里的显示名对不上。
+
+    这类模板没有可读名（显示名长在另一行模板上），模板名分支必须退化为
+    匹配任意模板名，否则 WL-02/WL-09 的模板名分支恒失效。
+    """
+    f = _claims_own_step_and_foreign_instance
+    # WL-02 的显示名是「需求流转」
+    assert f("wf_other · 需求流转/s1-complete 已产出",
+             "wf_sub_mine", "WL-02", "s1") is True
+    assert f("wf_other · 需求流转/s1 完成",
+             "wf_sub_mine", "WL-02", "s1") is True
+    # 退化只放宽模板名，不放开完成形态与步号边界
+    assert f("wf_other · 需求流转/s1/README 已更新",
+             "wf_sub_mine", "WL-02", "s1") is False
 
 
 def test_claim_ignores_workflow_id_prefix():

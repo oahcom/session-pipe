@@ -7,13 +7,23 @@ import threading
 import logging
 import os
 import time
-from typing import Optional
+from typing import Final, Mapping, Optional
 
 from paths import BUS_CLIENT, SESSION_LAUNCHER_SRC
 from workflow.db import create_connection
 
 LOGGER = logging.getLogger("workflow.client")
 CCS_CLI = SESSION_LAUNCHER_SRC / "ccs.py"
+
+# 分类合同层：bus_category 是确定性路由键，命中即定模板，不参与打分。
+# WHY: 打分只看标题字符 2-gram，cat 只值 +5 分 → 缺陷事实被送进首步是
+# scout / product_architect 的链，跑满 7 步后在末步价值审计失败（bus #439027）。
+# ponytail: 静态常量，新增分类需改代码重启；未覆盖分类仍走 recommend() 启发式。
+CATEGORY_TEMPLATE: Final[Mapping[str, str]] = {
+    # 缺陷由工程师修，与引擎返工链对 engineer 的默认模板一致
+    # （pipeflow/wf_lifecycle.py:_REWORK_TPL_FOR_ROLE），单步、首步即 engineer。
+    "bug_report": "WF-engineer_feature",
+}
 
 
 class WorkflowClient:
@@ -133,7 +143,9 @@ class WorkflowClient:
             raise ValueError(
                 f"跨角色重复任务: title='{title[:40]}' 已派给 {_cross[0]}，"
                 f"5 分钟内不再为 {assignee} 重复创建")
-        # 自动选择模板: 未指定时按任务标题 + 发起角色 + bus 分类匹配
+        # 自动选择模板: 先查分类合同层（确定性），未命中再按标题 + 角色匹配
+        if not template_id:
+            template_id = self._template_from_category(bus_category)
         if not template_id:
             from template_registry import TemplateRegistry
             _reg = TemplateRegistry(str(self.db_path) if hasattr(self, 'db_path') and self.db_path else None)
@@ -168,6 +180,25 @@ class WorkflowClient:
         wf_id = self._create_workflow_instance(task_id, template_id, assignee, initiator_role)
         gate.route_task(task_id, initiator_role, assignee)
         return (task_id, wf_id)
+
+    def _template_from_category(self, bus_category: str) -> str:
+        """分类合同层：cat 命中映射且模板可用 → 返回模板 id；否则返回 ""。
+
+        失效（模板被删/停用）时返回空串让调用方回退 recommend()，不抛异常：
+        本函数在建链热路径上，抛错会让事实永久无法建链。
+        """
+        tid = CATEGORY_TEMPLATE.get(bus_category or "")
+        if not tid:
+            return ""
+        row = self._conn.execute(
+            "SELECT is_active FROM workflow_templates WHERE template_id=?", (tid,)
+        ).fetchone()
+        if row and row[0] in (1, "1", True):
+            LOGGER.info("模板由 cat 决定: cat=%s → %s", bus_category, tid)
+            return tid
+        LOGGER.warning("分类映射失效（模板不存在或已停用），回退 recommend(): "
+                       "cat=%s → %s", bus_category, tid)
+        return ""
 
     def _align_assignee_to_first_step(self, template_id: str, assignee: str) -> str:
         """把 assignee 校正为模板首步的 target_role。
