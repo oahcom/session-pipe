@@ -84,7 +84,7 @@ def test_tasks_md_untouched_when_delivery_fails(tmp_path, monkeypatch):
 def test_negative_lessons_survive_rewrite(tmp_path, monkeypatch):
     """评分回写的 negative 教训必须活过下一次投递。
 
-    task_evidence._append_role_feedback 把教训 append 到 TASKS.md，而投递整体重写
+    历史上 task_evidence 曾把教训 append 到 TASKS.md，而投递整体重写
     会抹掉它 —— 实测 17 个 TASKS.md 里 0 个存活，闭环收集的反馈从不进角色上下文。
     """
     monkeypatch.setattr(rl, "_CCS_WORKSPACES", tmp_path)

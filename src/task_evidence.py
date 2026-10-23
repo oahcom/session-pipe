@@ -143,30 +143,6 @@ def _classify_outputs(n: int, size: int, evidence: str, bus_evidence: bool) -> s
     return "negative"
 
 
-def _append_role_feedback(role: str, title: str, task_id: str) -> bool:
-    """把 negative 评分回写到 role TASKS.md「历史教训」节。
-
-    WHY: 评分信号收集在 bus 却不回写 role prompt —— 角色无法从模板任务教训学习
-   （GEPA rounds memory 要求评分回写 persona/prompt）。补全闭环。
-    仅记录 negative，positive 不回写（防噪）。幂等：同 task_id 不重复。
-    CLAUDE.md 红线：绝不回写 CLAUDE.md（inject 管理），仅 TASKS.md。
-    """
-    try:
-        p = WORKSPACES / role / "TASKS.md"
-        if not p.exists():
-            return False
-        txt = p.read_text(encoding="utf-8", errors="ignore")
-        # 幂等：匹配 `({task_id})` 边界，避免 task_123 被 task_1234 子串误杀
-        if f"({task_id})" in txt:
-            return False
-        line = f"\n- [negative] 任务《{title}》({task_id}) → 评分回写：无产出/无证据/模板残留。参考 bus feedback + code_fix 自省。"
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(line)
-        return True
-    except Exception:
-        return False  # 回写失败不影响主流程
-
-
 def evaluate_and_feedback(hours: float = 1):
     """提取已完成任务证据 → 写质量反馈到 bus，供 coordinator/workflow_engine 消费。
 
@@ -279,108 +255,57 @@ def _evaluate_with(db, hours: float = 1):
             "evidence_type": _evidence,
         })
 
-    # 汇总写 bus
+    # 汇总写 bus：一轮评估里所有写入**都成功**才落账签名（codex P1-1）。
+    # 否则下轮被 _already_reported 跳过，失败的那条永不重试（混合成败：feedback
+    # 成功会先落账，blocker 失败就被吞掉）。
     _bus = BUS_CLIENT
+
+    def _bus_write(*args) -> bool:
+        try:
+            return subprocess.run(
+                [str(_bus), "write", *args], capture_output=True, timeout=10
+            ).returncode == 0
+        except Exception:
+            return False
+
     for a in assessments:
-        # 评估签名未变则跳过 feedback 写入：任务完成后 1h 内每 tick 重评估结果完全相同，
+        # 评估签名未变则跳过：任务完成后 1h 内每 tick 重评估结果完全相同，
         # 重复写不产生新信息，只把旧 fact 的 ts 刷新、重新顶进 unread。
-        # 注意：只跳过 bus feedback，不跳过下方的 negative 复盘分支——
-        # 复盘与 TASKS.md 回写自带幂等（_append_role_feedback 按 task_id 去重），
-        # 被 continue 连带跳过会让角色的学习信号永久丢失。
         # 签名只取"结论"维度：output_count/output_size 每 tick 都在抖（角色还在写），
-        # 带上它们等于每分钟一个新签名 → 实测 83min 内同一任务写 18 条同文案 fact
+        # 带上它们等于每分钟一个新签名 -> 实测 83min 内同一任务写 18 条同文案 fact
         # （engineer s4 / PA s2 / pm s1 / reviewer 共 53 条），每个角色都得读一遍自证。
         # 文案版本也进签名：措辞变了要重写，否则 --hours 回填对"质量不变、detail 变"的历史 fact 无效
         _sig = f"{a['quality']}|{a['evidence_type']}|{_DETAIL_VERSION}"
-        _already_reported = _LAST_ASSESSMENT.get(a["task_id"]) == _sig
-        # 签名只在写入**成功后**落账（codex P1-1）。先记后写会让瞬时失败
-        # （bus 锁冲突/超时）在 1h 窗口内永不重试——原实现每 tick 重写恰好
-        # 有自愈性，守卫不能把自愈性一并消掉。
-        if not _already_reported:
-            try:
-                _r = subprocess.run(
-                    [str(_bus), "write", "feedback",
-                     # bus 按标题 UPSERT：同一 task+quality 只保留一条，后续评估覆盖
-                     # 第一条（ts 冻在初次评估时刻）。标题里不要带时刻/文件数：它们每
-                     # 分钟都会变，导致每次插新行而不是覆盖（实测 6h 内 90 条里 75 条重复，
-                     # 同一任务同一结论最多写 18 次，21 个角色各自读一遍）。
-                     f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
-                     "--evidence", json.dumps(a),
-                     "--src", "task_evidence"],
-                    capture_output=True, timeout=10)
-                if _r.returncode == 0:
-                    _LAST_ASSESSMENT[a["task_id"]] = _sig
-                    _record_assessed(db, a["task_id"], _sig)
-            except Exception:
-                pass
-        # R2-2 self-reflection（Reflexion 洞察 3）: 无产出任务写 code_fix 根因总结，
-        # 供后续 session 消费避免同类错误重复（失败后语言化复盘 > 纯重试）
-        if a["quality"] == "negative" and not a.get("role_spoke", True):
-            # 引擎空推进：步骤 completed 但角色一句话没说、workspace 里也没有文件。
-            # 不写 TASKS.md（那是惩罚角色），改发 blocker 让运维看引擎侧。
-            try:
-                if not _already_reported:
-                    _rb = subprocess.run(
-                        [str(_bus), "write", "blocker",
-                         f"[task_evidence] {a['task_id']} completed 但角色零回话零产出",
-                         "--evidence", json.dumps({
-                             "task_id": a["task_id"], "role": a["role"],
-                             "title": a["title"][:60],
-                             "detail": a["detail"],
-                             "why": "exit_messages/summary/bus 全空 → 步骤疑似被引擎空推进；"
-                                    "该角色产出若在代码仓库，按 workspace 目录判也必然 0 文件",
-                         }, ensure_ascii=False),
-                         "--src", "task_evidence"],
-                        capture_output=True, timeout=10)
-                    # 只写成功才落账：失败留空让下轮重试（codex P1-1 回归）
-                    if _rb.returncode == 0:
-                        _LAST_ASSESSMENT[a["task_id"]] = _sig
-                        _record_assessed(db, a["task_id"], _sig)
-            except Exception:
-                pass
-        elif a["quality"] == "negative":
-            try:
-                _reflect = {
+        if _LAST_ASSESSMENT.get(a["task_id"]) == _sig:
+            continue
+        # bus 按标题 UPSERT：同一 task+quality 只保留一条，后续评估覆盖第一条
+        # （ts 冻在初次评估时刻）。标题里不要带时刻/文件数：它们每分钟都会变，
+        # 导致每次插新行而不是覆盖（实测 6h 内 90 条里 75 条重复，同一任务同一
+        # 结论最多写 18 次，21 个角色各自读一遍）。
+        _ok = _bus_write(
+            "feedback",
+            f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
+            "--evidence", json.dumps(a),
+            "--src", "task_evidence")
+        # negative ⟺ 0 产出文件且无回话（n>=1 已在 _classify_outputs 判 neutral），
+        # 所以这里的 negative 必然是引擎空推进：步骤 completed 但角色一句话没说、
+        # workspace 里也没有文件。不写 TASKS.md（那是拿引擎的空推进罚角色，R161），
+        # 改发 blocker 让运维看引擎侧。
+        if a["quality"] == "negative":
+            _ok = _bus_write(
+                "blocker",
+                f"[task_evidence] {a['task_id']} completed 但角色零回话零产出",
+                "--evidence", json.dumps({
                     "task_id": a["task_id"], "role": a["role"],
                     "title": a["title"][:60],
-                    "root_cause": "无产出文件、无 bus 证据、无 exit_messages — 任务未真正执行或角色未响应",
-                    "action_items": [
-                        "检查角色是否存活/被拉起（survival_monitor 已接自动恢复）",
-                        "检查任务模板是否被角色实际消费（route_all 是否创建 workflow）",
-                        "确认角色 eval_criteria 是否阻止了执行（eval_consistency 预检）",
-                    ],
-                    "quality": "negative",
-                }
-                # self-reflect 与 feedback 各写一条，但共享同一签名。
-                # 必须用**本轮开始时**的 _already_reported 判断，不能用
-                # _LAST_ASSESSMENT 现查 —— 上面的 feedback 分支刚把自己落账，
-                # 现查会恒为 True 而永远跳过 self-reflect（实测回归）。
-                if not _already_reported:
-                    _r2 = subprocess.run(
-                        [str(_bus), "write", "code_fix",
-                         f"[self-reflect] 任务《{a['title'][:40]}》无产出 — 需根因排查",
-                         "--evidence", json.dumps(_reflect, ensure_ascii=False),
-                         "--src", "task_evidence"],
-                        capture_output=True, timeout=10)
-                    # 失败则注销签名，让下一轮两条一起重试
-                    if _r2.returncode != 0:
-                        _LAST_ASSESSMENT.pop(a["task_id"], None)
-                # TASKS.md 回写无条件执行：它自身按 task_id 幂等，
-                # 且上一轮可能因文件缺失失败，早退会丢掉学习信号。
-                # 回写评分信号到 role TASKS.md（闭环补全 —— 评分→prompt学习）
-                # WHY: evaluate_and_feedback 原仅写 bus，role 无法从 negative 教训学习。
-                # CLAUDE.md 禁止回写 CLAUDE.md，仅 TASKS.md 足矣。
-                _append_role_feedback(a["role"], a["title"][:60], a["task_id"])
-            except Exception as _e:
-                # 不能静默：这条路径是「评分 → 角色 prompt 学习」的唯一闭环，
-                # 吞掉异常 = 角色永远学不到 negative 教训，而日志里看不出没学。
-                print(f"[task_evidence] 负面反馈回写失败 task={a.get('task_id')}: {_e}",
-                      file=sys.stderr)
-
-    # 修剪只按 1h 窗口，不按本轮 LIMIT 结果集：窗口内实测 13 个 completed 任务
-    # 竞争 LIMIT 10 槽位，排序翻转时被挤出的任务签名会被删，下一轮回到窗口
-    # 又重写一遍。实测同一 fact 每 tick 重写一发（写放大 88.6×，R42）。
-    # 按窗口修剪后：落出 TOP10 的任务保留签名，回来时命中 _already_reported。
+                    "detail": a["detail"],
+                    "why": "exit_messages/summary/bus 全空 -> 步骤疑似被引擎空推进；"
+                           "该角色产出若在代码仓库，按 workspace 目录判也必然 0 文件",
+                }, ensure_ascii=False),
+                "--src", "task_evidence") and _ok
+        if _ok:
+            _LAST_ASSESSMENT[a["task_id"]] = _sig
+            _record_assessed(db, a["task_id"], _sig)
     _window_ids = {r[0] for r in db.execute(
         "SELECT task_id FROM tasks WHERE status='completed' AND updated_at > ?",
         (_cutoff,)).fetchall()}

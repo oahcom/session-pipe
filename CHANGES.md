@@ -61,6 +61,19 @@
 - 产出归属仍只靠 workspace + 时间窗：实测 120 条窗口内 381 个文件命中、去重 258，
   **73 个文件被多个任务共用**（约 19%）→ positive 数应视为上界，不写成"真实交付数"。
 
+### 2026-10-23 追加（codex 第 6 轮「需修改」→ 已修）
+- **删掉不可达分支**：`_classify_outputs` 里 n>=1 即判 neutral，所以 negative 等价于
+  `role_spoke=False`，原 `elif quality=="negative"`（self-reflect + TASKS.md 回写）恒不执行 ——
+  连同唯一调用点 `_append_role_feedback` 一并删除（净 -60 行），R161 的结论也从
+  「negative 分两路」简化为「negative == 引擎空推进，只发 blocker」。
+- **签名单点落账**（codex 第 6 轮 important）：原实现 feedback 成功即落账，blocker 失败时
+  下轮被 `_already_reported` 跳过、永不重试 → 改为一轮内所有 bus 写入都成功才落账
+  （`_bus_write` 助手 + 统一 `if _ok`）。
+- 测试 `tests/test_task_evidence_idempotence.py` 5 条：新增 `test_blocker_failure_is_retried`
+  覆盖混合成败；三个 task_evidence 文件 22 passed。
+- **codex nit 驳回（有据）**：点文件排除会漏掉 `.gitignore`/`.env.example` —— 全量 workspace 实测
+  ≥1KB 的点文件仅 14 个，全是 `.coverage`/`*.log`/`*.sh` 临时物，无一为交付物。
+
 ## 2026-10-22 — temp-pr-branch 合入 main（漂移收敛，35 文件 / 4 处 modify-delete）## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效
 
 ### 问题（可观测证据）

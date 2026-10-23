@@ -7,11 +7,8 @@
 
 测试完全封闭：DB 用内存库、workspace 用临时目录、bus 写入用假 subprocess。
 """
-import os
 import sqlite3
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -23,11 +20,12 @@ import task_evidence as te  # noqa: E402
 
 
 class _FakeRun:
-    """假 subprocess.run：记录 bus 写入，可控 returncode。"""
+    """假 subprocess.run：记录 bus 写入，按标题子串决定成败。"""
 
     def __init__(self):
         self.writes = []
         self.returncode = 0
+        self.fail_substrings = []
 
     def __call__(self, cmd, **kwargs):
         if len(cmd) > 3 and cmd[1] == "write":
@@ -37,7 +35,8 @@ class _FakeRun:
             pass
 
         r = _R()
-        r.returncode = self.returncode
+        bad = self.returncode or any(s in cmd[3] for s in self.fail_substrings)
+        r.returncode = 1 if bad else 0
         r.stdout = ""
         return r
 
@@ -47,13 +46,9 @@ def env(monkeypatch, tmp_path):
     """隔离环境：假 subprocess + 临时 workspace 根 + 清空签名。"""
     fake = _FakeRun()
     monkeypatch.setattr(te.subprocess, "run", fake)
-    calls = []
-    monkeypatch.setattr(
-        te, "_append_role_feedback", lambda *a, **kw: calls.append(a) or True
-    )
     monkeypatch.setattr(te, "WORKSPACES", tmp_path / "ccs-workspaces")
     te._LAST_ASSESSMENT.clear()
-    return {"writes": fake.writes, "calls": calls, "fake": fake, "root": tmp_path}
+    return {"writes": fake.writes, "fake": fake, "root": tmp_path}
 
 
 def _run_once(env, role="pm"):
@@ -77,12 +72,12 @@ def _run_once(env, role="pm"):
 
 
 def test_negative_task_writes_once_then_skips(env):
-    """negative 任务首次写 feedback + self-reflect 共 2 条，同签名重评估全跳过。"""
+    """negative 任务首次写 feedback + blocker 共 2 条，同签名重评估全跳过。"""
     _run_once(env)
     first = len(env["writes"])
     _run_once(env)
     second = len(env["writes"]) - first
-    assert first == 2, f"首次应写 feedback + self-reflect，实际 {first}"
+    assert first == 2, f"首次应写 feedback + blocker，实际 {first}"
     assert second == 0, f"同签名重评估应跳过，实际 {second}"
 
 
@@ -92,7 +87,7 @@ def test_changed_signature_rewrites(env):
     before = len(env["writes"])
     te._LAST_ASSESSMENT["t1"] = "stale_signature"
     _run_once(env)
-    assert len(env["writes"]) - before == 2, "签名变化应重写 feedback + self-reflect"
+    assert len(env["writes"]) - before == 2, "签名变化应重写 feedback + blocker"
 
 
 def test_failed_write_is_retried(env):
@@ -103,7 +98,6 @@ def test_failed_write_is_retried(env):
     _run_once(env)
     assert env["writes"], "首轮应有写入"
 
-    # 模拟写入失败：清空签名（等价于从未成功落账）后重跑
     te._LAST_ASSESSMENT.clear()
     env["fake"].returncode = 1
     before = len(env["writes"])
@@ -111,10 +105,23 @@ def test_failed_write_is_retried(env):
     assert len(env["writes"]) > before, "失败后应重试写入"
     assert te._LAST_ASSESSMENT.get("t1") is None, "失败不得落账，否则永不重试"
 
-    # 恢复成功后应正常落账并停止重试
     env["fake"].returncode = 0
     _run_once(env)
     assert te._LAST_ASSESSMENT.get("t1") is not None, "成功后应落账"
+
+
+def test_blocker_failure_is_retried(env):
+    """feedback 成功、blocker 失败时不得落账，下轮 blocker 必须重试（混合成败）。"""
+    env["fake"].fail_substrings = ["零回话零产出"]
+    _run_once(env)
+    assert te._LAST_ASSESSMENT.get("t1") is None, "部分失败不得落账"
+
+    env["fake"].fail_substrings = []
+    before = len(env["writes"])
+    _run_once(env)
+    assert any("零回话零产出" in w for w in env["writes"][before:]), \
+        "下轮应重试 blocker"
+    assert te._LAST_ASSESSMENT.get("t1") is not None, "全部成功后才落账"
 
 
 def test_silent_completion_reports_blocker_not_tasks_md(env):
@@ -125,6 +132,6 @@ def test_silent_completion_reports_blocker_not_tasks_md(env):
     且 engineer/maintainer 的产出在代码仓库，按 workspace 目录判结构性恒为 0 文件。
     """
     _run_once(env)
-    _run_once(env)
-    assert env["calls"] == [], f"静默完成不该写 TASKS.md，实际 {env['calls']}"
     assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
+    assert not any("[self-reflect]" in w for w in env["writes"]), env["writes"]
+    assert not (env["root"] / "ccs-workspaces" / "pm" / "TASKS.md").exists()
