@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """survival_monitor.py — L1/L2/L3 三层存活检测。
 
-L1: 进程存活（tmux has-session + 哨兵文件）
+L1: 进程存活（一次 pane 快照 + 哨兵文件）
 L2: 思考存活（tmux pane/window 最后活动时间）
 L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
 
@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
+
+from liveness import tmux_snapshot   # 单次 pane 快照，L1 与 pipeflow 共用一份判据
 
 try:
     from paths import CCS_SENTINEL_DIR as SENTINEL_DIR, SESSION_ROLES_ROOT
@@ -107,53 +109,33 @@ class SurvivalMonitor:
     # ── L1: 进程存活 ──
 
     def _l1_check(self, role: str) -> dict:
-        """L1: 进程存活。红线3 — 单次 tmux 探测失败(超时/socket抖动)不立即翻转状态,
-        连续3次失败才降级判活/不活, 抑制 ccs_health 0↔9 全天噪声(bus#302580/#323191)。"""
-        tmux_name = f"ccs-{role}"
-        alive = False
-        probe_ok = True
-        try:
-            r = subprocess.run(
-                ["tmux", "has-session", "-t", tmux_name],
-                capture_output=True, timeout=3,
-            )
-            alive = r.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            probe_ok = False
-        prev = self._cache.get(role, {})
-        prev_fail = prev.get("l1_fail_streak", 0)
-        if not probe_ok:
-            fail_streak = prev_fail + 1
-            # socket 瞬时抖动/隔离: 探测命令本身异常(非returncode判定), 保留前态不翻转
-            if fail_streak < 3:
-                if prev.get("tmux_alive") is True:
-                    # 前态存活: 沿用 ALIVE 结论, 不把9角色整体判死
-                    has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
-                    status = "ALIVE" if has_sentinel else prev.get("status", "UNKNOWN")
-                    return {"status": status, "tmux_alive": True,
-                            "has_sentinel": has_sentinel, "l1_fail_streak": fail_streak}
-                if prev.get("status"):
-                    # 前态非存活但有记录: 沿用前态(异常=无法探测, 非确认死亡), 抑制 ORPHAN 噪声
-                    return {"status": prev["status"], "tmux_alive": None,
-                            "has_sentinel": prev.get("has_sentinel", False),
-                            "l1_fail_streak": fail_streak}
-            alive = False  # 连续3次失败或无前态: 正常判活/不活
-        else:
-            fail_streak = 0
-        sentinel = SENTINEL_DIR / f"{role}.json"
-        has_sentinel = sentinel.exists()
+        """L1: 进程存活 —— tmux 快照里有没有 `ccs-<role>` 这个 pane。
+
+        旧实现每角色一次 `tmux has-session`（3s 超时），再用「连续 3 次失败才翻态」
+        （红线3）兜住超时。但那份计数读的是 cache 顶层，而 tick() 写的是
+        `{"l1": {...}}` → 状态从未存下来（`prev.get("tmux_alive")` 恒 None），
+        一次超时就直判 ORPHAN/DEAD：日志里 16:39 `stale/dead: [...]` 与两分钟后的
+        「存活恢复: 会话本就在（L1 存活）」并存（2026-10-22 实测）。
+        现在复用 liveness 的单次快照（一次 `list-panes -a` 服务全部角色）：
+        `None`=探针不可用 → UNKNOWN，不判死、不进 orphan 清理、不进恢复队列；
+        有答案就直接定态。fail-streak 记账整段删除。
+        """
+        has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
+        snap = tmux_snapshot()
+        if snap is None:
+            return {"status": "UNKNOWN", "tmux_alive": None,
+                    "has_sentinel": has_sentinel}
+        alive = role in snap
         if alive and has_sentinel:
             status = "ALIVE"
-        elif has_sentinel and not alive:
-            # 单次 tmux 检查失败不立即判 ORPHAN（3 次连续失败才 kill，红线）
-            status = "ORPHAN"
-        elif alive and not has_sentinel:
-            # tmux 会话在但哨兵缺失: 状态丢失, 需重建（DEAD 分支, 走 _cleanup_dead 删残留）
-            status = "DEAD"
+        elif has_sentinel:
+            status = "ORPHAN"      # 哨兵残留：kill 仍要 dead/orphan_checks_since 连击
+        elif alive:
+            status = "DEAD"        # 会话在但哨兵缺失 = 状态丢失，走 _cleanup_dead
         else:
             status = "UNKNOWN"
         return {"status": status, "tmux_alive": alive,
-                "has_sentinel": has_sentinel, "l1_fail_streak": fail_streak}
+                "has_sentinel": has_sentinel}
 
     # ── L2: 思考存活 ──
 

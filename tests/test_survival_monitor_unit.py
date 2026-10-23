@@ -67,108 +67,45 @@ def monitor():
 
 
 class TestL1Check:
-    """L1: 进程存活"""
+    """L1: 进程存活 —— 判据是 tmux 快照里的 pane；探针不可用不等于死。"""
 
     def test_l1_alive_with_sentinel(self, monitor, monkeypatch):
-        tmux_alive = MagicMock(returncode=0)
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: tmux_alive)
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
         _make_sentinel("qa", sm.SENTINEL_DIR)
 
         result = monitor._l1_check("qa")
-        assert result["status"] == "ALIVE"
-        assert result["tmux_alive"] is True
-        assert result["has_sentinel"] is True
+        assert result == {"status": "ALIVE", "tmux_alive": True, "has_sentinel": True}
 
-    def test_l1_orphan(self, monitor, monkeypatch):
-        tmux_dead = MagicMock(returncode=1)
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: tmux_dead)
+    def test_l1_orphan_when_session_gone_but_sentinel_left(self, monitor, monkeypatch):
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {})
         _make_sentinel("qa", sm.SENTINEL_DIR)
 
-        result = monitor._l1_check("qa")
-        assert result["status"] == "ORPHAN"
+        assert monitor._l1_check("qa")["status"] == "ORPHAN"
 
-    def test_l1_no_sentinel_unknown(self, monitor, monkeypatch):
-        tmux_dead = MagicMock(returncode=1)
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: tmux_dead)
-        # no sentinel file
+    def test_l1_dead_when_session_without_sentinel(self, monitor, monkeypatch):
+        """会话在但哨兵缺失 = 状态丢失（DEAD 走 _cleanup_dead 重建）。"""
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
 
-        result = monitor._l1_check("qa")
-        assert result["status"] == "UNKNOWN"
+        assert monitor._l1_check("qa")["status"] == "DEAD"
 
-    def test_l1_tmux_error(self, monitor, monkeypatch):
-        def raise_error(*a, **kw):
-            raise FileNotFoundError("tmux not found")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+    def test_l1_unknown_when_neither(self, monitor, monkeypatch):
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {})
+
+        assert monitor._l1_check("qa")["status"] == "UNKNOWN"
+
+    def test_l1_probe_unavailable_is_not_death(self, monitor, monkeypatch):
+        """快照不可用（tmux 卡死）→ UNKNOWN + tmux_alive=None：不判死、不进恢复队列。
+
+        旧实现用「连续 3 次失败」兜这个窗口，但状态读的是 cache 顶层（tick 写的是
+        {"l1": …}）→ 计数从未生效，一次超时即判 ORPHAN（2026-10-22 16:39 实测
+        stale/dead 与两分钟后「会话本就在（L1 存活）」并存）。
+        """
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: None)
         _make_sentinel("qa", sm.SENTINEL_DIR)
 
-        result = monitor._l1_check("qa")
-        assert "tmux_alive" in result
-        assert result["has_sentinel"] is True
-
-    def test_l1_transient_probe_failure_keeps_alive(self, monitor, monkeypatch):
-        """红线3: socket 瞬时抖动(连续<3次失败)沿用前态存活, 不翻转 → 抑制0↔9噪声。"""
-        def raise_error(*a, **kw):
-            raise FileNotFoundError("tmux socket 抖动")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
-        _make_sentinel("qa", sm.SENTINEL_DIR)
-        # 前态: 存活
-        monitor._cache["qa"] = {"tmux_alive": True, "status": "ALIVE", "l1_fail_streak": 0}
-
-        r1 = monitor._l1_check("qa")
-        assert r1["status"] == "ALIVE"          # 第1次失败, 沿用存活
-        assert r1["tmux_alive"] is True
-        assert r1["l1_fail_streak"] == 1
-        monitor._cache["qa"] = r1               # tick() 会写回 cache, 模拟之
-
-        r2 = monitor._l1_check("qa")
-        assert r2["status"] == "ALIVE"          # 第2次失败, 仍沿用
-        assert r2["l1_fail_streak"] == 2
-        monitor._cache["qa"] = r2
-
-        # 第3次连续失败 → 降级判 ORPHAN(有哨兵但tmux不可达)
-        r3 = monitor._l1_check("qa")
-        assert r3["status"] == "ORPHAN"
-        assert r3["l1_fail_streak"] == 3
-
-    def test_l1_transient_failure_no_prior_alive_not_suppressed(self, monitor, monkeypatch):
-        """无前态存活记录时, 探测失败按原逻辑判(不掩盖真死亡)。"""
-        def raise_error(*a, **kw):
-            raise FileNotFoundError("tmux not found")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
-        _make_sentinel("qa", sm.SENTINEL_DIR)
-        # 前态无 tmux_alive=True 记录 → 不抑制
-
-        r1 = monitor._l1_check("qa")
-        assert r1["status"] == "ORPHAN"          # 无前态存活, 正常判
-        assert r1["tmux_alive"] is False
-
-    def test_l1_probe_exception_keeps_prior_orphan_not_flip(self, monitor, monkeypatch):
-        """探测异常(socket隔离/抖动)且前态为 ORPHAN → 保留前态, 不刷 ORPHAN 噪声。"""
-        def raise_error(*a, **kw):
-            raise FileNotFoundError("tmux socket 隔离")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
-        _make_sentinel("qa", sm.SENTINEL_DIR)
-        # 前态: ORPHAN (已存在但 tmux 不可达)
-        monitor._cache["qa"] = {"tmux_alive": False, "status": "ORPHAN",
-                                 "has_sentinel": True, "l1_fail_streak": 0}
-
-        r1 = monitor._l1_check("qa")
-        assert r1["status"] == "ORPHAN"          # 沿用前态, 不翻转
-        assert r1["tmux_alive"] is None          # 探测异常=无法判定, 非 False
-        assert r1["l1_fail_streak"] == 1
-
-    def test_l1_probe_exception_keeps_prior_unknown(self, monitor, monkeypatch):
-        """探测异常且前态为 UNKNOWN → 保留 UNKNOWN, 不误判 ORPHAN/DEAD。"""
-        def raise_error(*a, **kw):
-            raise subprocess.TimeoutExpired(cmd="tmux", timeout=3)
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
-        # 前态: UNKNOWN, 无哨兵
-        monitor._cache["qa"] = {"tmux_alive": False, "status": "UNKNOWN",
-                                 "has_sentinel": False, "l1_fail_streak": 0}
-
-        r1 = monitor._l1_check("qa")
-        assert r1["status"] == "UNKNOWN"          # 沿用前态
-        assert r1["tmux_alive"] is None
+        r = monitor._l1_check("qa")
+        assert r["status"] == "UNKNOWN"
+        assert r["tmux_alive"] is None
 
 
 class TestL2Check:
@@ -321,7 +258,8 @@ class TestTick:
     def test_tick_single_role(self, monitor, monkeypatch):
         _make_sentinel("qa", sm.SENTINEL_DIR)
 
-        # Mock L1 → ALIVE
+        # Mock L1 → ALIVE（判据是 pane 快照，不再是逐角色 has-session）
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: MagicMock(returncode=0, stdout=""))
         # Mock bus
         monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
@@ -332,6 +270,7 @@ class TestTick:
 
     def test_tick_caches_l2_l3(self, monitor, monkeypatch):
         _make_sentinel("qa", sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
         monkeypatch.setattr("routing.survival_monitor.subprocess.run", lambda *a, **kw: MagicMock(returncode=0, stdout=""))
         monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
 
@@ -345,6 +284,7 @@ class TestTick:
         """infinite 角色即使无哨兵也进巡检——否则「从未启动」与「健康」无法区分。"""
         monkeypatch.setattr(sm, "_load_role_lifecycles",
                             lambda: {"scout": "infinite", "qa": "ondemand"})
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {})
         monkeypatch.setattr(sm, "subprocess", MagicMock(
             run=lambda *a, **kw: MagicMock(returncode=1, stdout="")))
         monkeypatch.setattr(monitor, "_ensure_role_alive", lambda r: True, raising=False)
