@@ -1,5 +1,28 @@
 # CHANGES.md
 
+## 2026-10-26 — 配额耗尽不再每 30 分钟盲发「继续」：1h 探活 + 每角色 6h 一条审计
+
+### 问题（可观测证据）
+1. 24h（10-25 04:29 ~ 10-26 04:29）`facts` 371 条，其中 `[rate_limit]` **255 条 = 68.7%**；
+   `src=workflow_engine` 的 274 条里 93.1% 是它（bus #455493）。
+2. 255 次注入后 600s 内：tool_use 仅 9 次（3.5%），**又报同一错 223 次（87.5%）**。
+3. 同期 294 个 API 错误轮里 **284 个（96.6%）是 `FreeUsageLimitError`**（免费额度耗尽），
+   不是瞬时限流；每次 429 还会让 ASIP 判出口脏并轮换 IP（R115）。
+4. 审计 `evidence=output[-300:]` 实测 252/255 是 UI 壳（`❯ ⏵⏵ bypass permissions`），判不了因。
+
+### 改动（role_lifecycle +56/−5，另新增 3 条用例 95 行）
+- 新增 `_QUOTA_HINTS` / `_QUOTA_RETRY_SEC=3600` / `_QUOTA_REPORT_COOLDOWN=6h` 与
+  `_last_api_error_text()`（读转录最后一条错误轮正文，64KB 尾部，失败按瞬时处理）。
+- 配额态：探活间隔 1h（额度回来仍能自愈），bus 审计每角色 6h 一条，标题 `[quota]`；
+  非配额 429/403 的退避曲线（120→1800s）与「已发继续」语义完全不变。
+- `evidence` 改用真实错误行（pane 命中行优先，否则转录正文），不再是 pane 尾部 UI 壳。
+
+### 验证
+- `pytest tests/test_quota_nudge.py tests/test_rate_recovery.py tests/test_rate_limit_backoff_reset.py -q` → **26 passed**。
+- 变异检验：`_QUOTA_RETRY_SEC=0` → 1 failed；`_QUOTA_REPORT_COOLDOWN=0` → 1 failed（原码 3 passed）。
+- 全量 `pytest tests/ -q -x` → 447 passed 后停在 `test_24h_real_reasoning_volume`（R165 的产线吞吐断言，
+  与本改动无关，改动前即红）。
+
 ## 2026-10-26 — 全量测试"无 summary、退出码 0"的真因：看门狗线程在别的用例中途开火
 
 ### 问题
