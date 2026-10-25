@@ -112,8 +112,9 @@ class SurvivalMonitor:
         """L1: 进程存活 —— liveness 快照里有没有 `ccs-<role>` 这个 pane。
 
         返回的 status：ALIVE(有 pane 有哨兵) / ORPHAN(只剩哨兵) / DEAD(只剩 pane) /
-        UNKNOWN(探针不可用，或 pane 与哨兵俱无)。UNKNOWN 不判死、不进 orphan 清理、
-        不进恢复队列 —— 把「探不到」当成「死了」会误杀（历史见 TECHNICAL_DEEP_DIVE §8）。
+        UNKNOWN(pane 与哨兵俱无，或探针不可用)。UNKNOWN 一律不判死、不进 orphan 清理；
+        恢复队列只排除探针不可用（tmux_alive=None）的那种，pane 与哨兵俱无的 infinite
+        角色仍按「从未启动」拉起（把「探不到」当成「死了」会误杀，历史见 §8）。
         """
         has_sentinel = (SENTINEL_DIR / f"{role}.json").exists()
         snap = tmux_snapshot()
