@@ -1,5 +1,25 @@
 # CHANGES.md
 
+## 2026-10-26 — 全量测试"无 summary、退出码 0"的真因：看门狗线程在别的用例中途开火
+
+### 问题
+`pytest tests/ -q` 反复停在 96%~99% 的进度点、无 "N passed"，退出码却是 0 —— 被当成全绿引用。
+`-v` 定位到进程是**中途被杀**，不是跑完。
+
+### 根因
+1. `src/pipeflow/daemon.py` 的 `_force_exit_after(sec)` 无条件 `os._exit(0)`；`daemon_loop` 正常返回后
+   线程仍在 10s 后开火。`tests/test_workflow_daemon.py` 在自己进程里发过 SIGTERM → 10 秒后把 pytest 杀掉。
+2. 进程内跑 `daemon_loop` 的用例还会吃到源码热加载：并发 session 改 `src/**` → `os.execv` 把 pytest
+   整个换成 daemon（同样无 summary、退出码 0）。
+
+### 改动
+- `_force_exit_after(sec, done)` 改为 `done.wait(sec)`，`daemon_loop` finally 置位 `_loop_done`；
+  生产语义不变（真卡住的 tick 仍强杀）。
+- `WF_NO_REEXEC=1` 关闭测试进程内的热重载；`tests/conftest.py` 统一置位。
+
+### 验证
+- `pytest tests/test_workflow_daemon.py tests/test_daemon_shutdown_grace.py -q` → **10 passed**（修前 9 个点、无 summary）。
+
 ## 2026-10-22 — 空推进的步骤不再罚角色（negative 拆成「角色没做」与「引擎放行」）
 
 ### 问题（可观测证据）
