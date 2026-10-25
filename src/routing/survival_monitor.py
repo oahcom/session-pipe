@@ -147,24 +147,20 @@ class SurvivalMonitor:
         若该 endpoint 将来真的实现，须恢复"token 活跃也算 thinking"的语义
         —— 届时 stale 判定会更严（无输出但有 token 消耗的角色会被判 stale）。
         """
-        tmux_name = f"ccs-{role}"
         now = time.time()
-
-        # #{pane_activity} 在 tmux 3.4 恒为空串（实测 lang= 空），改用 #{window_activity}。
-        # ccs-* 会话均为单 window 单 pane，window_activity 即该 pane 最后一次输出时间，
-        # 已实测随 send-keys 输出递增（2026-10-16）。
+        # 复用 liveness 的同一份快照：每角色一次 list-panes 在 19 个角色 × 每 tick 下
+        # 就是 19 次子进程，而快照里第 3 列就是 #{window_activity}（tmux 3.4 的
+        # #{pane_activity} 恒空，故用 window_activity；ccs-* 单 window 单 pane，
+        # 它即该 pane 最后一次输出时间，实测随 send-keys 递增）。
         last_activity = 0.0
-        try:
-            r = subprocess.run(
-                ["tmux", "list-panes", "-t", tmux_name, "-F", "#{window_activity}"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                val = r.stdout.strip().split("\n")[0]
-                if val and val != "0":
-                    last_activity = float(val)
-        except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-            LOGGER.debug("tmux pane activity check failed for %s", role)
+        snap = tmux_snapshot()
+        if snap is not None:
+            _ent = snap.get(role)
+            if _ent:
+                try:
+                    last_activity = float(_ent[1] or 0)
+                except (TypeError, ValueError):
+                    last_activity = 0.0
         # last_activity == 0 表示无数据（非 epoch 0），标记为 unknown(-1)
         pane_age = now - last_activity if last_activity > 0 else -1
         # pane_age < 0 表示探测不可用，退化为 unknown 让调用方走 L3 fallback

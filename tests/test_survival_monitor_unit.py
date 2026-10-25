@@ -111,66 +111,38 @@ class TestL1Check:
 class TestL2Check:
     """L2: 思考存活"""
 
-    def test_l2_thinking_via_pane_activity(self, monitor, monkeypatch):
-        """pane 活动在 5 分钟内 → thinking=True。"""
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            if "list-panes" in cmd:
-                m.stdout = f"{time.time() - 60}\n"  # 1 分钟前
-            elif "list-sessions" in cmd:
-                m.stdout = "ccs-qa\n"
-            else:
-                m.stdout = ""
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
+    def test_l2_thinking_via_window_activity(self, monitor, monkeypatch):
+        """pane 活动在 5 分钟内 → thinking=True（读快照的 window_activity 列）。"""
+        monkeypatch.setattr(
+            "routing.survival_monitor.tmux_snapshot",
+            lambda *a, **kw: {"qa": ("12345", str(time.time() - 60))})
 
         result = monitor._l2_check("qa")
         assert result["thinking"] is True
 
     def test_l2_stale_pane(self, monitor, monkeypatch):
         """pane 活动超过 5 分钟 → thinking=False。"""
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 0
-            if "list-panes" in cmd:
-                m.stdout = f"{time.time() - 600}\n"  # 10 分钟前
-            elif "list-sessions" in cmd:
-                m.stdout = "ccs-qa\n"
-            else:
-                m.stdout = ""
-            return m
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "routing.survival_monitor.tmux_snapshot",
+            lambda *a, **kw: {"qa": ("12345", str(time.time() - 600))})
 
         result = monitor._l2_check("qa")
         assert result["thinking"] is False
 
-    def test_l2_reads_window_activity_not_pane_activity(self, monitor, monkeypatch):
-        """回归守卫: #{pane_activity} 在 tmux 3.4 恒为空 → 必须用 #{window_activity}。
+    def test_l2_role_absent_from_snapshot_is_unknown(self, monitor, monkeypatch):
+        """快照里没有该角色 → 探测不可用（thinking=None），不误判成「不思考」。"""
+        monkeypatch.setattr("routing.survival_monitor.tmux_snapshot",
+                            lambda *a, **kw: {"other": ("1", "0")})
 
-        问错变量会让 last_activity 恒为 0 → thinking 恒 None → overall 恒 unknown，
-        三层存活检测整体失效而不报错（实测 2026-10-16）。
-        """
-        seen = []
+        assert monitor._l2_check("qa")["thinking"] is None
 
-        def fake_run(cmd, **kw):
-            seen.append(cmd)
-            return MagicMock(returncode=0, stdout=f"{time.time() - 10}\n")
-
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", fake_run)
-        monitor._l2_check("qa")
-
-        assert any("#{window_activity}" in c for c in seen), "L2 必须查 window_activity"
-        assert not any("#{pane_activity}" in c for c in seen), "pane_activity 在 tmux 3.4 恒空"
-
-    def test_l2_tmux_error_fallback(self, monitor, monkeypatch):
-        """tmux 命令出错不崩溃。"""
-        def raise_error(*a, **kw):
-            raise FileNotFoundError("no tmux")
-        monkeypatch.setattr("routing.survival_monitor.subprocess.run", raise_error)
+    def test_l2_probe_unavailable_is_unknown(self, monitor, monkeypatch):
+        """tmux 快照不可用 → 不崩、thinking=None（交给 L3 兜底）。"""
+        monkeypatch.setattr("routing.survival_monitor.tmux_snapshot",
+                            lambda *a, **kw: None)
 
         result = monitor._l2_check("qa")
-        assert "thinking" in result  # no crash
+        assert result["thinking"] is None
 
 
 class TestL3Check:
