@@ -125,6 +125,14 @@ _API_ERROR_AGE = 120
 _RATE_LIMIT_NUDGE = ("上一轮 API 错误中断。继续，但先核对已完成的动作有没有落盘（读/写可能只做了一半），"
                      "再重发被中断的那次请求；不要重新规划；收尾回一行可验证据（命令或文件:行），不要写报告。")
 
+# 免费额度耗尽（FreeUsageLimitError）与「被限流打断」是两件事：前者重发只会再撞
+# 同一面墙——24h 实测 255 次注入里 223 次（87.5%）600s 内又报同一错，只有 3.5% 恢复。
+# 每次 429 还会让 ASIP 判出口脏并轮换 IP（R115），高频重发是在制造抖动。
+# 处置：配额态改 1h 探活（额度回来仍能自愈），审计每角色 6h 最多一条。
+_QUOTA_HINTS = ("FreeUsageLimitError", "Free usage limit", "usage limit reached")
+_QUOTA_RETRY_SEC = 3600
+_QUOTA_REPORT_COOLDOWN = 6 * 3600
+
 
 def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AGE) -> bool:
     """角色**最后一条** assistant 轮是否就是一条 API 错误（这类轮 output_tokens 恒为 0）。
@@ -149,6 +157,28 @@ def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AG
             return True  # 时间戳不可解析：保守按"刚发生"，宁可多发一句
         return (time.time() - _dt.timestamp()) < max_age
     return False
+
+
+def _last_api_error_text(role: str) -> str:
+    """最后一条 assistant 错误轮的正文；最后一轮不是错误 → ""。
+
+    只用来分清「配额耗尽」和「瞬时限流」：两类都要唤醒，但前者 1h 一次就够，
+    后者按原退避曲线。取不到正文按瞬时处理（宁可多试一次，不要漏掉可恢复的）。
+    """
+    for line in _read_transcript_tail(role):
+        if '"type":"assistant"' not in line.replace(" ", ""):
+            continue
+        if '"isApiErrorMessage":true' not in line.replace(" ", ""):
+            return ""
+        try:
+            content = json.loads(line).get("message", {}).get("content")
+        except ValueError:
+            return ""
+        if isinstance(content, list):
+            return " ".join(b.get("text") or "" for b in content
+                            if isinstance(b, dict)).strip()
+        return content if isinstance(content, str) else ""
+    return ""
 
 
 def role_erroring(role: str) -> bool:
@@ -522,6 +552,13 @@ class RoleLifecycleMixin:
             # 写出「已发继续」假审计（实测 6h 12 次注入中 1 次转录无落地）。
             if _tool_use_within(role):
                 continue
+            # 配额耗尽与瞬时限流分开（见 _QUOTA_HINTS 注释）：前者 1h 探活一次，
+            # 后者按原退避曲线。pane 有错误行就先用它，否则读转录最后一条错误。
+            _why = next((ln for ln in _recent.splitlines()
+                         if any(p in ln for p in self._RATE_LIMIT_PATTERNS)), "")
+            if not any(h in _why for h in _QUOTA_HINTS):
+                _why = _last_api_error_text(role) or _why
+            _quota = any(h in _why for h in _QUOTA_HINTS)
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt
             # 计数重置回 1，把快恢复的角色重新推回 10/10（实测 devops/closer/qa
@@ -546,8 +583,9 @@ class RoleLifecycleMixin:
                 self._last_rate_recover.update(
                     _load_rate_state(_ALERT_STATE, now, self._ALERT_TTL_S))
                 last, attempt = self._last_rate_recover.get(role, (0.0, 0))
-                wait = self._RATE_LIMIT_BACKOFF_SEC[
-                    min(attempt, len(self._RATE_LIMIT_BACKOFF_SEC) - 1)]
+                wait = (_QUOTA_RETRY_SEC if _quota else
+                        self._RATE_LIMIT_BACKOFF_SEC[
+                            min(attempt, len(self._RATE_LIMIT_BACKOFF_SEC) - 1)])
                 if now - last < wait:
                     continue
                 self._last_rate_recover[role] = (now, attempt + 1)
@@ -583,10 +621,23 @@ class RoleLifecycleMixin:
             # 的注入会覆盖昨天那行（实测今日 8 次注入在 facts 里查不到，最后可见
             # 行停在 2026-10-20 23:46；24h 902 次写只落到 91 行 ≈10:1 合并）。
             try:
+                # 配额态的 1h 探活不重复记账：24h 实测 255 条 [rate_limit] 占 bus
+                # 68.7%，87.5% 在 600s 内又报同一错——每敲一次写一条只是把日志
+                # 搬进 bus。每角色 6h 一条，且带上真正的错误原文（旧写法
+                # evidence=output[-300:] 252/255 是 UI 壳，判不了因）。
+                if _quota:
+                    _rep = getattr(self, "_quota_reported", None)
+                    if _rep is None:
+                        self._quota_reported = _rep = {}
+                    if now - _rep.get(role, 0.0) < _QUOTA_REPORT_COOLDOWN:
+                        continue
+                    _rep[role] = now
                 self._bb.write("monitor_audit",
-                    f"[rate_limit] {role} 被额度拒绝 → 已发继续"
-                    f"（第 {attempt + 1} 次 {time.strftime('%Y-%m-%d %H:%M:%S')}）",
-                    evidence=output[-300:], src="workflow_engine")
+                    (f"[quota] {role} 免费额度耗尽，改 1h 探活（第 {attempt + 1} 次 "
+                     f"{time.strftime('%Y-%m-%d %H:%M')}）" if _quota else
+                     f"[rate_limit] {role} 被额度拒绝 → 已发继续"
+                     f"（第 {attempt + 1} 次 {time.strftime('%Y-%m-%d %H:%M:%S')}）"),
+                    evidence=(_why or output[-300:])[:300], src="workflow_engine")
             except Exception as e:
                 LOGGER.warning("额度拒绝审计写入失败 %s: %s", role, e)
 
