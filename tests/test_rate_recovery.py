@@ -447,6 +447,9 @@ def test_nudge_carries_what_to_retry(tmp_path, monkeypatch):
     # 反向断言：旧文案断言"0 产出"，而 6h 内 11 次中断里 10 次被杀前已调 7~92 次工具
     # → 角色据此重做已做过的动作（本轮实测）。文案不许再声称零产出。
     assert "0 产出" not in body, body
+    # 反向断言：旧文案把证据一起禁了（"不要写自检报告"），而这条注入是角色失忆后
+    # 唯一的上下文锚 → 必须索要一行可验证据，不许只喊继续。
+    assert "可验证据" in body and "不要写自检报告" not in body, body
 
 
 def test_reset_predicate_ignores_error_turn_age():
