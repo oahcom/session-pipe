@@ -735,12 +735,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         _cur = _eff_role(inst, step.id, fallback=step.target_role)
         _inst_id = inst.get("instance_id") if isinstance(inst, dict) else getattr(inst, "id", "")
         if _cur != step.target_role:
-            if not role_erroring(_cur):
+            # 探测包在自己的 try 里：这两条探针异常冒泡出去会中断整轮生产工作流扫描
+            # （该方法的注释记录过同族 P0：NameError 让每个 tick 整体失败）。
+            try:
+                _cur_alive = self._is_agent_alive(_cur)
+                _cur_erroring = role_erroring(_cur)
+            except Exception as _e:
+                LOGGER.debug("_resolve_effective_role 沿用探测失败，保持 %s: %s", _cur, _e)
+                return _cur
+            if not _cur_erroring and _cur_alive is True:
                 return _cur  # 已有持久化决定 → 沿用
-            # 钉住的角色进了错误态：解钉回模板角色。缺这一步时闸门对已写坏的
-            # effective_roles 完全无效 —— 而现场那 3 条正是「先钉上、后 429」。
-            LOGGER.info("dev pool: 钉住的 %s 处于 API 错误态 → %s/%s 退回 %s",
-                        _cur, str(_inst_id)[:12], step.id, step.target_role)
+            # 钉住的角色不可用（错误态 / 没有 pane）：解钉回模板角色。缺这一步时闸门对
+            # 已写坏的 effective_roles 完全无效 —— 现场那 3 条正是「先钉上、后 429」，
+            # 另有 3 条钉在从不存在的 pg 上（tmux 无 ccs-pg）挂到 timeout_count=4。
+            LOGGER.info("dev pool: 钉住的 %s 不可用（错误态=%s pane=%s）→ %s/%s 退回 %s",
+                        _cur, _cur_erroring, _cur_alive,
+                        str(_inst_id)[:12], step.id, step.target_role)
             self._pin_effective_role(_inst_id, step.id, step.target_role)
             return step.target_role
         if step.target_role not in _DEV_ROLE_POOL:
@@ -755,6 +765,16 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                 # 每 tick 都会走到这里且不落库，故只留 DEBUG（INFO 会刷成每小时数千行）
                 LOGGER.debug("dev pool: %s 处于 API 错误态 → %s/%s 保持 %s",
                              _alt, str(_inst_id)[:12], step.id, step.target_role)
+                return _cur
+            # 「不忙」≠「可用」：role_liveness 对没有 pane 的角色返回 busy=False、
+            # reason=session=dead，只看 busy 就会把任务改投给一个不存在的 pane。
+            # 实测 wf_94299e0ffd00 / wf_50c4b4363b4d / wf_0bb82ef2edd2 三条 s0 改投 pg
+            # 后全部 notified 挂到 timeout_count=4 被 cancel，而 tmux 从未有过 ccs-pg。
+            # 只认 True：None（探测失败）按不可用处理，宁可排队不误投。
+            _alt_alive = self._is_agent_alive(_alt)
+            if _alt_alive is not True:
+                LOGGER.debug("dev pool: %s 无 pane（探测=%s）→ %s/%s 保持 %s",
+                             _alt, _alt_alive, str(_inst_id)[:12], step.id, step.target_role)
                 return _cur
         except Exception as _e:
             LOGGER.debug("_resolve_effective_role 探测失败，保持 %s: %s", step.target_role, _e)

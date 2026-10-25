@@ -89,12 +89,19 @@ def _engine(tmp: Path):
 
     必须用 with 收尾：类级 patch 泄漏到后续用例会让整轮 10 条无关用例全红
     （本轮实测：.start() 不 stop，stability/chain_convergence 一起挂）。
+
+    _is_agent_alive 默认 True：本文件的绝大多数用例只关心「错误态闸」，
+    它们不该被「本机此刻 pg 有没有 pane」这种环境状态左右 —— 真实机器上
+    pg 常年没有 pane，不钉住前提会让这些用例变成环境依赖的假红。
+    需要证明 pane 闸本身的用例显式覆盖它（见 test_redirect_skipped_when_alt_pane_missing）。
     """
     eng = WorkflowEngine(workflows_dir=tmp)
     eng._is_role_busy = MagicMock(return_value=False)
     _lm = MagicMock()
     with patch.object(type(eng), "_lifecycle", new_callable=PropertyMock,
-                      return_value=_lm):
+                      return_value=_lm), \
+            patch.object(type(eng), "_is_agent_alive",
+                         staticmethod(lambda role, fresh=False: True)):
         yield eng, _lm
 
 
@@ -171,3 +178,40 @@ def test_pinned_erroring_role_is_unpinned():
     assert eff == "engineer", "钉住的角色进错误态时必须退回模板角色"
     _sql, _args = lm.execute.call_args[0]
     assert json.loads(_args[0]) == {"s0": "engineer"} and _args[1] == "engineer"
+
+
+def test_redirect_skipped_when_alt_pane_missing():
+    """角色池不得把步骤改投到**没有 pane** 的角色。
+
+    现场：wf_94299e0ffd00 / wf_50c4b4363b4d / wf_0bb82ef2edd2 三条 food_chain_loop 的
+    s0 被改投给 pg，而 `tmux ls` 里从来没有 ccs-pg（status-role pg → alive:false）。
+    三条全是 notified 挂到 timeout_count=4 被 cancel。
+
+    role_erroring 挡不住这一族：它只看转录最后一轮是不是 API 错误。pg 目录的
+    最后一条恰好也是 429，所以闸门「碰巧」生效；一旦转录换成任何非错误轮
+    （或目录被清理），改投照样发生 —— 判据必须是 pane 存在本身。
+    """
+    with _transcripts({"pg": [_asst("已提交 src/w.py:7，5 passed")]}), \
+            _engine(Path(tempfile.mkdtemp())) as (eng, lm), \
+            patch.object(type(eng), "_is_agent_alive", staticmethod(lambda role, fresh=False: role != "pg")):
+        eff = eng._resolve_effective_role({"instance_id": "wf_t4"}, _step(), {})
+    assert eff == "engineer", "备选角色没有 pane 时不得改投"
+    lm.execute.assert_not_called()
+
+
+def test_pinned_role_without_pane_is_unpinned():
+    """已钉住、但角色没有 pane 时必须解钉回模板角色。
+
+    这一支与上面那条走的是不同分支：上面是「还没钉 → 别钉」，这里是「已经钉死了
+    → 必须解开」。缺它则被写坏的 effective_roles 永远修不回来，因为沿用分支只看
+    role_erroring，而 pane 缺失的角色转录完全可能健康（401 恢复后、目录被清理后）。
+    现场 6 条死链里有 3 条属于这一支：钉在从不存在的 pg 上，一直挂到 timeout_count=4。
+    """
+    inst = {"instance_id": "wf_t5", "effective_roles": json.dumps({"s0": "pg"})}
+    with _transcripts({"pg": [_asst("已提交 src/v.py:3，4 passed")]}), \
+            _engine(Path(tempfile.mkdtemp())) as (eng, lm), \
+            patch.object(type(eng), "_is_agent_alive", staticmethod(lambda role, fresh=False: role != "pg")):
+        eff = eng._resolve_effective_role(inst, _step(), {})
+    assert eff == "engineer", "钉住但无 pane 的角色必须解钉"
+    _sql, _args = lm.execute.call_args[0]
+    assert json.loads(_args[0]) == {"s0": "engineer"} and _args[1] == "engineer", "解钉必须落库"
