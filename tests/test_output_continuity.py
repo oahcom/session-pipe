@@ -18,6 +18,15 @@ from pathlib import Path
 
 import pytest
 
+# 这是**生产健康守卫**（由 ~/.hermes/scripts/test_executor.py 以脚本方式每日跑），
+# 不是单元测试：产线空闲时它本来就该红（实测 24h 真实产出 13 < 100）。
+# 被 pytest 收集时默认跳过，避免"开发套件红"和"产线饿"两件事混在一起；
+# 需要的话用 HERMES_PROD_ASSERT=1 pytest tests/test_output_continuity.py 强制跑。
+if __name__ != "__main__" and os.environ.get("HERMES_PROD_ASSERT") != "1":
+    import pytest as _pytest
+    _pytest.skip("生产吞吐守卫：由 te-daily-test 执行（HERMES_PROD_ASSERT=1 可强制）",
+                 allow_module_level=True)
+
 DEFAULT_DB = Path.home() / ".hermes" / "sister_bus" / "blackboard.db"
 # 这条测的是**生产** bus 的连续性。跟着 HERMES_BLACKBOARD_DB 走只会读到 conftest
 # 重定向的临时库 —— 于是「过去 24h 无产出即数据源断了」的断言由测试自己写的数据
