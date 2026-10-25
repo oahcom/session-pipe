@@ -1324,16 +1324,20 @@ class StepHandlerMixin:
         # 内会被整条吞掉（连 bus 都不写）——实测 test_tick_paths 的 schema 用例先
         # 占了键，verify 用例的消息再也发不出去，主分支直接变红。频率控制交给
         # _gate_alert 的退避（5/10/20/40/80min），不靠吞消息。
+        # 标题契约要照抄 exit_condition.text_contains：模板要求的是
+        # "<模板>/<step>-complete"，只写 "<step>-complete" 时角色照做也永不匹配。
+        _tc = ((getattr(step, 'exit_condition', None) or {}).get('text_contains')
+               or step.id + '-complete')
+        # exit_messages 落库后，:426 tick rescue 先命中并在 :450 return，主路径 :1080
+        # 再也走不到 → 重写声明不会被消费（实测 wf_37b76f7b32/s3 空转 1679 tick 到
+        # 24h 回收）。但宽松推进 :868 时 exit_messages 尚未落库，改对标题重写仍有效。
+        _tail = ("补/修上述产出即可（闸门每 tick 自动重评，重写完成声明不会推进本步）。"
+                 if self._step_sd(run, step).get("exit_messages") else
+                 f"补齐上述产出后重新写 bus 完成声明（标题必须含 {_tc}），否则本步无法推进。")
         try:
             self._notify_role(
                 self._eff_role(run, step), msg,
-                f"{run.workflow_name}/{step.id}（实例 {run.id}）闸门未通过："
-                # 标题契约要照抄 exit_condition.text_contains：模板要求的是
-                # "<模板>/<step>-complete"，这里只写 "<step>-complete" 时角色照做也
-                # 永不匹配（69 个步骤是长形态）→ 闸门提示成了死指令。
-                f"补齐上述产出后重新写 bus 完成声明（标题必须含 "
-                f"{(getattr(step, 'exit_condition', None) or {}).get('text_contains') or step.id + '-complete'}），"
-                f"否则本步无法推进。")
+                f"{run.workflow_name}/{step.id}（实例 {run.id}）闸门未通过：{_tail}")
         except Exception as _e:
             LOGGER.debug("gate prompt to role failed: %s", _e)
 

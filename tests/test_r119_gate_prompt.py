@@ -26,6 +26,7 @@ def _fake():
     # 单线程 tick 会被 N 个卡步叠成 90s×N 阻塞（三方审查 B-1）
     fake._notify_role = MagicMock()
     fake._eff_role = MagicMock(return_value="pg")
+    fake._step_sd = StepHandlerMixin._step_sd
     return fake
 
 
@@ -54,6 +55,25 @@ def test_notify_failure_does_not_raise():
     fake._notify_role.side_effect = RuntimeError("ccs send failed")
     StepHandlerMixin._gate_prompt(fake, _run(), _step(), "x")
     print("✅ 提示失败不阻断闸门 ✓")
+
+
+def test_anchored_exit_stops_asking_for_rewrite():
+    """exit_messages 已落库时不能叫角色重写声明——那条消息不会被消费。"""
+    fake = _fake()
+    run = _run()
+    run.step_results["s1"] = {"exit_messages": [{"id": 1}], "status": "running"}
+    StepHandlerMixin._gate_prompt(fake, run, _step(), "x")
+    title = fake._notify_role.call_args[0][2]  # (role, msg, evidence)；文案在 evidence
+    assert "重写完成声明不会推进本步" in title, f"应告知重写无效，实际 {title}"
+
+
+def test_unanchored_exit_still_asks_for_rewrite():
+    """宽松推进路径 exit_messages 未落库，改对标题重写仍是有效动作，不能被掐掉。"""
+    fake = _fake()
+    StepHandlerMixin._gate_prompt(fake, _run(), _step(), "x")
+    evidence = fake._notify_role.call_args[0][2]
+    assert "重新写 bus 完成声明" in evidence, f"应保留重写指引，实际 {evidence}"
+
 
 
 if __name__ == "__main__":
