@@ -408,7 +408,7 @@ class WorkflowRun:
 # ── 混入模块：方法签名和 self 访问完全不变 ─────────────────────────
 # 注意：混入导入必须放在 dataclass 定义之后，mixin 顶层依赖这些类。
 from pipeflow.step_handler import StepHandlerMixin, _queue_budget_sec
-from pipeflow.role_lifecycle import RoleLifecycleMixin
+from pipeflow.role_lifecycle import RoleLifecycleMixin, role_erroring
 from pipeflow.task_generator import TaskGeneratorMixin
 from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
                                    _role_producing_recently)
@@ -720,38 +720,64 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         busy 门控 / exit_schema 的 workspace / codex 的 cwd）。只在投递处换参数时，
         pg 以 src=pg 写的产出因过滤条件仍是 engineer 而永不被认可 → 步骤必然超时。
 
-        择一规则：仅当目标属池且对侧空闲时重定向；已决定过则沿用（防 tick 间
-        反复横跳）；探测失败或两者都忙 → 保持模板值（宁排队不误投）。
+        择一规则：仅当目标属池且对侧空闲**且可用**时重定向；已决定过则沿用（防
+        tick 间反复横跳）；探测失败或两者都忙 → 保持模板值（宁排队不误投）。
+
+        「空闲」≠「可用」：被 429/断连打停的角色判忙为假（没有在跑的步骤）、
+        _role_producing_recently 又因转录仍在写而判真 → 改投过去只能白等到超时
+        （3 条 food_chain_loop 的 s0 钉在 pg 上等到 timeout_count=4 被 cancel）。
+        故改投与**沿用已有决定**两条路都要过 role_erroring 闸。
 
         历史坑：原实现引用被删除的 _DEV_ROLE_POOL → NameError 被外层 except
         吞掉 → 每个 tick 的生产工作流扫描整体失败。故池常量必须与本方法同文件。
         """
         from liveness import effective_role as _eff_role
         _cur = _eff_role(inst, step.id, fallback=step.target_role)
+        _inst_id = inst.get("instance_id") if isinstance(inst, dict) else getattr(inst, "id", "")
         if _cur != step.target_role:
-            return _cur  # 已有持久化决定 → 沿用
+            if not role_erroring(_cur):
+                return _cur  # 已有持久化决定 → 沿用
+            # 钉住的角色进了错误态：解钉回模板角色。缺这一步时闸门对已写坏的
+            # effective_roles 完全无效 —— 而现场那 3 条正是「先钉上、后 429」。
+            LOGGER.info("dev pool: 钉住的 %s 处于 API 错误态 → %s/%s 退回 %s",
+                        _cur, str(_inst_id)[:12], step.id, step.target_role)
+            self._pin_effective_role(_inst_id, step.id, step.target_role)
+            return step.target_role
         if step.target_role not in _DEV_ROLE_POOL:
             return _cur
         _alt = next((r for r in _DEV_ROLE_POOL if r != step.target_role), None)
         if not _alt:
             return _cur
-        _inst_id = inst.get("instance_id") if isinstance(inst, dict) else getattr(inst, "id", "")
         try:
             if self._is_role_busy(_alt, exclude_wf_id=_inst_id or "", pane_fallback=False):
                 return _cur  # 两个都忙 → 排队
+            if role_erroring(_alt):
+                # 每 tick 都会走到这里且不落库，故只留 DEBUG（INFO 会刷成每小时数千行）
+                LOGGER.debug("dev pool: %s 处于 API 错误态 → %s/%s 保持 %s",
+                             _alt, str(_inst_id)[:12], step.id, step.target_role)
+                return _cur
         except Exception as _e:
             LOGGER.debug("_resolve_effective_role 探测失败，保持 %s: %s", step.target_role, _e)
             return _cur
-        try:
-            if _inst_id:
-                self._lifecycle.execute(
-                    "UPDATE workflow_instances SET effective_roles=?, assignee=? WHERE instance_id=?",
-                    (json.dumps({step.id: _alt}, ensure_ascii=False), _alt, _inst_id))
-        except Exception as _e:
-            LOGGER.debug("effective_roles 持久化失败 %s: %s", _inst_id, _e)
+        self._pin_effective_role(_inst_id, step.id, _alt)
         LOGGER.info("dev pool: %s 忙 → %s/%s 改投空闲的 %s",
                     step.target_role, str(_inst_id)[:12], step.id, _alt)
         return _alt
+
+
+    def _pin_effective_role(self, inst_id: str, step_id: str, role: str) -> None:
+        """把本步执行角色写进实例（effective_roles + assignee），失败只留痕。
+
+        下游全部按角色取值（exit_messages 过滤 / busy 门控 / exit_schema 的
+        workspace / codex 的 cwd），所以选角色与落库必须同一个动作。
+        """
+        try:
+            if inst_id:
+                self._lifecycle.execute(
+                    "UPDATE workflow_instances SET effective_roles=?, assignee=? WHERE instance_id=?",
+                    (json.dumps({step_id: role}, ensure_ascii=False), role, inst_id))
+        except Exception as _e:
+            LOGGER.debug("effective_roles 持久化失败 %s: %s", inst_id, _e)
 
 
     def start(self, name: str, context: dict = None, initiator: str = None) -> str:

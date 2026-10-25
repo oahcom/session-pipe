@@ -151,6 +151,17 @@ def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AG
     return False
 
 
+def role_erroring(role: str) -> bool:
+    """角色是否停在 API 错误上（不可投递）—— 「转录在写」不等于「在干活」。
+
+    复用 _transcript_last_turn_is_api_error：结构字段 isApiErrorMessage + 同一份
+    错误词表（429/403/Please run /login/断连），不另立第二套判据。
+    max_age=inf：错误不会因为「过了两分钟」就变成可用，恰恰相反——429 的角色
+    往往几小时不再产出，按 120s 窗口判会把它们读成健康。
+    """
+    return _transcript_last_turn_is_api_error(role, max_age=float("inf"))
+
+
 def _transcript_progress_after_error(role: str) -> bool:
     """最新一轮里是否**真的**有了进展（有工具调用的 assistant 轮）。
 
