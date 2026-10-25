@@ -38,8 +38,14 @@ class _FakeRun:
 
         r = _R()
         if len(cmd) > 2 and cmd[1] == "search":
-            r.stdout = json.dumps({"facts": self.search_facts})
-            r.returncode = 0
+            # 只认带 --json 的调用：不带时 bus_client 输出人读文本，解析必然失败。
+            # 这样删掉 --json 会立刻红灯，而不是留在假绿里。
+            if "--json" in cmd:
+                r.stdout = json.dumps({"facts": self.search_facts})
+                r.returncode = 0
+            else:
+                r.stdout = "No results."
+                r.returncode = 0
             return r
         bad = self.returncode or any(s in cmd[3] for s in self.fail_substrings)
         r.returncode = 1 if bad else 0
@@ -57,8 +63,12 @@ def env(monkeypatch, tmp_path):
     return {"writes": fake.writes, "fake": fake, "root": tmp_path}
 
 
-def _run_once(env, role="pm"):
-    """驱动一轮 _evaluate_with（空 workspace → quality=negative）。"""
+def _run_once(env, role="pm", stored_sig=None):
+    """驱动一轮 _evaluate_with（空 workspace → quality=negative）。
+
+    stored_sig 会写进 workflow_logs 并让 _load_assessed 重新播种，用来测"重启后按
+    库里的签名判断"这条真实路径（只改内存测不到 os.execv 之后的行为）。
+    """
     ws = env["root"] / "ccs-workspaces" / role
     ws.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(":memory:")
@@ -67,6 +77,15 @@ def _run_once(env, role="pm"):
         "status TEXT, created_at REAL, updated_at REAL)"
     )
     db.execute("CREATE TABLE workflow_instances (task_id TEXT, step_results TEXT)")
+    # id 自增列必须在：_load_assessed 用 ORDER BY id DESC 取最近记录
+    db.execute("CREATE TABLE workflow_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "task_id TEXT, action TEXT, actor TEXT, detail TEXT, ts REAL)")
+    if stored_sig:
+        db.execute("INSERT INTO workflow_logs(task_id, action, actor, detail, ts) "
+                   "VALUES ('t1','evidence_assessed','task_evidence',?,?)",
+                   (stored_sig, time.time()))
+        te._LAST_ASSESSMENT.clear()
+        te._SEEN_LOADED = False
     db.execute(
         "INSERT INTO tasks VALUES ('t1','测试任务',?,'completed',?,?)",
         (role, time.time() - 60, time.time() - 30),
@@ -172,8 +191,28 @@ def test_other_role_fact_is_not_evidence(env):
 
 
 def test_old_signature_version_is_reassessed(env):
-    """旧版本签名的历史记录不能再挡住重评估（版本 3→4 的目的）。"""
-    te._LAST_ASSESSMENT["t1"] = "negative||3"
-    _run_once(env)
+    """库里存的旧版本签名（重启后 _load_assessed 播种）不能挡住重评估。"""
+    _run_once(env, stored_sig="negative||3")
     assert env["writes"], "旧版本签名应被当作未评估"
     assert te._LAST_ASSESSMENT["t1"].endswith("|4"), te._LAST_ASSESSMENT
+
+
+def test_same_version_signature_from_db_is_skipped(env):
+    """库里的当前版本签名要生效：重启后不该把同一 fact 再写一遍（写放大）。"""
+    _run_once(env)
+    sig = te._LAST_ASSESSMENT["t1"]
+    before = len(env["writes"])
+    _run_once(env, stored_sig=sig)
+    assert len(env["writes"]) == before, "同签名重启后应跳过"
+
+
+def test_feedback_failure_but_blocker_ok_is_retried(env):
+    """feedback 失败、blocker 成功：整体不得落账，下轮 feedback 必须重写。"""
+    env["fake"].fail_substrings = ["质量: negative"]
+    _run_once(env)
+    assert te._LAST_ASSESSMENT.get("t1") is None, "部分失败不得落账"
+    env["fake"].fail_substrings = []
+    before = len(env["writes"])
+    _run_once(env)
+    assert any("质量: negative" in w for w in env["writes"][before:]), \
+        "下轮应重写 feedback"

@@ -65,8 +65,8 @@
 - **删掉不可达分支**：`_classify_outputs` 里 n>=1 即判 neutral，所以 negative ⇒ 必无回话
   （反之不然：小于 2KB 的单文件产出也是 `role_spoke=False` 的 neutral），原 `elif quality=="negative"`
   （self-reflect + TASKS.md 回写）恒不执行 ——
-  连同唯一调用点 `_append_role_feedback` 一并删除（本轮 src/task_evidence.py 净 -66 行，
-  `git diff --numstat 5b07873..HEAD` 实测 +58/−124），R161 的结论也从
+  连同唯一调用点 `_append_role_feedback` 一并删除（本轮 src/task_evidence.py 净 -67 行，
+  `git diff --numstat 5b07873..HEAD` 实测 +58/−125 = 净 −67），R161 的结论也从
   「negative 分两路」简化为「negative == 引擎空推进，只发 blocker」。
 - **签名单点落账**（codex 第 6 轮 important）：原实现 feedback 成功即落账，blocker 失败时
   下轮被 `_already_reported` 跳过、永不重试 → 改为一轮内所有 bus 写入都成功才落账
@@ -87,7 +87,8 @@
   否则升级后仍直接 continue，历史上 blocker 写失败的 task 永远不会重试。
 - 连带删掉 role_lifecycle 的「## 历史教训」保留块：唯一写 - [negative] 的
   _append_role_feedback 已随死分支删除，全仓无生产者、现有 TASKS.md 里 0 条命中 —— 纯死逻辑。
-  对应 test_negative_lessons_survive_rewrite（断言缺失文件时不写，恒成立，防不住回退）一并删除。
+  对应 test_negative_lessons_survive_rewrite 一并删除：**用例本身是好的**（seed 教训再断言存活），
+  删是因为这条行为被有意取消（生产者没了），不是因为测试恒真；将来恢复写入方要一起恢复该用例。
 - 测试收紧：断言首轮写的是 feedback + blocker（不是 blocker + blocker）；TASKS.md 先 seed 再断言不变。
 
 ## 2026-10-22 — temp-pr-branch 合入 main（漂移收敛，35 文件 / 4 处 modify-delete）## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效

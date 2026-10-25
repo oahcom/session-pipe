@@ -64,14 +64,19 @@ def _load_assessed(db) -> None:
         pass
 
 
-def _record_assessed(db, task_id, sig) -> None:
+def _record_assessed(db, task_id, sig) -> bool:
+    """签名落库（跨 os.execv 存活）。失败不能静默：内存已置位，库侧没有这条
+    → 下次 re-exec 会当没评估过、把同一 fact 再写一遍（写放大复发）。"""
     try:
         db.execute("INSERT INTO workflow_logs(task_id, action, actor, detail, ts) "
                    "VALUES(?,?,?,?,?)",
                    (task_id, "evidence_assessed", "task_evidence", sig, time.time()))
         db.commit()
-    except Exception:
-        pass
+        return True
+    except Exception as _e:
+        print(f"[task_evidence] 签名落库失败 task={task_id}（下次重启会重写）: {_e}",
+              file=sys.stderr)
+        return False
 
 # 产出收益判定不依赖部署路径：文档类产出留在 workspace 即为交付
 
@@ -190,15 +195,20 @@ def _evaluate_with(db, hours: float = 1):
         """
         try:
             _r = subprocess.run(
-                [str(BUS_CLIENT), "search", tid, "--limit", "20", "--json"],
+                # limit 100 而不是 20：自评模块对同一 task 会写 2~3 条 fact，
+                # 窗口太小时角色自己的消息可能被挤出去（limit 在 src 过滤之前生效）。
+                [str(BUS_CLIENT), "search", tid, "--limit", "100", "--json"],
                 capture_output=True, text=True, timeout=15)
             _data = json.loads(_r.stdout)
+            _facts = _data.get("facts") or _data.get("results") or _data.get("items") or []
+            # 只有"角色自己说的"才算回话：自评模块/引擎/巡检/其他角色都按 task_id 写 fact，
+            # 算进来等于让别人替角色作证（negative → neutral）。
+            # 全段落都在 try 内：bus_client 输出异常形状（list/None/非 dict 元素）必须降级为
+            # "无证据"，不能抛出去把整轮评估打断。
+            return any(isinstance(f, dict) and (f.get("src") or "") == role
+                       for f in _facts)
         except Exception:
             return False
-        _facts = _data.get("facts") or _data.get("results") or _data.get("items") or []
-        # 只有"角色自己说的"才算回话：自评模块/引擎/巡检/其他角色都按 task_id 写 fact，
-        # 算进来等于让别人替角色作证（negative → neutral）。
-        return any((f.get("src") or "") == role for f in _facts)
 
     # 预查: 每个任务关联的 workflow_instances 中 exit_messages 或 summary 写入情况
     _wf_evidence = {}
