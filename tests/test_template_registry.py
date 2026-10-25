@@ -202,6 +202,36 @@ def test_upsert_rejects_bad_structure():
         assert rows, "好结构模板应写入 DB"
 
 
+# ── 9b. 前缀模板没有裸名行时不进「刷新」分支 ──
+def test_prefixed_template_skips_missing_alias(caplog):
+    """WL- 前缀模板没有裸名行时不得判 stale。
+
+    旧实现把「查不到行」当 stale → 每 tick 对 0 行 UPDATE 并打一条
+    「刷新 0 个步骤定义」（实测 19 模板 × 10s = 6,707 行/小时）。
+    """
+    import logging as _logging
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from pipeflow.engine import WorkflowEngine, WorkflowDef, Step
+    with tempfile.TemporaryDirectory() as tmp:
+        wf_dir = Path(tmp) / "wf"
+        wf_dir.mkdir()
+        eng = WorkflowEngine(workflows_dir=wf_dir, db_path=str(Path(tmp) / "t.db"))
+        wf = WorkflowDef(
+            name="WL-99", title="t", description="d",
+            steps=[Step(id="s1", title="t", target_role="engineer", prompt_template="p",
+                        exit_condition={"type": "exit_message", "match": "done"})],
+        )
+        eng._upsert_template("WL-99", wf)
+        caplog.set_level(_logging.WARNING, logger="workflow.engine")
+        caplog.clear()
+        eng._upsert_template("WL-99", wf)   # 第二遍：DB 已同步，不应再刷新
+        noisy = [r.getMessage() for r in caplog.records if "刷新" in r.getMessage()]
+        assert not noisy, f"无裸名行却仍判 stale: {noisy}"
+        assert not eng._lifecycle.query(
+            "SELECT 1 FROM workflow_templates WHERE template_id='99'"), "不得凭空建裸名行"
+
+
 # ── 10. 双节点端到端闭环（完整推进链） ──
 def test_dual_node_full_cycle():
     """start → run_once → complete_step(s0) → run_once(s1 dual_node) → complete_step(s1) → run_once → 引擎推进。验证完整生命周期。"""

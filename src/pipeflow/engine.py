@@ -868,10 +868,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     _sj = json.dumps(list(_by_id.values()), ensure_ascii=False)
                     # 逐键比对而不是只看 _changed：规范行可能早已同步，而裸名别名行
                     # 自己漂移（子链按裸名读模板）。只认 _changed 时别名永不自愈。
-                    _stale = [t for t in _template_ids(name)
-                              if (self._lifecycle.query(
-                                  "SELECT steps_json FROM workflow_templates WHERE template_id=?",
-                                  (t,)) or [[None]])[0][0] != _sj]
+                    # 裸名别名行可能根本不存在（表里只有 WL-01，没有 01）。把「无此行」
+                    # 当 stale 会每 tick 对 0 行 UPDATE 并打一条「刷新 0 个步骤定义」：
+                    # 实测 19 模板 × 10s = 6,707 行/小时纯噪音 + 同样次数的空写锁。
+                    _stale = []
+                    for _tid in _template_ids(name):
+                        _r = self._lifecycle.query(
+                            "SELECT steps_json FROM workflow_templates WHERE template_id=?", (_tid,))
+                        if _r and _r[0][0] != _sj:
+                            _stale.append(_tid)
                     if _stale:
                         LOGGER.warning("[wf] 模板 %s 刷新 %d 个步骤定义（JSON 为权威源，行 %s）",
                                        name, _changed, ",".join(_stale))
