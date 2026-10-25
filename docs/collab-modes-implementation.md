@@ -1,7 +1,7 @@
 # 步骤级协作声明（guard / wait_roles）
 
 > 更新: 2026-10-22 | 代码: `src/pipeflow/engine.py`（`Step` 字段、加载校验、守护消费）+ `src/pipeflow/step_handler.py`（协作门）
-> 原设计稿 `guard_track_design.md` 与收编方案 `collab-modes-to-workflow.md` 已删除（结论已并入本文）。
+> 原设计稿 `guard_track_design.md` 已删除；收编方案 [collab-modes-to-workflow.md](collab-modes-to-workflow.md) 保留为设计记录（四种模式→workflow 原语的映射来由），现状以本文为准。
 
 ## 1. 现状（2026-10-22 实测）
 
