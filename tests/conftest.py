@@ -9,6 +9,11 @@ from pathlib import Path
 
 # 确保 src/ 在 sys.path 最前面（各测试文件的 sys.path.insert 在模块顶层执行，
 # 但 conftest 先于测试模块加载，此时 paths 等 src/ 模块尚不可 import）
+# 进程内跑 daemon_loop 的用例（tests/test_workflow_daemon.py）不能热重载：并发 session
+# 改 src/** 会触发 os.execv，把 pytest 换成 daemon —— 整套测试静默中止、退出码 0、无 summary
+# （实测多次在 96%~99% 截断）。置位后 daemon 只跳过"源码变更"判断，其余行为不变。
+os.environ["WF_NO_REEXEC"] = "1"
+
 _src = str(Path(__file__).resolve().parent.parent / "src")
 if _src in sys.path:
     sys.path.remove(_src)

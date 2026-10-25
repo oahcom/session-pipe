@@ -64,6 +64,10 @@ def _parse_tick_sec(name, default):
 # （多 session 同时改 src/**），每次重执行都丢掉当前 tick 并重跑启动流程。
 # 不是禁用热加载（分支上的修复就永远不生效），而是限速：最多 1 次 / 5 分钟。
 _RELOAD_MIN_INTERVAL_SEC = 300
+# 测试进程内跑 daemon_loop 时禁用热重载：仓库被并发编辑时 os.execv 会把 pytest
+# 进程整个换成 daemon，整套测试静默中止且**退出码 0、无 summary**（实测多次在
+# 96%~99% 处截断，被误当"跑了就是绿"）。conftest 里置 WF_NO_REEXEC=1。
+_NO_REEXEC = os.environ.get("WF_NO_REEXEC") == "1"
 
 
 def _reload_decision(now_mtime, seen_mtime, pending_mtime, now_ts, last_reload_ts,
@@ -122,8 +126,15 @@ _STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后切换退避�
 _SHUTDOWN_GRACE_SEC = 10
 
 
-def _force_exit_after(sec: float) -> None:
-    time.sleep(sec)
+def _force_exit_after(sec: float, done: threading.Event) -> None:
+    """到点仍未正常退出才强杀；正常退出后这个线程必须失效。
+
+    原实现无条件 os._exit：daemon_loop 正常返回后线程仍会在 sec 秒后开火 ——
+    测试进程里跑 daemon_loop（tests/test_workflow_daemon.py）就会在**别的用例中途**
+    把 pytest 杀掉，退出码 0 且无 summary（实测整套测试反复在 96%~99% 静默截断）。
+    """
+    if done.wait(sec):
+        return
     LOGGER.warning("优雅关闭超时 %.0fs，强制退出", sec)
     logging.shutdown()
     os._exit(0)
@@ -349,6 +360,7 @@ def daemon_loop(interval: int):
 
     eng = WorkflowEngine()
     shutdown = False
+    _loop_done = threading.Event()  # 正常退出后让强制退出线程失效
 
     def _handler(s, f):
         nonlocal shutdown
@@ -359,8 +371,8 @@ def daemon_loop(interval: int):
         # deactivating —— 2026-10-22 实测两次、最长 >4min，TimeoutStopSec=15 未生效。
         # 到点强制退出，Restart=always 用新代码拉起。SQLite 走 WAL，未提交事务由
         # journal 回滚，不会留半写状态。
-        threading.Thread(target=_force_exit_after, args=(_SHUTDOWN_GRACE_SEC,),
-                         daemon=True).start()
+        threading.Thread(target=_force_exit_after,
+                         args=(_SHUTDOWN_GRACE_SEC, _loop_done), daemon=True).start()
 
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _handler)
@@ -443,7 +455,8 @@ def daemon_loop(interval: int):
                     # 若此后没人再改代码，daemon 会一直跑旧代码（codex P1）。
                     _now_ts = time.time()
                     _pending_mtime, _do_reload = _reload_decision(
-                        _src_mtime(), _seen_mtime, _pending_mtime, _now_ts, _last_reload)
+                        _seen_mtime if _NO_REEXEC else _src_mtime(),
+                        _seen_mtime, _pending_mtime, _now_ts, _last_reload)
                     if _pending_mtime > _seen_mtime:
                         if not _do_reload:
                             # 同一 mtime 只记一次：限速期内每 tick 都探到它，逐 tick 打印
@@ -482,6 +495,7 @@ def daemon_loop(interval: int):
     except Exception as e:
         LOGGER.error("Daemon 主循环异常: %s", e, exc_info=True)
     finally:
+        _loop_done.set()
         LOGGER.info("正在关闭 Workflow Daemon...")
         if _LOCK_FD is not None:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
