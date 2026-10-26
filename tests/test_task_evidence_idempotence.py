@@ -224,10 +224,14 @@ def test_feedback_failure_but_blocker_ok_is_retried(env):
 
 
 def test_feedback_title_is_stable(env):
-    """标题只含 task_id/角色/质量：带文件数或措辞会让 bus 的 UPSERT 变成插新行。"""
+    """标题逐字等于常量格式：带文件数/措辞会让 bus 的 UPSERT 变成插新行。
+
+    断言整串而不是"不含某个子串"——negative 的 detail 本来就不含"个产出文件"，
+    子串断言抓不到"又把 detail 拼回标题"的回归。
+    """
     _run_once(env)
     title = next(w for w in env["writes"] if "质量:" in w)
-    assert "t1" in title and "个产出文件" not in title, title
+    assert title == "[task_evidence] t1 pm — 质量: negative", title
 
 
 def test_mixed_fact_payload_uses_valid_entries(env):
@@ -297,3 +301,17 @@ def test_limit_does_not_starve_tasks_beyond_ten(env):
         db.close()
     assert "t11" in te._LAST_ASSESSMENT, "第 11 个任务被 LIMIT 饿死了"
     assert "t10" in te._LAST_ASSESSMENT, "第 10 个任务应被评估"
+
+
+def test_bus_search_exception_means_no_evidence(env, monkeypatch):
+    """search 抛异常（超时/子进程崩）→ 降级为无证据，不能打断整轮评估。"""
+    fake = env["fake"]
+
+    def boom(cmd, **kw):
+        if len(cmd) > 2 and cmd[1] == "search":
+            raise TimeoutError("bus timeout")
+        return fake(cmd, **kw)
+
+    monkeypatch.setattr(te.subprocess, "run", boom)
+    _run_once(env)
+    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
