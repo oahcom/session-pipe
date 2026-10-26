@@ -63,6 +63,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(te.subprocess, "run", fake)
     monkeypatch.setattr(te, "WORKSPACES", tmp_path / "ccs-workspaces")
     te._LAST_ASSESSMENT.clear()
+    te._SEEN_LOADED = False  # 不清会让下个用例读不到自己 seed 的签名（用例间状态耦合）
     return {"writes": fake.writes, "fake": fake, "root": tmp_path}
 
 
@@ -246,3 +247,16 @@ def test_search_failure_still_honours_content(env):
     env["fake"].search_rc = 1
     _run_once(env)
     assert not any("零回话零产出" in w for w in env["writes"]), env["writes"]
+
+
+def test_signature_dropped_when_db_record_fails(env, monkeypatch):
+    """库侧签名写失败时撤掉内存签名，下一轮重写（标题稳定，重写不会插新行）。"""
+    orig = te._record_assessed
+    monkeypatch.setattr(te, "_record_assessed", lambda *a, **k: False)
+    _run_once(env)
+    assert te._LAST_ASSESSMENT.get("t1") is None, "落库失败不得留在内存里"
+    monkeypatch.setattr(te, "_record_assessed", orig)  # 只恢复这一处；undo() 会把假 subprocess 也撤掉
+    before = len(env["writes"])
+    _run_once(env)
+    assert len(env["writes"]) > before, "下一轮应重写"
+    assert te._LAST_ASSESSMENT.get("t1") is not None, "落库成功后才记签名"

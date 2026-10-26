@@ -110,9 +110,10 @@
 - `pytest tests/test_task_evidence_scoring.py tests/test_task_evidence_quality_gate.py` → 15 passed。
 - `pytest tests/` 全量 → 1391 passed / 0 failed（`--junit-xml` 记录）。
 - `python3 scripts/doccheck.py` → CLEAN（exit 0）。
-- 回填实测：`--hours 24` → 51 条重算。宽松取样时 48 positive / 3 neutral；
-  收紧取样后 32 positive / 15 neutral / 4 negative（`_DETAIL_VERSION` 变更后同一 task 会写新 fact，
-  旧 fact 仍留在库里，消费方取最近一条）。
+- 回填实测（当轮实测，窗口数据会随时间变化）：`--hours 24` → 51 条重算。宽松取样时 48 positive / 3 neutral；
+  收紧取样后 32 positive / 15 neutral / 4 negative。
+  ⚠️ 当时写的"版本变更后同一 task 会写新 fact、旧 fact 留库里"已被 2026-10-26 的**稳定标题**推翻：
+  标题只含 task_id/role/quality，同一结论在不同版本下走 UPSERT 覆盖，不再插新行。
 
 ### 已知边界
 - 历史 bus 里已写的假中性 fact 不会被删除：消费方取最近一条；判据/文案再次变更时靠
@@ -131,7 +132,7 @@
   下轮被 `_already_reported` 跳过、永不重试 → 改为一轮内所有 bus 写入都成功才落账
   （`_bus_write` 助手 + 统一 `if _ok`）。
 - 测试 `tests/test_task_evidence_idempotence.py` 5 条：新增 `test_blocker_failure_is_retried`
-  覆盖混合成败；三个 task_evidence 文件 22 passed。
+  覆盖混合成败（当时三个 task_evidence 文件 22 passed；此后用例持续增加，当前以各轮实测为准）。
 - **codex nit 驳回（有据）**：点文件排除会漏掉 `.gitignore`/`.env.example` —— 全量 workspace 实测
   ≥1KB 的点文件仅 14 个，全是 `.coverage`/`*.log`/`*.sh` 临时物，无一为交付物。
 

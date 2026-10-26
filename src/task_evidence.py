@@ -281,8 +281,10 @@ def _evaluate_with(db, hours: float = 1):
 
     def _bus_write(*args) -> bool:
         try:
+            # 30s 而不是 10s：bus 持锁峰值实测 9.8s（CHANGES 2026-10-22），
+            # 10s 会把"慢但成功"判成失败 → 每 tick 重试、且签名永不落账。
             return subprocess.run(
-                [str(_bus), "write", *args], capture_output=True, timeout=10
+                [str(_bus), "write", *args], capture_output=True, timeout=30
             ).returncode == 0
         except Exception:
             return False
@@ -324,7 +326,10 @@ def _evaluate_with(db, hours: float = 1):
                 "--src", "task_evidence") and _ok
         if _ok:
             _LAST_ASSESSMENT[a["task_id"]] = _sig
-            _record_assessed(db, a["task_id"], _sig)
+            if not _record_assessed(db, a["task_id"], _sig):
+                # 库侧没落账：撤掉内存签名让下轮重来。标题已稳定（见上面注释），
+                # 重写只刷新同一条 fact 的 ts，不会再插新行 —— 放大风险已消除。
+                _LAST_ASSESSMENT.pop(a["task_id"], None)
     _window_ids = {r[0] for r in db.execute(
         "SELECT task_id FROM tasks WHERE status='completed' AND updated_at > ?",
         (_cutoff,)).fetchall()}
