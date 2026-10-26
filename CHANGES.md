@@ -25,9 +25,9 @@
   结果完全相同。故不调 TTL，只把结论写进注释（负结果留档，避免下一人重复改）。
 
 ### 验证
-- `pytest tests/test_quota_nudge.py tests/test_rate_recovery.py tests/test_rate_limit_backoff_reset.py tests/test_alert_cooldown_persist.py -q` → **40 passed**。
-- 变异检验（原码 6 passed，每个变异各 1 failed）：`_QUOTA_RETRY_SEC=0` / `_QUOTA_REPORT_COOLDOWN=0` /
-  `_QUOTA_TRANSIENT=()` / 去掉 `reversed()`。
+- `pytest tests/test_quota_nudge.py tests/test_rate_recovery.py tests/test_rate_limit_backoff_reset.py tests/test_alert_cooldown_persist.py -q` → **41 passed**。
+- 变异检验（原码 7 passed，每个变异各 1 failed）：`_QUOTA_RETRY_SEC=0` / `_QUOTA_REPORT_COOLDOWN=0` /
+  `_QUOTA_TRANSIENT=()` / 去掉 `reversed()` / 把 `_rep[role]=now` 移到 write 之前（R3 指出的无看守分支）。
 - 全量 `pytest tests/ -q -x` → 447 passed 后停在 `test_24h_real_reasoning_volume`（R165 的产线吞吐断言，
   与本改动无关，改动前即红）。
 
