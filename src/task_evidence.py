@@ -176,9 +176,14 @@ def _evaluate_with(db, hours: float = 1):
     completed = db.execute(
         "SELECT task_id, title, assignee, created_at, updated_at FROM tasks "
         "WHERE status='completed' AND updated_at > ? "
+        # 已按**当前版本**评估过的任务不再占 LIMIT 名额。否则同一小时超过 10 个完成时，
+        # 排在前面的旧结论一直命中签名被 continue，第 11 个起永远进不了结果集（饿死）。
+        # 只排除当前版本的签名：旧版本行要留着，版本升级后仍需要重评（codex 第 22 轮 important）。
+        "AND task_id NOT IN (SELECT task_id FROM workflow_logs "
+        "                    WHERE action='evidence_assessed' AND detail LIKE ?) "
         "ORDER BY updated_at DESC LIMIT ?",
         # 回填不设上限：LIMIT 500 会让 7 天窗口里更旧的 246 条永远轮不到（codex 第 3 轮 P2）
-        (_cutoff, 10 if hours <= 1 else -1)
+        (_cutoff, f"%|{_DETAIL_VERSION}", 10 if hours <= 1 else -1)
     ).fetchall()
     if not completed:
         return {"evaluated": 0, "assessments": []}

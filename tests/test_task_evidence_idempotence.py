@@ -230,12 +230,18 @@ def test_feedback_title_is_stable(env):
     assert "t1" in title and "个产出文件" not in title, title
 
 
-def test_malformed_fact_payload_is_ignored(env):
-    """bus 返回非 dict 元素/非法形状时降级为"无证据"，不能打断整轮评估。"""
+def test_mixed_fact_payload_uses_valid_entries(env):
+    """payload 里混了非 dict 元素：坏元素跳过，合法的那条仍然算回话。"""
     env["fake"].search_facts = ["oops", None, {"src": "pm"}, 42]
     _run_once(env)
-    # 含一条合法 pm fact → 仍算回话（证明坏元素被跳过、好元素生效）
     assert not any("零回话零产出" in w for w in env["writes"]), env["writes"]
+
+
+def test_pure_invalid_payload_is_no_evidence(env):
+    """整份 payload 都不合法 → 无证据（降级 False），且不能抛异常打断整轮。"""
+    env["fake"].search_facts = ["oops", None, 42]
+    _run_once(env)
+    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
 
 
 def test_search_failure_still_honours_content(env):
@@ -260,3 +266,34 @@ def test_signature_dropped_when_db_record_fails(env, monkeypatch):
     _run_once(env)
     assert len(env["writes"]) > before, "下一轮应重写"
     assert te._LAST_ASSESSMENT.get("t1") is not None, "落库成功后才记签名"
+
+
+def test_limit_does_not_starve_tasks_beyond_ten(env):
+    """同一小时 >10 个完成时，已评估过的不占 LIMIT 名额，第 11 个也能轮到（codex 22 轮）。"""
+    ws = env["root"] / "ccs-workspaces" / "pm"
+    ws.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE tasks (task_id TEXT, title TEXT, assignee TEXT, "
+               "status TEXT, created_at REAL, updated_at REAL)")
+    db.execute("CREATE TABLE workflow_instances (task_id TEXT, step_results TEXT)")
+    db.execute("CREATE TABLE workflow_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "task_id TEXT, action TEXT, actor TEXT, detail TEXT, ts REAL)")
+    now = time.time()
+    for i in range(12):
+        tid = f"t{i:02d}"
+        db.execute("INSERT INTO tasks VALUES (?,?,'pm','completed',?,?)",
+                   (tid, f"任务{i}", now - 120, now - 10 - i))
+    # 前 10 个（updated_at 最新）已按当前版本评估过
+    for i in range(10):
+        db.execute("INSERT INTO workflow_logs(task_id, action, actor, detail, ts) "
+                   "VALUES (?,?,?,?,?)",
+                   (f"t{i:02d}", "evidence_assessed", "task_evidence",
+                    f"negative||{te._DETAIL_VERSION}", now))
+    te._LAST_ASSESSMENT.clear()
+    te._SEEN_LOADED = False
+    try:
+        te._evaluate_with(db)
+    finally:
+        db.close()
+    assert "t11" in te._LAST_ASSESSMENT, "第 11 个任务被 LIMIT 饿死了"
+    assert "t10" in te._LAST_ASSESSMENT, "第 10 个任务应被评估"
