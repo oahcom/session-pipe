@@ -52,7 +52,7 @@ PYTHONPATH=src python3 -m pipeflow.daemon --interval 10       # 工作流守护�
 PYTHONPATH=src python3 -m routing_daemon                      # 路由守护进程
 ```
 
-注意：`routing.auto --daemon` 只打印一次 status 后退出（`auto.py:219-221`），不是守护模式；常驻进程是 `routing_daemon.py`。
+注意：`routing.auto --daemon` 只打印一次 status 后退出（`auto.py:148-150`），不是守护模式；常驻进程是 `routing_daemon.py`。
 
 ## 项目结构
 
