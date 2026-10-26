@@ -19,8 +19,10 @@
 - 审查修复（R1，两个独立审查各 1 条 P1）：词表按 1,039 份真实转录补全
   （FreeTierError 2029 / free-models-per-day 220，原词表只覆盖 36%），并排除
   `current egress` 短窗口限流；pane 取**最新**命中行（原 `next()` 取最旧，旧配额行会
-  盖住新 403）；状态 TTL 改为 `max(60min, 1h+300s)`（原 TTL=等待=3600，到期条目先被
-  TTL 裁掉 → last=0 → 每 tick 放行）；写审计成功后才记 6h 冷却。
+  盖住新 403）；写审计成功后才记 6h 冷却。
+- R2 复核推翻了 R1 的「TTL 地雷」判断：TTL(3600)=等待(3600) 时，到期条目只让 attempt
+  归 1，下一次仍按 wait 放行，不会每 tick 放行 —— 等价性探针实测 ttl 3600/3900 的闸门
+  结果完全相同。故不调 TTL，只把结论写进注释（负结果留档，避免下一人重复改）。
 
 ### 验证
 - `pytest tests/test_quota_nudge.py tests/test_rate_recovery.py tests/test_rate_limit_backoff_reset.py tests/test_alert_cooldown_persist.py -q` → **40 passed**。
