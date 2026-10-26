@@ -58,12 +58,6 @@ def test_empty_wf_id_never_matches():
     assert not _mentions(_F("wf_sub_4e63ad633d39 完成"), "")
 
 
-if __name__ == "__main__":
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print(f"✓ {name} PASS")
-    print("all relaxed-advance ownership checks passed")
 
 def test_strict_ownership_ignores_body_mentions():
     # 严格路径（t 字段）不得因正文顺带提及本 id 而放行
@@ -133,7 +127,13 @@ def test_refusal_titles_are_not_output():
               "reviewer/s2-complete APPROVED 3 处建议",
               "document_driven/s1-complete DOCUMENT.md 已落盘 88 行",
               # 生产原文 436491：维护角色合法完成里报告「别人的」零产出，不得误杀
-              "maintainer_health_monitor/s2-complete wf_rw_21f1f230b439 — 根因: s1 零产出闭合"):
+              "maintainer_health_monitor/s2-complete wf_rw_21f1f230b439 — 根因: s1 零产出闭合",
+              # 拒绝词后紧跟「已修复/测试通过」= 在描述已解决的问题，不是本轮结论
+              "qa/s2-complete 零输入测试通过",
+              "reviewer/s1-complete 拒绝审批意见已修复 APPROVED",
+              "pm/s1-complete 无法开始条件已修复并验证",
+              # 审查角色的驳回结论本身就是交付物
+              "技术实现/s3-complete: 代码审查 CHANGES_REQUESTED — 0 P0 / 3 P1"):
         assert not _REFUSAL_T.search(t), f"不应判为拒绝: {t}"
 
 class _Fact:
@@ -153,6 +153,8 @@ def test_check_exit_skips_refusal_titles():
     """主路径 exit 匹配也不得把自述拒绝当完成（R163 s3/s4 走的就是主路径）。"""
     from pipeflow.step_handler import StepHandlerMixin
     h = type("H", (), {})()
+    noted = []
+    h._refusal_note = lambda refused, wf, step: noted.append([r.id for r in refused])
     h._bb = _BB([
         _Fact(1, "文档驱动5阶段工作流/s3-complete wf_bc4112d2767f 需求对齐判定：上游零文档"),
         _Fact(2, "文档驱动5阶段工作流/s3-complete wf_bc4112d2767f 需求文档 PRD.md 120 行", ts=2.0),
@@ -160,3 +162,10 @@ def test_check_exit_skips_refusal_titles():
     ts, msgs = StepHandlerMixin._check_exit(h, "user_story", "pm", "s3-complete")
     assert [m["id"] for m in msgs] == [2], f"拒产消息不应算完成: {msgs}"
     assert ts == 2.0
+    assert noted == [[1]], f"被排除的拒产消息必须留痕（返工链/审计的唯一线索）: {noted}"
+if __name__ == "__main__":
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print(f"✓ {name} PASS")
+    print("all relaxed-advance ownership checks passed")

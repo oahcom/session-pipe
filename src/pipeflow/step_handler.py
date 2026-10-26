@@ -158,9 +158,14 @@ _WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
 # s1/s2 无产出均被判完成）。只扫标题不扫正文：正文命中多为元讨论（"宽松推进把
 # blocker 当产出"）。不含裸"零产出"——维护/审计角色会在**合法完成**的标题里报告
 # 别人的零产出（实测 436491 maintainer_health_monitor/s2-complete 会被误杀）。
-# 30 天生产库 10003 条 fact，标题命中 7 条，带 -complete 的 2 条都是真拒绝。
+# 实测（全库 10006 条 fact，ttl_pruner 已裁到约 10 天）：标题命中 7 条，其中**命中步骤
+# 契约**的只有 2 条，都是真拒绝；其余 5 条是分析/RCA 类（src=claude/knowledge_curator…），
+# 过滤后不影响任何步骤完成。
+# 末尾否定前瞻：拒绝词后 12 字内出现「已修复/已通过…」说明那是问题描述而非本轮
+# 结论（"零输入测试通过"、"拒绝审批意见已修复"），不算拒产。
 _REFUSAL_T = re.compile(
-    r"拒产|拒审|拒绝(产出|审|交付|设计|对齐)|无法(对齐|产出|交付|开始)|零文档|零输入|输入为零")
+    r"(?:拒产|拒审|拒绝(?:产出|审|交付|设计|对齐)|无法(?:对齐|产出|交付|开始)|零文档|零输入|输入为零)"
+    r"(?!.{0,12}(?:已修复|已解决|已通过|已验证|测试通过))")
 
 
 def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
@@ -462,7 +467,11 @@ class StepHandlerMixin:
 
         # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
         _sdata = self._step_sd(run, step)
-        if _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_approved")):
+        # 抢救路径只读已落库的 exit_messages，不经 _check_exit —— 历史写进去的
+        # 「拒产/拒审」标题会在这里二次生效（R163 残留），同一谓词过滤一遍。
+        _emsgs = [m for m in (_sdata.get("exit_messages") or [])
+                  if not _REFUSAL_T.search((m or {}).get("text") or "")]
+        if _emsgs and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_approved")):
             # 抢救路径同样过质量闸门：exit_messages 只证明"角色写了消息"，不证明
             # 产出落盘。此前直接 complete → 文件契约缺失的步骤照样推进（与宽松推进
             # 同一类假完成，R119 已在宽松推进处堵住，这里漏了同一扇门）。
@@ -1695,6 +1704,19 @@ class StepHandlerMixin:
 
         return (len(errs) == 0, errs)
 
+    def _refusal_note(self, refused, wf_id: str, step_id: str) -> None:
+        """拒产/拒审消息被排除出完成判定时在 bus 留痕。
+
+        标题写死（不含计数/时间戳）→ bus 按标题 UPSERT，同一处反复命中只留一行。
+        """
+        try:
+            self._bb.write("blocker",
+                f"[refusal] {wf_id or '?'} {step_id or '?'} 自述拒绝不算完成",
+                evidence="\n".join(f"#{f.id} {f.src}: {f.t[:160]}" for f in refused[-3:]),
+                src="workflow_engine")
+        except Exception as _e:
+            LOGGER.debug("refusal note failed: %s", _e)
+
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
                     wf_id: str = "", wait_roles: list = None,
                     eff_role: str = "", own_wf_id: str = "",
@@ -1717,10 +1739,19 @@ class StepHandlerMixin:
         生产实测（2026-08-11 blackboard.db）：协作角色用角色名写 bus（test_report
         分类 6 条全部 src=qa），精确匹配可行。
         """
-        facts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
         # 自述拒绝不是产出（R163：wf_bc4112d2767f 的 s3/s4 以「拒产/无法对齐」标题通过
-        # 契约 text_contains 被判完成，下游拿不到契约件才回头返工）。
-        facts = [f for f in facts if not _REFUSAL_T.search(f.t or "")]
+        # 契约 text_contains 被判完成，下游拿不到契约件才回头返工）。丢掉的消息必须在
+        # bus 留痕：返工链第一来源就是这里的 exit_messages，静默丢弃会让"为什么没推进"
+        # 无据可查（只剩通用 timeout 文案）。
+        facts, _refused = [], []
+        for f in (self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)):
+            if _REFUSAL_T.search(f.t or ""):
+                if not text_filter or text_filter in f.t:  # 只记"本来会判完成"的那几条
+                    _refused.append(f)
+                continue
+            facts.append(f)
+        if _refused:
+            self._refusal_note(_refused, own_wf_id or wf_id, step_id)
         # 屏障锚定「首次写入」而非 facts.ts：facts.t 是 UNIQUE，同文本重写走 UPSERT
         # 会把 ts/cat 原地抬高（blackboard_legacy.py:238-242）。实测 1698 条 fact 被重写、
         # 36 条 exit_message 因此从屏障前移到屏障后 → 旧消息复活被后序步骤消费。
@@ -1810,7 +1841,7 @@ class StepHandlerMixin:
             missing = set(wait_roles) - have
             for _r in missing:
                 _rfacts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
-                _rfacts = [f for f in _rfacts if not _REFUSAL_T.search(f.t or "")]
+                _rfacts = [f for f in _rfacts if not _REFUSAL_T.search(f.t or "")]  # 已在上面留痕，补查不再重复
                 _rmsg = None
                 for _f in _rfacts:
                     # 精确匹配目标角色 src；不放宽到 claude（否则一条

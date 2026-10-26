@@ -16,13 +16,20 @@ s3/s4 走主匹配路径（契约只校 cat/src/`-complete` 令牌，"照格式�
 - `_check_exit` 读到事实后立刻过滤（`step_handler.py:1718`）：主匹配、dual_node 抢救、busy 匹配、
   协作门补查共用此入口，一处覆盖 6 个 `complete_step` 点。
 - 宽松推进候选额外滤 `cat=blocker` 与拒绝标题（`step_handler.py:912-920`）——该路径不经过 `_check_exit`。
+- 抢救路径（`step_handler.py:465`）只读落库的 `exit_messages`、不经 `_check_exit`，同一谓词再滤一遍，
+  否则历史写入的拒产标题会在抢救时二次生效。
+- 被排除的消息**必须留痕**：`_refusal_note()` 写一条标题定死的 `[refusal] <wf> <step> 自述拒绝不算完成`
+  （UPSERT 天然去重），evidence 带 fact id + 原文。无声丢弃会让"为什么没推进"只剩通用 timeout 文案。
+- 谓词末尾加否定前瞻：拒绝词后 12 字内出现「已修复/已通过/已验证/测试通过」→ 是在描述已解决的问题，
+  不算拒产（codex 第一轮举的 4 条误杀样本都属这类）。
 - 不扩 `review_gate.REJECT_KEYWORDS`：那套是"审查结论"语义，扩进去会污染驳回判定链。
 - 只扫标题不扫正文：正文命中 25 条里多数是元讨论（"宽松推进把 blocker 当产出"），扫正文会误杀。
 
 ### 验证
-- 误判率实测（30 天生产库 10003 条 fact）：标题命中 7 条，其中带 `-complete` 的 2 条全是真拒绝；
-  未收窄的 v1 谓词会误杀 1 条合法完成（436491）故收窄。
-- `pytest tests/test_relaxed_advance_ownership.py -q` → 12 passed；全量 `tests/` → 1457 passed。
+- 误判率实测（全库 10006 条 fact，ttl 裁剪后约 10 天）：标题命中 7 条，其中**命中步骤契约**的
+  2 条都是真拒绝；其余 5 条是分析/RCA 类（src=claude/knowledge_curator/maintainer 的元讨论），
+  不参与任何步骤完成。未收窄的 v1 谓词会误杀 1 条合法完成（436491 maintainer RCA 标题含「零产出」）故收窄。
+- `pytest tests/test_relaxed_advance_ownership.py -q` → 12 passed；全量 `tests/` → 1458 passed（收窄后）。
 - 变异：删 `_check_exit` 的过滤行 → `test_check_exit_skips_refusal_titles` FAILED；
   删候选里的 `_REFUSAL_T` 子句 → `test_blocker_message_does_not_advance` FAILED。
 - 需求单：`~/hermes/workspace/R163-自述拒绝被记成完成/需求.md`
