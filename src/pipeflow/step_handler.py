@@ -58,6 +58,37 @@ _QUEUE_BUDGET_FLOOR = 1800
 # 只升级一次：判据不修时每 tick 再喊一遍不带来新信息。
 _GATE_ESCALATE_AT = 30
 
+# dual_node 第二节点（codex 审查通过）的完成证据标记。manager.complete_step
+# 只认 step_results[step_id]["node2_approved"]：node1_done 的语义是"第一节点收到"，
+# node2_sent 是引擎注入指令时与 node1_done 同毫秒写入的（30d 实测 10/10 相同），
+# 两者都不证明审过。30d 内 10 个到达 node1 的 dual_node 步骤有 9 个无 approved 事实
+# 却被判完成 —— 闸门过去是纯标签，判据只能落在真正到达的审查结论上。
+_APPROVED_MARK = "-codex-approved"
+
+
+def _codex_review_prompt(wf_name: str, step_id: str, cat: str) -> str:
+    """注入给角色的 codex 审查指令（两个完成站点共用，避免文案漂移）。"""
+    return (
+        "/goal\n## codex CLI 三方审查\n"
+        f"对 {wf_name}/{step_id} 的产出执行 codex review --uncommitted：\n"
+        "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
+        "2. 若发现问题修复后重跑，直到连续两次零问题\n"
+        "3. 通过后写 bus cat=" + cat + "，标题含 " + step_id + _APPROVED_MARK + "\n"
+        "## 完成\n"
+        "写 bus cat=" + cat + "，标题含 " + step_id + _APPROVED_MARK + "。"
+    )
+
+
+def _has_codex_approved(matched_msgs: list, step_id: str) -> bool:
+    """匹配到的消息里是否真有本步的 codex-approved 结论。
+
+    dual_node 的宽过滤 s{N}- 会同时命中 s{N}-complete（第一节点消息本身），
+    只看"匹配到了"会把第一节点消息误当第二节点。
+    """
+    _needle = step_id + _APPROVED_MARK
+    return any(isinstance(m, dict) and _needle in str(m.get("text", ""))
+               for m in (matched_msgs or []))
+
 
 def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> float:
     """排队上限 = 该步声明的 timeout_minutes × 可重试次数，不低于下限。
@@ -423,7 +454,7 @@ class StepHandlerMixin:
 
         # ── 旧引擎产物抢救: exit_messages 已存在但 tick 未闭合 → 直接 complete ──
         _sdata = self._step_sd(run, step)
-        if _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_sent")):
+        if _sdata.get("exit_messages") and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_approved")):
             # 抢救路径同样过质量闸门：exit_messages 只证明"角色写了消息"，不证明
             # 产出落盘。此前直接 complete → 文件契约缺失的步骤照样推进（与宽松推进
             # 同一类假完成，R119 已在宽松推进处堵住，这里漏了同一扇门）。
@@ -566,11 +597,33 @@ class StepHandlerMixin:
                 # 角色忙 ≠ 任务未完成：先做 exit 匹配，产出已存在则直接推进
                 # （否则角色完成产出但忙其他任务时，本工作流无限排队，bus #167081）
                 if cat:
-                    _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
+                    # dual_node 第二节点：宽过滤 s{N}- 才能命中 approved 消息
+                    # （否则 text_filter=s{N}-complete 永远匹配不到审查结论 →
+                    #  角色审完也推进不了，30d 4/9 步曾从这里直接越过闸门）。
+                    _b_sd = self._step_sd(run, step)
+                    _b_filter = text_filter
+                    if getattr(step, "dual_node", False) and _b_sd.get("node2_sent"):
+                        _b_filter = re.sub(r"-complete$", "-", text_filter)
+                    _busy_match_ts, _busy_match_msgs = self._check_exit(cat, src_filter, _b_filter, created_after=last_ts,
                         wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
                         template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
+                    if _busy_match_ts and getattr(step, "dual_node", False) \
+                            and not _b_sd.get("node2_approved") \
+                            and _has_codex_approved(_busy_match_msgs, step.id):
+                        run.step_results[step.id] = {
+                            **self._step_sd(run, step),
+                            "node2_approved": True,
+                            "node2_approved_at": time.time(),
+                            "node2_approved_by": "role_bus",
+                        }
+                        self._sync_step_results(run.id, run.step_results)
+                        _b_sd = self._step_sd(run, step)
+                    # 闸门：dual_node 未拿到审查结论前，忙分支不得推进
+                    # （原实现只有一处（:426）带守卫，此处漏了 → 4/9 步由此越过）
+                    if getattr(step, "dual_node", False) and not _b_sd.get("node2_approved"):
+                        _busy_match_ts = 0.0
                     if _busy_match_ts:
                         # exit_schema 校验与主路径一致：busy 不绕过文件约束
                         # （2026-08-12 codex P1：schema 要求不能因忙检测分支成空文）
@@ -1032,15 +1085,8 @@ class StepHandlerMixin:
                 if getattr(step, 'dual_node', False):
                     _sdata = self._step_sd(run, step)
                     if not _sdata.get("node2_sent"):
-                        _codex_prompt = (
-                            "/goal\n## codex CLI 三方审查\n"
-                            f"对 {run.workflow_name}/{step.id} 的产出执行 codex review --uncommitted：\n"
-                            "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
-                            "2. 若发现问题修复后重跑，直到连续两次零问题\n"
-                            "3. 通过后写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved\n"
-                            "## 完成\n"
-                            "写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved。"
-                        )
+                        _codex_prompt = _codex_review_prompt(
+                            run.workflow_name, step.id, cat)
                         run.step_results[step.id] = {
                             **_sdata,
                             "node1_done": True, "node1_at": time.time(),
@@ -1051,7 +1097,18 @@ class StepHandlerMixin:
                         # R5: 自动执行 codex review --uncommitted (三方20维审查自动化)
                         _codex_result = self._run_codex_review(run, step)
                         if _codex_result.get("success"):
-                            LOGGER.info("双节点: %s/%s codex review 通过，等待 node2 消息", run.workflow_name, step.id)
+                            # 引擎自己跑出的零问题结论就是审查证据，比角色自述更强：
+                            # 置 node2_approved 才是"第二节点真到"（manager.complete_step
+                            # 只认这个字段，node1_done/node2_sent 都无判别力）。
+                            run.step_results[step.id] = {
+                                **self._step_sd(run, step),
+                                "node2_approved": True,
+                                "node2_approved_at": time.time(),
+                                "node2_approved_by": "engine_codex",
+                            }
+                            self._sync_step_results(run.id, run.step_results)
+                            LOGGER.info("双节点: %s/%s codex review 通过，node2 已批",
+                                        run.workflow_name, step.id)
                         else:
                             LOGGER.warning("双节点: %s/%s codex review 失败: %s，仍发提示让角色人工审查",
                                            run.workflow_name, step.id, _codex_result.get("error", "未知错误"))
@@ -1059,6 +1116,17 @@ class StepHandlerMixin:
                                            wf_id=run.id, step_id=step.id, force=True)
                         return
                     else:
+                        # 第二节点消息到达：宽过滤（s{N}-）会同时命中 s{N}-complete
+                        # 与 s{N}-codex-approved，必须看标题是否真有 approved 才认。
+                        if not self._step_sd(run, step).get("node2_approved") \
+                                and _has_codex_approved(_match_msgs, step.id):
+                            run.step_results[step.id] = {
+                                **self._step_sd(run, step),
+                                "node2_approved": True,
+                                "node2_approved_at": time.time(),
+                                "node2_approved_by": "role_bus",
+                            }
+                            self._sync_step_results(run.id, run.step_results)
                         # 第二节点（codex-approved）消息到达 → 完成步骤
                         # 用户要求"每个步骤"都提醒 → dual_node 完成路径也补发
                         _integ_send_bypass(run, step, "dual_node_codex_approved",
@@ -1169,32 +1237,43 @@ class StepHandlerMixin:
                 LOGGER.info("completion_check: %s 文件存在且 ≥%d 字节 → 推进 %s",
                             _fp.name, _min, step.id)
                 if step.dual_node:
-                    # dual_node：文件存在 = 第一节点完成，注入第二节点审查指令
+                    # dual_node：文件存在 = 第一节点完成，注入第二节点审查指令。
+                    # 这里必须有 else：node1_done 一旦为真旧代码就直落下面的
+                    # complete_step——第二 tick 无条件完成，注入的审查指令根本没跑
+                    # （30d 6/9 步走的就是这条，实测 node1→completed 仅 10.7s，
+                    # 而 codex review 单次 6m19s 物理上不可能审完）。
                     _sdata = self._step_sd(run, step)
                     if not _sdata.get("node1_done"):
                         _sdata["node1_done"] = True
                         _sdata["node1_at"] = time.time()
                         _sdata["ts"] = time.time()
-                        # 发 codex CLI 审查指令（第二节点）+ 设 node2_sent 阻断 complete_step
-                        _codex_prompt = (
-                            "/goal\n## codex CLI 三方审查\n"
-                            f"对 {run.workflow_name}/{step.id} 的产出执行 codex review --uncommitted：\n"
-                            "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
-                            "2. 若发现问题修复后重跑，直到连续两次零问题\n"
-                            "3. 通过后写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved\n"
-                            "## 完成\n"
-                            "写 bus cat=" + cat + "，标题含 " + step.id + "-codex-approved。"
-                        )
+                        # 发 codex CLI 审查指令（第二节点）+ 设 node2_sent 阻断重复注入
+                        _codex_prompt = _codex_review_prompt(
+                            run.workflow_name, step.id, cat)
                         _sdata["node2_sent"] = True
                         _sdata["node2_sent_at"] = time.time()
                         run.step_results[step.id] = _sdata
                         self._sync_step_results(run.id, run.step_results)
                         try:
-                            self._send_to_role(_eff, _codex_prompt,
-                                               wf_id=run.id, step_id=step.id, force=True)
-                            LOGGER.info("双节点: %s/%s 第一节点完成，codex 审查指令已发送", run.workflow_name, step.id)
+                            _sent = self._send_to_role(_eff, _codex_prompt,
+                                                       wf_id=run.id, step_id=step.id,
+                                                       force=True)
+                            if _sent is True:
+                                LOGGER.info("双节点: %s/%s 第一节点完成，codex 审查指令已发送",
+                                            run.workflow_name, step.id)
+                            else:
+                                # "busy"/False = 指令没到角色手上。旧代码无条件写
+                                # "已发送"，日志与事实相反（08:31:23 现场：同毫秒
+                                # 既"未投递"又"已发送"）。node2_sent 保持真值以免每 tick
+                                # 重复注入；证据靠 node2_approved，不靠这句日志。
+                                LOGGER.warning("双节点: %s/%s 审查指令未投递 (%s)，等角色自行审查",
+                                               run.workflow_name, step.id, _sent)
                         except Exception as _send_err:
-                            LOGGER.exception("双节点: %s/%s 审查指令发送失败: %s", run.workflow_name, step.id, _send_err)
+                            LOGGER.exception("双节点: %s/%s 审查指令发送失败: %s",
+                                             run.workflow_name, step.id, _send_err)
+                        return
+                    # node1 已落章但审查未过 → 本 tick 不推进，继续等 node2
+                    if not _sdata.get("node2_approved"):
                         return
                 # bypass 补发完整性提醒（不阻塞完成）：
                 # completion_check 文件判据直接推进，跳过 dual_node 审查流程。

@@ -309,11 +309,10 @@ class LifecycleManager:
                 # 引擎注入 codex 审查指令后，第二条消息到才真正完成。
                 # 角色不知双节点——第二步由引擎在 _tick 中注入。
                 if step.get("dual_node"):
-                    _n1 = results.get(step_id, {}).get("node1_done", False)
-                    if not _n1:
+                    _sr = results.setdefault(step_id, {})
+                    if not _sr.get("node1_done"):
                         # 第一节点到达：标记 node1_done，删除 status 字段防止
                         # 残留 step_done_ready 驱动 _advance 推进（2026-08-09 根因）
-                        _sr = results.setdefault(step_id, {})
                         _sr["node1_done"] = True
                         _sr["node1_at"] = time.time()
                         # 保持 status=notified（不 pop）——status 缺失会让引擎下次 tick
@@ -324,6 +323,17 @@ class LifecycleManager:
                             (json.dumps(results, ensure_ascii=False), wf_id))
                         self._conn.commit()
                         return "node1_done"
+                    # 第二道门：必须存在真正的 codex-approved 事实才放行。
+                    # 30d 实测 10 个到达 node1 的步骤里 9 个无 approved 即完成 ——
+                    # 因为 node1_done 的语义是"第一节点收到"，不是"已审完"；
+                    # node2_sent 是引擎注入指令时与本字段同毫秒写入的（10/10 实测
+                    # node1_at==node2_sent_at），完全没有判别力。所以只认 node2_approved：
+                    # 它由 step_handler 在**实际匹配到标题含 <step>-codex-approved 的
+                    # bus 消息**时置位。此处是所有 complete_step 调用（6 个 step_handler
+                    # 站点 + tick-rescue + stale rescue）的唯一收口，挡住这里等于挡住全部。
+                    if not _sr.get("node2_approved"):
+                        self._conn.commit()
+                        return "node2_pending"
                     # 第二节点已到 → 走正常完成
 
                 handler = {

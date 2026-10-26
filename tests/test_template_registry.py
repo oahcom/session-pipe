@@ -284,7 +284,19 @@ def test_dual_node_full_cycle():
             assert _sr1.get("s1", {}).get("node1_done") is True, "第二次 run_once 应完成 dual_node 第一步 node1_done"
             assert _sr1.get("s1", {}).get("node2_sent") is True, "第二次 run_once 应发送 codex review 指令"
 
-            # 完成 s1
+            # dual_node 闸门：node1 已到但没有 codex-approved 证据 → 不得完成。
+            # 旧断言在这里直接 complete_step 并期望成功，等于把"闸门是纯标签"
+            # 写成了回归基线（30d 10 个到 node1 的步骤 9 个就这么越过的）。
+            assert eng._lifecycle.complete_step(wf_id, "s1") == "node2_pending", \
+                "无审查证据时 dual_node 步骤必须停在 node2_pending"
+
+            # 拿到审查证据（node2_approved）后才推进
+            _sr = json.loads(eng._lifecycle._get_wf_unsafe(wf_id)["step_results"])
+            _sr["s1"]["node2_approved"] = True
+            _sr["s1"]["node2_approved_by"] = "role_bus"
+            eng._lifecycle.execute(
+                "UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps(_sr, ensure_ascii=False), wf_id))
             r2 = eng._lifecycle.complete_step(wf_id, "s1")
             assert r2 in ("step_done_ready", "completed_and_advanced"), f"第二步应完成: {r2}"
             eng.run_once()
