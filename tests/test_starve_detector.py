@@ -367,3 +367,60 @@ def test_backoff_engages_with_only_failure_ts():
             # 连续失败计数不递增（因为冷却期内 return）
             saved = json.loads(state_path.read_text())
             assert saved["consecutive_failures"] == 6
+
+# ── 16. 过期的失败 streak 不再封死产线（2026-10-26 实测 8h 纯饿） ──
+def test_stale_failure_streak_does_not_block_restart():
+    """14:02 连撞 5 次，21:19 整条链已跑完并产出子链 → 那 5 次失败不能续命到次日。
+
+    修复前：last_failure_ts 在 24h 内 → 一直 return，期间 start() 与额度都正常。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        stale = time.time() - 8 * 3600
+        state_path.write_text(json.dumps({
+            "last_fire": stale,                  # 8h 前成功拉过一次链
+            "consecutive_failures": 5,
+            "last_failure_ts": stale,            # 失败也是 8h 前，streak 早已中断
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "subprocess"):
+            eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
+            eng.start.return_value = "wf_after_stale"
+            daemon._starve_signal(eng)
+            eng.start.assert_called_once()
+            assert json.loads(state_path.read_text())["last_wf"] == "wf_after_stale"
+
+
+# ── 17. 达到阈值那一次留一条 bus blocker，之后退避期不再刷屏 ──
+def test_threshold_failure_writes_one_blocker():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "state.json"
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 7 * 3600,
+            "consecutive_failures": 4,
+            "last_failure_ts": time.time() - 120,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "subprocess") as sp:
+            eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
+            eng.start.side_effect = Exception("模板不存在")
+            daemon._starve_signal(eng)
+            calls = [c.args[0] for c in sp.run.call_args_list]
+            assert any("blocker" in c for c in calls), calls
+            assert json.loads(state_path.read_text())["consecutive_failures"] == 5
+
+        # 阈值之后（6 次）：只递增，不再写 bus
+        state_path.write_text(json.dumps({
+            "last_fire": time.time() - 7 * 3600,
+            "consecutive_failures": 5,
+            "last_failure_ts": time.time() - 120,
+        }))
+        with patch.object(daemon, "_STARVE_STATE", state_path), \
+             patch.object(daemon, "subprocess") as sp2:
+            eng = MagicMock()
+            eng._ensure_role_alive = MagicMock(return_value=True)
+            eng.start.side_effect = Exception("模板不存在")
+            daemon._starve_signal(eng)
+            sp2.run.assert_not_called()

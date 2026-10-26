@@ -120,6 +120,29 @@ _STARVE_FAIL_RETRY_INTERVAL = 60  # 未达阈值：失败后短退避 60s 重试
 _STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后切换退避策略
 
 
+def _starve_failed(state: dict, consec: int, now: float, why) -> None:
+    """记一次创建失败；刚好到阈值那一次往 bus 留一条，退避期不再刷屏。
+
+    WHY 必须留一条：2026-10-26 14:02 连撞 5 次后退避 24h，产线零产出 8h，
+    bus 里没有任何「我不再尝试了」的记录 —— 唯一的发现途径是人肉翻状态文件。
+    """
+    state["consecutive_failures"] = consec
+    state["last_failure_ts"] = now
+    _safe_write_state(state)
+    if consec != _STARVE_FAIL_THRESHOLD:
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(_BUS_SCRIPT), "write", "blocker",
+             f"饥饿自愈连续 {consec} 次创建食物链失败 → 退避 24h，期间产线零产出",
+             "--src", "workflow_engine",
+             "--evidence", f"最后一次失败: {why}"[:500]],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+
 # 优雅关闭的硬上限：超过就 os._exit，把「关不掉」变成「最多等这么久」。
 # ponytail: 不看事务边界，粗暴退出依赖 SQLite WAL 回滚；要更干净得让 run_once
 # 在循环里轮询 shutdown 标志（改动面大得多）。
@@ -157,6 +180,11 @@ def _starve_signal(eng: WorkflowEngine) -> None:
     last_fire = state.get("last_fire", 0)
     last_failure_ts = state.get("last_failure_ts", 0)
     consec_fails = state.get("consecutive_failures", 0)
+    # 「连续」失败必须真的连续：14:02 连撞 5 次后同一台机器跑完了整条食物链
+    # （21:19 收尾，期间产出 6 条子链），那 5 次失败却把 24h 退避续到次日 14:02
+    # —— 期间额度与 start() 全正常，纯饿 8h。streak 超过一个成功冷却期即视为中断。
+    if last_failure_ts and now - last_failure_ts > _STARVE_COOLDOWN:
+        consec_fails = 0
     if consec_fails >= _STARVE_FAIL_THRESHOLD:
         # 达到阈值 + 最近失败在 24h 内 → 退避（不创建）
         # 失败时间戳过旧（迁移前脏数据/首次触碰）→ 允许创建一次以重置计数
@@ -197,16 +225,12 @@ def _starve_signal(eng: WorkflowEngine) -> None:
         })
     except Exception as e:
         LOGGER.warning("饥饿创建工作流失败 (连续第 %d 次): %s", consec_fails + 1, e)
-        state["consecutive_failures"] = consec_fails + 1
-        state["last_failure_ts"] = now
-        _safe_write_state(state)
+        _starve_failed(state, consec_fails + 1, now, e)
         return
     # 类型守卫：mock/非 str 返回值（测试环境污染）禁止写入 bus 与状态文件
     if not isinstance(wf_id, str) or not wf_id.startswith("wf_"):
         LOGGER.error("饥饿触发返回值异常，丢弃: %r", wf_id)
-        state["consecutive_failures"] = consec_fails + 1
-        state["last_failure_ts"] = now
-        _safe_write_state(state)
+        _starve_failed(state, consec_fails + 1, now, f"返回值异常: {wf_id!r}")
         return
     LOGGER.info("饥饿触发: food_chain_loop 已创建 wf=%s", wf_id)
 
