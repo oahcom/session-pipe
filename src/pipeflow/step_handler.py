@@ -847,13 +847,20 @@ class StepHandlerMixin:
                     # [:8] 截断下大面积碰撞（实测 31 次宽松推进 29 次是别的工作流
                     # 的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
                     _relaxed = [
-                        {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src}
+                        {"id": f.id, "text": f.t[:200], "ts": f.ts, "src": f.src,
+                         "cat": f.cat}
                         for f in _role_msgs
                         if f.src == _eff
                         and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                         and f.ts > _notified_ts
                         and f.ts < time.time() + 60  # 防未来时间戳
                         and _mentions(f, _wf_id)
+                        # 分类与文本都已匹配的消息留给本 tick 后面的正常 exit 匹配。
+                        # 抢在它前面吞掉会把合规完成记成「分类不匹配」，blocker 文案与
+                        # 事实相反（实测 wf_4eaa331e88ed/s6：cat=code_review src=reviewer
+                        # 完全合规，却被宽松推进吞下，下游据此误判 reviewer 失职）。
+                        and not (cat and f.cat == cat
+                                 and (not text_filter or text_filter in f.t))
                     ]
                     # task_spec 锚点确认确实是本工作流任务（同样是完整 id，不做前缀匹配）
                     _has_anchor = any(
@@ -877,8 +884,7 @@ class StepHandlerMixin:
                         }
                         self._sync_step_results(run.id, run.step_results)
                         self._bb.write("blocker",
-                            f"[workflow] {run.workflow_name} {step.id} 宽松推进: "
-                            f"角色写了同工作流消息但分类不匹配（期望 {cat}）",
+                            f"角色写了同工作流消息但分类不匹配（收到 {_relaxed[0].get('cat')}，期望 {cat}）",
                             src="workflow_engine")
                         # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
                         _integ_send_bypass(run, step, "relaxed",
