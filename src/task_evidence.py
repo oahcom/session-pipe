@@ -297,14 +297,14 @@ def _evaluate_with(db, hours: float = 1):
         _sig = f"{a['quality']}|{a['evidence_type']}|{_DETAIL_VERSION}"
         if _LAST_ASSESSMENT.get(a["task_id"]) == _sig:
             continue
-        # bus 按标题 UPSERT：同一 task+quality 只保留一条，后续评估覆盖第一条
-        # （ts 冻在初次评估时刻）。标题里不要带时刻/文件数：它们每分钟都会变，
-        # 导致每次插新行而不是覆盖（实测 6h 内 90 条里 75 条重复，同一任务同一
-        # 结论最多写 18 次，21 个角色各自读一遍）。
+        # bus 按标题 UPSERT。标题必须**只由结论维度组成**：带 detail（含文件数、措辞）
+        # 就会每 tick 插新行（实测 6h 内 90 条里 75 条重复），而且 _DETAIL_VERSION 升级后
+        # 旧文案对应的 fact 永远覆盖不掉 —— "回填重写历史 fact" 就不成立（第三方审查 2026-10-26）。
+        # detail 全文进 evidence（JSON），消费方取最近一条即可。
         _ok = _bus_write(
             "feedback",
-            f"[task_evidence] {a['detail']} — 质量: {a['quality']}",
-            "--evidence", json.dumps(a),
+            f"[task_evidence] {a['task_id']} {a['role']} — 质量: {a['quality']}",
+            "--evidence", json.dumps(a, ensure_ascii=False),
             "--src", "task_evidence")
         # negative ⟺ 0 产出文件且无回话（n>=1 已在 _classify_outputs 判 neutral），
         # 所以这里的 negative 必然是引擎空推进：步骤 completed 但角色一句话没说、

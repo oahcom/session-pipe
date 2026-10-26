@@ -216,3 +216,10 @@ def test_feedback_failure_but_blocker_ok_is_retried(env):
     _run_once(env)
     assert any("质量: negative" in w for w in env["writes"][before:]), \
         "下轮应重写 feedback"
+
+
+def test_feedback_title_is_stable(env):
+    """标题只含 task_id/角色/质量：带文件数或措辞会让 bus 的 UPSERT 变成插新行。"""
+    _run_once(env)
+    title = next(w for w in env["writes"] if "质量:" in w)
+    assert "t1" in title and "个产出文件" not in title, title

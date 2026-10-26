@@ -51,6 +51,13 @@
 ### 验证
 - `pytest tests/test_workflow_daemon.py tests/test_daemon_shutdown_grace.py -q` → **10 passed**（修前 9 个点、无 summary）。
 
+
+### 2026-10-26 追加三：标题带 detail 导致"回填重写"不成立（第三方审查发现）
+- bus 的 UPSERT 键是**标题**，而标题里嵌了 `detail`（含文件数、措辞）→ 版本升级或措辞变化只会
+  **插新行**，旧 fact 永不被覆盖，`_DETAIL_VERSION` 号称的"回填时重写历史 fact"是假的。
+- 改为标题只由结论维度组成：`[task_evidence] <task_id> <role> — 质量: <quality>`，
+  `detail` 全文进 evidence JSON；新增 `test_feedback_title_is_stable` 锁住（标题含"个产出文件"即红）。
+
 ## 2026-10-22 — 空推进的步骤不再罚角色（negative 拆成「角色没做」与「引擎放行」）
 
 ### 问题（可观测证据）
