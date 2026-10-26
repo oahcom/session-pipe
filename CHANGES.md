@@ -10,16 +10,22 @@
    不是瞬时限流；每次 429 还会让 ASIP 判出口脏并轮换 IP（R115）。
 4. 审计 `evidence=output[-300:]` 实测 252/255 是 UI 壳（`❯ ⏵⏵ bypass permissions`），判不了因。
 
-### 改动（role_lifecycle +56/−5，另新增 3 条用例 95 行）
-- 新增 `_QUOTA_HINTS` / `_QUOTA_RETRY_SEC=3600` / `_QUOTA_REPORT_COOLDOWN=6h` 与
-  `_last_api_error_text()`（读转录最后一条错误轮正文，64KB 尾部，失败按瞬时处理）。
-- 配额态：探活间隔 1h（额度回来仍能自愈），bus 审计每角色 6h 一条，标题 `[quota]`；
-  非配额 429/403 的退避曲线（120→1800s）与「已发继续」语义完全不变。
+### 改动
+- 新增 `_QUOTA_HINTS` / `_QUOTA_TRANSIENT` / `_QUOTA_RETRY_SEC=3600` / `_QUOTA_REPORT_COOLDOWN=6h`
+  与 `_last_api_error_text()`（读转录最后一条错误轮正文，64KB 尾部，失败按瞬时处理）。
+- 硬限态：探活间隔 1h（额度回来仍能自愈），bus 审计每角色 6h 一条，标题 `[quota]`；
+  瞬时 429/403 的退避曲线（120→1800s）与「已发继续」语义完全不变。
 - `evidence` 改用真实错误行（pane 命中行优先，否则转录正文），不再是 pane 尾部 UI 壳。
+- 审查修复（R1，两个独立审查各 1 条 P1）：词表按 1,039 份真实转录补全
+  （FreeTierError 2029 / free-models-per-day 220，原词表只覆盖 36%），并排除
+  `current egress` 短窗口限流；pane 取**最新**命中行（原 `next()` 取最旧，旧配额行会
+  盖住新 403）；状态 TTL 改为 `max(60min, 1h+300s)`（原 TTL=等待=3600，到期条目先被
+  TTL 裁掉 → last=0 → 每 tick 放行）；写审计成功后才记 6h 冷却。
 
 ### 验证
-- `pytest tests/test_quota_nudge.py tests/test_rate_recovery.py tests/test_rate_limit_backoff_reset.py -q` → **26 passed**。
-- 变异检验：`_QUOTA_RETRY_SEC=0` → 1 failed；`_QUOTA_REPORT_COOLDOWN=0` → 1 failed（原码 3 passed）。
+- `pytest tests/test_quota_nudge.py tests/test_rate_recovery.py tests/test_rate_limit_backoff_reset.py tests/test_alert_cooldown_persist.py -q` → **40 passed**。
+- 变异检验（原码 6 passed，每个变异各 1 failed）：`_QUOTA_RETRY_SEC=0` / `_QUOTA_REPORT_COOLDOWN=0` /
+  `_QUOTA_TRANSIENT=()` / 去掉 `reversed()`。
 - 全量 `pytest tests/ -q -x` → 447 passed 后停在 `test_24h_real_reasoning_volume`（R165 的产线吞吐断言，
   与本改动无关，改动前即红）。
 

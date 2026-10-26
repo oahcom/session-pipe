@@ -93,3 +93,44 @@ def test_quota_detected_from_transcript_when_pane_has_no_hint(monkeypatch, tmp_p
 
     assert "FreeUsageLimitError" in _rl._last_api_error_text(ROLE)
     assert _rl._last_api_error_text("no_such_role") == ""
+
+
+def _write_transcript(root, role, text):
+    d = root / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+    d.mkdir(exist_ok=True)
+    rec = {"type": "assistant", "isApiErrorMessage": True,
+           "timestamp": "2030-01-01T00:00:00.000Z",
+           "message": {"content": [{"type": "text", "text": text}]}}
+    (d / "s.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+
+def test_quota_from_transcript_when_pane_is_clean(monkeypatch, tmp_path):
+    """生产主路径：错误早滚出 pane（0.67% 可见），归类只能靠转录。
+
+    真实 pane 会带 `Retrying … attempt N/M`，那条会在 :575 早退 —— 所以配额判定
+    必须能在「pane 干净 + 转录是配额错误」时生效，否则本改动等于没上线。
+    """
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: 429 · FreeUsageLimitError: "
+                                      "Free usage limit reached")
+    eng = _engine()
+    assert len(_run(eng, "❯ \n⏵⏵ bypass permissions on")) == 1
+    assert _facts(eng)[0].args[1].startswith("[quota]"), _facts(eng)
+
+
+def test_egress_short_limit_stays_transient():
+    """`Free usage limit reached on the current egress` 是短窗口限流（原文让按提示重试），
+    不能被 1h 硬限闸门压住。"""
+    eng = _engine()
+    line = ("● API Error: Request rejected (429) · FreeUsageLimitError: Free usage limit "
+            "reached on the current egress. Retry after the indicated delay")
+    assert len(_run(eng, line)) == 1
+    assert _facts(eng)[0].args[1].startswith("[rate_limit]"), _facts(eng)
+
+
+def test_latest_error_line_wins_over_stale_quota_line():
+    """窗口上方残留的旧配额行不该覆盖下方新的 403：取最新命中行。"""
+    eng = _engine()
+    pane = "\n".join([QUOTA_LINE, "✻ 工作中", "● Please run /login · API Error: 403"])
+    assert len(_run(eng, pane)) == 1
+    assert _facts(eng)[0].args[1].startswith("[rate_limit]"), _facts(eng)

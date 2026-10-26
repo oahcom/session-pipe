@@ -274,7 +274,9 @@ def test_audit_title_carries_time_so_rows_dont_merge():
         eng._recover_rate_limited_roles()
 
     assert titles, "注入后必须有审计行"
-    assert re.search(r"已发继续（第 1 次 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}）",
+    # FreeTierError 属硬限（IP/额度，重发不能恢复）→ 标题是 [quota] 且只到分钟；
+    # 两种标题都必须带日期，否则跨天 UPSERT 会把今天的注入并进昨天那行。
+    assert re.search(r"（第 1 次 \d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?）",
                      titles[0]), f"标题缺完整日期 → 跨天 UPSERT 会合并, got {titles[0]}"
 
 
