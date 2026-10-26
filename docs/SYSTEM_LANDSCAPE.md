@@ -30,7 +30,7 @@ git -C ~/session-pipeline rev-parse --abbrev-ref HEAD
 git -C ~/session-pipeline merge-base --is-ancestor <commit> HEAD && echo live || echo "未上线"
 ```
 
-实测 2026-10-23 19:40：两边 merge-base 停在 `5311cf1`（10-22 16:54），main 独有 138 个补丁未进运行分支——「已合并」与「已生效」是两件事，判断上线只能看上面第三条命令。
+实测 2026-10-26：merge-base 已推进到 `241511b`，main 独有 **224** 个补丁未进运行分支，运行分支独有 **1** 个（v25 L2 并入快照）；「已合并」与「已生效」是两件事，判断上线只能看上面第三条命令。`git merge-base --is-ancestor <commit> HEAD` 为 `live` 才代表已上线。`doccheck` 只校验 `~/wt-pipeline` 的 `CLAUDE.md` 行数，不校验运行分支。`9901`（memory-server-dkk）与 `9902`（memory-server-ssk）在 `ss` 输出为 *:20127（nine-router 主实例）、*:8890（control-panel）、*:8767（gateway），说明 Sister Bus 4 个 session socket（cron/dkk/feed/ssk）与三项目端口在同台机器上跑。
 
 ## 系统入口
 
