@@ -420,6 +420,33 @@ class StepHandlerMixin:
             return False
 
 
+    def _write_timeout_forensics(self, run, step, role: str, timeout_count: int) -> None:
+        """超时回收前的现场快照（best-effort，失败不影响回收）。
+
+        WHY：7 天 147 个非完成实例里，多数死在「步骤超时 N 次、该角色全程零工具调用」，
+        回收时只留一句「超时自动回收」判不了因 —— 是 CLI 卡在重试？pane 活着但没读
+        消息？还是角色从未被唤起？这些都能从 CLI/pane 现场区分，代价只有一次
+        capture-pane。
+        """
+        try:
+            from liveness import pane_cli_busy, tmux_pane_active
+            _r = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"ccs-{role}"],
+                                capture_output=True, text=True, timeout=3)
+            _tail = "\n".join([ln for ln in (_r.stdout or "").splitlines() if ln.strip()][-5:])
+            _decl = int((step.exit_condition or {}).get("timeout_minutes", 30))
+            self._bb.write("blocker",
+                f"[workflow] {run.workflow_name}/{run.id[:12]}/{step.id} "
+                f"{role} 超时 {timeout_count} 次且全程零产出 → 回收",
+                evidence=(f"步骤声明 {_decl} 分钟/次，已超时 {timeout_count} 次\n"
+                          f"角色: {role}\n"
+                          f"CLI busy: {pane_cli_busy(role)}（None=探测失败）\n"
+                          f"pane 存活: {tmux_pane_active(role)}\n"
+                          f"transcript: 本步全程无工具调用\n"
+                          f"pane 尾 5 行:\n{_tail}"),
+                src="workflow_engine")
+        except Exception as _e:
+            LOGGER.debug("超时现场写入失败 %s/%s: %s", run.id[:8], step.id, _e)
+
     def _tick(self, run: WorkflowRun, step: Step):
         """推进单个步骤：exit 匹配/协作门/track/完整性提醒/超时处理。"""
         # ponytail: skip completed/cancelled runs — prevents stale step-escalation noise
@@ -788,6 +815,8 @@ class StepHandlerMixin:
                             LOGGER.warning("tick 末位收尾失败 %s/%s: %s", run.id[:8], step.id, _e)
             # 超限 → 自动 cancel，阻止死循环升级
             if timeout_count >= _auto_cancel_at:
+                if not _role_producing_recently(_eff):
+                    self._write_timeout_forensics(run, step, _eff, timeout_count)
                 try:
                     self._lifecycle.close_wf(
                         run.id, status="cancelled",
