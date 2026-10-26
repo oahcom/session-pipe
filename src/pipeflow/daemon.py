@@ -124,8 +124,11 @@ _STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后切换退避�
 _SHUTDOWN_GRACE_SEC = 10
 
 
-def _force_exit_after(sec: float) -> None:
-    time.sleep(sec)
+def _force_exit_after(sec: float, cancelled: threading.Event) -> None:
+    # 循环自己走完 finally 时会置位 cancelled：那种情况下进程该继续活着跑别的
+    # 事（测试同进程调 daemon_loop 后还有用例），硬退出会把它一起杀掉且 rc=0。
+    if cancelled.wait(sec):
+        return
     LOGGER.warning("优雅关闭超时 %.0fs，强制退出", sec)
     logging.shutdown()
     os._exit(0)
@@ -351,6 +354,7 @@ def daemon_loop(interval: int):
 
     eng = WorkflowEngine()
     shutdown = False
+    stopped = threading.Event()  # 循环正常退出即置位，取消看门狗的硬退出
 
     def _handler(s, f):
         nonlocal shutdown
@@ -361,7 +365,7 @@ def daemon_loop(interval: int):
         # deactivating —— 2026-10-22 实测两次、最长 >4min，TimeoutStopSec=15 未生效。
         # 到点强制退出，Restart=always 用新代码拉起。SQLite 走 WAL，未提交事务由
         # journal 回滚，不会留半写状态。
-        threading.Thread(target=_force_exit_after, args=(_SHUTDOWN_GRACE_SEC,),
+        threading.Thread(target=_force_exit_after, args=(_SHUTDOWN_GRACE_SEC, stopped),
                          daemon=True).start()
 
     if threading.current_thread() is threading.main_thread():
@@ -484,6 +488,7 @@ def daemon_loop(interval: int):
     except Exception as e:
         LOGGER.error("Daemon 主循环异常: %s", e, exc_info=True)
     finally:
+        stopped.set()
         LOGGER.info("正在关闭 Workflow Daemon...")
         if _LOCK_FD is not None:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
