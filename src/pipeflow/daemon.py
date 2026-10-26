@@ -115,16 +115,17 @@ def _active_count(eng: WorkflowEngine) -> int:
     return eng.active_workflow_count()
 
 
-_STARVE_FAIL_BACKOFF = 24 * 3600  # 连续失败 ≥5 次后退避 24 小时
 _STARVE_FAIL_RETRY_INTERVAL = 60  # 未达阈值：失败后短退避 60s 重试窗口
-_STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后切换退避策略
+_STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后改为每冷却窗口试一轮
 
 
 def _starve_failed(state: dict, consec: int, now: float, why) -> None:
-    """记一次创建失败；刚好到阈值那一次往 bus 留一条，退避期不再刷屏。
+    """记一次创建失败；刚好到阈值那一次往 bus 留一条。
 
-    WHY 必须留一条：2026-10-26 14:02 连撞 5 次后退避 24h，产线零产出 8h，
-    bus 里没有任何「我不再尝试了」的记录 —— 唯一的发现途径是人肉翻状态文件。
+    WHY 必须留一条：2026-10-26 14:02 连撞 5 次后产线零产出 8h，bus 里没有任何
+    「我不再尝试了」的记录 —— 唯一发现途径是人肉翻状态文件。
+    每过一个冷却窗口重试又连撞 5 次时会再留一条（最多 4 条/天），这是有意的：
+    持续坏掉的生产者每天该有 4 条痕迹，不是 1 条。
     """
     state["consecutive_failures"] = consec
     state["last_failure_ts"] = now
@@ -134,7 +135,7 @@ def _starve_failed(state: dict, consec: int, now: float, why) -> None:
     try:
         subprocess.run(
             [sys.executable, str(_BUS_SCRIPT), "write", "blocker",
-             f"饥饿自愈连续 {consec} 次创建食物链失败 → 退避 24h，期间产线零产出",
+             f"饥饿自愈连续 {consec} 次创建食物链失败，产线零产出（每 6h 重试一轮）",
              "--src", "workflow_engine",
              "--evidence", f"最后一次失败: {why}"[:500]],
             capture_output=True, timeout=10,
@@ -186,10 +187,13 @@ def _starve_signal(eng: WorkflowEngine) -> None:
     if last_failure_ts and now - last_failure_ts > _STARVE_COOLDOWN:
         consec_fails = 0
     if consec_fails >= _STARVE_FAIL_THRESHOLD:
-        # 达到阈值 + 最近失败在 24h 内 → 退避（不创建）
-        # 失败时间戳过旧（迁移前脏数据/首次触碰）→ 允许创建一次以重置计数
-        if last_failure_ts > 0 and now - last_failure_ts < _STARVE_FAIL_BACKOFF:
-            return  # 24h 内有失败记录 → 退避
+        # 达到阈值 → 一个冷却窗口内不再尝试，窗口过后重置计数再试一轮。
+        # 原来这里是 24h 绝对退避：一天里撞够 5 次就静默关掉产线，而失败成因
+        # （DB 锁、额度耗尽、模板抖动）通常几小时就没了 —— 实测 2026-10-26
+        # 14:02 撞够 5 次，之后同一台机器跑完了整条链并产出 6 条子链，产线却
+        # 继续零产出到次日。窗口与成功冷却用同一个（6h），状态机只剩一个间隔概念。
+        if last_failure_ts > 0 and now - last_failure_ts < _STARVE_COOLDOWN:
+            return  # 本轮退避期未过
         # 退避期已过 → 重置计数重新尝试。缺此重置则失败计数永久 ≥ 阈值，
         # 每次退避到期都只是再退避一次，饥饿恢复路径永不重试
         # （实测 2026-10-17：consecutive_failures 卡在 5，last_active_ts 停在 8-08）。

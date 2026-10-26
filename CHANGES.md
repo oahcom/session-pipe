@@ -13,9 +13,14 @@
 ### 改动
 - `_starve_signal`：`now - last_failure_ts > _STARVE_COOLDOWN`(6h) 时把失败计数按 0 处理。
   "连续失败"在一个成功冷却周期内没有新失败，就不成立。
+- 删掉 `_STARVE_FAIL_BACKOFF`(24h)：达到阈值后只静默一个冷却窗口（6h），过后重置计数
+  再试一轮。失败成因（DB 锁 / 额度耗尽 / 模板抖动）通常几小时就没了，24h 绝对退避
+  没有恢复证据做前提；状态机也因此只剩一个间隔概念。
 - 新增 `_starve_failed()`：刚到达阈值那一次写一条 `cat=blocker`（连续次数 + 最后一次
   异常原文），6/7/8… 次不再写。
-- 不改 24h 退避本身、不改 6h 成功冷却：失败成因还没查清，先不放宽。
+- 不改 `_STARVE_COOLDOWN`(6h) 的值，也不给失败分类设不同退避：成因还没查清。
+- 独立审查（codex）指出：streak 过期重置会让"退避期不刷屏"不成立（每 6h 会再撞 5 次、
+  再留一条 blocker）。采纳为**有意行为**并改掉文案：≤4 条/天是持续故障应有的痕迹。
 
 ### 验证
 - `pytest tests/test_starve_detector.py tests/test_starve_integration.py -q` → 28 passed；
