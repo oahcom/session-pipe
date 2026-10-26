@@ -134,3 +134,22 @@ def test_latest_error_line_wins_over_stale_quota_line():
     pane = "\n".join([QUOTA_LINE, "✻ 工作中", "● Please run /login · API Error: 403"])
     assert len(_run(eng, pane)) == 1
     assert _facts(eng)[0].args[1].startswith("[rate_limit]"), _facts(eng)
+
+
+def test_failed_audit_is_retried_not_remembered():
+    """写 bus 失败不能记 6h 冷却：否则一次 bus 抖动让这个角色 6h 没有配额审计。
+
+    反向：把 `_rep[role] = now` 移到 write 之前，本用例必须红（第二次不再尝试写）。
+    """
+    eng = _engine()
+    eng._bb.write.side_effect = RuntimeError("bus down")
+    with patch.object(_rl, "_QUOTA_RETRY_SEC", 0):
+        _run(eng, QUOTA_LINE)
+        _run(eng, QUOTA_LINE)
+    assert eng._bb.write.call_count == 2, "写失败后下一次注入仍应尝试记账"
+
+    eng2 = _engine()
+    with patch.object(_rl, "_QUOTA_RETRY_SEC", 0):
+        _run(eng2, QUOTA_LINE)
+        _run(eng2, QUOTA_LINE)
+    assert eng2._bb.write.call_count == 1, "写成功后 6h 内不再重复记账"
