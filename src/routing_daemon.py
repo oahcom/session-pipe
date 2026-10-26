@@ -269,6 +269,27 @@ def _eval_source_mtimes() -> tuple[float, ...]:
         return ()
 
 
+_DEPLOY_MARK = Path.home() / ".hermes" / "run" / "deploy_sync_ts"
+_DEPLOY_MIN_GAP = 900      # 两次自愈重启之间至少隔 15min：main 坏掉时不至于每 tick 退一次
+
+
+def _tree_behind_main(root: str = "") -> int:
+    """部署树落后 main 几个提交；算不出来返回 0（不动作）。
+
+    WHY 要看这个：生产跑的是 ~/wt-live 的检出，而修复都落在 main 上。实测 2026-10-26
+    落后 191 个提交（角色投递/闸门/证据判据整整一代没上线），靠人记得重启必然复发。
+    退出后由 systemd 的 Restart=always 拉起，ExecStartPre 会把树快进到 main —— 于是
+    「合进 main」本身就成了部署动作。
+    """
+    _root = root or str(Path(__file__).resolve().parent.parent)
+    try:
+        r = subprocess.run(["git", "-C", _root, "rev-list", "--count", "HEAD..main"],
+                           capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
 def main():
     LOGGER.info("routing_daemon 启动 PID=%d", os.getpid())
     last_ccs = 0
@@ -298,6 +319,24 @@ def main():
     try:
         error_backoff = 0
         while True:
+            # 部署树落后 main 就自杀重启：systemd 的 ExecStartPre 会快进到 main。
+            # 只在这一 tick 的边界退出，不打断任何在途投递。
+            _behind = _tree_behind_main()
+            if _behind:
+                _now = time.time()
+                try:
+                    _last = float(_DEPLOY_MARK.read_text().strip())
+                except (OSError, ValueError):
+                    _last = 0.0
+                if _now - _last >= _DEPLOY_MIN_GAP:
+                    try:
+                        _DEPLOY_MARK.parent.mkdir(parents=True, exist_ok=True)
+                        _DEPLOY_MARK.write_text(str(_now))
+                    except OSError as _de:
+                        LOGGER.debug("deploy_sync_ts 写失败: %s", _de)
+                    LOGGER.warning("部署树落后 main %d 个提交 → 退出，由 systemd 重启并快进",
+                                   _behind)
+                    return
             if not _any_live_targets():
                 LOGGER.warning("无存活 CCS 目标，休眠 300s")
                 time.sleep(300)
