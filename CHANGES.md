@@ -147,7 +147,8 @@
   _append_role_feedback 已随死分支删除，全仓无生产者、现有 TASKS.md 里 0 条命中 —— 纯死逻辑。
   对应 test_negative_lessons_survive_rewrite 一并删除：**用例本身是好的**（seed 教训再断言存活），
   删是因为这条行为被有意取消（生产者没了），不是因为测试恒真；将来恢复写入方要一起恢复该用例。
-- 测试收紧：断言首轮写的是 feedback + blocker（不是 blocker + blocker）；TASKS.md 先 seed 再断言不变。
+- 测试收紧：假 bus 记录 fact 类型，断言首轮是 `feedback` + `blocker`（类型与顺序，不是只数标题条数）；
+  另补非法 fact 形状（非 dict/None）与 search 非零返回两个用例；TASKS.md 先 seed 再断言不变。
 
 ## 2026-10-22 — temp-pr-branch 合入 main（漂移收敛，35 文件 / 4 处 modify-delete）## 2026-10-22 — 全量套件从未跑完：测试真拉起活体角色 + 巡检预算在单角色上失效
 

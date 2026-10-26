@@ -24,14 +24,17 @@ class _FakeRun:
     """假 subprocess.run：记录 bus 写入，按标题子串决定成败。"""
 
     def __init__(self):
-        self.writes = []
+        self.writes = []      # 标题
+        self.kinds = []       # fact 类型（feedback/blocker）——只断言标题会漏掉类型错位
         self.returncode = 0
         self.fail_substrings = []
         self.search_facts = []
+        self.search_rc = 0
 
     def __call__(self, cmd, **kwargs):
         if len(cmd) > 3 and cmd[1] == "write":
             self.writes.append(cmd[3])
+            self.kinds.append(cmd[2])
 
         class _R:
             pass
@@ -42,7 +45,7 @@ class _FakeRun:
             # 这样删掉 --json 会立刻红灯，而不是留在假绿里。
             if "--json" in cmd:
                 r.stdout = json.dumps({"facts": self.search_facts})
-                r.returncode = 0
+                r.returncode = self.search_rc
             else:
                 r.stdout = "No results."
                 r.returncode = 0
@@ -103,6 +106,8 @@ def test_negative_task_writes_once_then_skips(env):
     _run_once(env)
     second = len(env["writes"]) - len(first)
     assert len(first) == 2, f"首次应写 feedback + blocker，实际 {first}"
+    assert env["fake"].kinds == ["feedback", "blocker"], \
+        f"写入类型必须是 feedback + blocker，实际 {env['fake'].kinds}"
     assert any("质量: negative" in w for w in first), first
     assert any("零回话零产出" in w for w in first), first
     assert second == 0, f"同签名重评估应跳过，实际多写 {second} 条"
@@ -146,8 +151,7 @@ def test_blocker_failure_is_retried(env):
     env["fake"].fail_substrings = []
     before = len(env["writes"])
     _run_once(env)
-    assert any("零回话零产出" in w for w in env["writes"][before:]), \
-        "下轮应重试 blocker"
+    assert "blocker" in env["fake"].kinds[before:], "下轮应重试 blocker"
     assert te._LAST_ASSESSMENT.get("t1") is not None, "全部成功后才落账"
 
 
@@ -223,3 +227,19 @@ def test_feedback_title_is_stable(env):
     _run_once(env)
     title = next(w for w in env["writes"] if "质量:" in w)
     assert "t1" in title and "个产出文件" not in title, title
+
+
+def test_malformed_fact_payload_is_ignored(env):
+    """bus 返回非 dict 元素/非法形状时降级为"无证据"，不能打断整轮评估。"""
+    env["fake"].search_facts = ["oops", None, {"src": "pm"}, 42]
+    _run_once(env)
+    # 含一条合法 pm fact → 仍算回话（证明坏元素被跳过、好元素生效）
+    assert not any("零回话零产出" in w for w in env["writes"]), env["writes"]
+
+
+def test_search_failure_counts_as_no_evidence(env):
+    """search 非零返回但输出可解析：当前实现仍按内容判定（保守不误伤），这里锁住行为。"""
+    env["fake"].search_facts = []
+    env["fake"].search_rc = 1
+    _run_once(env)
+    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
