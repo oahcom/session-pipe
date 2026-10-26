@@ -61,7 +61,7 @@ src/
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
     engine.py         ── 编排 + CLI（2172 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1865 行）
+    step_handler.py   ── 步骤处理（1867 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1412 行）
     task_generator.py ── 任务生成（1022 行）
     wf_lifecycle.py   ── 工作流生命周期（2214 行）
