@@ -131,7 +131,9 @@ def test_refusal_titles_are_not_output():
     for t in ("文档驱动5阶段工作流/s3-complete wf_x 需求文档 PRD.md 120 行",
               "engineer_feature/s1-complete — 落地页门禁 已部署 3 文件",
               "reviewer/s2-complete APPROVED 3 处建议",
-              "document_driven/s1-complete DOCUMENT.md 已落盘 88 行"):
+              "document_driven/s1-complete DOCUMENT.md 已落盘 88 行",
+              # 生产原文 436491：维护角色合法完成里报告「别人的」零产出，不得误杀
+              "maintainer_health_monitor/s2-complete wf_rw_21f1f230b439 — 根因: s1 零产出闭合"):
         assert not _REFUSAL_T.search(t), f"不应判为拒绝: {t}"
 
 class _Fact:

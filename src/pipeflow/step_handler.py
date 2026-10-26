@@ -155,10 +155,12 @@ def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
 _WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
 
 # 角色自述"拒绝产出/无法对齐"的标题不是产出（R163：wf_bc4112d2767f s3/s4 拒产与
-# s1/s2 无产出均被判完成）。只扫标题：14 天生产库 4840 条角色消息标题命中 3 条，
-# 全是真拒绝；正文命中 25 条多数是元讨论（"宽松推进把 blocker 当产出"）。
+# s1/s2 无产出均被判完成）。只扫标题不扫正文：正文命中多为元讨论（"宽松推进把
+# blocker 当产出"）。不含裸"零产出"——维护/审计角色会在**合法完成**的标题里报告
+# 别人的零产出（实测 436491 maintainer_health_monitor/s2-complete 会被误杀）。
+# 30 天生产库 10003 条 fact，标题命中 7 条，带 -complete 的 2 条都是真拒绝。
 _REFUSAL_T = re.compile(
-    r"拒产|拒审|拒绝(产出|审|交付|设计|对齐)|无法(对齐|产出|交付|开始)|零(文档|输入|产出)|输入为零")
+    r"拒产|拒审|拒绝(产出|审|交付|设计|对齐)|无法(对齐|产出|交付|开始)|零文档|零输入|输入为零")
 
 
 def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
