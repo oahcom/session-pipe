@@ -58,67 +58,6 @@ def status() -> dict:
     }
 
 
-def consume_with_linkage(fact_id: int, category: str, consumer: str = "claude") -> dict:
-    """消费一条消息，自动标记其他应消费该分类的角色为已消费。
-
-    消费联动（P1 修复）：
-    - 主消费者 consume（幂等 + 熔断）
-    - 其他应消费该分类的角色自动标记 consume（联动更新 rc）
-    - 记录 ACK + metrics + 心跳
-    """
-    from bus_protocol import Blackboard
-
-    bb = Blackboard()
-    router = _rt_mod.get_router()
-    tid = fact_id
-
-    # 获取所有应消费该分类的角色
-    all_consumers = router.get_consumers(category)
-    # 排除主消费者自己
-    linked = [r for r in all_consumers if r != consumer]
-
-    # 熔断器保护消费操作
-    def _do_consume():
-        bb.mark_consumed(fact_id, consumer)
-
-    try:
-        CIRCUIT_BREAKER.call(_do_consume)
-        # 联动：自动标记其他角色已消费
-        for linked_role in linked:
-            try:
-                bb.mark_consumed(fact_id, linked_role)
-            except Exception as exc:
-                LOGGER.warning("auto-link consume failed for fact=%s linked_role=%s: %s", fact_id, linked_role, exc)
-                METRICS.inc("consume_errors_total", labels={"consumer": linked_role})
-    except Exception as e:
-        LOGGER.error(f"consume #{tid} failed: {e}", extra={"trace_id": str(tid)})
-        METRICS.inc("consume_errors_total", labels={"consumer": consumer})
-        return {
-            "consumed": fact_id,
-            "by": consumer,
-            "category": category,
-            "error": str(e),
-        }
-
-    HEARTBEAT.beat(consumer)
-    METRICS.inc("consume_count", labels={"consumer": consumer})
-
-    ACK_TRACKER.record_ack(fact_id, consumer, "consumed", category=category)
-
-    LOGGER.info(
-        f"Consumed #{fact_id} [{category}] by {consumer}, auto-linked: {linked}",
-        extra={"trace_id": str(fact_id)}
-    )
-
-    return {
-        "consumed": fact_id,
-        "by": consumer,
-        "category": category,
-        "auto_linked": linked,
-    }
-
-
-
 # ── 路由分发（从 routes 导入）──
 from routing.routes import route_all, route_to_ccs, route_all_to_ccs
 
@@ -144,15 +83,6 @@ def _cli_route_all(argv, flags, has_json):
             icon = "→" if d.get("assigned") else "✗"
             print(f"  {icon} #{d['id']} [{d['category']}] → {d.get('assigned', 'none')}")
         print(f"\n路由: {result['routed']}/{result['total']} 条")
-
-
-def _cli_consume(argv, has_json):
-    """--consume CLI。"""
-    fid = int(argv[1])
-    cat = argv[2]
-    c = argv[3] if len(argv) > 3 else "claude"
-    result = consume_with_linkage(fid, cat, c)
-    _output_json(result, has_json)
 
 
 def _cli_route_to_ccs(argv, dry_run, has_json):
@@ -199,7 +129,6 @@ if __name__ == "__main__":
     _ack_retry_flag = "--ack-retry" in flags
     _config_flag = "--config" in flags
     _route_all_flag = "--route-all" in flags
-    _consume_flag = "--consume" in flags
     _routetoccs_flag = "--route-to-ccs" in flags
     _routetoccsall_flag = "--route-all-to-ccs" in flags
     _dry_run = "--dry-run" in flags
@@ -208,7 +137,7 @@ if __name__ == "__main__":
     # 删掉 --dispatch-investigator 后，仍带该 flag 的调用会静默落到广播路径
     # （每条未消费 fact 都被推一遍），一次拼错 flag 就是一轮全量噪音。
     _known = {"--daemon", "--health", "--status", "--metrics", "--ack-stats",
-              "--ack-retry", "--config", "--route-all", "--consume",
+              "--ack-retry", "--config", "--route-all",
               "--route-to-ccs", "--route-all-to-ccs", "--dry-run", "--json"}
     _unknown = [a for a in argv if a.startswith("-") and a not in _known]
     if _unknown:
@@ -241,8 +170,6 @@ if __name__ == "__main__":
         _output_json(get_config().to_dict(), has_json)
     elif _route_all_flag:
         _cli_route_all(argv, flags, has_json)
-    elif _consume_flag and len(argv) >= 3:
-        _cli_consume(argv, has_json)
     elif _routetoccs_flag:
         _cli_route_to_ccs(argv, _dry_run, has_json)
     elif _routetoccsall_flag:
