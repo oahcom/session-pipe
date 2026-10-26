@@ -154,6 +154,12 @@ def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
 
 _WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
 
+# 角色自述"拒绝产出/无法对齐"的标题不是产出（R163：wf_bc4112d2767f s3/s4 拒产与
+# s1/s2 无产出均被判完成）。只扫标题：14 天生产库 4840 条角色消息标题命中 3 条，
+# 全是真拒绝；正文命中 25 条多数是元讨论（"宽松推进把 blocker 当产出"）。
+_REFUSAL_T = re.compile(
+    r"拒产|拒审|拒绝(产出|审|交付|设计|对齐)|无法(对齐|产出|交付|开始)|零(文档|输入|产出)|输入为零")
+
 
 def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
                                           step_id: str, siblings=()) -> bool:
@@ -906,6 +912,8 @@ class StepHandlerMixin:
                         for f in _role_msgs
                         if f.src == _eff
                         and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
+                        and getattr(f, "cat", "") != "blocker"  # 拒产/拒审的 blocker 不是产出（R163）
+                        and not _REFUSAL_T.search(f.t or "")  # 自述拒绝同样不是产出（R163）
                         and f.ts > _notified_ts
                         and f.ts < time.time() + 60  # 防未来时间戳
                         and _mentions(f, _wf_id)
@@ -1708,6 +1716,9 @@ class StepHandlerMixin:
         分类 6 条全部 src=qa），精确匹配可行。
         """
         facts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
+        # 自述拒绝不是产出（R163：wf_bc4112d2767f 的 s3/s4 以「拒产/无法对齐」标题通过
+        # 契约 text_contains 被判完成，下游拿不到契约件才回头返工）。
+        facts = [f for f in facts if not _REFUSAL_T.search(f.t or "")]
         # 屏障锚定「首次写入」而非 facts.ts：facts.t 是 UNIQUE，同文本重写走 UPSERT
         # 会把 ts/cat 原地抬高（blackboard_legacy.py:238-242）。实测 1698 条 fact 被重写、
         # 36 条 exit_message 因此从屏障前移到屏障后 → 旧消息复活被后序步骤消费。
@@ -1797,6 +1808,7 @@ class StepHandlerMixin:
             missing = set(wait_roles) - have
             for _r in missing:
                 _rfacts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
+                _rfacts = [f for f in _rfacts if not _REFUSAL_T.search(f.t or "")]
                 _rmsg = None
                 for _f in _rfacts:
                     # 精确匹配目标角色 src；不放宽到 claude（否则一条

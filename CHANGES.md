@@ -1,5 +1,31 @@
 # CHANGES.md
 
+## 2026-10-26 — 自述拒绝不再被记成 completed
+
+### 问题（外部痕迹，wf_bc4112d2767f 一条链四步）
+角色自己在 bus 上写了「拒产」「拒审」「上游零文档可对照」「设计输入为零」，引擎全部判 completed：
+s1/s2 走宽松推进（timeout_count>=1 + 有 task_spec 锚点 + 角色写过任意同 wf 消息，不看语义），
+s3/s4 走主匹配路径（契约只校 cat/src/`-complete` 令牌，"照格式写一条拒绝"就是完成）。
+下游拿不到契约件才回头返工，返工链又因缺证据建不出来。
+
+### 改动（两处判据，一个谓词）
+- 新增 `_REFUSAL_T`（`step_handler.py:157`）：只扫**标题**的拒绝谓词
+  `拒产|拒审|拒绝(产出|审|交付|设计|对齐)|无法(对齐|产出|交付|开始)|零(文档|输入|产出)|输入为零`。
+  不含 `驳回/未通过`——审查角色"驳回 3 处"是合法完成。
+- `_check_exit` 读到事实后立刻过滤（`step_handler.py:1718`）：主匹配、dual_node 抢救、busy 匹配、
+  协作门补查共用此入口，一处覆盖 6 个 `complete_step` 点。
+- 宽松推进候选额外滤 `cat=blocker` 与拒绝标题（`step_handler.py:912-920`）——该路径不经过 `_check_exit`。
+- 不扩 `review_gate.REJECT_KEYWORDS`：那套是"审查结论"语义，扩进去会污染驳回判定链。
+- 只扫标题不扫正文：正文命中 25 条里多数是元讨论（"宽松推进把 blocker 当产出"），扫正文会误杀。
+
+### 验证
+- 误判率实测（14 天生产库 4840 条角色消息）：标题命中 3 条，3/3 都是真拒绝
+  （`拒产设计` / `零文档可对照` / `拒绝审批 wf_54d7…`）。
+- `pytest tests/test_relaxed_advance_ownership.py -q` → 12 passed；全量 `tests/` → 1457 passed。
+- 变异：删 `_check_exit` 的过滤行 → `test_check_exit_skips_refusal_titles` FAILED；
+  删候选里的 `_REFUSAL_T` 子句 → `test_blocker_message_does_not_advance` FAILED。
+- 需求单：`~/hermes/workspace/R163-自述拒绝被记成完成/需求.md`
+
 ## 2026-10-26 — 饥饿自愈不再被过期的失败 streak 封死
 
 ### 问题（22:16 现场）

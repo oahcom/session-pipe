@@ -104,3 +104,57 @@ def test_message_dicts_always_carry_evidence():
     assert len(blocks) >= 3, f"消息构造点少于预期（{len(blocks)}），检查点可能失效"
     bad = [b for b in blocks if "evidence" not in b]
     assert not bad, f"缺 evidence 的消息构造: {bad}"
+def test_blocker_message_does_not_advance():
+    """拒产/拒审的 blocker 不算"角色已产出"（R163: wf_bc4112d2767f s1/s2）。
+
+    宽松推进只要求角色写过任意同 wf 消息，不看语义 → 角色写"我拒绝产出/无法对齐"
+    也被判完成，下游拿不到契约件。候选构造处排除 cat=blocker。
+    """
+    import re
+    from pathlib import Path
+    import pipeflow.step_handler as sh
+    src = Path(sh.__file__).read_text()
+    m = re.search(r"_relaxed = \[[\s\S]{0,700}?\n                    \]", src)
+    assert m, "找不到 relaxed-advance 候选构造，检查点已失效"
+    assert '!= "blocker"' in m.group(0), "候选构造必须排除 cat=blocker"
+    assert "_REFUSAL_T" in m.group(0), "候选构造必须排除自述拒绝的标题"
+
+
+def test_refusal_titles_are_not_output():
+    """_REFUSAL_T 命中真实拒产标题，且不误伤正常产出（R163 生产原文）。"""
+    from pipeflow.step_handler import _REFUSAL_T
+    for t in ("文档驱动5阶段工作流/s4-complete wf_bc4112d2767f s4 拒产设计：设计输入为零",
+              "文档驱动5阶段工作流/s3-complete wf_bc4112d2767f 需求对齐判定：上游零文档可对照 ALIGNMENT.md",
+              "拒绝审批 wf_54d7ab0d4ec1/s2 (phantom)",
+              "engineer_feature/s1-complete 无法产出：上游契约缺失"):
+        assert _REFUSAL_T.search(t), f"应判为拒绝: {t}"
+    for t in ("文档驱动5阶段工作流/s3-complete wf_x 需求文档 PRD.md 120 行",
+              "engineer_feature/s1-complete — 落地页门禁 已部署 3 文件",
+              "reviewer/s2-complete APPROVED 3 处建议",
+              "document_driven/s1-complete DOCUMENT.md 已落盘 88 行"):
+        assert not _REFUSAL_T.search(t), f"不应判为拒绝: {t}"
+
+class _Fact:
+    def __init__(self, i, t, src="pm", e="", ts=1.0):
+        self.id, self.t, self.src, self.e, self.ts, self.cat = i, t, src, e, ts, "user_story"
+
+
+class _BB:
+    def __init__(self, facts):
+        self.facts = facts
+
+    def read(self, **kw):
+        return list(self.facts)
+
+
+def test_check_exit_skips_refusal_titles():
+    """主路径 exit 匹配也不得把自述拒绝当完成（R163 s3/s4 走的就是主路径）。"""
+    from pipeflow.step_handler import StepHandlerMixin
+    h = type("H", (), {})()
+    h._bb = _BB([
+        _Fact(1, "文档驱动5阶段工作流/s3-complete wf_bc4112d2767f 需求对齐判定：上游零文档"),
+        _Fact(2, "文档驱动5阶段工作流/s3-complete wf_bc4112d2767f 需求文档 PRD.md 120 行", ts=2.0),
+    ])
+    ts, msgs = StepHandlerMixin._check_exit(h, "user_story", "pm", "s3-complete")
+    assert [m["id"] for m in msgs] == [2], f"拒产消息不应算完成: {msgs}"
+    assert ts == 2.0
