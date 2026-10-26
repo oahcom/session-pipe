@@ -1,5 +1,29 @@
 # CHANGES.md
 
+## 2026-10-26 — 饥饿自愈不再被过期的失败 streak 封死
+
+### 问题（22:16 现场）
+最近一条 workflow 建于 15:46，活跃 0 条 —— 纯饿 6.5h。`wf_starve.json` 里
+`consecutive_failures=5` / `last_failure_ts=14:02`，24h 退避把下一次尝试压到次日 14:02。
+可同一时刻额度可用（`:20127` → 200）、`eng.start` 可用（22:21 手工建
+`wf_85aafa99596c`，s0 正常 running），而且 14:02 之后同一条链把 s0..s7 全跑完、
+产出 6 条子链（21:19 收尾）—— streak 早被现实推翻。bus 里也没有任何「我不再尝试了」
+的记录，只能人肉翻状态文件。
+
+### 改动
+- `_starve_signal`：`now - last_failure_ts > _STARVE_COOLDOWN`(6h) 时把失败计数按 0 处理。
+  "连续失败"在一个成功冷却周期内没有新失败，就不成立。
+- 新增 `_starve_failed()`：刚到达阈值那一次写一条 `cat=blocker`（连续次数 + 最后一次
+  异常原文），6/7/8… 次不再写。
+- 不改 24h 退避本身、不改 6h 成功冷却：失败成因还没查清，先不放宽。
+
+### 验证
+- `pytest tests/test_starve_detector.py tests/test_starve_integration.py -q` → 28 passed；
+  全量 `tests/` → 1454 passed。
+- 变异：删 streak 重置 → `test_stale_failure_streak_does_not_block_restart` FAILED；
+  把阈值处的 bus 写改成直接 return → `test_threshold_failure_writes_one_blocker` FAILED。
+- 需求单：`~/hermes/workspace/R166-饥饿自愈被过期失败封死/需求.md`
+
 ## 2026-10-26 — ❌ 死路：按角色收窄驳回判据（试验后【已撤回】，未进 main）
 
 ### 假设
