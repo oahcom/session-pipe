@@ -211,22 +211,12 @@ class IdempotentConsume:
     def __init__(self):
         self._lock = threading.Lock()
 
-    def is_consumed(self, bb, fact_id: int, consumer: str) -> bool:
-        """检查指定 fact 是否已被指定 consumer 消费。
-        注意：log 表用 cat 列存储 consumer 名称（mark_consumed 写入逻辑）。"""
-        with bb._conn() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM log WHERE fid = ? AND typ = 'consume' AND cat = ? LIMIT 1",
-                (fact_id, consumer),
-            ).fetchone()
-            return row is not None
-
     def safe_consume(self, bb, fact_id: int, consumer: str) -> dict:
         """幂等消费：已消费则返回 skipped，否则执行 consume。
 
-        R3 加固（codex D7/D8）：is_consumed + mark_consumed 合并到一个
-        BEGIN IMMEDIATE 事务，检查与写入原子化——跨进程双 daemon 并发时
-        数据库写锁保证只有一个成功（threading.Lock 只保护进程内）。
+        R3 加固（codex D7/D8）：检查与写入合并到一个 BEGIN IMMEDIATE 事务
+        （独立的 is_consumed 读探针会退化成 check-then-act，R165 已删），
+        跨进程双 daemon 并发时数据库写锁保证只有一个成功（threading.Lock 只保护进程内）。
 
         返回：
         - {"status": "consumed", "fact_id": N, "consumer": "X"}

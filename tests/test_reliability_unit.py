@@ -291,19 +291,6 @@ class TestIdempotentConsume:
         assert result["status"] == "error"
         assert "db locked" in result["error"]
 
-    def test_is_consumed_true(self):
-        ic = reliability.IdempotentConsume()
-        bb, conn = self._make_bb()
-        conn.execute.return_value.fetchone.return_value = (1,)
-        assert ic.is_consumed(bb, 1, "x") is True
-
-    def test_is_consumed_false(self):
-        ic = reliability.IdempotentConsume()
-        bb, conn = self._make_bb()
-        conn.execute.return_value.fetchone.return_value = None
-        assert ic.is_consumed(bb, 1, "x") is False
-
-
 # ── AckTracker ──────────────────────────────────────────────────────
 
 class TestAckTracker:
