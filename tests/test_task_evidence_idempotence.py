@@ -237,9 +237,12 @@ def test_malformed_fact_payload_is_ignored(env):
     assert not any("零回话零产出" in w for w in env["writes"]), env["writes"]
 
 
-def test_search_failure_counts_as_no_evidence(env):
-    """search 非零返回但输出可解析：当前实现仍按内容判定（保守不误伤），这里锁住行为。"""
-    env["fake"].search_facts = []
+def test_search_failure_still_honours_content(env):
+    """search 返回非零但内容可解析：仍按内容判（宁可认"说过话"，不误罚角色）。
+
+    锁的是"非零返回 ≠ 无证据"这条行为；空列表的退化情形证明不了它。
+    """
+    env["fake"].search_facts = [{"src": "pm", "t": "pm 的进度"}]
     env["fake"].search_rc = 1
     _run_once(env)
-    assert any("零回话零产出" in w for w in env["writes"]), env["writes"]
+    assert not any("零回话零产出" in w for w in env["writes"]), env["writes"]

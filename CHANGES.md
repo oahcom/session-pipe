@@ -71,9 +71,10 @@
    等于拿引擎的空推进去惩罚角色。
 
 ### 改动（+27/-1）
-- 评估结果新增 `role_spoke`（= 有 exit_messages 或 bus 证据）。
+- 评估结果新增 `role_spoke`（= 有 exit_messages **或 summary** 或角色本人 bus fact）。
 - negative 且 `not role_spoke` → 改发 **blocker**（"completed 但角色零回话零产出"，供运维查引擎），
-  **不写 TASKS.md**；negative 且角色确实说过话才继续走原复盘路径。
+  **不写 TASKS.md**。⚠️ 当时写的"negative 且角色说过话继续走复盘"在 2026-10-23 已删除：
+  `_classify_outputs` 里 n>=1 即判 neutral，negative ⇒ 必无回话，那条分支不可达。
 - `_DETAIL_VERSION` 2 → 3：语义变了，历史 fact 需按新口径重写。
 - 数据修正：删掉 engineer 3 条、maintainer 1 条误罚行（备份 /tmp/eng_tasks.bak、/tmp/mnt_tasks.bak）。
 
