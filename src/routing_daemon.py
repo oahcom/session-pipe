@@ -329,14 +329,18 @@ def main():
                 except (OSError, ValueError):
                     _last = 0.0
                 if _now - _last >= _DEPLOY_MIN_GAP:
+                    # 标记写不进去就不退：冷却失效时退出会变成「每 tick 退一次」的重启风暴
+                    # （ExecStartPre 也拉不动时尤其糟）。宁可继续跑旧代码等下一次机会。
                     try:
                         _DEPLOY_MARK.parent.mkdir(parents=True, exist_ok=True)
                         _DEPLOY_MARK.write_text(str(_now))
                     except OSError as _de:
-                        LOGGER.debug("deploy_sync_ts 写失败: %s", _de)
-                    LOGGER.warning("部署树落后 main %d 个提交 → 退出，由 systemd 重启并快进",
-                                   _behind)
-                    return
+                        LOGGER.warning("落后 main %d 个提交，但冷却标记写失败（不重启）: %s",
+                                       _behind, _de)
+                    else:
+                        LOGGER.warning("部署树落后 main %d 个提交 → 退出，由 systemd 重启并快进",
+                                       _behind)
+                        return
             if not _any_live_targets():
                 LOGGER.warning("无存活 CCS 目标，休眠 300s")
                 time.sleep(300)
