@@ -1,5 +1,34 @@
 # CHANGES.md
 
+## 2026-10-26 — 测试不再写生产的饥饿自愈状态（R166 的真实成因）
+
+### 问题
+R166 记的「14:02 连撞 5 次创建失败」并不是生产失败。用 `sitecustomize` 拦
+`Path.write_text`/`Path.replace` 抓线程栈，拿到确切链路：
+
+```
+pytest 子进程 Thread._bootstrap → daemon_loop → _starve_signal
+  → 「引擎返回值异常」分支 → _starve_failed → 写 ~/.hermes/run/wf_starve.json
+```
+
+`tests/test_daemon_tick_watchdog.py` / `test_daemon_shutdown_grace.py` /
+`test_tick_paths.py` 在子进程里用假引擎跑 `daemon_loop`，`eng.start()` 返回 `0` → 判
+「创建失败」→ 落到生产路径。`STARVE_STATE` 是 `paths.py` 里唯一没有 env 覆盖的状态常量，
+conftest 的 `HERMES_RUN_DIR` 重定向管不到它。**跑一轮 pytest 就能把
+consecutive_failures 累到阈值 5**，生产自愈随即退避 —— 这就是今天 8h 零产出。
+
+### 改动
+- `paths.STARVE_STATE` 支持 `SESSION_PIPELINE_STARVE_STATE`（与 `WORKFLOWS_DB` /
+  `METRICS_JSONL` / `CCS_WORKSPACES` 同口径）；conftest 指向 `_run_dir`。
+- 新增 `test_starve_state_not_production_path_under_pytest` 看守。
+- 清掉被污染的生产状态（`consecutive_failures` / `last_failure_ts`）——它们记录的
+  从来不是生产失败。
+
+### 验证
+- 三个 daemon_loop 用例 → 31 passed，生产 state 文件 md5 前后完全一致（`44867bfc…`）。
+- 反向变异（删掉 conftest 那一行）→ 看守用例 1 failed。
+- 全量 `tests/` → 1459 passed，跑完生产 state 文件 md5 仍不变（`a88408e4…`）。
+
 ## 2026-10-26 — 自述拒绝不再被记成 completed
 
 ### 问题（外部痕迹，wf_bc4112d2767f 一条链四步）
