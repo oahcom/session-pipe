@@ -108,7 +108,7 @@ def test_blocker_message_does_not_advance():
     from pathlib import Path
     import pipeflow.step_handler as sh
     src = Path(sh.__file__).read_text()
-    m = re.search(r"_relaxed = \[[\s\S]{0,700}?\n                    \]", src)
+    m = re.search(r"_relaxed = \[[\s\S]{0,1600}?\n                    \]", src)
     assert m, "找不到 relaxed-advance 候选构造，检查点已失效"
     assert '!= "blocker"' in m.group(0), "候选构造必须排除 cat=blocker"
     assert "_refusal_not_verdict" in m.group(0), \
