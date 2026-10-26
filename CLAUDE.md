@@ -60,8 +60,8 @@ src/
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（2154 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1743 行）
+    engine.py         ── 编排 + CLI（2172 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（1822 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1398 行）
     task_generator.py ── 任务生成（1022 行）
     wf_lifecycle.py   ── 工作流生命周期（2214 行）
@@ -69,7 +69,7 @@ src/
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1157 行）
+    manager.py        ── 工作流状态机（1167 行）
 
   workflow/
     client.py         ── CCS 角色工作流客户端（537 行）
