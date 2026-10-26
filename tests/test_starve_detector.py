@@ -424,3 +424,14 @@ def test_threshold_failure_writes_one_blocker():
             eng.start.side_effect = Exception("模板不存在")
             daemon._starve_signal(eng)
             sp2.run.assert_not_called()
+
+
+# ── 18. 生产状态文件不得被测试写到（R166 的真实成因） ──
+def test_starve_state_not_production_path_under_pytest():
+    """用假引擎跑 daemon_loop 的用例会走到饥饿分支并写状态文件。
+
+    2026-10-26 实测：一轮 pytest 就能把 consecutive_failures 累到阈值 5，
+    生产的饥饿自愈随后退避，产线零产出 8h。conftest 必须把路径重定向到 tmp。
+    """
+    prod = Path.home() / ".hermes" / "run" / "wf_starve.json"
+    assert Path(daemon._STARVE_STATE) != prod, f"测试会写生产饥饿状态: {daemon._STARVE_STATE}"
