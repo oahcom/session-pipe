@@ -153,3 +153,24 @@ def test_failed_audit_is_retried_not_remembered():
         _run(eng2, QUOTA_LINE)
         _run(eng2, QUOTA_LINE)
     assert eng2._bb.write.call_count == 1, "写成功后 6h 内不再重复记账"
+
+def test_quota_audit_cooldown_survives_restart():
+    """重启（新引擎实例=空字典）后仍受 6h 冷却约束：从 bus 回填最近一条 [quota]。"""
+    now = _rl.time.time()
+    fact = MagicMock()
+    fact.ts = now - 600                      # 10 分钟前刚记过账
+    fact.t = f"[quota] {ROLE} 额度/出口硬限，改 1h 探活（第 1 次 2026-10-26 22:00）"
+
+    eng = _engine()
+    eng._bb.read.return_value = [fact]
+    _run(eng, QUOTA_LINE)
+    assert _facts(eng) == [], "同角色 6h 内已记过账 → 不应再写一条"
+
+    # 旧记录超过 6h → 允许再记一条
+    eng2 = _engine()
+    fact_old = MagicMock()
+    fact_old.ts = now - 7 * 3600
+    fact_old.t = fact.t
+    eng2._bb.read.return_value = [fact_old]
+    _run(eng2, QUOTA_LINE)
+    assert len(_facts(eng2)) == 1, "超过 6h 的旧账不该压住新账"

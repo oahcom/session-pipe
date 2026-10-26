@@ -138,6 +138,8 @@ _QUOTA_HINTS = ("FreeUsageLimitError", "FreeTierError", "free-models-per-day",
 _QUOTA_TRANSIENT = ("current egress",)
 _QUOTA_RETRY_SEC = 3600
 _QUOTA_REPORT_COOLDOWN = 6 * 3600
+# 重启后回填冷却用：monitor_audit 约 150 条/天，80 条覆盖 ~12h > 6h 冷却窗口。
+_QUOTA_SEED_ROWS = 80
 
 
 def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AGE) -> bool:
@@ -639,7 +641,19 @@ class RoleLifecycleMixin:
                 _rep = getattr(self, "_quota_reported", None)
                 if _rep is None:
                     self._quota_reported = _rep = {}
-                if _quota and now - _rep.get(role, 0.0) < _QUOTA_REPORT_COOLDOWN:
+                if role not in _rep:
+                    # 冷却必须跨重启存活：进程内字典在 execv/restart 后归零，
+                    # 实测 knowledge_curator 15:39 / 17:10 / 20:26 三条同角色
+                    # [quota]（6h 冷却形同虚设）。bus 里已有这些行，回填最近一条，
+                    # 不再另开状态文件。
+                    try:
+                        _rep[role] = max(
+                            (f.ts for f in self._bb.read(cat="monitor_audit",
+                                                         limit=_QUOTA_SEED_ROWS)
+                             if f.t.startswith(f"[quota] {role} ")), default=0.0)
+                    except Exception:      # 读不到就当没记过账，不阻断恢复
+                        _rep[role] = 0.0
+                if _quota and now - _rep[role] < _QUOTA_REPORT_COOLDOWN:
                     continue
                 self._bb.write("monitor_audit",
                     (f"[quota] {role} 额度/出口硬限，改 1h 探活（第 {attempt + 1} 次 "
