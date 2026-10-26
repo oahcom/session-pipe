@@ -55,6 +55,18 @@ REJECT_KEYWORDS = ("changes_requested", "rejected", "not_approved", "驳回", "�
 # APPROVED/CHANGES_REQUESTED。判据因此按角色收窄：只有审查角色才有"必须表态"。
 REVIEW_ROLES = ("reviewer",)
 
+# 角色自述「拒绝产出/无法对齐」的标题不是产出（R163：wf_bc4112d2767f 的 s3/s4 以
+# 拒产/无法对齐标题通过契约 text_contains 被判完成）。只扫**标题**不扫正文：正文命中
+# 多为元讨论（"宽松推进把 blocker 当产出"）。不含裸"零产出"——维护/审计角色会在合法
+# 完成的标题里报告别人的零产出（436491 maintainer_health_monitor/s2-complete）。
+# 末尾否定前瞻：拒绝词后 12 字内出现「已修复/已通过…」说明那是问题描述而非本轮结论
+# （"零输入测试通过"、"拒绝审批意见已修复"），不算拒产。
+# 实测：全库 10006 条 fact 标题命中 7 条，其中命中步骤契约的 2 条都是真拒绝。
+# 定在这里而不是 step_handler：wf_lifecycle 的 stale rescue 也要用，互相 import 成环。
+REFUSAL_T = re.compile(
+    r"(?:拒产|拒审|拒绝(?:产出|审|交付|设计|对齐)|无法(?:对齐|产出|交付|开始)|零文档|零输入|输入为零)"
+    r"(?!.{0,12}(?:已修复|已解决|已通过|已验证|测试通过))")
+
 
 def is_review_role(role: str) -> bool:
     return (role or "").strip().lower() in REVIEW_ROLES

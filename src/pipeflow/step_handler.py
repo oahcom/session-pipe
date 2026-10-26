@@ -13,6 +13,7 @@ import logging
 import pathlib
 from pathlib import Path
 
+from review_gate import REFUSAL_T
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
 from pipeflow.engine import Step, WorkflowRun, _fail_parent_step
@@ -154,18 +155,8 @@ def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
 
 _WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
 
-# 角色自述"拒绝产出/无法对齐"的标题不是产出（R163：wf_bc4112d2767f s3/s4 拒产与
-# s1/s2 无产出均被判完成）。只扫标题不扫正文：正文命中多为元讨论（"宽松推进把
-# blocker 当产出"）。不含裸"零产出"——维护/审计角色会在**合法完成**的标题里报告
-# 别人的零产出（实测 436491 maintainer_health_monitor/s2-complete 会被误杀）。
-# 实测（全库 10006 条 fact，ttl_pruner 已裁到约 10 天）：标题命中 7 条，其中**命中步骤
-# 契约**的只有 2 条，都是真拒绝；其余 5 条是分析/RCA 类（src=claude/knowledge_curator…），
-# 过滤后不影响任何步骤完成。
-# 末尾否定前瞻：拒绝词后 12 字内出现「已修复/已通过…」说明那是问题描述而非本轮
-# 结论（"零输入测试通过"、"拒绝审批意见已修复"），不算拒产。
-_REFUSAL_T = re.compile(
-    r"(?:拒产|拒审|拒绝(?:产出|审|交付|设计|对齐)|无法(?:对齐|产出|交付|开始)|零文档|零输入|输入为零)"
-    r"(?!.{0,12}(?:已修复|已解决|已通过|已验证|测试通过))")
+# 自述拒绝判据的唯一真相源在 review_gate（wf_lifecycle 的 stale rescue 也用同一份）。
+_REFUSAL_T = REFUSAL_T
 
 
 def _claims_own_step_and_foreign_instance(text: str, wf_id: str, template: str,
@@ -469,8 +460,11 @@ class StepHandlerMixin:
         _sdata = self._step_sd(run, step)
         # 抢救路径只读已落库的 exit_messages，不经 _check_exit —— 历史写进去的
         # 「拒产/拒审」标题会在这里二次生效（R163 残留），同一谓词过滤一遍。
-        _emsgs = [m for m in (_sdata.get("exit_messages") or [])
-                  if not _REFUSAL_T.search((m or {}).get("text") or "")]
+        # 生产库存在畸形值（int/str），历史上只判真值不迭代；这里开始迭代，必须挡。
+        _raw_emsgs = _sdata.get("exit_messages")
+        _emsgs = ([m for m in _raw_emsgs if isinstance(m, dict)
+                   and not _REFUSAL_T.search(m.get("text") or "")]
+                  if isinstance(_raw_emsgs, list) else [])
         if _emsgs and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_approved")):
             # 抢救路径同样过质量闸门：exit_messages 只证明"角色写了消息"，不证明
             # 产出落盘。此前直接 complete → 文件契约缺失的步骤照样推进（与宽松推进
@@ -1751,7 +1745,16 @@ class StepHandlerMixin:
                 continue
             facts.append(f)
         if _refused:
-            self._refusal_note(_refused, own_wf_id or wf_id, step_id)
+            # 同一批拒绝消息每 tick 都会重新命中：进程内去重，别让 bus 的 log 表按 tick 膨胀。
+            _key = (own_wf_id or wf_id, step_id, tuple(f.id for f in _refused))
+            _noted = getattr(self, "_refusal_noted", None)
+            if _noted is None:
+                _noted = self._refusal_noted = set()
+            if _key not in _noted:
+                if len(_noted) > 500:
+                    _noted.clear()
+                _noted.add(_key)
+                self._refusal_note(_refused, own_wf_id or wf_id, step_id)
         # 屏障锚定「首次写入」而非 facts.ts：facts.t 是 UNIQUE，同文本重写走 UPSERT
         # 会把 ts/cat 原地抬高（blackboard_legacy.py:238-242）。实测 1698 条 fact 被重写、
         # 36 条 exit_message 因此从屏障前移到屏障后 → 旧消息复活被后序步骤消费。

@@ -163,6 +163,28 @@ def test_check_exit_skips_refusal_titles():
     assert [m["id"] for m in msgs] == [2], f"拒产消息不应算完成: {msgs}"
     assert ts == 2.0
     assert noted == [[1]], f"被排除的拒产消息必须留痕（返工链/审计的唯一线索）: {noted}"
+def test_refusal_predicate_single_source():
+    """判据只有一份：step_handler 与 wf_lifecycle 共用 review_gate.REFUSAL_T。
+
+    分叉过：谓词先写在 step_handler，wf_lifecycle 的 stale rescue 用不上 → 同一条
+    拒产消息能在回收前抢救路径二次闭合。互相 import 会成环，故下沉到 review_gate。
+    """
+    import review_gate
+    import pipeflow.step_handler as sh
+    assert sh._REFUSAL_T is review_gate.REFUSAL_T, "不得各自编译一份正则"
+
+
+def test_tick_rescue_guards_malformed_exit_messages():
+    """exit_messages 在生产库存在 int/str 畸形值，迭代前必须 isinstance 挡。"""
+    import re
+    from pathlib import Path
+    import pipeflow.step_handler as sh
+    src = Path(sh.__file__).read_text()
+    assert re.search(r"_emsgs = \(\[m for m in _raw_emsgs if isinstance\(m, dict\)", src), \
+        "抢救路径必须过滤非 dict 元素"
+    assert "if isinstance(_raw_emsgs, list) else [])" in src, "非 list 必须降级为空"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

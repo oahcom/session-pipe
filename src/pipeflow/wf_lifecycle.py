@@ -440,7 +440,13 @@ class WorkflowLifecycleMixin:
                     try:
                         _cur = d.get("current_step_id", "")
                         _sdata = sr.get(_cur, {}) if isinstance(sr, dict) else {}
-                        if isinstance(_sdata, dict) and _sdata.get("exit_messages"):
+                        # 拒产/拒审标题不算产出（R163）：stale rescue 也只判"有没有
+                        # exit_messages"，历史写进去的拒产消息会在这里二次闭合。
+                        _emsgs = _sdata.get("exit_messages") if isinstance(_sdata, dict) else None
+                        _ok_msgs = ([m for m in _emsgs if isinstance(m, dict)
+                                     and not _review_gate.REFUSAL_T.search(m.get("text") or "")]
+                                    if isinstance(_emsgs, list) else [])
+                        if _ok_msgs:
                             # 用户要求"每个步骤"都提醒 → stale rescue 也补发完整性提醒
                             # steps 定义在 workflow_templates 表（workflow_instances 无 steps 列）
                             try:

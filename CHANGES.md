@@ -38,7 +38,7 @@ s3/s4 走主匹配路径（契约只校 cat/src/`-complete` 令牌，"照格式�
 下游拿不到契约件才回头返工，返工链又因缺证据建不出来。
 
 ### 改动（两处判据，一个谓词）
-- 新增 `_REFUSAL_T`（`step_handler.py:157`）：只扫**标题**的拒绝谓词
+- 新增 `REFUSAL_T`（见下条，最终落在 `review_gate.REFUSAL_T`）：只扫**标题**的拒绝谓词
   `拒产|拒审|拒绝(产出|审|交付|设计|对齐)|无法(对齐|产出|交付|开始)|零文档|零输入|输入为零`。
   不含 `驳回/未通过`（审查角色"驳回 3 处"是合法完成），也不含裸"零产出"——维护/审计角色会在
   合法完成的标题里报告别人的零产出（实测 436491 会被误杀）。
@@ -53,12 +53,19 @@ s3/s4 走主匹配路径（契约只校 cat/src/`-complete` 令牌，"照格式�
   不算拒产（codex 第一轮举的 4 条误杀样本都属这类）。
 - 不扩 `review_gate.REJECT_KEYWORDS`：那套是"审查结论"语义，扩进去会污染驳回判定链。
 - 只扫标题不扫正文：正文命中 25 条里多数是元讨论（"宽松推进把 blocker 当产出"），扫正文会误杀。
+- 判据下沉到 `review_gate.REFUSAL_T`（`review_gate.py:58`），`step_handler._REFUSAL_T` 只是别名：
+  `wf_lifecycle.py:443` 的 stale rescue 也判"有没有 exit_messages"，不共用一份就会从回收前抢救路径
+  二次闭合；互相 import 会成环，故放叶子模块。
+- 抢救路径的 `exit_messages` 迭代前加 `isinstance` 守卫：生产库存在 int/str 畸形值，旧代码只判真值
+  不迭代，新代码迭代会 TypeError 冒到 run_once 外层。
+- `[refusal]` 留痕按 `(wf, step, 拒绝消息 id 集)` 在进程内去重：否则持续拒产时每 tick 一次 UPSERT，
+  bus 的 log 表按 tick 膨胀（子代理估算 120min≈720 次）。
 
 ### 验证
 - 误判率实测（全库 10006 条 fact，ttl 裁剪后约 10 天）：标题命中 7 条，其中**命中步骤契约**的
   2 条都是真拒绝；其余 5 条是分析/RCA 类（src=claude/knowledge_curator/maintainer 的元讨论），
   不参与任何步骤完成。未收窄的 v1 谓词会误杀 1 条合法完成（436491 maintainer RCA 标题含「零产出」）故收窄。
-- `pytest tests/test_relaxed_advance_ownership.py -q` → 12 passed；全量 `tests/` → 1458 passed（收窄后）。
+- `pytest tests/test_relaxed_advance_ownership.py -q` → 14 passed；全量 `tests/` 见本轮末次结果。
 - 变异：删 `_check_exit` 的过滤行 → `test_check_exit_skips_refusal_titles` FAILED；
   删候选里的 `_REFUSAL_T` 子句 → `test_blocker_message_does_not_advance` FAILED。
 - 需求单：`~/hermes/workspace/R163-自述拒绝被记成完成/需求.md`
