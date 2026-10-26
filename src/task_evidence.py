@@ -399,10 +399,12 @@ def _extract_with(db):
         # 产出文件
         n_files, sample_files = count_output_files(role, t["created_at"], t["updated_at"])
 
-        # exit_messages 检查：引擎是否捕获了角色产出证据
+        # exit_messages 检查：引擎是否捕获了角色产出证据。
+        # 旧写法里套了 wf.get("wf_results") 分支 —— 该键从未存在（wf_map 只放 step_results，
+        # 且已 json.loads 成 dict），整段是解析不到的兜底（第三方审查 2026-10-26）。
         has_exit_messages = any(
             isinstance(v, dict) and v.get("exit_messages")
-            for wf in wfs for v in (json.loads(wf.get("wf_results","{}")) if isinstance(wf.get("wf_results"), str) else wf.get("step_results",{})).values()
+            for wf in wfs for v in wf["step_results"].values()
         ) if wfs else False
 
         result.append({
