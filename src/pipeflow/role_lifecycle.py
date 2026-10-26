@@ -588,11 +588,10 @@ class RoleLifecycleMixin:
                 # 退避状态落盘（与 _ALERT_TS 同一套文件/锁）：daemon 重启后 attempt
                 # 从 0 重新爬，退避曲线等于没有 → 实测 2h 内同一句「上一轮 API 错误
                 # 中断」注入 29 次、跨 13 个角色。
-                # TTL 必须覆盖最长等待：_ALERT_TTL_S 恰好 = _QUOTA_RETRY_SEC 时，
-                # 到期条目先被 TTL 裁掉 → last=0 → 每个 tick 都放行，1h 闸门失效。
-                _ttl = max(self._ALERT_TTL_S, _QUOTA_RETRY_SEC + 300)
+                # 注意 TTL 与 1h 等待相等：条目到期被裁只让 attempt 归 1、下一次
+                # 照常按 wait 放行（不是每 tick 放行），故此处不额外调大 TTL。
                 self._last_rate_recover.update(
-                    _load_rate_state(_ALERT_STATE, now, _ttl))
+                    _load_rate_state(_ALERT_STATE, now, self._ALERT_TTL_S))
                 last, attempt = self._last_rate_recover.get(role, (0.0, 0))
                 wait = (_QUOTA_RETRY_SEC if _quota else
                         self._RATE_LIMIT_BACKOFF_SEC[
@@ -600,7 +599,8 @@ class RoleLifecycleMixin:
                 if now - last < wait:
                     continue
                 self._last_rate_recover[role] = (now, attempt + 1)
-                _save_rate_state(_ALERT_STATE, self._last_rate_recover, now, _ttl)
+                _save_rate_state(_ALERT_STATE, self._last_rate_recover, now,
+                                 self._ALERT_TTL_S)
 
             LOGGER.warning("额度拒绝: %s 命中 403/429（%s），第 %d 次发「继续」重试",
                            role, "硬限" if _quota else "瞬时", attempt + 1)
