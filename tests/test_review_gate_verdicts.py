@@ -156,3 +156,31 @@ def test_last_step_rejection_does_not_complete(mock_run):
 
     assert _saw_rejected, f"末步驳回必须判 rejected，状态序列 {_statuses}"
     assert "completed" not in _statuses, f"末步驳回不得完成，状态序列 {_statuses}"
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_last_step_rejection_fails_fast_without_retry(mock_run):
+    """末步被驳回 → 直接按 failed 收口，不进重投与 2h 升级窗口。
+
+    旧实现：末步驳回落进「无返工链 → 重投原步」，产物不变则必然再驳回，封顶
+    _MAX_REJECTED_RETRY(3) 后升级 coordinator，再等 _REJECTED_ESCALATED_MAX(7200s)
+    无人处置才 failed。实测 wf_971532460c9e/s2 正是这条轨道：
+    retry=3 + rework_escalated_at 落锤后 7209s 由定时器判死。
+    """
+    d = _make_env()
+    _write_wf(d, "rev_last_fast", [_step("s1", type="review")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("rev_last_fast", {})
+
+    eng.run_once()
+    eng._bb.write("notice", "TOK_S1 — 代码审查 CHANGES_REQUESTED: 3 P1", src="test_role")
+    _ticks(eng, 8)
+
+    s = eng.status(rid)
+    assert s["status"] == "failed", \
+        f"末步驳回应立即 failed，实际 {s['status']} / {s['results'].get('s1')}"
+    sr = s["results"]["s1"]
+    assert not sr.get("rework_escalated_at"), "不该走 2h 升级窗口"
+    assert (sr.get("rejected_retry") or 0) == 0, f"不该重投，retry={sr.get('rejected_retry')}"
+

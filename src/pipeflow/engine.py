@@ -1712,7 +1712,25 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         LOGGER.warning("rework 全部完成 %s/%s → 重审原步",
                                        inst["instance_id"][:12], step_id)
 
-                    # ── 无返工链（分类解析不出/末步）→ 回退重投原步 ──
+                    # 末步驳回没有「下一步」可推进：重投只是让同一角色把同一结论再写
+                    # 一遍（产物不变 → 必然再驳回），封顶后还要等 2h 升级窗口没人接。
+                    # 实测 30 天 9 条升级里 7 条 delta 贴着 7200s = 定时器收的，没有一条
+                    # 有 coordinator 署名的处置。故直接按 failed 收口，原因进 wf_logs。
+                    if not _has_next:
+                        self._bb.write(
+                            "blocker",
+                            f"[workflow] {inst['instance_id'][:12]}/{step_id} "
+                            f"末步被驳回 → 按 failed 收口（不重投）",
+                            evidence=(f"末步无 next_step，重投只会复写同一驳回。\n"
+                                      f"驳回理由: {(_rej_sr.get('rejection_reason') or '')[:200]}\n"
+                                      f"已重投 {_rej_sr.get('rejected_retry', 0) or 0} 次"),
+                            src="workflow_engine")
+                        self._lifecycle.close_wf(
+                            inst["instance_id"], status="failed",
+                            reason=f"last step {step_id} rejected "
+                                   f"(retry={_rej_sr.get('rejected_retry', 0) or 0})")
+                        continue
+
                     # 复用首投路径：清空 status → 下轮 `if not step_status` 重发。
                     # 同时清 rejected_at/by/reason 与 bus 锚点：不清锚点则重投后
                     # _tick 的 created_after 屏障停在旧时刻，同一条驳回消息会被
