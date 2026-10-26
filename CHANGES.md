@@ -1,5 +1,33 @@
 # CHANGES.md
 
+## 2026-10-26 — ❌ 死路：按角色收窄驳回判据（试验后【已撤回】，未进 main）
+
+### 假设
+`review_gate.review_verdict` 只看文案，不区分「谁在说」。若让非审查角色必须同时给出
+【系统问题】/【业务问题】分类才算驳回，可消除 2 例「交付物 NO-GO 被当成评审驳回」的返工。
+
+### 实现（只在开发分支，未上线）
+`review_gate.is_step_rejection(verdict, target_role, classified, step_type)`，由
+`wf_lifecycle._advance_production_wf` 与 `lifecycle/manager._advance_unsafe` 共用。
+当时 8 passed / 相关套件 149 passed / 全量 1437 passed。
+
+### 撤回理由（三方审查 64772be1 / 复核 a6ab7b08）
+1. **P1 误放真驳回**：`wf_sub_95155e009948/s3` 是 pm 拒收（「无可排需求」），
+   `wf_3565289ca783/s3` 是 pm 判定未通过（即 R41 记载的被吞驳回案例）。两条都是真驳回，
+   新规则放行后零产出步骤被当完成推进。全库重算：verdict=rejected 的 59 步中
+   **25 步从「拦」变「放」**，收益只有 2 条。
+2. **P1「唯一真相源」不成立**：`src/pipeflow/task_generator.py:97 _subflow_verdict_rejected`
+   仍走纯文本 `is_rejected`，库内 6 例 `rejected_by=subflow_verdict` 绕过新判据。
+3. **P2 零测试覆盖**：删掉 manager 侧新块后 164 条相关用例全绿；原称「wf_lifecycle 关掉
+   → 1 failed」实为 `_classified` NameError，不是行为红。
+4. **收益窗口 n=5**（7 天全库 engine 驳回 5 例：非审查 3 / 真驳回 2，均 reviewer），
+   且 `devops_deploy_plan/s2` 是末步，放行 NO-GO 会让实例以 `completed` 收尾。
+
+### 结论
+R41 的文本判据已被生产验证，按角色收窄引入的误报多于它消除的误报，代码回退到 `e7de762`。
+再议的前提：(a) 把 `task_generator` 第三条路径并入同一判据；(b) 给 manager 侧补一条
+删掉实现就会红的用例，并先量「非末步 / 末步」两类驳回各自的代价。
+
 ## 2026-10-26 — 配额耗尽不再每 30 分钟盲发「继续」：1h 探活 + 每角色 6h 一条审计
 
 ### 问题（可观测证据）
