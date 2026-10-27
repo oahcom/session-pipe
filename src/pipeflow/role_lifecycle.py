@@ -707,11 +707,14 @@ class RoleLifecycleMixin:
             # 角色 grep/读过 role_lifecycle.py 后输出里的匹配串会被当成溢出 —— 实测
             # coordinator 24h 自触发 34 次，命中在第 417/524 行（自己跑的 grep 结果），
             # 底部 30 行无溢出；真实溢出是最后一轮输出，落在尾窗内。
-            _tail = "\n".join(output.splitlines()[-30:])
-            has_overflow = (
-                any(_p in _tail for _p in _OVERFLOW_PATTERNS)
-                or ("Context" in _tail and "remaining" in _tail and "compact" in _tail.lower())
-            )
+            _tail = output.splitlines()[-30:]
+            # 状态栏形态按**单行**判：本文件第 713 行源码同时含 Context/remaining/compact
+            # 三个词，角色 grep 到它就会命中整段字符串拼接的旧判据（2026-10-27 17:24:54
+            # coordinator 仍有 1 次自触发）。真横幅是 `Context low (12% remaining) · Run /compact`，
+            # 带百分号；源码行没有。
+            _sig = next((_p for _l in _tail for _p in _OVERFLOW_PATTERNS if _p in _l), "")
+            if not _sig and any("Context" in _l and "remaining" in _l and "%" in _l for _l in _tail):
+                _sig = "status-bar"
 
             # `-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，故溢出报错一旦滚出
             # 视口就再也抓不到。transcript 是落盘事实，不受视口与进程存活影响。
@@ -720,12 +723,12 @@ class RoleLifecycleMixin:
             # 而本函数从未触发过一次 /compact——只有 pane 单路时角色溢出后永久卡死
             # （product-architect 90 次 / consumer 35 次）。CLAUDE.md 早已声明本路存在，
             # 实为缺失实现。
-            if not has_overflow:
-                has_overflow = _transcript_shows_overflow(role)
-            if not has_overflow:
+            if not _sig and _transcript_shows_overflow(role):
+                _sig = "transcript"
+            if not _sig:
                 continue
 
-            LOGGER.info("上下文溢出: %s 检测到溢出信号，发送 /compact", role)
+            LOGGER.info("上下文溢出: %s 信号=%s → 发送 /compact", role, _sig)
             try:
                 # 先清输入行：溢出时角色常卡在未提交的半截 prompt 上，
                 # 直接发 /compact 会被拼到该行尾变成普通文本而非斜杠命令

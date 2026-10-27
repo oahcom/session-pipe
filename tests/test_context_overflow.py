@@ -271,3 +271,48 @@ def test_stale_pane_history_does_not_trigger_compact():
         eng._check_context_overflow()
 
     assert [c for c in send_keys if "/compact" in c] == [], f"历史残留不该触发: {send_keys}"
+
+def test_source_line_echo_of_status_heuristic_does_not_trigger():
+    """角色 grep 到 role_lifecycle.py 里那行 Context/remaining/compact 源码不算溢出。
+
+    旧判据把三者拼在一个字符串里判，源码行本身就含这三个词（2026-10-27 17:24:54
+    coordinator 修完尾窗后仍有 1 次自触发）。真横幅带百分号。
+    """
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    send_keys = []
+    echo = ['713: 或 ("Context" in _tail and "remaining" in _tail and "compact" in _tail.lower())'] * 5
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="\n".join(echo))
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run), \
+         patch("pipeflow.role_lifecycle._transcript_shows_overflow", return_value=False):
+        eng._check_context_overflow()
+    assert [c for c in send_keys if "/compact" in c] == [], f"源码回显不该触发: {send_keys}"
+
+    # 真状态栏横幅（带百分号）仍要触发
+    eng._last_compact = {}
+    send_keys.clear()
+
+    def fake_run2(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="Context low (12% remaining) · Run /compact")
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run2), \
+         patch("pipeflow.role_lifecycle._transcript_shows_overflow", return_value=False):
+        eng._check_context_overflow()
+    assert [c for c in send_keys if "/compact" in c], "真横幅必须触发 /compact"
