@@ -542,13 +542,9 @@ _CLI_RETRY_MARKERS = ("retrying in", "attempt")
 _PANE_TAIL_LINES = 6   # 底栏状态行上方的 tip/输入框最多 3~5 行
 
 
-def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
-    """判断 CLI 是否仍在执行（底栏 esc/retrying 标记）。调用方可无条件调用。
-
-    只看底部若干行：角色正文里讨论 "esc to interrupt"、贴日志里的 "Retrying …
-    attempt" 时，全文匹配会把该角色所有投递永久判忙（排队到被回收）。
-    返回 None 表示探测失败——调用方按"不可用不判死"处理。
-    """
+def _pane_tail(role: str, timeout: float = 3.0) -> str | None:
+    """pane 底部若干行（小写）。只看底部：角色正文里讨论 "esc to interrupt"、贴日志里的
+    "Retrying … attempt" 时，全文匹配会把该角色所有投递永久判忙。None=探测失败。"""
     try:
         r = subprocess.run(
             ["tmux", "capture-pane", "-p", "-t", f"ccs-{role}"],
@@ -556,11 +552,35 @@ def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
         if r.returncode != 0:
             return None
         lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
-        tail = "\n".join(lines[-_PANE_TAIL_LINES:]).lower()
-        if any(m in tail for m in _CLI_BUSY_MARKERS):
-            return True
-        # 退避中的 CLI 不显示 esc 提示，只挂 "Retrying in 4m 27s · attempt 19/30"：
-        # 仅凭 _CLI_BUSY_MARKERS 会把"正在重试"读成"已死"（#433589 后果 A）。
-        return all(m in tail for m in _CLI_RETRY_MARKERS)
+        return "\n".join(lines[-_PANE_TAIL_LINES:]).lower()
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
+
+
+def pane_cli_busy(role: str, timeout: float = 3.0) -> bool | None:
+    """判断 CLI 是否仍在执行（底栏 esc/retrying 标记）。调用方可无条件调用。
+
+    返回 None 表示探测失败——调用方按"不可用不判死"处理。
+    """
+    tail = _pane_tail(role, timeout)
+    if tail is None:
+        return None
+    if any(m in tail for m in _CLI_BUSY_MARKERS):
+        return True
+    # 退避中的 CLI 不显示 esc 提示，只挂 "Retrying in 4m 27s · attempt 19/30"：
+    # 仅凭 _CLI_BUSY_MARKERS 会把"正在重试"读成"已死"（#433589 后果 A）。
+    return all(m in tail for m in _CLI_RETRY_MARKERS)
+
+
+def pane_cli_retrying(role: str, timeout: float = 3.0) -> bool | None:
+    """CLI 是否卡在传输层/配额退避（底栏 `Retrying in … · attempt n/m`）。
+
+    与 pane_cli_busy 分开：busy=正在执行且会自己结束；retrying=在等上游回来，
+    期间没有工具调用、转录也不写。步骤超时路径据此给宽限而不是记一次超时
+    （实测 2026-10-27 11:28 food_chain_loop/s0：engineer 卡在
+    `Connection refused … Retrying in 0s · attempt 10/15` 两小时 → 4 次超时回收）。
+    """
+    tail = _pane_tail(role, timeout)
+    if tail is None:
+        return None
+    return all(m in tail for m in _CLI_RETRY_MARKERS)

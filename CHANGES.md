@@ -1,5 +1,68 @@
 # CHANGES.md
 
+## 2026-10-27 — 传输层退避不再被判成步骤超时（R168）
+
+### 问题
+R167 的现场快照（bus #459139，11:28）第一次给出真相：
+`food_chain_loop/wf_59463da67abf/s0` 被 4 次超时回收，实例存活 518 分钟，
+而 engineer 的 pane 尾 5 行是
+
+```
+✻ Connection refused — a firewall or proxy m… · Retrying in 0s · attempt 10/15
+```
+
+pane 活着、`CLI busy=True`、转录**零工具调用** —— 角色没死也没偷懒，在等上游。
+上游侧同日实测：9router 进程 14:30:37 才起、`opencode-transport.mjs` 14:48 又重启；
+连打 3 次 `/v1/models` → `200 7.7s / 000 7.3s / 000 0.0006s`（端口在抖）。
+角色侧 24h 出现 `Connection refused`/`Retrying in 0s` **97 次**（coordinator 56）。
+
+### 根因
+超时分支只看 `_is_role_busy`（跑别的任务）与 `_role_producing_recently`（转录有工具调用），
+传输层退避两者都不成立 → 上游抖动 2 小时被记成 4 次角色超时，链被回收。
+`liveness` 早有 `_CLI_RETRY_MARKERS`，却只被 `pane_cli_busy` 合并成一个 True。
+
+### 改动
+- `liveness`：抽出 `_pane_tail()`（`pane_cli_busy` 行为不变），新增
+  `pane_cli_retrying()`（三态，只认 `retrying in` + `attempt`）。
+- `step_handler._retry_grace()`：超时到点且 pane 在退避 → 刷新 `ts` 延一个窗口、
+  **不记** `timeout_count`；`retry_since` 记真实起点，超过 2 个窗口（`timeout*2`）放手回收。
+  探测失败（None）按不延期处理。
+- `tests/conftest.py`：autouse fixture 默认关掉真实 pane 探测 —— 退避中的 pane 会让
+  步骤记账随机器状态红绿互换（实测 `test_delivery_fail_count_accumulates_when_unnotified`
+  在 9router 抖动期反复横跳）。
+
+### 验证
+- `tests/test_retry_grace.py` → 5 passed（含 `_tick` 接线用例）；
+- 变异：删 `_tick` 里的 `if self._retry_grace(...): return` → 接线用例 1 failed；
+- 全量 `tests/` **连续 4 次** 1468 passed（fixture 前那轮 1 failed 已定位为本问题）。
+- 需求单：`~/hermes/workspace/R168-传输层退避被判超时/需求.md`
+
+## 2026-10-27 — 步骤超时回收前留下 CLI/pane 现场（R167）
+
+### 问题
+7 天 306 个实例：completed 160 / cancelled 96 / failed 11；按天完成率
+63%→50%→51%→8%→0%→0%→62%。回收时只写一句 `timeout_count=N >= M`，判不了因。
+
+把「该步目标角色在实例窗口内的工具调用次数」算出来，两类死法被同一句话盖住：
+
+| 步骤（声明超时） | 实例存活 | 角色工具调用 | 死因 |
+|---|---|---|---|
+| `architect_full_design/s1`(45min) ×4 | 181~191min | **0** | 4 次超时回收 |
+| `food_chain_loop/s0`(30min) ×3 | 121~136min | **0** | 4 次超时回收 |
+| `consumer_bus_processing/s1`(30min) | 170min | **0** | 5 次超时回收 |
+| `reviewer_pr_review/s1`(120min) | 279min | 148 | 4h 僵尸回收（真在干活） |
+
+### 改动
+`_write_timeout_forensics()`：在 `timeout_count >= auto_cancel_at` 且
+`not _role_producing_recently(角色)` 时写一条 `cat=blocker`，带声明分钟/实际次数、
+角色、`pane_cli_busy()` 三态（None 不伪装成 False）、`tmux_pane_active()`、pane 尾 5 行。
+抓不到 tmux 静默跳过。不改超时/回收阈值，也不自动重启 pane —— 成因未确认前不猜。
+
+### 验证
+- `tests/test_timeout_forensics.py` → 2 passed；变异（busy 写死 False）→ 1 failed。
+- 全量 `tests/` → 1463 passed。
+- 需求单：`~/hermes/workspace/R167-超时回收零产出无现场/需求.md`
+
 ## 2026-10-26 — 测试不再写生产的饥饿自愈状态（R166 的真实成因）
 
 ### 问题

@@ -420,6 +420,35 @@ class StepHandlerMixin:
             return False
 
 
+    def _retry_grace(self, run, step, eff: str, timeout: float) -> bool:
+        """CLI 卡在传输层退避时延一个窗口、不记超时。返回 True = 本轮已延期。
+
+        传输层故障（Connection refused / 429 客户端退避）与角色无关：角色既没工具
+        调用也没产出，但它在等上游回来。记一次超时只会让链在故障期里被回收 ——
+        实测 2026-10-27 11:28 food_chain_loop/wf_59463da67abf/s0：engineer 卡在
+        `Connection refused … Retrying in 0s · attempt 10/15`，2 小时后 4 次超时回收。
+
+        宽限上限 2 个窗口（用 retry_since 记真实起点，ts 每次延期都会刷新），
+        超过就按原路径回收 —— 上游挂两小时以上，链也不该无限等。
+        判据只看 pane 底 6 行且要求「retrying in」+「attempt」同时出现，
+        角色正文里贴日志的误伤最多损失一个窗口。
+        """
+        from liveness import pane_cli_retrying
+        if not pane_cli_retrying(eff):
+            return False
+        _sd = self._step_sd(run, step)
+        _since = _sd.get("retry_since") or time.time()
+        if time.time() - _since >= timeout * 2:
+            return False
+        run.step_results[step.id] = {**_sd, "ts": time.time(), "retry_since": _since}
+        try:
+            self._sync_step_results(run.id, run.step_results)
+        except Exception as _e:
+            LOGGER.debug("退避宽限同步失败 %s/%s: %s", run.id[:8], step.id, _e)
+        LOGGER.info("步骤 %s/%s 角色 %s 卡在传输退避，延一个窗口（已延 %.0f 分钟）",
+                    run.workflow_name, step.id, eff, (time.time() - _since) / 60)
+        return True
+
     def _write_timeout_forensics(self, run, step, role: str, timeout_count: int) -> None:
         """超时回收前的现场快照（best-effort，失败不影响回收）。
 
@@ -629,6 +658,9 @@ class StepHandlerMixin:
         # 收紧到 2 次即回收——角色 2 个 timeout 窗口无响应即可判定卡死，断死循环。
         _auto_cancel_at = 2 if run.status == "delivery_blocked" else max(max_retries + 3, 4)
         if elapsed >= timeout:
+            # 传输层退避（底栏 Retrying in … attempt n/m）→ 延窗口，不计超时
+            if self._retry_grace(run, step, _eff, timeout):
+                return
             # 角色忙（有其他任务执行中）→ 排队语义：不递增 timeout_count，
             # 仅延长响应窗口（避免"忙时被塞任务→未响应→超时回收"的假阳性）
             if self._is_role_busy(_eff, exclude_wf_id=run.id):

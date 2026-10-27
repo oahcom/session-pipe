@@ -380,3 +380,17 @@ def _alarm_kills_test_not_process():
         signal.alarm(0)
         signal.signal(signal.SIGALRM, _old)
 
+
+
+@pytest.fixture(autouse=True)
+def _no_live_pane_retry_probe(monkeypatch):
+    """默认关掉真实 pane 的退避探测。
+
+    `step_handler._retry_grace` 会在超时时探一次 pane，读的是**本机真实 tmux**：
+    上游抖动时某个 ccs-* pane 的底栏会出现 `Retrying in … · attempt n/m`，
+    于是步骤记账随机器状态红绿互换（实测
+    test_delivery_fail_count_accumulates_when_unnotified 在 9router 抖动期反复横跳）。
+    默认按「没在退避」处理；要真值的用例自己 patch。
+    """
+    import liveness as _lv
+    monkeypatch.setattr(_lv, "pane_cli_retrying", lambda *a, **k: False, raising=False)
