@@ -141,6 +141,54 @@ _QUOTA_REPORT_COOLDOWN = 6 * 3600
 # 重启后回填冷却用：monitor_audit 约 150 条/天，80 条覆盖 ~12h > 6h 冷却窗口。
 _QUOTA_SEED_ROWS = 80
 
+# 终态错误：重发永远不会恢复，只有换模型重启会话才行。与「限流/额度」是两件事——
+# 后者等一会儿会好，前者等多久都撞同一面墙。实测 410 ModelDeprecated 被当成瞬时
+# 限流走了 5 档退避，第 5 档后永久 1800s 重发，pm 输入框积 10 份 nudge、13.1h 零产出
+# （#463020）。判据只认错误原文里的错误类型，不认 410 状态码本身：410 也可用于
+# 别的一次性语义。
+_TERMINAL_HINTS = ("ModelDeprecated",)
+
+
+def _is_terminal_api_error(text: str) -> bool:
+    """这条 API 错误重发能恢复吗？模型被下线 = 不能。"""
+    return any(h in (text or "") for h in _TERMINAL_HINTS)
+
+
+def _seed_report_ts(bb, role: str) -> float:
+    """跨重启回填审计冷却：bus 里已有该角色的报告行就取最近一条的 ts。
+
+    进程内字典在 execv/restart 后归零，实测 knowledge_curator 15:39 / 17:10 /
+    20:26 三条同角色 [quota]（6h 冷却形同虚设）。bus 里已有这些行，回填最近一条，
+    不再另开状态文件。
+    """
+    try:
+        return max((f.ts for f in bb.read(cat="monitor_audit", limit=_QUOTA_SEED_ROWS)
+                    if f.t.startswith(f"[quota] {role} ")
+                    or f.t.startswith(f"[terminal] {role} ")), default=0.0)
+    except Exception:      # 读不到就当没记过账，不阻断恢复
+        return 0.0
+
+
+def _type_and_submit(tmux_name: str, text: str) -> list[int]:
+    """清空输入框 → 按字面量写入 text → **单独**发一次 Enter。返回各步 rc。
+
+    文本与 Enter 必须分两次 send-keys：同一次调用里带 Enter 时，Enter 落在多行
+    文本中间而非结尾，实测干净 pane 落地 0/3，分调用 3/3（#459931 A/B，真值取
+    转录 user 轮）。`-l --` 让文本按字面量写入：文本含 `-` 开头、或含 tmux 键名
+    （q / C-c / Space）时不被当成按键。rc 由调用方判——tmux 对"文本写进输入框
+    但没提交"同样返回 0，rc=0 只证明按键送到了。
+    """
+    _sp = _engine_mod._sp
+    rcs = []
+    for cmd in (
+        ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
+        ["tmux", "send-keys", "-l", "-t", f"{tmux_name}:0.0", "--", text],
+        ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "Enter"],
+    ):
+        rcs.append(getattr(_sp.run(cmd, capture_output=True, timeout=5),
+                           "returncode", 1))
+    return rcs
+
 
 def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AGE) -> bool:
     """角色**最后一条** assistant 轮是否就是一条 API 错误（这类轮 output_tokens 恒为 0）。
@@ -569,6 +617,26 @@ class RoleLifecycleMixin:
                 _why = _last_api_error_text(role) or _why
             _quota = (any(h in _why for h in _QUOTA_HINTS)
                       and not any(t in _why for t in _QUOTA_TRANSIENT))
+            # 终态错误不进退避曲线：重发不会恢复，只会把同一段 88 字文本一遍遍
+            # 叠进输入框（实测 10 份 / 13.1h 零产出）。每角色 6h 一条审计就够，
+            # 人工换模型重启会话才是处置。
+            if _is_terminal_api_error(_why):
+                _rep = getattr(self, "_quota_reported", None)
+                if _rep is None:
+                    self._quota_reported = _rep = {}
+                if role not in _rep:
+                    _rep[role] = _seed_report_ts(self._bb, role)
+                if now - _rep[role] >= _QUOTA_REPORT_COOLDOWN:
+                    self._bb.write("monitor_audit",
+                        f"[terminal] {role} 模型已下线，停止重发"
+                        f"（{time.strftime('%Y-%m-%d %H:%M')}）",
+                        evidence=(_why or output[-300:])[:300], src="workflow_engine")
+                    _rep[role] = now
+                # 终态不是"暂时失败"：清掉退避记录，别让恢复后第一次限流从第 5 档起步
+                self._last_rate_recover.pop(role, None)
+                _save_rate_state(_ALERT_STATE, self._last_rate_recover, now,
+                                 self._ALERT_TTL_S, delete_roles=(role,))
+                continue
             _tail = [ln for ln in output.splitlines() if ln.strip()][-4:]
             # 429 客户端重试进行中：CLI 自己在退避，发 C-u +「继续」会把 attempt
             # 计数重置回 1，把快恢复的角色重新推回 10/10（实测 devops/closer/qa
@@ -607,14 +675,7 @@ class RoleLifecycleMixin:
             LOGGER.warning("额度拒绝: %s 命中 403/429（%s），第 %d 次发「继续」重试",
                            role, "硬限" if _quota else "瞬时", attempt + 1)
             try:
-                _r1 = _engine_mod._sp.run(
-                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
-                    capture_output=True, timeout=5,
-                )
-                _r2 = _engine_mod._sp.run(
-                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", _RATE_LIMIT_NUDGE, "Enter"],
-                    capture_output=True, timeout=5,
-                )
+                _rcs = _type_and_submit(tmux_name, _RATE_LIMIT_NUDGE)
             except Exception as e:
                 LOGGER.warning("额度恢复发送失败 %s: %s", role, e)
                 continue
@@ -624,7 +685,6 @@ class RoleLifecycleMixin:
             # 负数 rc（-9 SIGKILL / -15 SIGTERM）与 None（无法判定）都不是成功：
             # max() 会把 -9 折成 0 → 写出「已发继续」假审计（审查 P2，实测可复现）。
             # 默认取 1：判不了失败时就当失败，宁可多等一轮也不要假审计。
-            _rcs = [getattr(x, "returncode", 1) for x in (_r1, _r2)]
             if any(_rc != 0 for _rc in _rcs):
                 LOGGER.warning("额度恢复发送失败 %s: tmux rc=%s", role, _rcs)
                 continue
@@ -642,17 +702,7 @@ class RoleLifecycleMixin:
                 if _rep is None:
                     self._quota_reported = _rep = {}
                 if role not in _rep:
-                    # 冷却必须跨重启存活：进程内字典在 execv/restart 后归零，
-                    # 实测 knowledge_curator 15:39 / 17:10 / 20:26 三条同角色
-                    # [quota]（6h 冷却形同虚设）。bus 里已有这些行，回填最近一条，
-                    # 不再另开状态文件。
-                    try:
-                        _rep[role] = max(
-                            (f.ts for f in self._bb.read(cat="monitor_audit",
-                                                         limit=_QUOTA_SEED_ROWS)
-                             if f.t.startswith(f"[quota] {role} ")), default=0.0)
-                    except Exception:      # 读不到就当没记过账，不阻断恢复
-                        _rep[role] = 0.0
+                    _rep[role] = _seed_report_ts(self._bb, role)
                 if _quota and now - _rep[role] < _QUOTA_REPORT_COOLDOWN:
                     continue
                 self._bb.write("monitor_audit",
@@ -733,14 +783,7 @@ class RoleLifecycleMixin:
                 # 先清输入行：溢出时角色常卡在未提交的半截 prompt 上，
                 # 直接发 /compact 会被拼到该行尾变成普通文本而非斜杠命令
                 # （实测遗留文本 + "/compact" → 不执行，角色继续溢出）。
-                _engine_mod._sp.run(
-                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "C-u"],
-                    capture_output=True, timeout=5,
-                )
-                _engine_mod._sp.run(
-                    ["tmux", "send-keys", "-t", f"{tmux_name}:0.0", "/compact", "Enter"],
-                    capture_output=True, timeout=5,
-                )
+                _type_and_submit(tmux_name, "/compact")
                 with self._COMPACT_LOCK:
                     self._last_compact[role] = now
                 # 带时刻：压缩频率是上下文压力的唯一时间线，UPSERT 会把它压成一行。
