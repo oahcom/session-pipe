@@ -13,7 +13,10 @@ import logging
 import pathlib
 from pathlib import Path
 
-from review_gate import REFUSAL_T, refusal_hit as _refusal_hit
+# 只有 is_refusal_not_verdict（不是 refusal_hit）：审查角色的合法驳回标题天然带
+# 「无法对齐」这类拒产词，有结论词（CHANGES_REQUESTED/驳回…）时以结论为准，
+# 否则真实驳回被当成拒产丢掉、返工链建不出来（codex 第四轮 P1）。
+from review_gate import REFUSAL_T, is_refusal_not_verdict as _refusal_not_verdict
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
 from pipeflow.engine import Step, WorkflowRun, _fail_parent_step
@@ -519,7 +522,7 @@ class StepHandlerMixin:
         # 生产库存在畸形值（int/str），历史上只判真值不迭代；这里开始迭代，必须挡。
         _raw_emsgs = _sdata.get("exit_messages")
         _emsgs = ([m for m in _raw_emsgs if isinstance(m, dict)
-                   and not _refusal_hit(m.get("text"))]
+                   and not _refusal_not_verdict(m.get("text"))]
                   if isinstance(_raw_emsgs, list) else [])
         if _emsgs and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_approved")):
             # 抢救路径同样过质量闸门：exit_messages 只证明"角色写了消息"，不证明
@@ -979,7 +982,7 @@ class StepHandlerMixin:
                         if f.src == _eff
                         and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                         and getattr(f, "cat", "") != "blocker"  # 拒产/拒审的 blocker 不是产出（R163）
-                        and not _refusal_hit(f.t)  # 自述拒绝同样不是产出（R163）
+                        and not _refusal_not_verdict(f.t)  # 自述拒绝同样不是产出（R163；带结论词的驳回除外）
                         and f.ts > _notified_ts
                         and f.ts < time.time() + 60  # 防未来时间戳
                         and _mentions(f, _wf_id)
@@ -1801,15 +1804,21 @@ class StepHandlerMixin:
         # bus 留痕：返工链第一来源就是这里的 exit_messages，静默丢弃会让"为什么没推进"
         # 无据可查（只剩通用 timeout 文案）。
         facts, _refused = [], []
+        _wf_id_note = own_wf_id or wf_id
         for f in (self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)):
-            if _refusal_hit(f.t):
-                if not text_filter or text_filter in f.t:  # 只记"本来会判完成"的那几条
+            if _refusal_not_verdict(f.t):
+                # 只记"本来会判完成"的那几条：标题过契约 token，且**确实是本实例的**。
+                # 不收窄到本实例时，同类别并发链里 B 实例的拒产会被 A 的 tick 抓走，
+                # 留痕写成 [refusal] <A>/<A's step>，把排障指到错的链上（codex 第四轮 P1）。
+                _t = f.t if isinstance(f.t, str) else str(f.t or "")
+                if (not text_filter or text_filter in _t) and (
+                        not _wf_id_note or _mentions(f, _wf_id_note)):
                     _refused.append(f)
                 continue
             facts.append(f)
         if _refused:
             # 同一批拒绝消息每 tick 都会重新命中：进程内去重，别让 bus 的 log 表按 tick 膨胀。
-            _key = (own_wf_id or wf_id, step_id, tuple(f.id for f in _refused))
+            _key = (_wf_id_note, step_id, tuple(f.id for f in _refused))
             _noted = getattr(self, "_refusal_noted", None)
             if _noted is None:
                 _noted = self._refusal_noted = set()
@@ -1817,7 +1826,7 @@ class StepHandlerMixin:
                 if len(_noted) > 500:
                     _noted.clear()
                 # 只有写成功才记账：写失败被吞掉时下次 tick 还有机会重试（codex 第三轮）
-                if self._refusal_note(_refused, own_wf_id or wf_id, step_id):
+                if self._refusal_note(_refused, _wf_id_note, step_id):
                     _noted.add(_key)
         # 屏障锚定「首次写入」而非 facts.ts：facts.t 是 UNIQUE，同文本重写走 UPSERT
         # 会把 ts/cat 原地抬高（blackboard_legacy.py:238-242）。实测 1698 条 fact 被重写、
@@ -1908,7 +1917,7 @@ class StepHandlerMixin:
             missing = set(wait_roles) - have
             for _r in missing:
                 _rfacts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
-                _rfacts = [f for f in _rfacts if not _refusal_hit(f.t)]  # 已在上面留痕，补查不再重复
+                _rfacts = [f for f in _rfacts if not _refusal_not_verdict(f.t)]  # 已在上面留痕，补查不再重复
                 _rmsg = None
                 for _f in _rfacts:
                     # 精确匹配目标角色 src；不放宽到 claude（否则一条

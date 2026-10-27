@@ -111,8 +111,34 @@ def test_blocker_message_does_not_advance():
     m = re.search(r"_relaxed = \[[\s\S]{0,700}?\n                    \]", src)
     assert m, "找不到 relaxed-advance 候选构造，检查点已失效"
     assert '!= "blocker"' in m.group(0), "候选构造必须排除 cat=blocker"
-    assert "_refusal_hit" in m.group(0) or "_REFUSAL_T" in m.group(0), \
-        "候选构造必须排除自述拒绝的标题"
+    assert "_refusal_not_verdict" in m.group(0), \
+        "候选构造必须排除自述拒绝的标题（别名须指向 is_refusal_not_verdict）"
+
+
+def test_verdict_titles_survive_refusal_filter():
+    """审查角色的合法驳回不能被当拒产丢掉（codex 第四轮 P1）。"""
+    from review_gate import is_refusal_not_verdict
+    # 真驳回：标题带拒产词但**带结论词** → 以结论为准，不丢
+    assert is_refusal_not_verdict("技术实现/s3-complete wf_x: 代码审查 CHANGES_REQUESTED — 接口无法对齐 3 处") is False
+    assert is_refusal_not_verdict("reviewer/s2-complete wf_x 审查未通过：零文档零实现") is False
+    # 纯拒产：无结论词 → 仍丢
+    assert is_refusal_not_verdict("工程/s1-complete wf_x 拒产：设计输入为零") is True
+    assert is_refusal_not_verdict("s1-complete wf_x 无法对齐：上游零文档") is True
+
+
+def test_refusal_note_ignores_foreign_instances():
+    """同类别并发链里 B 实例的拒产不能记到 A 的账上（codex 第四轮 P1）。"""
+    from pipeflow.step_handler import StepHandlerMixin
+    h = type("H", (), {})()
+    noted = []
+    h._refusal_note = lambda refused, wf, step: noted.append([r.id for r in refused]) or True
+    h._bb = _BB([
+        _Fact(1, "工程/s2-complete wf_Aaa 拒产：设计输入为零"),
+        _Fact(2, "工程/s2-complete wf_Bbb 拒产：设计输入为零", ts=2.0),
+    ])
+    StepHandlerMixin._check_exit(h, "code_fix", "engineer", "s2-complete",
+                                 own_wf_id="wf_Aaa")
+    assert noted == [[1]], f"只该记本实例的拒产: {noted}"
 
 
 def test_refusal_hit_tolerates_non_str():
