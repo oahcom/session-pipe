@@ -1,5 +1,24 @@
 # CHANGES.md
 
+## 2026-10-27 — R163 补两处 codex 第三轮指出的洞
+
+### 问题
+codex 第三轮（R163 复审）判「需修改」，两条：
+1. `step_handler.py:522` / `wf_lifecycle.py:447` 把 `m.get("text")` 直接喂 `REFUSAL_T.search`，
+   SQLite 动态类型给出 int/bytes 时抛 `TypeError`，抢救路径没兜住 → 冒到 `run_once`。
+2. `_check_exit` 里 `_noted.add(_key)` 写在 `_refusal_note()` **之前**，写失败被吞后，
+   同一批拒绝消息永远不会再尝试留痕 → `[refusal]` 永久丢失。
+
+### 改动
+- `review_gate.refusal_hit(text)`：非 str 先转字符串再匹配；step_handler 4 处 +
+  wf_lifecycle 1 处统一走它（不再各处直接 `REFUSAL_T.search`）。
+- `_refusal_note()` 返回 bool，只有写成功才记 `_noted`。
+
+### 验证
+- `tests/test_relaxed_advance_ownership.py::test_refusal_hit_tolerates_non_str`（None/int/bytes/list 不抛）。
+- 全量 `tests/` → 1469 passed。
+
+
 ## 2026-10-27 — 传输层退避不再被判成步骤超时（R168）
 
 ### 问题

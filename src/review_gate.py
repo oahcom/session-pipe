@@ -68,6 +68,12 @@ REFUSAL_T = re.compile(
     r"(?!.{0,12}(?:已修复|已解决|已通过|已验证|测试通过))")
 
 
+def refusal_hit(text) -> bool:
+    """标题是否自述拒绝。非 str 先转字符串：SQLite 动态类型可能给出 int/bytes，
+    直接喂给 search 会抛 TypeError（codex R163 第三轮指出）。"""
+    return bool(REFUSAL_T.search(text if isinstance(text, str) else str(text or "")))
+
+
 def is_review_role(role: str) -> bool:
     return (role or "").strip().lower() in REVIEW_ROLES
 

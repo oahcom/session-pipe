@@ -13,7 +13,7 @@ import logging
 import pathlib
 from pathlib import Path
 
-from review_gate import REFUSAL_T
+from review_gate import REFUSAL_T, refusal_hit as _refusal_hit
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
 from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
 from pipeflow.engine import Step, WorkflowRun, _fail_parent_step
@@ -519,7 +519,7 @@ class StepHandlerMixin:
         # 生产库存在畸形值（int/str），历史上只判真值不迭代；这里开始迭代，必须挡。
         _raw_emsgs = _sdata.get("exit_messages")
         _emsgs = ([m for m in _raw_emsgs if isinstance(m, dict)
-                   and not _REFUSAL_T.search(m.get("text") or "")]
+                   and not _refusal_hit(m.get("text"))]
                   if isinstance(_raw_emsgs, list) else [])
         if _emsgs and _sdata.get("status") != "completed" and not (getattr(step, 'dual_node', False) and not _sdata.get("node2_approved")):
             # 抢救路径同样过质量闸门：exit_messages 只证明"角色写了消息"，不证明
@@ -979,7 +979,7 @@ class StepHandlerMixin:
                         if f.src == _eff
                         and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                         and getattr(f, "cat", "") != "blocker"  # 拒产/拒审的 blocker 不是产出（R163）
-                        and not _REFUSAL_T.search(f.t or "")  # 自述拒绝同样不是产出（R163）
+                        and not _refusal_hit(f.t)  # 自述拒绝同样不是产出（R163）
                         and f.ts > _notified_ts
                         and f.ts < time.time() + 60  # 防未来时间戳
                         and _mentions(f, _wf_id)
@@ -1759,7 +1759,7 @@ class StepHandlerMixin:
 
         return (len(errs) == 0, errs)
 
-    def _refusal_note(self, refused, wf_id: str, step_id: str) -> None:
+    def _refusal_note(self, refused, wf_id: str, step_id: str) -> bool:
         """拒产/拒审消息被排除出完成判定时在 bus 留痕。
 
         标题写死（不含计数/时间戳）→ bus 按标题 UPSERT，同一处反复命中只留一行。
@@ -1769,8 +1769,10 @@ class StepHandlerMixin:
                 f"[refusal] {wf_id or '?'} {step_id or '?'} 自述拒绝不算完成",
                 evidence="\n".join(f"#{f.id} {f.src}: {f.t[:160]}" for f in refused[-3:]),
                 src="workflow_engine")
+            return True
         except Exception as _e:
             LOGGER.debug("refusal note failed: %s", _e)
+            return False
 
     def _check_exit(self, cat: str, src_filter: str, text_filter: str, created_after: float = None,
                     wf_id: str = "", wait_roles: list = None,
@@ -1800,7 +1802,7 @@ class StepHandlerMixin:
         # 无据可查（只剩通用 timeout 文案）。
         facts, _refused = [], []
         for f in (self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)):
-            if _REFUSAL_T.search(f.t or ""):
+            if _refusal_hit(f.t):
                 if not text_filter or text_filter in f.t:  # 只记"本来会判完成"的那几条
                     _refused.append(f)
                 continue
@@ -1814,8 +1816,9 @@ class StepHandlerMixin:
             if _key not in _noted:
                 if len(_noted) > 500:
                     _noted.clear()
-                _noted.add(_key)
-                self._refusal_note(_refused, own_wf_id or wf_id, step_id)
+                # 只有写成功才记账：写失败被吞掉时下次 tick 还有机会重试（codex 第三轮）
+                if self._refusal_note(_refused, own_wf_id or wf_id, step_id):
+                    _noted.add(_key)
         # 屏障锚定「首次写入」而非 facts.ts：facts.t 是 UNIQUE，同文本重写走 UPSERT
         # 会把 ts/cat 原地抬高（blackboard_legacy.py:238-242）。实测 1698 条 fact 被重写、
         # 36 条 exit_message 因此从屏障前移到屏障后 → 旧消息复活被后序步骤消费。
@@ -1905,7 +1908,7 @@ class StepHandlerMixin:
             missing = set(wait_roles) - have
             for _r in missing:
                 _rfacts = self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)
-                _rfacts = [f for f in _rfacts if not _REFUSAL_T.search(f.t or "")]  # 已在上面留痕，补查不再重复
+                _rfacts = [f for f in _rfacts if not _refusal_hit(f.t)]  # 已在上面留痕，补查不再重复
                 _rmsg = None
                 for _f in _rfacts:
                     # 精确匹配目标角色 src；不放宽到 claude（否则一条

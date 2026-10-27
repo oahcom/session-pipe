@@ -111,7 +111,21 @@ def test_blocker_message_does_not_advance():
     m = re.search(r"_relaxed = \[[\s\S]{0,700}?\n                    \]", src)
     assert m, "找不到 relaxed-advance 候选构造，检查点已失效"
     assert '!= "blocker"' in m.group(0), "候选构造必须排除 cat=blocker"
-    assert "_REFUSAL_T" in m.group(0), "候选构造必须排除自述拒绝的标题"
+    assert "_refusal_hit" in m.group(0) or "_REFUSAL_T" in m.group(0), \
+        "候选构造必须排除自述拒绝的标题"
+
+
+def test_refusal_hit_tolerates_non_str():
+    """标题可能不是 str（SQLite 动态类型），search 直接炸会冒到 run_once（codex 第三轮）。"""
+    from review_gate import refusal_hit
+    for v in (None, 123, b"bytes", ["x"], "拒产"):
+        try:
+            hit = refusal_hit(v)
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(f"refusal_hit({v!r}) 抛了 {type(e).__name__}: {e}")
+        assert isinstance(hit, bool)
+    assert refusal_hit("s4-complete 拒产设计") is True
+    assert refusal_hit("s4-complete 已部署") is False
 
 
 def test_refusal_titles_are_not_output():
