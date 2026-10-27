@@ -444,7 +444,7 @@ class WorkflowLifecycleMixin:
                         # exit_messages"，历史写进去的拒产消息会在这里二次闭合。
                         _emsgs = _sdata.get("exit_messages") if isinstance(_sdata, dict) else None
                         _ok_msgs = ([m for m in _emsgs if isinstance(m, dict)
-                                     and not _review_gate.REFUSAL_T.search(m.get("text") or "")]
+                                     and not _review_gate.refusal_hit(m.get("text"))]
                                     if isinstance(_emsgs, list) else [])
                         if _ok_msgs:
                             # 用户要求"每个步骤"都提醒 → stale rescue 也补发完整性提醒
