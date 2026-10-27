@@ -121,6 +121,13 @@ def test_verdict_titles_survive_refusal_filter():
     # 真驳回：标题带拒产词但**带结论词** → 以结论为准，不丢
     assert is_refusal_not_verdict("技术实现/s3-complete wf_x: 代码审查 CHANGES_REQUESTED — 接口无法对齐 3 处") is False
     assert is_refusal_not_verdict("reviewer/s2-complete wf_x 审查未通过：零文档零实现") is False
+    # 结论词表不能是第二份：REJECTED/不通过/No-Go 都是既有 _REJECT_WORD 的形态（codex 第五轮 P1）
+    assert is_refusal_not_verdict("技术实现/s3-complete wf_x 审查 REJECTED — 接口无法对齐 3 处") is False
+    assert is_refusal_not_verdict("技术实现/s3-complete wf_x 审查不通过 — 上游无法交付") is False
+    assert is_refusal_not_verdict("技术实现/s3-complete wf_x 审批=No Go，输入为零") is False
+    # 结论词在「后」不算结论：拒产词先出现 → 这是角色自述拒绝（位置定语义）
+    assert is_refusal_not_verdict("工程/s1-complete wf_x 拒产：上一轮 CHANGES_REQUESTED 未修复") is True
+    assert is_refusal_not_verdict("工程/s1-complete wf_x 拒产：等待 approved 环境") is True
     # 纯拒产：无结论词 → 仍丢
     assert is_refusal_not_verdict("工程/s1-complete wf_x 拒产：设计输入为零") is True
     assert is_refusal_not_verdict("s1-complete wf_x 无法对齐：上游零文档") is True

@@ -703,9 +703,14 @@ class RoleLifecycleMixin:
 
             # 信号匹配走共享清单 _OVERFLOW_PATTERNS（与 transcript 路径同源）。
             # 另加状态栏百分比形态（"Context (数字% remaining)"）。
+            # 只认视口**尾部 30 行**：-S -500 连带历史一起抓，而信号词的字面量就在本文件里，
+            # 角色 grep/读过 role_lifecycle.py 后输出里的匹配串会被当成溢出 —— 实测
+            # coordinator 24h 自触发 34 次，命中在第 417/524 行（自己跑的 grep 结果），
+            # 底部 30 行无溢出；真实溢出是最后一轮输出，落在尾窗内。
+            _tail = "\n".join(output.splitlines()[-30:])
             has_overflow = (
-                any(_p in output for _p in _OVERFLOW_PATTERNS)
-                or ("Context" in output and "remaining" in output and "compact" in output.lower())
+                any(_p in _tail for _p in _OVERFLOW_PATTERNS)
+                or ("Context" in _tail and "remaining" in _tail and "compact" in _tail.lower())
             )
 
             # `-S -500` 与 `-S -5000` 返回逐字节相同的视口内容，故溢出报错一旦滚出

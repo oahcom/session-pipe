@@ -244,3 +244,30 @@ def test_transcript_missing_dir_returns_false(tmp_path, monkeypatch):
     from pipeflow import role_lifecycle as rl
     monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
     assert rl._transcript_shows_overflow("no_such_role") is False
+
+def test_stale_pane_history_does_not_trigger_compact():
+    """信号只在历史输出里（角色自己 grep 到本文件）不算溢出：24h 34 次自触发根因。
+
+    实测 coordinator 命中位于 524 行里的第 417 行（grep 结果），底部 30 行无溢出。
+    """
+    eng = _make_overflow_eng()
+    eng._last_compact = {}
+    send_keys = []
+    # 400 行 grep 结果 + 尾部 40 行正常输出（尾窗 30 行，留 10 行余量）
+    stale = ["grep: Context limit reached / Prompt is too long"] * 400 + ["$ 等待下一轮"] * 40
+
+    def fake_run(cmd, *a, **k):
+        if "list-sessions" in cmd:
+            return MagicMock(returncode=0, stdout="ccs-lr\n")
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="\n".join(stale))
+        if "send-keys" in cmd:
+            send_keys.append(cmd)
+            return MagicMock(returncode=0)
+        return MagicMock(returncode=0, stdout="")
+
+    with patch("pipeflow.engine._sp.run", side_effect=fake_run), \
+         patch("pipeflow.role_lifecycle._transcript_shows_overflow", return_value=False):
+        eng._check_context_overflow()
+
+    assert [c for c in send_keys if "/compact" in c] == [], f"历史残留不该触发: {send_keys}"

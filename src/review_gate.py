@@ -68,18 +68,21 @@ REFUSAL_T = re.compile(
     r"(?!.{0,12}(?:已修复|已解决|已通过|已验证|测试通过))")
 
 
-# 审查角色的合法交付物就是"驳回结论"，标题里天然会带「无法对齐/无法产出」这类
-# 拒产词（实测形态：`s3-complete 代码审查 CHANGES_REQUESTED — 接口无法对齐 3 处`）。
-# 有结论词时以结论为准，否则真实驳回会被当成拒产丢掉，返工链建不出来。
-_VERDICT_HIT = re.compile(r"approved|changes_requested|not_approved|驳回|未通过|no-go|nogo", re.I)
-
-
 def is_refusal_not_verdict(text) -> bool:
-    """自述拒绝，且**不是**一条带结论的驳回。"""
-    if not refusal_hit(text):
-        return False
+    """自述拒绝，且拒产词**先于**结论词才算拒产。
+
+    审查角色的合法交付物就是驳回结论，标题天然带拒产词（实测形态
+    `s3-complete 代码审查 CHANGES_REQUESTED — 接口无法对齐 3 处`）：结论词在前 →
+    这是驳回，照拒产丢掉就吞掉真实驳回、返工链建不出来。位置定语义，与 _anchored_verdict
+    里"结论是锚点后第一个谓词"同一条规则。结论词表复用下面 _REJECT_WORD/_PASS_WORD，
+    不另立第二份（第二份必然漏词：REJECTED/不通过/No-Go 都曾被漏掉）。
+    """
     t = text if isinstance(text, str) else str(text or "")
-    return not _VERDICT_HIT.search(t)
+    m = REFUSAL_T.search(t)
+    if not m:
+        return False
+    _v = [x.start() for x in (_REJECT_WORD.search(t), _PASS_WORD.search(t)) if x]
+    return not _v or m.start() < min(_v)
 
 
 def refusal_hit(text) -> bool:

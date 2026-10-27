@@ -1810,7 +1810,7 @@ class StepHandlerMixin:
                 # 只记"本来会判完成"的那几条：标题过契约 token，且**确实是本实例的**。
                 # 不收窄到本实例时，同类别并发链里 B 实例的拒产会被 A 的 tick 抓走，
                 # 留痕写成 [refusal] <A>/<A's step>，把排障指到错的链上（codex 第四轮 P1）。
-                _t = f.t if isinstance(f.t, str) else str(f.t or "")
+                _t = str(f.t or "")  # SQLite 动态类型：int/bytes 直接做 in 会抛 TypeError
                 if (not text_filter or text_filter in _t) and (
                         not _wf_id_note or _mentions(f, _wf_id_note)):
                     _refused.append(f)
@@ -1818,7 +1818,7 @@ class StepHandlerMixin:
             facts.append(f)
         if _refused:
             # 同一批拒绝消息每 tick 都会重新命中：进程内去重，别让 bus 的 log 表按 tick 膨胀。
-            _key = (_wf_id_note, step_id, tuple(f.id for f in _refused))
+            _key = (_wf_id_note, step_id, tuple(sorted(f.id for f in _refused)))  # read 按 ts DESC 无 tie-breaker，同 ts 顺序会变
             _noted = getattr(self, "_refusal_noted", None)
             if _noted is None:
                 _noted = self._refusal_noted = set()
@@ -1875,7 +1875,7 @@ class StepHandlerMixin:
                 _src_ok = bool(eff_role) and f.src == eff_role
                 if not _src_ok and (not wait_roles or f.src not in wait_roles):
                     continue
-            if text_filter and text_filter not in f.t:
+            if text_filter and text_filter not in str(f.t or ""):
                 continue
             if created_after and _birth.get(f.id, f.ts) < created_after:
                 continue
@@ -1924,7 +1924,7 @@ class StepHandlerMixin:
                     # claude-src 消息可满足所有缺失角色，削弱协作门）
                     if _f.src != _r:
                         continue
-                    if text_filter and text_filter not in _f.t:
+                    if text_filter and text_filter not in str(_f.t or ""):
                         continue
                     if created_after and _birth.get(_f.id, _f.ts) < created_after:
                         continue
