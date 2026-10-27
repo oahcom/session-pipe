@@ -9,6 +9,8 @@ import os
 import re
 import time
 import subprocess
+import shutil
+import tempfile
 import logging
 import pathlib
 from pathlib import Path
@@ -1366,30 +1368,72 @@ class StepHandlerMixin:
 
         return
 
+    def _codex_scope_dir(self, run, step) -> tuple:
+        """建一个只含本步产出的临时目录，返回 (目录, 产出文件, 错误)。
+
+        codex review 没有任何路径过滤参数：--uncommitted/--base/--commit 都吃整仓
+        diff，且 --uncommitted 与 [PROMPT] 互斥（实测 EXIT=2），所以"用 prompt
+        限定范围"这条路不存在。角色 workspace 又只是 home 的子目录
+        （`git -C ~/ccs-workspaces/<role> rev-parse --show-toplevel` 全部返回
+        /home/administrator）→ 在那里跑等于把整个 home 的未提交改动送审
+        （实测 1938 处 / 97 文件）。范围只能靠"仓库里只有本步产出"来限定。
+        """
+        req = list((getattr(step, "exit_schema", None) or {}).get("required") or [])
+        if not req:
+            return (None, [], "本步无 exit_schema.required，无法限定审查范围")
+        ws = _CCS_WORKSPACES / self._eff_role(run, step)
+        ws_real = os.path.realpath(ws)
+        floor = (getattr(run, "created_at", 0) or 0) - 2
+        picked = []
+        for name in req:
+            src = ws / name
+            hits = []
+            for m in (sorted(src.parent.glob(src.name)) if "*" in name else [src]):
+                # glob 结果要再验一遍：schema 里的字面路径已验过，但通配符能
+                # 匹配到指向 ws 外的符号链接（realpath 才是真正落点）。
+                real = os.path.realpath(m)
+                # 必须带分隔符边界：startswith("/ws/dev") 会放行兄弟目录 /ws/devops
+                if not (real == ws_real or real.startswith(ws_real + os.sep)):
+                    return (None, [], f"路径越权: {name} -> {real}")
+                if Path(real).is_file() and os.stat(real).st_mtime >= floor:
+                    hits.append(Path(real))
+            if not hits:
+                # 缺一项就审 = 用残缺产出换"通过"，node2_approved 是假证据
+                return (None, [], f"缺少本实例产出: {name}")
+            picked.extend(hits)
+        tmp = Path(tempfile.mkdtemp(prefix="codex-scope-"))
+        for m in picked:
+            dst = tmp / os.path.relpath(m, ws_real)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(m, dst)
+        return (tmp, [str(m) for m in picked], "")
+
     def _run_codex_review(self, run, step) -> dict:
         """自动执行 codex review --uncommitted (三方20维审查自动化，R5 增长).
 
-        在 dual_node 第一节点完成后，自动运行 codex review --uncommitted
-        代替手动提示角色执行。成功时返回 success=True，失败时返回 error 信息。
-
-        R5 增长点: step_handler.py 原来只发 prompt 让角色手动跑 codex review；
-        现在由引擎自动调用 codex CLI (codex review --uncommitted -c model=9router_hermes)。
+        审查范围由本步 exit_schema.required + 本实例产出文件决定（见
+        _codex_scope_dir），与角色 workspace 的 git 根无关。
         """
+        scope = None
         try:
-            # 运行 codex review --uncommitted -c model=9router_hermes
+            scope, _files, _err = self._codex_scope_dir(run, step)
+            if scope is None:
+                return {"success": False, "error": _err}
             # timeout 实测标定：21 文件/734 行 diff 在本机需 6m19s（2026-10-17 实测），
             # 原值 300s 在该规模下必然超时 → 闸门回落人工审查。值可经
             # CODEX_REVIEW_TIMEOUT 调整（大 diff 上调，无需改代码）。
-            # cwd 取角色 workspace：WorkflowRun 无 workspace 字段，旧代码在此抛
-            # AttributeError 被下面 except Exception 吞掉 → codex 从未真正执行，
-            # 质量闸门形同虚设（实测 2026-10-16）。
-            # cwd 取**实际执行者**的 workspace（effective_roles 覆盖优先）：
-            # 若按模板角色取，分流后的步骤会在错误目录里跑 codex（审不到产出）。
-            _ws = _CCS_WORKSPACES / self._eff_role(run, step)
+            subprocess.run(["git", "init", "-q", str(scope)],
+                           capture_output=True, timeout=60)
+            # 必须先 stage：空仓库里复制进来的文件是 untracked，若 codex 只取
+            # `git diff` 则 diff 为空 → 恒判"无发现"= 假通过（比审整个 home 更坏）。
+            # --uncommitted 的 help 写的是 staged+unstaged+untracked，stage 一遍
+            # 让两种实现都看得到内容。
+            subprocess.run(["git", "-C", str(scope), "add", "-A"],
+                           capture_output=True, timeout=60)
             result = subprocess.run(
                 ["codex", "review", "--uncommitted", "-c", "model=9router_hermes"],
                 capture_output=True, text=True, timeout=_CODEX_REVIEW_TIMEOUT,
-                cwd=str(_ws) if _ws.exists() else None,
+                cwd=str(scope),
             )
             if result.returncode == 0:
                 out = result.stdout + result.stderr
@@ -1416,6 +1460,9 @@ class StepHandlerMixin:
             return {"success": False, "error": "codex CLI 未找到 (请确认已安装)"}
         except Exception as e:
             return {"success": False, "error": f"codex review 异常: {e}"}
+        finally:
+            if scope is not None:
+                shutil.rmtree(scope, ignore_errors=True)
 
 
     def _sync_step_results(self, wf_id: str, step_results: dict):

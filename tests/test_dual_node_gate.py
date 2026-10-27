@@ -14,6 +14,7 @@
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -199,3 +200,144 @@ def test_completion_check_advances_after_approved(tmp_path):
                                    "node2_approved": True})
     eng._tick(run, step)
     assert eng._lm.complete_step.called, "已批准却没推进 → 闸门变死锁"
+
+
+# ── 站点 B：codex review 的 cwd 不是独立仓库 ──
+
+def _scope_fixture(tmp_path, monkeypatch):
+    """假 home 里放一个角色 workspace（非独立仓库），返回 (run, step, ws)。"""
+    home = tmp_path / "home"
+    ws = home / "ccs-workspaces" / "scout"
+    ws.mkdir(parents=True)
+    (home / "unrelated_elsewhere.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr("pipeflow.step_handler._CCS_WORKSPACES",
+                        home / "ccs-workspaces")
+    from pipeflow.engine import WorkflowRun, Step
+    run = WorkflowRun(id="wf_scope", workflow_name="food_chain_loop",
+                      context={}, current_step="s1", status="running",
+                      created_at=1e9)
+    step = Step(id="s1", title="调研", target_role="scout", prompt_template="调研",
+                exit_condition={}, dual_node=True,
+                exit_schema={"required": ["SCOUT_REPORT.md"]})
+    return run, step, ws
+
+
+def test_codex_review_never_sends_whole_home_diff(tmp_path, monkeypatch):
+    """红转绿：workspace 只是 home 的子目录（show-toplevel=/home）时，
+    codex 的 cwd 不得是 workspace 或 home —— 否则整 home 未提交改动被送审。"""
+    run, step, ws = _scope_fixture(tmp_path, monkeypatch)
+    (ws / "SCOUT_REPORT.md").write_text("# 报告\n结论：无发现。\n", encoding="utf-8")
+    eng = _engine_for_tick(tmp_path)
+
+    calls = []
+    real_run = subprocess.run
+
+    def _fake_run(cmd, **kw):
+        calls.append((list(cmd), kw.get("cwd")))
+        if cmd[0] == "git":
+            return real_run(cmd, **kw)          # 真建仓/真 stage，才能查里面到底有什么
+        # 送审目录跑完就被 finally 清掉，必须在调用当刻抓快照
+        calls.append(("snapshot", sorted(
+            str(p.relative_to(kw["cwd"]))
+            for p in Path(kw["cwd"]).rglob("*")
+            if p.is_file() and ".git" not in p.relative_to(kw["cwd"]).parts)))
+        # 空仓库里 untracked 文件在 `git diff` 下不可见 → 会恒判"无发现"假通过。
+        # 抓 staged 清单，证明 codex 真能看到内容。
+        calls.append(("staged", real_run(
+            ["git", "-C", kw["cwd"], "diff", "--cached", "--name-only"],
+            capture_output=True, text=True).stdout.split()))
+        return subprocess.CompletedProcess(cmd, 0, "No findings", "")
+
+    monkeypatch.setattr("pipeflow.step_handler.subprocess.run", _fake_run)
+    res = eng._run_codex_review(run, step)
+    assert res["success"] is True, res
+
+    codex_calls = [(c, d) for c, d in calls if isinstance(c, list) and c[0] == "codex"]
+    assert len(codex_calls) == 1, f"codex 应只跑一次: {calls}"
+    cwd = codex_calls[0][1]
+    assert cwd is not None, "旧代码在 ws 不存在时 cwd=None → 落在 daemon 自己的仓库"
+    assert os.path.realpath(cwd) != os.path.realpath(ws), \
+        "codex 的 cwd 仍是角色 workspace → 送审的是整个 home 的 diff"
+    assert not os.path.realpath(cwd).startswith(os.path.realpath(ws) + os.sep)
+    # 送审目录里只应有本步产出，没有 home 里的其它文件
+    sent = [v for k, v in calls if k == "snapshot"][0]
+    assert sent == ["SCOUT_REPORT.md"], f"送审范围被污染: {sent}"
+    staged = [v for k, v in calls if k == "staged"][0]
+    assert staged == ["SCOUT_REPORT.md"], \
+        f"产出没进 index → 空 diff → 恒判无发现（假通过）: {staged}"
+
+
+def test_codex_review_refuses_without_declared_outputs(tmp_path, monkeypatch):
+    """无 exit_schema.required 时不猜范围：直接拒绝，不去审 home。"""
+    run, step, ws = _scope_fixture(tmp_path, monkeypatch)
+    step.exit_schema = None
+    eng = _engine_for_tick(tmp_path)
+    calls = []
+    monkeypatch.setattr("pipeflow.step_handler.subprocess.run",
+                        lambda cmd, **kw: calls.append(list(cmd)))
+    res = eng._run_codex_review(run, step)
+    assert res["success"] is False
+    assert calls == [], f"范围无法确定时不得调用 codex: {calls}"
+
+
+def test_codex_review_refuses_stale_outputs_only(tmp_path, monkeypatch):
+    """只有历史文件（mtime 早于 run.created_at）时不得审——那是假证据。"""
+    run, step, ws = _scope_fixture(tmp_path, monkeypatch)
+    old = ws / "SCOUT_REPORT.md"
+    old.write_text("# 旧报告\n", encoding="utf-8")
+    os.utime(old, (1.0, 1.0))               # run.created_at = 1e9
+    eng = _engine_for_tick(tmp_path)
+    calls = []
+    monkeypatch.setattr("pipeflow.step_handler.subprocess.run",
+                        lambda cmd, **kw: calls.append(list(cmd)))
+    res = eng._run_codex_review(run, step)
+    assert res["success"] is False
+    assert "缺少本实例产出" in res["error"], res
+    assert calls == [], f"历史文件不得被当本步产出送审: {calls}"
+
+
+def test_codex_review_refuses_partial_outputs(tmp_path, monkeypatch):
+    """required 两项只写了一项 → 不得拿子集去审换"通过"。"""
+    run, step, ws = _scope_fixture(tmp_path, monkeypatch)
+    step.exit_schema = {"required": ["PRD.md", "REQUIREMENTS.md"]}
+    (ws / "PRD.md").write_text("# PRD\n", encoding="utf-8")
+    eng = _engine_for_tick(tmp_path)
+    calls = []
+    monkeypatch.setattr("pipeflow.step_handler.subprocess.run",
+                        lambda cmd, **kw: calls.append(list(cmd)))
+    res = eng._run_codex_review(run, step)
+    assert res["success"] is False
+    assert "REQUIREMENTS.md" in res["error"], res
+    assert calls == [], f"残缺产出不得送审: {calls}"
+
+
+def test_codex_review_rejects_glob_symlink_escape(tmp_path, monkeypatch):
+    """通配符匹配到指向 ws 外的符号链接 → 按越权拒绝，不复制出去。"""
+    run, step, ws = _scope_fixture(tmp_path, monkeypatch)
+    outside = tmp_path / "secret.py"
+    outside.write_text("KEY = 'x'\n", encoding="utf-8")
+    (ws / "evil.py").symlink_to(outside)
+    step.exit_schema = {"required": ["*.py"]}
+    eng = _engine_for_tick(tmp_path)
+    calls = []
+    monkeypatch.setattr("pipeflow.step_handler.subprocess.run",
+                        lambda cmd, **kw: calls.append(list(cmd)))
+    res = eng._run_codex_review(run, step)
+    assert res["success"] is False
+    assert "路径越权" in res["error"], res
+    assert calls == [], f"越权文件不得送审: {calls}"
+
+
+def test_codex_scope_error_does_not_escape(tmp_path, monkeypatch):
+    """准备阶段抛异常必须被收成 success=False，否则整个 tick 崩、角色收不到提示。"""
+    run, step, ws = _scope_fixture(tmp_path, monkeypatch)
+    (ws / "SCOUT_REPORT.md").write_text("# r\n", encoding="utf-8")
+    eng = _engine_for_tick(tmp_path)
+
+    def _boom(*a, **kw):
+        raise OSError("EACCES")
+
+    monkeypatch.setattr("pipeflow.step_handler.shutil.copy2", _boom)
+    res = eng._run_codex_review(run, step)
+    assert res["success"] is False, res
+    assert "异常" in res["error"], res
