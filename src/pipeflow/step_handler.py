@@ -71,6 +71,13 @@ _GATE_ESCALATE_AT = 30
 # 却被判完成 —— 闸门过去是纯标签，判据只能落在真正到达的审查结论上。
 _APPROVED_MARK = "-codex-approved"
 
+# 负向终态：codex 跑完但**未达零问题**（ADR-2026-10-28-dual-node-terminal 决策 B）。
+# 没有这个标记时，"审了但不通过" 与 "没审" 无法区分，步骤唯一出口是超时回收：
+# 实测 5 个实例 × timeout_minutes=45 × timeout_count=5 等死，其中
+# wf_a682df8dc6b5 的 scout 7 轮 codex 里 5 轮 429、诚实上报未达成（bus #463402）。
+# 用超时表达"诚实上报"会训练角色谎报通过，所以必须有显式负向标记。
+_BLOCKED_MARK = "-codex-blocked"
+
 
 def _codex_review_prompt(wf_name: str, step_id: str, cat: str) -> str:
     """注入给角色的 codex 审查指令（两个完成站点共用，避免文案漂移）。"""
@@ -94,6 +101,36 @@ def _has_codex_approved(matched_msgs: list, step_id: str) -> bool:
     _needle = step_id + _APPROVED_MARK
     return any(isinstance(m, dict) and _needle in str(m.get("text", ""))
                for m in (matched_msgs or []))
+
+def _has_codex_blocked(matched_msgs: list, step_id: str) -> bool:
+    """匹配到的消息里是否真有本步的 codex-blocked 结论。
+
+    与 _has_codex_approved 同一口径（宽过滤 s{N}- 会把两族标记都带进来）。
+    """
+    _needle = step_id + _BLOCKED_MARK
+    return any(isinstance(m, dict) and _needle in str(m.get("text", ""))
+               for m in (matched_msgs or []))
+
+
+def _codex_verdict(matched_msgs: list, step_id: str):
+    """本步的 codex 终态：'approved' / 'blocked' / None。**同一批里先到者定局**。
+
+    两个标记出现在不同消息里，但宽过滤 s{N}- 会一次带回一批：如果按 if 顺序
+    判，谁写在前面谁赢，就成了隐式优先级（"approve 永远压过 blocked"）。按 ts
+    取最早的那条，两族才是真互斥。
+    """
+    _best, _best_ts = None, None
+    for _m in (matched_msgs or []):
+        if not isinstance(_m, dict):
+            continue
+        _t = str(_m.get("text", ""))
+        for _mark, _verdict in ((_APPROVED_MARK, "approved"), (_BLOCKED_MARK, "blocked")):
+            if step_id + _mark in _t:
+                _ts = _m.get("ts") or 0.0
+                if _best_ts is None or _ts < _best_ts:
+                    _best, _best_ts = _verdict, _ts
+                break
+    return _best
 
 
 def _queue_budget_sec(ec: dict, attempts: int, parent_minutes: float = 0.0) -> float:
@@ -288,6 +325,51 @@ class StepHandlerMixin:
         """
         _v = run.step_results.get(step.id, {})
         return _v if isinstance(_v, dict) else {}
+
+    def _fail_codex_blocked(self, run, step, matched_msgs: list, source: str) -> None:
+        """codex 审过但未达零问题 → 步骤与实例都以 failed 收尾（ADR-2026-10-28 决策 B）。
+
+        不用 manager.fail_step：它的 allow_retry 分支整份覆写 step_results[step_id]
+        （{"status":"failed",...}），会把刚落章的 node2_blocked 一起抹掉 —— 而判据
+        要求 blocked 与 failed 同时可见。
+        引擎里没有「failed 步骤重试」机制（fail_step 的唯一调用点是判父步失败），
+        所以不把实例晾给回收器条件 0 收成 cancelled，而是自己按 failed 收口：
+        步骤判失败 = 这条链的结论就是失败，不是"被回收"。
+        """
+        _needle = step.id + _BLOCKED_MARK
+        reason = next((str(m.get("text", "")) for m in (matched_msgs or [])
+                       if isinstance(m, dict) and _needle in str(m.get("text", ""))), "")[:300]
+        run.step_results[step.id] = {
+            **self._step_sd(run, step),
+            "node2_blocked": True,
+            "node2_blocked_at": time.time(),
+            "node2_blocked_by": source,
+            "status": "failed",
+            "failed_at": time.time(),
+            "failed_reason": reason,
+        }
+        self._sync_step_results(run.id, run.step_results)
+        LOGGER.warning("双节点: %s/%s codex 未达零问题 → 步骤判失败（%s）",
+                       run.workflow_name, step.id, reason[:120])
+        try:
+            # 复用 close_wf：task 状态同步与子链级联都在里面，裸 UPDATE 会漏两件。
+            self._lifecycle.close_wf(
+                run.id, status="failed",
+                reason=f"dual_node {step.id} codex 未达零问题")
+        except Exception as _e:
+            LOGGER.warning("blocked close_wf 失败 %s/%s: %s", run.id[:8], step.id, _e)
+        try:
+            self._bb.write("blocker",
+                f"[workflow] {run.workflow_name}/{run.id[:12]}/{step.id} "
+                f"codex 未达零问题，步骤判失败",
+                evidence=(f"实例: {run.id}\n步骤: {step.id}\n结论来源: {source}\n"
+                          f"角色消息: {reason}\n"
+                          f"复跑: sqlite3 -readonly ~/.hermes/state/workflows.db "
+                          f"\"select step_results from workflow_instances "
+                          f"where instance_id='{run.id}'\""),
+                src="workflow_engine")
+        except Exception as _e:
+            LOGGER.debug("blocked blocker 写入失败: %s", _e)
 
     def _parent_step_minutes(self, run) -> float:
         """子链所在父步声明的 timeout_minutes；非子链返回 0。
@@ -684,9 +766,11 @@ class StepHandlerMixin:
                         template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
-                    if _busy_match_ts and getattr(step, "dual_node", False) \
-                            and not _b_sd.get("node2_approved") \
-                            and _has_codex_approved(_busy_match_msgs, step.id):
+                    _b_verdict = (_codex_verdict(_busy_match_msgs, step.id)
+                                  if (_busy_match_ts and getattr(step, "dual_node", False)
+                                      and not _b_sd.get("node2_approved")
+                                      and not _b_sd.get("node2_blocked")) else None)
+                    if _b_verdict == "approved":
                         run.step_results[step.id] = {
                             **self._step_sd(run, step),
                             "node2_approved": True,
@@ -695,6 +779,11 @@ class StepHandlerMixin:
                         }
                         self._sync_step_results(run.id, run.step_results)
                         _b_sd = self._step_sd(run, step)
+                    elif _b_verdict == "blocked":
+                        # 负向终态：角色审完了但未达零问题 → 不再空等到超时。
+                        # 两个终态互斥：先到者定局，后到的不覆盖（见 _codex_verdict）。
+                        self._fail_codex_blocked(run, step, _busy_match_msgs, "role_bus")
+                        return
                     # 闸门：dual_node 未拿到审查结论前，忙分支不得推进
                     # （原实现只有一处（:426）带守卫，此处漏了 → 4/9 步由此越过）
                     if getattr(step, "dual_node", False) and not _b_sd.get("node2_approved"):
@@ -1196,9 +1285,15 @@ class StepHandlerMixin:
                         return
                     else:
                         # 第二节点消息到达：宽过滤（s{N}-）会同时命中 s{N}-complete
-                        # 与 s{N}-codex-approved，必须看标题是否真有 approved 才认。
-                        if not self._step_sd(run, step).get("node2_approved") \
-                                and _has_codex_approved(_match_msgs, step.id):
+                        # 与 s{N}-codex-approved，必须看标题是否真有结论标记才认。
+                        _n2_sd = self._step_sd(run, step)
+                        _n2_verdict = (_codex_verdict(_match_msgs, step.id)
+                                       if not _n2_sd.get("node2_approved")
+                                       and not _n2_sd.get("node2_blocked") else None)
+                        if _n2_verdict == "blocked":
+                            self._fail_codex_blocked(run, step, _match_msgs, "role_bus")
+                            return
+                        if _n2_verdict == "approved":
                             run.step_results[step.id] = {
                                 **self._step_sd(run, step),
                                 "node2_approved": True,
@@ -1244,9 +1339,16 @@ class StepHandlerMixin:
                         template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
-        if (_dn_wide and _match_ts
-                and not self._step_sd(run, step).get("node2_approved")
-                and _has_codex_approved(_match_msgs, step.id)):
+        _dn_sd = self._step_sd(run, step)
+        _dn_verdict = (_codex_verdict(_match_msgs, step.id)
+                       if (_dn_wide and _match_ts
+                           and not _dn_sd.get("node2_approved")
+                           and not _dn_sd.get("node2_blocked")) else None)
+        if _dn_verdict == "blocked":
+            # 负向终态优先于本段其余逻辑：判失败后不得再落 bus_anchor / complete_step。
+            self._fail_codex_blocked(run, step, _match_msgs, "role_bus")
+            return
+        if _dn_verdict == "approved":
             # 放宽可达性 ≠ 放宽判据：宽 filter 把第一节点自己的 s{N}-complete
             # 也带进来了，只有标题真含 s{N}-codex-approved 才算审查到。
             run.step_results[step.id] = {
@@ -1880,7 +1982,17 @@ class StepHandlerMixin:
         facts, _refused = [], []
         _wf_id_note = own_wf_id or wf_id
         for f in (self._bb.read(cat=cat, limit=200) if cat else self._bb.read(limit=200)):
-            if _refusal_not_verdict(f.t):
+            # 显式负向终态是结论，不是自述拒绝（ADR-2026-10-28 §3 已否决「用措辞猜意图」）。
+            # 负向结论的自然表述恰恰带拒产词：实测
+            # is_refusal_not_verdict('s1-codex-blocked: 接口无法对齐 3 处') 为 True，
+            # 不豁免就静默吞掉，步骤退回等超时 —— 正是该 ADR 要消除的失败模式。
+            # 只豁免**本步**的 blocked 标记：只认裸标记会让
+            # `s3-complete: 无法交付（s2-codex-blocked 未清）` 这种替别步记账的拒产
+            # 也跳过 R163，那正是该过滤要拦的（R163 原意：自述拒绝不是产出）。
+            # approved 侧不豁免：「无法交付，未写 s1-codex-approved」是自述失败，
+            # 一并放行就把它当成审查通过。
+            _ft = str(f.t or "")
+            if _refusal_not_verdict(f.t) and (step_id + _BLOCKED_MARK) not in _ft:
                 # 只记"本来会判完成"的那几条：标题过契约 token，且**确实是本实例的**。
                 # 不收窄到本实例时，同类别并发链里 B 实例的拒产会被 A 的 tick 抓走，
                 # 留痕写成 [refusal] <A>/<A's step>，把排障指到错的链上（codex 第四轮 P1）。
@@ -1974,6 +2086,16 @@ class StepHandlerMixin:
             if not wf_id and _claims_own_step_and_foreign_instance(
                     f.t, own_wf_id, template, step_id, siblings=_siblings):
                 continue
+            # 负向终态的归属要更严：判错一次就把别人的链整条关成 failed（不可恢复），
+            # 与 completed 的多放行一次不对称。消息点名了别的实例、却没点名本实例时，
+            # 即便标题带本步的 blocked 标记，也不算本步结论 —— 实测同模板 5 条链
+            # 可以并发卡在同一步，一条 `s1-codex-blocked: … (wf_other)` 会全杀掉。
+            # 不带任何实例 id 的裸消息仍放行：注入文案与模板 D 段都没要求角色写实例 id，
+            # 强制要求会让负向终态永不触发，退回等超时（ADR 要消除的正是这个）。
+            if step_id and (step_id + _BLOCKED_MARK) in str(f.t or ""):
+                _bid = set(_WF_ID_RE.findall(str(f.t or "")))
+                if _bid and own_wf_id not in _bid:
+                    continue
 
             # evidence 必须一并带上：驳回分类段【系统问题→maintainer】写在 evidence 里，
             # 旧实现只取 t（标题）→ _parse_review_issues 拿不到分类 → 返工链恒建不出

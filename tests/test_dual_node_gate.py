@@ -28,7 +28,7 @@ if str(_src) not in sys.path:
 
 from lifecycle.manager import LifecycleManager  # noqa: E402
 from pipeflow.step_handler import (  # noqa: E402
-    _codex_review_prompt, _has_codex_approved,
+    _codex_review_prompt, _codex_verdict, _has_codex_approved, _has_codex_blocked,
 )
 
 _DUAL_STEPS = [
@@ -407,3 +407,180 @@ def test_first_node_message_alone_does_not_approve(tmp_path):
     # 引擎仍会调 complete_step，收口在 manager 的第二道门（返回 node2_pending）——
     # 那是 dual_node 设计的唯一收口，这里不重复断言（见
     # test_second_complete_blocked_without_approved）。
+
+
+# ── 站点 D：负向终态 codex-blocked（ADR-2026-10-28-dual-node-terminal 决策 B） ──
+
+def test_has_codex_blocked_matches_only_blocked_title():
+    """同一口径：只有标题真含 s1-codex-blocked 才算负向结论。"""
+    assert _has_codex_blocked([{"text": "s1-complete wf_x"}], "s1") is False
+    assert _has_codex_blocked([{"text": "s1-codex-approved wf_x"}], "s1") is False, \
+        "approved 标题不得被当成 blocked"
+    assert _has_codex_blocked([{"text": "s1-codex-blocked wf_x"}], "s1") is True
+    assert _has_codex_blocked([{"text": "s2-codex-blocked wf_x"}], "s1") is False, \
+        "别的步骤的 blocked 不能顶替本步"
+    assert _has_codex_blocked([], "s1") is False
+    assert _has_codex_blocked([{"text": None}], "s1") is False
+
+
+def test_codex_verdict_earliest_message_wins():
+    """同一批里两族标记都在时按 ts 取最早——不是按 if 顺序（那等于隐式优先级）。"""
+    _blk = {"text": "s1-codex-blocked wf_x", "ts": 100.0}
+    _apr = {"text": "s1-codex-approved wf_x", "ts": 200.0}
+    assert _codex_verdict([_blk, _apr], "s1") == "blocked", "blocked 先到却被 approved 覆盖"
+    assert _codex_verdict([_apr, _blk], "s1") == "blocked", \
+        "结论不该取决于消息在列表中的顺序"
+    assert _codex_verdict([{**_apr, "ts": 50.0}, _blk], "s1") == "approved"
+    assert _codex_verdict([{"text": "s1-complete wf_x", "ts": 1.0}], "s1") is None
+    assert _codex_verdict([], "s1") is None
+
+
+def test_blocked_fact_fails_step_instead_of_waiting_for_timeout(tmp_path):
+    """红转绿：角色写 s1-codex-blocked → 步骤立刻 failed，不再空等到超时。
+
+    旧契约只有 approved 一个终态，审不过的步唯一出口是 timeout_count 爬满后被
+    cancel（实测 5 实例 × 45min × 5 次）。用超时表达「诚实上报」会训练角色谎报通过。
+    """
+    fact = _Fact(9101, "s1-codex-blocked: food_chain_loop s1 残留 3 条未修 (wf_dn_tick)",
+                 ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    sd = run.step_results["s1"]
+    assert sd.get("node2_blocked") is True, "blocked 标记没落 → 负向终态不可见"
+    assert sd.get("status") == "failed", f"步骤应以 failed 结束，实际 {sd.get('status')!r}"
+    assert not sd.get("node2_approved"), "blocked 不得同时置 approved"
+    assert not eng._lm.complete_step.called, \
+        "已判失败的步骤仍被 complete → 闸门退化成标签"
+
+
+def test_blocked_does_not_overwrite_existing_approval(tmp_path):
+    """互斥：已 approved 的步骤再收到 blocked 不得翻案（先到者定局）。"""
+    fact = _Fact(9102, "s1-codex-blocked: 迟到结论 (wf_dn_tick)", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+    run.step_results["s1"]["node2_approved"] = True
+
+    eng._tick(run, step)
+
+    sd = run.step_results["s1"]
+    assert sd.get("node2_approved") is True
+    assert not sd.get("node2_blocked"), "迟到的 blocked 覆盖了已批准的结论"
+    assert sd.get("status") != "failed"
+
+
+def test_blocked_closes_instance_as_failed(tmp_path):
+    """实例行级状态也要收口成 failed：否则实例永久计为 running、任务悬空。"""
+    fact = _Fact(9103, "s1-codex-blocked: 残留问题 (wf_dn_tick)", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    assert eng._lm.close_wf.called, "blocked 后没有任何收尾 → 实例保持 running"
+    _kwargs = eng._lm.close_wf.call_args.kwargs
+    assert _kwargs.get("status") == "failed", _kwargs
+
+
+def test_blocked_title_with_refusal_wording_is_not_dropped(tmp_path):
+    """显式终态标记优先于措辞猜测：带拒产词的 blocked 标题不得被 R163 过滤吞掉。
+
+    `_check_exit` 在 `_codex_verdict` 之前调 `_refusal_not_verdict` 丢消息
+    （step_handler.py:1985，R163 自述拒绝不是产出）。而负向终态的自然表述恰恰就是
+    「无法对齐」「拒绝交付」—— 实测 `is_refusal_not_verdict('s1-codex-blocked: 接口
+    无法对齐 3 处')` 返回 True，消息被丢，步骤退回等超时，正是本 ADR 要消除的失败模式。
+    ADR §3 已否决「用措辞猜意图」，显式标记必须压过词表。
+    """
+    fact = _Fact(9104, "s1-codex-blocked: 接口无法对齐 3 处 (wf_dn_tick)", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    sd = run.step_results["s1"]
+    assert sd.get("node2_blocked") is True, \
+        "带「无法对齐」的 blocked 标题被拒产过滤吞掉 → 负向终态永远不生效"
+    assert sd.get("status") == "failed", f"步骤应判失败，实际 {sd.get('status')!r}"
+
+
+def test_refusal_exemption_covers_blocked_only(tmp_path):
+    """豁免不能连 approved 一起放：`无法交付，未写 s1-codex-approved` 是自述失败。
+
+    R163 拦的就是这类消息（角色说"我没交"却被判完成）。只豁免 blocked 一族。
+    """
+    fact = _Fact(9105, "无法交付，未写 s1-codex-approved (wf_dn_tick)", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    sd = run.step_results["s1"]
+    assert not sd.get("node2_approved"), "自述失败被当成审查通过（R163 回归）"
+    assert not sd.get("node2_blocked")
+
+
+def test_blocked_naming_another_instance_does_not_fail_this_one(tmp_path):
+    """一条点名别的实例的 blocked 不得杀掉本实例（判错即不可恢复）。
+
+    同模板可以并发跑多条链，ADR 基线里就有 5 条同时卡在 s1。消息点名
+    wf_otherABC 却没点名本实例 → 不是本链的结论。
+    """
+    fact = _Fact(9106, "s1-codex-blocked: 残留 3 条 (wf_otherABC)", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    sd = run.step_results["s1"]
+    assert not sd.get("node2_blocked"), "别的实例的 blocked 把本链判死了"
+    assert sd.get("status") != "failed"
+    assert not eng._lm.close_wf.called, "本链被无关消息关闭"
+
+
+def test_blocked_naming_own_instance_still_fails(tmp_path):
+    """点名了本实例的 blocked 必须照常判失败——归属校验不能变成永不触发。"""
+    fact = _Fact(9107, "s1-codex-blocked: 残留 3 条 (wf_dn_tick)", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    sd = run.step_results["s1"]
+    assert sd.get("node2_blocked") is True
+    assert sd.get("status") == "failed"
+
+
+def test_blocked_bare_title_without_instance_id_still_fails(tmp_path):
+    """不带任何实例 id 的裸标题仍要生效：注入文案与模板都没要求写实例 id。
+
+    收紧成「必须带本实例 id」会让负向终态永不触发，退回等超时。
+    """
+    fact = _Fact(9108, "s1-codex-blocked: 残留 3 条", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    assert run.step_results["s1"].get("node2_blocked") is True
+
+
+def test_refusal_exemption_not_triggered_by_other_step_marker(tmp_path):
+    """只认本步标记：`s1-complete: 无法交付（s2-codex-blocked 未清）` 仍是自述拒绝。
+
+    豁免若只测裸标记，这条消息会跳过 R163 进入 matched，成为 s1 的完成候选 ——
+    而 R163 拦的正是「自述拒绝当成产出」。直接断言 `_check_exit` 的匹配结果，
+    不经 `_codex_verdict`：本步没有 blocked 标记，走那条路两种实现都是空。
+    """
+    fact = _Fact(9109, "s1-complete: 无法交付（s2-codex-blocked 未清）", ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+
+    _ts, _msgs = eng._check_exit("evolution_report", "scout", "s1-complete",
+                                own_wf_id="wf_dn_tick", template="food_chain_loop",
+                                step_id="s1")
+
+    assert [m["id"] for m in _msgs] == [], \
+        "提到别步 blocked 的拒产标题被豁免进了 matched → R163 被绕过"
+    assert _ts == 0.0
+
