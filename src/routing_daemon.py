@@ -13,7 +13,7 @@ routing_daemon.py — 路由分发 daemon，定期轮询 bus 未消费消息并�
 
 TODO(split): 612 行已超 600 红线（AGENTS.md §9）—— 健康检查/重连段可独立成模块。
 """
-import fcntl, importlib, importlib.util, json, os, subprocess, sys, time
+import datetime, fcntl, importlib, importlib.util, json, os, subprocess, sys, time
 from pathlib import Path
 # Ensure pipeline src is first in sys.path
 _PIPELINE_SRC = str(Path(__file__).resolve().parent)
@@ -164,8 +164,12 @@ def _check_cron_schedules() -> int:
             triggered = {}
 
     now = time.time()
-    now_minute = int(now // 60) * 60  # 当前分钟的开始
+    # 种子必须用 datetime（本地时间）：croniter 对 float 种子按 UTC 解析，
+    # `0 4 * * *` 会算成「UTC 04:00」= 本地 12:00（实测 seed=12:00:30 → prev=12:00:00）。
+    # `*/N` 类表达式逐分钟对齐，本地/UTC 无差别，故该错位只影响带具体小时的表达式。
+    now_dt = datetime.datetime.fromtimestamp(now)
     triggered_count = 0
+    live_keys: set[str] = set()         # 本轮仍存在的角色键，用于剔除退场角色的冻结条目
     launcher = _paths_mod.CCS_CLI
 
     def _is_role_alive(role: str) -> bool:
@@ -202,43 +206,49 @@ def _check_cron_schedules() -> int:
             if not role:
                 continue
             # 检查是否触发了
+            key = f"{role}:{cron_exp}"
+            live_keys.add(key)
             try:
-                # 种子用 now（非 now-60）：get_prev 返回严格早于种子的调度点。
-                # 旧写法 seed=now-60 使 prev <= now-60，而 now_minute > now-60 恒成立
-                # → `now_minute <= prev` 恒假 → 本函数永不触发（实测 * * * * * 触发 0 次，
-                # subprocess.run 调用 0 次）。判据改为“调度点落在当前这一分钟内”。
-                cron = croniter.croniter(cron_exp, now)
-                prev = cron.get_prev(float)
-                if now_minute <= prev < now_minute + 60:
-                    # 去重：同一角色同一分钟不重复触发
-                    key = f"{role}:{cron_exp}"
-                    last = triggered.get(key, 0)
-                    if now - last > 60:
-                        triggered[key] = now
-                        # 强化死角色检测：防止盲发导致 ccs_send_fallback 刷屏
-                        if not _is_role_alive(role):
-                            LOGGER.info("cron_schedule 跳过死角色: %s (not running)", role)
-                            continue
-                        LOGGER.info("cron_schedule 触发: %s (%s)", role, cron_exp)
-                        # 必须显式 --from：ccs.py 的 --from 默认值是 "cli"，
-                        # 而 core.send 把 "cli"/"user" 当人类来源 → 触发意图提醒注入
-                        # 并**刷新该角色的用户请求痕迹 ts**。痕迹是意图守护 daemon 的
-                        # 触发源（ts 即"最近一次用户请求"），被定时任务刷新后，同一请求
-                        # 会被当成"新一轮请求"→ 预算重置 → 提醒无限重复。
-                        subprocess.run(
-                            [sys.executable, str(launcher), "send", role,
-                             f"定时任务触发 (cron: {cron_exp})",
-                             "--from", "routing_daemon"],
-                            capture_output=True, timeout=10,
-                        )
-                        triggered_count += 1
+                # 判据：调度点是否落在「上次检查之后、现在之前」的区间里。
+                # 旧判据只认「当前这一分钟」（now_minute <= prev < now_minute+60），
+                # 而本函数每 CCS_INTERVAL=300s 才跑一次 → 每个窗口被采到的概率仅
+                # 60/300 ≈ 20%，`0 4 * * *` 等于每天独立掷一次 20% 的骰子
+                # （实测 optimizer 连续 4 天 04-06 点零产出，账本 age 84h）。
+                # 区间判据与采样周期无关，且同一调度点只会命中一次（天然幂等）。
+                cron = croniter.croniter(cron_exp, now_dt)
+                prev = cron.get_prev(datetime.datetime).timestamp()
+                last = triggered.get(key, 0)
+                if last < prev <= now:
+                    # 强化死角色检测：防止盲发导致 ccs_send_fallback 刷屏
+                    if not _is_role_alive(role):
+                        LOGGER.info("cron_schedule 跳过死角色: %s (not running)", role)
+                        continue
+                    LOGGER.info("cron_schedule 触发: %s (%s)", role, cron_exp)
+                    # 必须显式 --from：ccs.py 的 --from 默认值是 "cli"，
+                    # 而 core.send 把 "cli"/"user" 当人类来源 → 触发意图提醒注入
+                    # 并**刷新该角色的用户请求痕迹 ts**。痕迹是意图守护 daemon 的
+                    # 触发源（ts 即"最近一次用户请求"），被定时任务刷新后，同一请求
+                    # 会被当成"新一轮请求"→ 预算重置 → 提醒无限重复。
+                    subprocess.run(
+                        [sys.executable, str(launcher), "send", role,
+                         f"定时任务触发 (cron: {cron_exp})",
+                         "--from", "routing_daemon"],
+                        capture_output=True, timeout=10,
+                    )
+                    triggered_count += 1
+                    # 账本只在真的发出去之后推进：死角色若也记账，本窗口会被
+                    # 永久消费掉，角色活过来也补不到这一班。
+                    triggered[key] = now
             except (ValueError, KeyError):
                 continue  # cron 表达式无效
         except Exception as e:
             LOGGER.debug("cron_schedule 解析失败 %s: %s", f.name, e)
             continue
 
-    # 写回去重跟踪
+    # 写回去重跟踪：只保留本轮仍存在的角色键。
+    # 旧实现整体读、整体写，从不删除已退场角色的条目 → curator / ccs-monitor
+    # 冻结在 126h / 109h 永不更新，账本只增不减且读起来像"这两个角色还在跑"。
+    triggered = {k: v for k, v in triggered.items() if k in live_keys}
     CRON_SCHEDULE_TRACKER.write_text(json.dumps(triggered))
     if triggered_count:
         LOGGER.info("cron_schedule: 本次触发 %d 个角色", triggered_count)
