@@ -341,3 +341,69 @@ def test_codex_scope_error_does_not_escape(tmp_path, monkeypatch):
     res = eng._run_codex_review(run, step)
     assert res["success"] is False, res
     assert "异常" in res["error"], res
+
+# ── 站点 C：node2 结论匹配整段挂在 integrity 闸门内 → dual_node 生产不可达 ──
+
+class _Fact:
+    """bus 事实的最小面（_check_exit 只读 id/t/e/src/ts）。"""
+    def __init__(self, fid, title, src="scout", ts=0.0, evidence=""):
+        self.id, self.t, self.src, self.ts, self.e = fid, title, src, ts, evidence
+
+
+def _engine_with_bus(tmp_path, facts):
+    eng = _engine_for_tick(tmp_path)
+    eng._bb.read.side_effect = lambda *a, **kw: list(facts)
+    return eng
+
+
+def _stuck_run_and_step():
+    """生产现场：node1 已落章、审查指令已发（busy 未送达）、integrity 从未激活。
+
+    13/13 个 dual_node 步在库里的形状就是这个 —— node1_done=True /
+    node2_sent=True / node2_approved=None / 无任何 integrity_* 字段。
+    """
+    run, step = _run_and_step()
+    run.step_results["s1"] = {"status": "notified", "ts": 1e12, "notified_at": 1e12,
+                              "node1_done": True, "node1_at": 1e12,
+                              "node2_sent": True, "node2_sent_at": 1e12}
+    return run, step
+
+
+def test_approved_fact_is_honoured_without_integrity_activation(tmp_path):
+    """红转绿：node2_sent 后角色写了 s1-codex-approved → 必须置 approved 并推进。
+
+    三个写 node2_approved 的站点（:692 busy / :1184 engine_codex / :1204 role_bus）
+    原本都在 `if _integ_state.complete and not _integ_dual_pending:` 里，而
+    `_integ_activate` 只在**非** dual_node 分支调用 → 该闸门对 dual_node 恒假，
+    整段（含宽 filter 匹配）是死代码。生产后果：角色写对了也永远匹配不到。
+    实测 4 个实例的角色确实写过 approved 事实（#439995 #459762 #461553 #462996），
+    库里 node2_approved 依旧全为 None。
+    """
+    # ts 必须 >= 实例的 last_ts（fixture 用 1e12 表示"永不超时"），
+    # 否则被 created_after 屏障挡掉，与"是否可达"无关。
+    fact = _Fact(9001, "s1-codex-approved: food_chain_loop s1 审查通过 (wf_dn_tick)",
+                 ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    assert run.step_results["s1"].get("node2_approved") is True, \
+        "角色已写 s1-codex-approved，引擎却没置 node2_approved → 宽 filter 段仍不可达"
+    assert eng._lm.complete_step.called, "拿到审查结论仍未推进 → 死锁"
+
+
+def test_first_node_message_alone_does_not_approve(tmp_path):
+    """放宽可达性不等于放宽判据：node2_sent 后只有 s1-complete 仍不得放行。"""
+    fact = _Fact(9002, "s1-complete: food_chain_loop s1 情报生产 (wf_dn_tick)",
+                 ts=1e12 + 10)
+    eng = _engine_with_bus(tmp_path, [fact])
+    run, step = _stuck_run_and_step()
+
+    eng._tick(run, step)
+
+    assert not run.step_results["s1"].get("node2_approved"), \
+        "第一节点自己的完成消息被当成审查结论 → 闸门形同虚设"
+    # 引擎仍会调 complete_step，收口在 manager 的第二道门（返回 node2_pending）——
+    # 那是 dual_node 设计的唯一收口，这里不重复断言（见
+    # test_second_complete_blocked_without_approved）。

@@ -1226,11 +1226,38 @@ class StepHandlerMixin:
                     return  # 完整性阶段接管：下 tick 发 dim01/dim02，等回复后推进
         if not cat:
             return
-        _match_ts, _match_msgs = self._check_exit(cat, src_filter, text_filter, created_after=last_ts,
+        # dual_node 第二节点：宽 filter 为 s{N}-，同时命中 s{N}-complete 与
+        # s{N}-codex-approved。必须在这里宽化而不是只在上方 :1129 宽化 ——
+        # 那一段整体嵌在 `if _integ_state.complete and not _integ_dual_pending:`
+        # 里，而 `_integ_activate` 只在**非** dual_node 分支调用（:1225），
+        # dual_node 步的 integrity_complete 永远是默认 False → 那段是死代码。
+        # 生产实测：13/13 dual_node 步停在 node1_done+node2_sent 且无 approved，
+        # 其中 4 个实例角色**已经写了** s1-codex-approved 事实（#439995/459762/
+        # 461553/462996），引擎收不到 —— 不是角色没写，是写对了也匹配不到。
+        _dn_wide = bool(getattr(step, "dual_node", False)
+                        and self._step_sd(run, step).get("node2_sent"))
+        _exit_filter = (re.sub(r"-complete$", "-", text_filter)
+                        if _dn_wide else text_filter)
+        _match_ts, _match_msgs = self._check_exit(
+                        cat, src_filter, _exit_filter, created_after=last_ts,
                         wf_id=run.id if ec.get("require_wf") else "", own_wf_id=run.id,
                         template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
+        if (_dn_wide and _match_ts
+                and not self._step_sd(run, step).get("node2_approved")
+                and _has_codex_approved(_match_msgs, step.id)):
+            # 放宽可达性 ≠ 放宽判据：宽 filter 把第一节点自己的 s{N}-complete
+            # 也带进来了，只有标题真含 s{N}-codex-approved 才算审查到。
+            run.step_results[step.id] = {
+                **self._step_sd(run, step),
+                "node2_approved": True,
+                "node2_approved_at": time.time(),
+                "node2_approved_by": "role_bus",
+            }
+            self._sync_step_results(run.id, run.step_results)
+            LOGGER.info("双节点: %s/%s 收到 codex-approved 结论，node2 已批",
+                        run.workflow_name, step.id)
         if _match_ts:
             # ── 锚定已匹配消息的时间戳，以后只检更新消息 ──
             # 同时保存 exit_messages 作为角色产出证据（task_evidence 依赖此字段判定收益）
