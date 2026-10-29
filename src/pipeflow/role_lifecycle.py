@@ -83,6 +83,24 @@ def _read_transcript_tail(role: str, nbytes: int = 65536) -> list[str]:
         return []
 
 
+def _transcript_mtime(role: str) -> float | None:
+    """角色最新 transcript 的 mtime；没有转录文件时返回 None。
+
+    WHY 单独一个函数：投递记账要判「rc=0 之后角色转录有没有长出新行」，
+    只读 mtime 不必解析 7.8MB 文件（_read_transcript_tail 只读尾部也有开销）。
+    返回 None 表示信号不可得，调用方必须退回旧行为，不能当成「没提交」。
+    """
+    import glob as _glob
+    try:
+        _d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+        files = _glob.glob(str(_d / "*.jsonl"))
+        if not files:
+            return None
+        return max(_os.path.getmtime(f) for f in files)
+    except OSError:
+        return None
+
+
 def _transcript_shows_overflow(role: str, max_age: float = _OVERFLOW_ERR_MAX_AGE) -> bool:
     """从角色 transcript 判断近期是否发生上下文溢出。
 
@@ -481,8 +499,11 @@ class RoleLifecycleMixin:
     # 窗口取 900s 而非 5min：实测重投节奏是每 tick 一次（间隔 300–310s），300s 的窗口
     # 刚好在下次重投前到期，守卫一次都拦不住（实测 2h 内 198 条里 31 条落在 301–310s）。
     # 同文案重发本来就没有信息增量，宁可少打扰，也不让窗口与 tick 撞线。
-    _LAST_SEND: dict[tuple, tuple[int, float]] = {}
+    _LAST_SEND: dict[tuple, tuple[int, float, float | None]] = {}
     _SAME_PROMPT_WINDOW_S = 900
+    # rc=0 之后多久才要求转录增长（秒）。窗口内先给角色启动时间：
+    # 实测提交成功后 1s 内就落 user 轮，但要留余量给慢启/排队。
+    _SEND_EVIDENCE_GRACE_S = 120
     # ── 模型额度拒绝（403/429）恢复 ──
     # 9router 免费层按出口 IP 计配额：角色 pane 只剩 "API Error: 403" /
     # "Rate limit exceeded"，进程活着但不产出。旧行为只把它排除出 idle 判定
@@ -1301,9 +1322,22 @@ class RoleLifecycleMixin:
         _fp = hash((role, wf_id, step_id, prompt))
         _prev = RoleLifecycleMixin._LAST_SEND.get((role, wf_id, step_id))
         if _prev and _prev[0] == _fp and time.time() - _prev[1] < self._SAME_PROMPT_WINDOW_S:
-            LOGGER.info("send-to-role %s 跳过: 同一 prompt 已在 %.0fs 内投递过 (wf=%s step=%s)",
-                        role, time.time() - _prev[1], wf_id[:12], step_id)
-            return "busy"
+            # rc=0 只证明按键送到（见 _type_and_submit 文档），不证明 CLI 提交了：
+            # 实测 2026-10-28 13:42:22 投递 s2 后 reviewer pane 有正文但 esc=0，
+            # 转录 790s 无新轮，却被记成「已投递」挡住重投（bus #464561）。
+            # 判据 = 投递后转录 mtime 是否越过投递前的水位线（转录是唯一能证伪
+            # 「提交了」的信号，pane 在 alternate_on 下不可靠）。信号不可得
+            # （无转录文件/旧条目无水位）时退回旧行为：宁可少打扰。
+            _aged = time.time() - _prev[1]
+            _wm = _prev[2]
+            _now_mt = _transcript_mtime(role)
+            _evidenced = (_wm is not None and _now_mt is not None and _now_mt > _wm)
+            if _evidenced or _aged < self._SEND_EVIDENCE_GRACE_S or _wm is None or _now_mt is None:
+                LOGGER.info("send-to-role %s 跳过: 同一 prompt 已在 %.0fs 内投递过 (wf=%s step=%s)",
+                            role, _aged, wf_id[:12], step_id)
+                return "busy"
+            LOGGER.warning("send-to-role %s 重投: 上次 rc=0 但转录 %.0fs 未增长，无提交证据 "
+                           "(wf=%s step=%s)", role, _aged, wf_id[:12], step_id)
         # 双要素第二关：goal 应含完成形态动词（输出/报告/修复/设计/实现/审查），
         # 缺少则 warning + bus notice 但不阻断（CrewAI expected_output 模式启发）
         _ACTION_VERBS = ("输出", "报告", "修复", "设计", "实现", "审查", "创建", "更新", "完成", "分析", "验证",
@@ -1370,6 +1404,9 @@ class RoleLifecycleMixin:
         # 投递成功与否以子进程退出码为准：returncode != 0 视为投递失败，必须返回 False，
         # 否则 engine 会错盖 notified（违反红线：投递失败必须返回 False，下轮重试，
         # 否则 step 永久停在空 step_results 的 running 状态被静默误杀）
+        # 投递前的水位线：ccs send 返回 0 后转录是否增长，用来区分「真提交」与
+        # 「按键送到但没提交」。必须在 ccs send 之前取，之后取到的已经是新值。
+        _wm_before = _transcript_mtime(role)
         try:
             _result = _engine_mod._sp.run(
                 ["python3", str(_CCS_CLI), "send", role, prompt,
@@ -1453,7 +1490,8 @@ class RoleLifecycleMixin:
                            wf_id[:12] if wf_id else "?", step_id, _err[:200])
             return False  # 非零退出码且非暂缓 = 投递失败：调用方据此不盖戳，下轮重试
         # 只有真投递成功才记账：失败/暂缓不占窗口，下轮照常重试。
-        RoleLifecycleMixin._LAST_SEND[(role, wf_id, step_id)] = (_fp, time.time())
+        # 第三元是投递前转录 mtime（水位线），读取侧据此判断这次是不是真提交了。
+        RoleLifecycleMixin._LAST_SEND[(role, wf_id, step_id)] = (_fp, time.time(), _wm_before)
         # TASKS.md 以**真正投递成功的那次**为准：上面那份写在发消息之前，判到
         # 别的任务占着文件就只追加一行 [排队] 照样发 —— 文件说"排队等前一个"、
         # prompt 说"现在做这个"，同一角色手里两份互相矛盾的任务书（实测 pm

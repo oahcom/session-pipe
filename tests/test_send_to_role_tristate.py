@@ -238,3 +238,50 @@ def test_changed_prompt_and_failure_do_not_take_the_window():
     # 文案不同 → 不受上一条记账影响
     assert _send_once(h, "请完成本次任务并给出结论（改口径）", ) in (True, "busy")
     RoleLifecycleMixin._LAST_SEND.clear()
+
+# ── rc=0 不等于已提交（bus #464561） ────────────────────────────────────
+
+def _send_then_age(h, age_s, mtimes):
+    """投递一次，把水位线与记账时刻改成 age_s 之前，再由 mtimes 决定后续 mtime。"""
+    from unittest.mock import patch as _patch
+    with _patch("pipeflow.role_lifecycle._transcript_mtime", return_value=mtimes[0]):
+        assert _send_once(h) is True
+    _k = ("qa", "wf_dup", "s1")
+    _fp, _ts, _wm = RoleLifecycleMixin._LAST_SEND[_k]
+    RoleLifecycleMixin._LAST_SEND[_k] = (_fp, _ts - age_s, _wm)
+    return _k
+
+def test_uncommitted_send_releases_retry_after_grace():
+    """上次 rc=0 但转录没增长（按键送到未提交）→ 超出宽限期后必须重投，不许判 busy。
+
+    实测 2026-10-28 13:42:22：reviewer pane 有 s2 正文但 esc=0，转录 790s 无新轮，
+    却被记成已投递、挡住重投（bus #464561）。
+    """
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._LAST_SEND.clear()
+    h = _Harness()
+    h._lm.query.return_value = []
+    _send_then_age(h, 300, (1000.0, 1000.0))  # 300s > 宽限 120s，mtime 未变
+    with patch("pipeflow.role_lifecycle._transcript_mtime", return_value=1000.0):
+        assert _send_once(h) is True, "无提交证据时应在宽限期后重投"
+
+def test_committed_send_still_holds_window():
+    """转录越过水位线 = 有提交证据 → 窗口内仍按排队返回，不重复灌 prompt。"""
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._LAST_SEND.clear()
+    h = _Harness()
+    h._lm.query.return_value = []
+    _send_then_age(h, 300, (1000.0, 1042.0))  # mtime 增长
+    with patch("pipeflow.role_lifecycle._transcript_mtime", return_value=1042.0):
+        assert _send_once(h) == "busy", "已提交的投递必须在窗口内挡住重投"
+
+def test_missing_transcript_signal_falls_back_to_old_behavior():
+    """拿不到转录（无文件）→ 退回旧行为按 busy 跳过，不能因缺信号疯狂重投。"""
+    from pipeflow.role_lifecycle import RoleLifecycleMixin
+    RoleLifecycleMixin._LAST_SEND.clear()
+    h = _Harness()
+    h._lm.query.return_value = []
+    _send_then_age(h, 300, (None, None))
+    with patch("pipeflow.role_lifecycle._transcript_mtime", return_value=None):
+        assert _send_once(h) == "busy"
+    RoleLifecycleMixin._LAST_SEND.clear()
