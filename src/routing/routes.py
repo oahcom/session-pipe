@@ -117,8 +117,8 @@ def _is_role_report_title(title: str, category: str = "", src: str = "") -> bool
 # 这类标题描述的是**已发生的事**，不是要让谁去做什么。不拦则每个消费者角色
 # 各自建一条完整链——7 天 909 个实例中 372 个此类，265 条直接作废
 # （WL-01 106 / consumer_processing 51 / maintainer_health_monitor 47）。
-# 不按 cat 豁免：`[bug_report] wf_x/s4 审批密钥不可达` 也是汇报，原消息仍
-# 正常路由给角色，只不 mint 新链。
+# 除 bug_report 外不按 cat 豁免：汇报形态的标题（`[optimizer] wf_x/s2 ...`）原消息
+# 仍正常路由给角色，只不 mint 新链。bug_report 是例外（见 _ECHO_EXEMPT_CATEGORIES）。
 # `/s2-complete` 必须带斜杠：不带斜杠时 "请新增 s3-complete 状态的审计脚本"
 # 这类**真实需求**会被误杀（实测 1 条）。带斜杠的 154/364 条全是汇报，
 # 误判方向不对称——漏判只多建一条链，误杀则丢掉用户的活。
@@ -126,7 +126,18 @@ _WF_ECHO_RE = re.compile(
     r"wf_(?:sub_|rw_)?[0-9a-f]{5,}|/\s*s\d+\s*[-_]?\s*complete", re.I)
 
 
-def _is_wf_echo_title(title: str) -> bool:
+# bug_report 豁免：qa 的缺陷报告标题天然带 `qa_test_execute/s2-complete wf_sub_xxx`
+# （它是「哪一步跑出来的」这项溯源信息），但正文是**尚待修复的新缺陷**。
+# 只按 title 判 echo 会让带 P1 的报告只在 bus 里漂：实测 14d 内 93 条 bug_report
+# 有 52 条标题命中 echo 正则，其中带 P0/P1 的（如 #466637 3×P1）从未建成任务。
+# design_issue / optimization 不豁免：同窗口内它们的 echo 标题实测全是 relay 转录
+# （"【触发】relay: [blocker] wf_x ..."），豁免只会复活转发噪音。
+_ECHO_EXEMPT_CATEGORIES = frozenset({"bug_report"})
+
+
+def _is_wf_echo_title(title: str, category: str = "") -> bool:
+    if category in _ECHO_EXEMPT_CATEGORIES:
+        return False
     return bool(_WF_ECHO_RE.search(title or ""))
 
 
@@ -310,7 +321,7 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                                     # INFO 而非 DEBUG：拦截会改变投递行为，需在 journalctl 可见，
                                     # 否则若某个合法任务被误判，排查时无迹可寻。
                                     LOGGER.info("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
-                                elif _is_wf_echo_title(_t):
+                                elif _is_wf_echo_title(_t, cat):
                                     # 事件汇报而非新需求：原消息已正常路由给角色，
                                     # 再 mint 新链只会派生同标题空任务（7 天 372 条）。
                                     LOGGER.info("Skipping workflow create: wf echo title (%s) role=%s", _t[:40], role)
@@ -571,6 +582,10 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                     # 从消息文本提取有意义的标题：取第一段或前 60 字符
                     _title = _raw.split("\n")[0] if _raw else ""
                     _title = _title[:80]
+                    # 闸门看未截断首行：wf_ 落在 80 字符之后时截断会让正则失守
+                    # （#439048 的 wf_rw_666710cad266 在第 110 字符 → 放行建链）。
+                    # 只喂给 echo 闸门，其余判据仍用截断后的标题，避免连带改判。
+                    _title_full = _raw.split("\n")[0] if _raw else ""
                     # 阈值与 route_all 对齐（len<8 或 无内容词）: 同消息两路径判定一致
                     if len(_title) < 8 or not _has_content_words(_title, _cat):
                         LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_title), role_name)
@@ -578,9 +593,12 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
                         # 与 route_all 对齐：[角色名] 开头是产出汇报，不是派发任务。
                         # 缺此判定时同一份完成汇报被 fan-out 成 7~9 个角色各自的新 workflow。
                         LOGGER.debug("Skipping workflow create: role report title (%s) role=%s", _title[:40], role_name)
-                    elif _is_wf_echo_title(_title):
+                    elif _is_wf_echo_title(_title_full, _cat):
                         # 与 route_all 对齐：事件汇报不 mint 新链。
-                        LOGGER.debug("Skipping workflow create: wf echo title (%s) role=%s", _title[:40], role_name)
+                        # INFO 而非 DEBUG：这是唯一活着的闸门（route_all 的可投递类在
+                        # delegated 分支就 continue），静默拦截时查不到为什么没建任务
+                        # —— #466637 的 3×P1 缺陷报告就是这样消失的。
+                        LOGGER.info("Skipping workflow create: wf echo title (%s) cat=%s role=%s", _title[:40], _cat, role_name)
                     elif _is_noop_report(_title, _raw):
                         # 与 route_all 对齐（DESIGN §7 S3）：no-op 健康报告不 mint。
                         LOGGER.debug("Skipping workflow create: no-op report (%s) role=%s", _title[:40], role_name)
