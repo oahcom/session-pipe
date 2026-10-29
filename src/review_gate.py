@@ -236,6 +236,29 @@ def review_verdict(text: str) -> str:
     return REJECTED if _full_scan(text) else UNKNOWN
 
 
+# 发布用语：`go / no-go` 是模板要求 qa、devops 在**产出里**写的发布建议
+# （qa_test_execute 的 prompt_template：「通过率≥90%，发布建议（go/no-go）」），
+# 不是"本步产出是否合格"的判断。混进驳回词表后，执行步的完成标题「… 17 passed /
+# 2 failed … No-Go」被引擎当成本步的驳回票：wf_sub_f5a5d278becc/s1 重投到
+# _MAX_REJECTED_RETRY(3) 后升级、2h 后被 close_wf(failed) 收口，而产物在盘上。
+_RELEASE_NOGO = re.compile(r"(?<![A-Za-z])no[ _-]?go(?![A-Za-z])", re.I)
+
+
+def step_verdict(text: str, step_type: str | None = None) -> str:
+    """带步骤类型的结论判定：review/gate 步保持全词表，其余步剔除发布用语。
+
+    与 review_verdict 分开而不是改它：后者是 context-free 的文本判据，被
+    task_generator 的子链快照判据复用，语义不该随步骤身份漂移。
+    R41（不限定 type 判驳回）仍然成立——只剔 no-go 这一个词，驳回/未通过/
+    CHANGES_REQUESTED 在执行步里照样拦。全库 1001 个有文本的步骤实测：
+    61→41 条 rejected，20 条翻转全部是 type=handoff、且由该步自己的角色署名；
+    review/gate 步 0 变化，非 review/gate 的其余 29 条驳回照旧判驳回。
+    """
+    if step_type in (None, "review", "gate"):
+        return review_verdict(text)
+    return review_verdict(_RELEASE_NOGO.sub(" ", text or ""))
+
+
 # 二态判据的公开名字：task_generator 只问"这条消息算不算驳回"，用 bool|None 比三态
 # 更直接（`verdict(x) is False`）。合并时这名字被 review_verdict 取代，调用点没跟改 →
 # AttributeError（test_subflow_verdict_freshness 11 红）。别名保持两条入口语义一致。

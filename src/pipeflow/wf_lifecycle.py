@@ -607,7 +607,10 @@ class WorkflowLifecycleMixin:
         elif _step_sr.get("subflow_id"):
             _verdict = "approved"
         else:
-            _verdict = _review_gate.review_verdict(_msgs)
+            # 带类型判：执行步（handoff/single/notify）的产出结论不外溢成驳回票
+            # （review_gate.step_verdict 的 docstring 有全库实测账）。
+            _verdict = _review_gate.step_verdict(
+                _msgs, getattr(_step_def, "type", None))
 
         # unknown 只拦"该表态却没表态"的步骤：type 是 review/gate 且执行角色是审查
         # 角色。只看 type 会把 maintainer 的健康检查（7 天 24 条）、product_architect

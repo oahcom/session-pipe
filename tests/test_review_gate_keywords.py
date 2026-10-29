@@ -20,7 +20,9 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from review_gate import APPROVED, REJECT_KEYWORDS, is_rejected, review_verdict  # noqa: E402
+from review_gate import (  # noqa: E402
+    APPROVED, REJECT_KEYWORDS, is_rejected, review_verdict, step_verdict,
+)
 
 
 # ── 必须判为驳回（真驳回文案，生产实测样本）──
@@ -205,3 +207,41 @@ def test_conditional_approval_counts_as_pass():
     """
     assert review_verdict("结论: conditional_approved — 2 P2 待补") == APPROVED
     assert review_verdict("APPROVED (conditional): 2 P2") == APPROVED
+
+
+def test_release_no_go_in_execution_step_is_not_a_rejection_ticket():
+    """执行步的发布建议（no-go）不是"本步产出不合格"的驳回票。
+
+    qa_test_execute / devops_deploy_plan 的 prompt_template 明确要求产出带
+    「发布建议（go/no-go）」，但 s1/s2 是 type=handoff 的执行步。全库 1001 个
+    有文本的步骤实测：4 条真实例因此被判 rejected 并重投到上限
+    （wf_sub_f5a5d278becc/s1、wf_sub_a9c847a20d8c/s1、wf_sub_e73bb912c637/s1、
+    wf_971532460c9e/s2），产物却都在盘上。
+    """
+    titles = {
+        "qa_test_execute/s1-complete wf_sub_f5a5d278becc 9router SSRF: "
+        "17 passed / 2 failed / 1 未跑 (89.5%, 未达 90%); No-Go": APPROVED,
+        "qa_test_execute/s1-complete wf_sub_a9c847a20d8c cbf2aa31 测试报告: "
+        "18 用例 17 passed / 1 failed (94.4%), No-Go": APPROVED,
+        "test_report: qa_test_execute/s1-complete wf_sub_e73bb912c637 —— "
+        "三份产出齐备(pass 100% 判定表11/11); 修复'已生效'主张No-Go(daemon未加载)": APPROVED,
+        "devops_deploy_plan/s2-complete wf_971532460c9e — 发布策略: NO-GO, "
+        "不创建 DEPLOY_SUCCESS(四闸门 0/4)": "unknown",
+    }
+    for text, want in titles.items():
+        assert review_verdict(text) == "rejected", "context-free 判据保持原样: %s" % text
+        assert step_verdict(text, "handoff") == want, "执行步不按发布建议判驳回: %s" % text
+
+
+def test_review_step_keeps_full_word_list():
+    """review/gate 步的 no-go 仍是驳回结论，且无类型时行为不变（保守回退）。
+
+    钉住 R41：只剔执行步的发布用语，评审步与未知类型一律走原词表——
+    按 type 收窄驳回判定曾是 21/35 条真驳回被吞的原因。
+    """
+    text = "代码审查 No-Go — 0 P0 / 3 P1"
+    assert step_verdict(text, "review") == "rejected"
+    assert step_verdict(text, "gate") == "rejected"
+    assert step_verdict(text, None) == "rejected"
+    assert step_verdict("判定: 未通过", "handoff") == "rejected", "中文驳回词在执行步照样拦"
+    assert step_verdict("结论: CHANGES_REQUESTED — 2 P1", "handoff") == "rejected"

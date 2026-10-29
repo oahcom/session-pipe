@@ -23,7 +23,7 @@ from paths import WORKFLOWS_DB as DB_PATH  # ponytail: direct import, switch to 
 # 视入口而定（daemon 以 src/ 为 cwd 时不缺，pytest 从仓库根跑时缺）。
 if str(Path(__file__).resolve().parents[1]) not in _sys.path:
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from review_gate import is_review_role, review_verdict  # noqa: E402
+from review_gate import is_review_role, step_verdict  # noqa: E402
 
 
 
@@ -1026,7 +1026,10 @@ class LifecycleManager:
             from pipeflow.wf_lifecycle import _live_subflow
             if _live_subflow(self, _cur_sr):
                 return False
-        _verdict = ("approved" if (_confirmed or _sf) else review_verdict(_msgs))
+        # step_verdict 而非 review_verdict：执行步的发布结论（no-go）不算本步驳回票，
+        # 与 pipeflow/wf_lifecycle.py 同口径（两条推进路径判定必须一致）。
+        _verdict = ("approved" if (_confirmed or _sf)
+                    else step_verdict(_msgs, _cur_step.get("type")))
         # 与 engine 路径同口径：只有审查角色 + review/gate 类型才要求表态
         # （见 review_gate.REVIEW_ROLES 的生产数据）。
         if (_verdict == "unknown" and _cur_step.get("type") in ("review", "gate")
