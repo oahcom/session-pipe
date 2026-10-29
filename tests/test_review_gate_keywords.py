@@ -245,3 +245,20 @@ def test_review_step_keeps_full_word_list():
     assert step_verdict(text, None) == "rejected"
     assert step_verdict("判定: 未通过", "handoff") == "rejected", "中文驳回词在执行步照样拦"
     assert step_verdict("结论: CHANGES_REQUESTED — 2 P1", "handoff") == "rejected"
+
+def test_reject_word_mentions_with_fix_marker_are_not_this_step_verdict():
+    """标题在描述「某驳回已修」时，那个驳回词不是本步结论。
+
+    实测本轮三条同名完成消息（CODE_FIX: … 执行步 no-go 误判驳回已修）被引擎判成
+    对自己的驳回票，s1 直接 failed —— 标题既提 no-go 又提 驳回，两个词都在讲
+    别人的缺陷已闭环。判据与 task_generator._FIX_MARK 同源（返工记录不算结论）。
+    """
+    text = ("CODE_FIX: engineer_feature/s1-complete wf_x — 执行步 no-go 误判"
+            "驳回已修 (1b12468, 61→41 全库复算)")
+    assert review_verdict(text) == "rejected", "context-free 判据保持原样"
+    assert step_verdict(text, "single") == "unknown"
+    # 未被标记的驳回提及仍然算驳回（不是整段豁免）
+    assert step_verdict("qa_test_execute/s3-complete — 驳回 2 项未修", "handoff") == "rejected"
+    assert step_verdict("qa_test_execute/s3-complete — 驳回 2 项已修复", "handoff") != "rejected"
+    # 评审步不吃这条豁免
+    assert step_verdict("代码审查 — 驳回 3 项已修复", "review") == "rejected"

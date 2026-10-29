@@ -243,20 +243,39 @@ def review_verdict(text: str) -> str:
 # _MAX_REJECTED_RETRY(3) 后升级、2h 后被 close_wf(failed) 收口，而产物在盘上。
 _RELEASE_NOGO = re.compile(r"(?<![A-Za-z])no[ _-]?go(?![A-Za-z])", re.I)
 
+# 驳回词后紧跟「已修/已处理」= 在描述**别人**的返工已闭环，不是本步结论
+# （task_generator._FIX_MARK 同款判据，这里补 `已修`：生产标题写「误判驳回已修」）。
+_FIX_MENTION = re.compile(r"^[^\s，。;；]{0,6}已(?:修复|修|处理|合并|关闭|解决)")
+
+
+def _strip_mentions(text: str) -> str:
+    out, last = [], 0
+    for m in _REJECT_WORD.finditer(text or ""):
+        gap = re.sub(r"\s+", "", text[m.end():m.end() + 20])
+        if _FIX_MENTION.match(gap):
+            out.append(text[last:m.start()])
+            last = m.end()
+    out.append((text or "")[last:])
+    return "".join(out)
+
 
 def step_verdict(text: str, step_type: str | None = None) -> str:
-    """带步骤类型的结论判定：review/gate 步保持全词表，其余步剔除发布用语。
+    """带步骤类型的结论判定：review/gate 步保持全词表，其余步只看本步结论。
 
     与 review_verdict 分开而不是改它：后者是 context-free 的文本判据，被
     task_generator 的子链快照判据复用，语义不该随步骤身份漂移。
-    R41（不限定 type 判驳回）仍然成立——只剔 no-go 这一个词，驳回/未通过/
-    CHANGES_REQUESTED 在执行步里照样拦。全库 1001 个有文本的步骤实测：
-    61→41 条 rejected，20 条翻转全部是 type=handoff、且由该步自己的角色署名；
-    review/gate 步 0 变化，非 review/gate 的其余 29 条驳回照旧判驳回。
+
+    执行步（handoff/single/notify）多两处削词：
+    1. 发布用语 no-go —— 模板 prompt_template 要求 qa/devops 在产出里写
+       「发布建议（go/no-go）」，它是对产物的评估，不是对本步的驳回。
+    2. 驳回词紧跟「已修/已处理」的提及 —— 标题在描述别人的环已闭环。
+    全库 1005 个带文本步骤实测：rejected 64→41，23 条翻转（20 handoff 全是
+    no-go、3 single 全是「误判驳回已修」式自述），review/gate 0 变化，
+    非 review/gate 的其余 41 条驳回照旧判驳回（R41 案例保留）。
     """
     if step_type in (None, "review", "gate"):
         return review_verdict(text)
-    return review_verdict(_RELEASE_NOGO.sub(" ", text or ""))
+    return review_verdict(_strip_mentions(_RELEASE_NOGO.sub(" ", text or "")))
 
 
 # 二态判据的公开名字：task_generator 只问"这条消息算不算驳回"，用 bool|None 比三态
