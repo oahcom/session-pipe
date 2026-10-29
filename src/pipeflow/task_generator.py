@@ -61,6 +61,16 @@ def _is_test_harness_template(template_id: str | None) -> bool:
     return _strip_wf_prefix(template_id).startswith(_TEST_HARNESS_PREFIXES)
 
 
+def _role_in_text(role: str, text: str) -> bool:
+    """角色名是否作为独立词出现在 text 里。
+
+    子串匹配会让 `pm` 命中 `npm`（#466526 的窗口只含 "npm install"，
+    却被判成「pm 的需求」→ 给 pm 建无主空转链）。下划线不算词边界，
+    所以 `pm_requirements/s3-complete` 仍然命中。
+    """
+    return bool(re.search(r"(?<![a-z])" + re.escape(role) + r"(?![a-z])", text))
+
+
 def _requires_user_brief(wf) -> bool:
     """首步就委派子链的模板，开工前需要一份真实需求书。
 
@@ -877,9 +887,7 @@ class TaskGeneratorMixin:
                         # closer 周期性 backlog 扫描是模板循环产物，不是真实需求
                         if "backlog_scan" not in (_f.t or ""):
                             _demand_text += (_f.t or "") + " " + (_f.e or "") + " "
-                # 需求信号必须与目标角色相关：标题或内容含角色名/其职责关键词才算
-                # 子串判据已覆盖 "@role" / "assignee=role" 两种写法，不必单列。
-                _role_hits = _role in _demand_text
+                _role_hits = _role_in_text(_role, _demand_text)
                 _has_demand = bool(_demand_text) and _role_hits and _demand_text.strip() != ""
                 if not _has_demand:
                     continue

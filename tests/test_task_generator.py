@@ -13,7 +13,18 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pipeflow.engine import WorkflowEngine, WorkflowDef, Step, WorkflowRun
-from pipeflow.task_generator import _event_key, MAX_RUNNING_PER_ROLE
+from pipeflow.task_generator import _event_key, _role_in_text, MAX_RUNNING_PER_ROLE
+
+
+def test_role_in_text_rejects_substring_false_positive():
+    """`pm` 不能命中 `npm` —— #466526 的窗口只含 "npm install"，#467010 实测
+    旧子串判据因此把该窗口判成「pm 的需求」，给 pm 建无主空转链。"""
+    assert not _role_in_text("pm", " TASK_SPEC: 8 任务 DAG npm install --production ")
+    assert _role_in_text("pm", " pm_requirements/s3-complete 已完成 ")
+    assert _role_in_text("pm", " assignee=pm 需求已就绪 ")
+    assert not _role_in_text("pm", " xpmx ")
+    # 长角色名不被短名判据波及（词边界右界在 `_` 上不成立）
+    assert _role_in_text("qa", " qa_test_execute/s2-complete ")
 
 
 def _get_test_eng():
