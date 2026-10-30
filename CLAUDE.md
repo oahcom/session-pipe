@@ -50,26 +50,26 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 src/
   routing/
     router.py         ── 路由表 + produce/consume 推导（361 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（668 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（699 行）
     auto.py           ── 自动路由消费 + investigator 分派（187 行）
     polling.py        ── 消息轮询（104 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
-    survival_monitor.py ── 三层存活监测 L1/L2/L3（616 行）
+    survival_monitor.py ── 三层存活监测 L1/L2/L3（702 行）
     consistency.py    ── 路由一致性检查（105 行，生长接入 daemon）
 
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（2172 行，导入下方 mixin）
+    engine.py         ── 编排 + CLI（2191 行，导入下方 mixin）
     step_handler.py   ── 步骤处理（2017 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1501 行）
-    task_generator.py ── 任务生成（1022 行）
-    wf_lifecycle.py   ── 工作流生命周期（2220 行）
+    task_generator.py ── 任务生成（1030 行）
+    wf_lifecycle.py   ── 工作流生命周期（2232 行）
     daemon.py         ── 工作流守护 while 循环（543 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
-    manager.py        ── 工作流状态机（1167 行）
+    manager.py        ── 工作流状态机（1170 行）
 
   workflow/
     client.py         ── CCS 角色工作流客户端（537 行）
