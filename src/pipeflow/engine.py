@@ -1635,7 +1635,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 的 next_step 形参在函数体内从未使用（wf_lifecycle.py:1309）。
                     # 因此单步链也应允许建返工链；否则末步直接被判死，正确驳回
                     # 意见永远无法回到执行者。多步链末步仍保持原 fail-fast 语义。
-                    _single_step = len(wf.steps) == 1
+                    _single_step = _idx == 0 and len(wf.steps) == 1
                     _can_rework = _has_next or _single_step
                     # 系统问题链不算"已建业务返工链"：把它留在集内会让本判据恒假，
                     # 再驳回只重投不返工，直到 retry 封顶（报告 P1 CASE-B 实测）。
