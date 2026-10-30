@@ -624,6 +624,15 @@ class SurvivalMonitor:
             if _now_idle - getattr(self, "_last_idle_warn_ts", 0) > 600:
                 LOGGER.warning("存活告警 idle（无产出）: %s", idled)
                 self._last_idle_warn_ts = _now_idle
+        # unknown 同样要有低频告警：unknown 不进 stalled 恢复队列、不进 idle 提醒、
+        # 首次观测起 prev_overall 就是 unknown 时 _write_bus 也永远不触发——
+        # 四路信号全不可判的角色（探针故障/L4 查询失败）会永久静默，只能靠这条例行告警暴露。
+        unknowned = [r for r, h in results.items() if h.get("overall") == "unknown"]
+        if unknowned:
+            _now_unk = time.time()
+            if _now_unk - getattr(self, "_last_unknown_warn_ts", 0) > 600:
+                LOGGER.warning("存活告警 unknown（信号不可判）: %s", unknowned)
+                self._last_unknown_warn_ts = _now_unk
         if recoverable:
             # 节流 600s：与 idled 分支及下方恢复冷却同量级。此前只有 idled 有节流，
             # stalled 每 120s（tick 周期）重复告警同一批角色，实测 60min 内 9 条。

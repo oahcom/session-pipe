@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
@@ -372,6 +372,27 @@ class TestTick:
         result = monitor.tick()
         assert "scout" in result, "infinite 角色必须进巡检"
         assert "qa" not in result, "ondemand 且无哨兵不应被巡检"
+
+    def test_tick_unknown_role_warns_throttled(self, monitor, monkeypatch):
+        """unknown 角色要有 600s 节流告警——否则永久静默（unknown 不进任何恢复/提醒队列）。"""
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run",
+                            lambda *a, **kw: MagicMock(returncode=0, stdout=""))
+        monkeypatch.setattr(sm, "_load_role_targets", lambda: {})
+        # L3 不可判 + L4 查询失败 → overall=unknown
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": None})
+        monkeypatch.setattr(monitor, "_l4_check",
+                            lambda r: {"work_evidence": None, "error": "workflow_probe_failed: x"})
+
+        with patch.object(sm.LOGGER, "warning") as warning:
+            monitor.tick()
+            monitor.tick()
+        unknown_warnings = [c for c in warning.call_args_list
+                            if "unknown" in str(c.args[0] if c.args else "")]
+        assert len(unknown_warnings) == 1, \
+            f"两次 tick 应恰好 1 条 unknown 告警（节流），实际 {len(unknown_warnings)}"
+        assert "qa" in str(unknown_warnings[0])
 
 
 class TestWriteBus:
