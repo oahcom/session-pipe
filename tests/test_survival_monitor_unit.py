@@ -205,7 +205,7 @@ class TestL4Check:
         con.execute(
             "insert into workflow_instances values (?,?,?,?,?)",
             ("wf_x", "running", "qa", time.time() - 600,
-             json.dumps({"s1": {"notified_at": time.time() - 60}})),
+             json.dumps({"s1": {"completed_at": time.time() - 60}})),
         )
         con.commit()
         con.close()
@@ -214,6 +214,31 @@ class TestL4Check:
         assert result["available"] is True
         assert result["work_evidence"] is True
         assert result["workflow_age_seconds"] < 120
+
+    def test_l4_engine_progress_keys_are_not_work_evidence(self, monitor, tmp_path, monkeypatch):
+        """notified_at/poll_since/kick_stalled_at 是引擎刷新，不是角色产出。"""
+        import sqlite3
+        db = tmp_path / "workflows.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "create table workflow_instances (instance_id text, status text, assignee text, "
+            "created_at real, step_results text)"
+        )
+        now = time.time()
+        con.execute(
+            "insert into workflow_instances values (?,?,?,?,?)",
+            ("wf_x", "running", "qa", now - 600, json.dumps({"s1": {
+                "status": "notified",
+                "notified_at": now - 30,
+                "poll_since": now - 30,
+                "kick_stalled_at": now - 100,
+            }})),
+        )
+        con.commit()
+        con.close()
+        monkeypatch.setattr(sm, "WORKFLOWS_DB", db)
+        result = monitor._l4_check("qa")
+        assert result["work_evidence"] is not True
 
     def test_l4_missing_db_is_unknown_not_false(self, monitor, tmp_path, monkeypatch):
         monkeypatch.setattr(sm, "WORKFLOWS_DB", tmp_path / "missing.db")

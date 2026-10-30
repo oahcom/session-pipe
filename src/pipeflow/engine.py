@@ -1669,6 +1669,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                                  inst["instance_id"][:12], step_id)
                                 LOGGER.warning("rejected → 已建返工链 %s/%s: %s",
                                                inst["instance_id"][:12], step_id, _rework_ids)
+                                if _rework_ids:
+                                    # 门禁看“活业务链”，本轮刚建出的就是业务链。
+                                    # 不刷新会让历史系统链占位，单步链永远不 fail-fast。
+                                    _biz_rw = list(_rework_ids)
                         except Exception as _rw:
                             LOGGER.warning("rejected 建返工链失败 %s/%s: %s",
                                            inst["instance_id"][:12], step_id, _rw)
@@ -1728,20 +1732,22 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 例外：单步链若已建出返工链，必须允许返工回调后重审，不能在这里
                     # 把仍在进行的返工工作判死。
                     _rej_txt = " ".join(
-                        str(m.get("text") or "")
+                        f"{m.get('text') or ''} {m.get('evidence') or ''}".strip()
                         for m in (_rej_sr.get("exit_messages") or [])
                         if isinstance(m, dict)
                     ).strip()[:400]
                     _rej_reason = str(_rej_sr.get("rejection_reason") or "").strip()
-                    if not _has_next and not (_single_step and _rework_ids):
+                    if not _has_next and not (_single_step and _biz_rw):
+                        _reason_line = _rej_reason or _rej_txt
                         self._bb.write(
                             "blocker",
                             f"[workflow] {inst['instance_id'][:12]}/{step_id} "
                             f"末步被驳回 → 按 failed 收口（不重投）",
-                            evidence=(f"末步无 next_step 且无可用返工链。\n"
-                                      f"驳回理由: {(_rej_reason or _rej_txt)[:200]}\n"
-                                      f"驳回原文: {_rej_txt[:200]}\n"
-                                      f"已重投 {_rej_sr.get('rejected_retry', 0) or 0} 次"),
+                            evidence=(f"末步无 next_step 且无可用业务返工链。\n"
+                                      f"驳回理由: {_reason_line[:200]}\n"
+                                      + (f"驳回原文: {_rej_txt[:200]}\n"
+                                         if _rej_txt and _rej_txt != _reason_line else "")
+                                      + f"已重投 {_rej_sr.get('rejected_retry', 0) or 0} 次"),
                             src="workflow_engine")
                         self._lifecycle.close_wf(
                             inst["instance_id"], status="failed",

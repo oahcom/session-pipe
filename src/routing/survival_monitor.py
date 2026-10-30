@@ -290,8 +290,7 @@ class SurvivalMonitor:
                 finally:
                     con.close()
                 stamps = []
-                for created_at, raw in rows:
-                    stamps.append(float(created_at or 0))
+                for _created_at, raw in rows:
                     try:
                         data = json.loads(raw or "{}")
                     except (json.JSONDecodeError, TypeError):
@@ -302,8 +301,11 @@ class SurvivalMonitor:
                         if not isinstance(sdata, dict):
                             continue
                         for key, value in sdata.items():
-                            if (key.endswith(("_at", "_ts", "_since", "_check"))
-                                    or key in ("ts", "notified_at")):
+                            # 只认角色推进产出的事实。notified_at / poll_since /
+                            # kick_stalled_at 是引擎每轮刷新/催办写的——把它们算作
+                            # “有活”会让卡得越死越被判 healthy，stale 永久失效。
+                            # completed_at / bus_anchor 才代表该步真的产出了东西。
+                            if key in ("completed_at", "bus_anchor"):
                                 if isinstance(value, (int, float)) and value > 0:
                                     stamps.append(float(value))
                 if stamps:

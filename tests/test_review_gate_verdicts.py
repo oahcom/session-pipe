@@ -183,6 +183,10 @@ def test_last_step_rejection_fails_fast_without_retry(mock_run):
     sr = s["results"]["s1"]
     assert not sr.get("rework_escalated_at"), "不该走 2h 升级窗口"
     assert (sr.get("rejected_retry") or 0) == 0, f"不该重投，retry={sr.get('rejected_retry')}"
+    log = eng._lifecycle.query_one(
+        "SELECT detail FROM workflow_logs WHERE workflow_instance_id=? AND action='wf_closed'",
+        (rid,))
+    assert "CHANGES_REQUESTED" in (log["detail"] or ""), f"终态 reason 丢失驳回原文: {log}"
 
 
 @patch("pipeflow.engine._sp.run", return_value=MagicMock(
@@ -219,4 +223,32 @@ def test_last_step_classified_rejection_builds_rework(mock_run):
         "WHERE parent_wf_id=? AND subflow_source_step_id='s1'", (rid,))
     assert len(rows) == 1, f"应只建一条返工链，实际 {rows}"
     assert rows[0]["template_id"] == "engineer_feature", rows
+
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_multi_step_last_rejection_still_fails_fast(mock_run):
+    """多步链末步即使带分类也保持 fail-fast：R173 只放开单步链。"""
+    d = _make_env()
+    _write_wf(d, "multi_last", [_step("s1"), _step("s2", type="review")])
+    _write_wf(d, "engineer_feature", [_step("s1", target_role="engineer")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("multi_last", {})
+
+    eng.run_once()
+    eng._bb.write("notice", "TOK_S1 完成", src="test_role")
+    _ticks(eng, 3)
+    eng._bb.write(
+        "notice",
+        "TOK_S2 — CHANGES_REQUESTED\n【业务问题→engineer】\n- P1 | x | y.py:1",
+        src="test_role",
+    )
+    _ticks(eng, 8)
+
+    s = eng.status(rid)
+    assert s["status"] == "failed", f"多步末步仍应 failed：{s}"
+    rows = eng._lifecycle.query(
+        "SELECT instance_id FROM workflow_instances "
+        "WHERE parent_wf_id=? AND subflow_source_step_id='s2'", (rid,))
+    assert rows == [], f"多步末步不应建返工链：{rows}"
 

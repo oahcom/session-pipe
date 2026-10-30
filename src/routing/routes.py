@@ -470,8 +470,9 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     messages = [m for m in raw_msgs if _is_for_me(m)]
     if not messages or "error" in messages[0]:
         return {"role": role_name, "routed": 0, "total": 0, "dry_run": dry_run, "details": []}
-    # 同优先级内按时间升序：原 SQL 是 ts DESC，窗口被最新消息钉死，老消息永远排不进
-    # 30 条窗口（FIFO 反向），积压越久越投不出去。
+    # 同优先级内按时间升序：SQL 先按 ts DESC 截 30 条窗口，若窗口内再保持
+    # DESC，本轮永远只投最新那批；这里只修窗口内次序，窗口外更老的积压仍
+    # 需要 bus 查询支持升序翻页才能看到（未在本次改动内，别把本行当全局 FIFO）。
     messages.sort(key=lambda m: (m.get("priority", 99), m.get("ts") or 0))
 
     # 子进程调 ccs.py 发消息，规避 routing 包名冲突
