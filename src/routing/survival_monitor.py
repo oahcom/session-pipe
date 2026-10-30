@@ -32,6 +32,13 @@ HEALTH_DIR = Path(os.environ.get(
     "CCS_HEALTH_DIR", str(Path.home() / ".hermes" / "run" / "ccs-health")))
 TRANSCRIPT_ROOT = Path(os.environ.get(
     "CCS_TRANSCRIPT_ROOT", str(Path.home() / ".claude" / "projects")))
+
+# L4 缓存 TTL / 证据窗口：与 _l2/_l3 的 120/300 同族但独立可调。
+L4_CACHE_TTL_S = 120
+L4_WORK_WINDOW_S = 900
+# L3 缓存 TTL：pane 静默时更快刷新，避免拿旧值判 stale。
+L3_CACHE_TTL_ACTIVE_S = 120
+L3_CACHE_TTL_IDLE_S = 300
 PERSONAS_DIR = _ROLES_ROOT / "personas" / "session-roles"
 BUS_SCRIPT = Path(os.environ.get(
     "BUS_CLIENT",
@@ -261,6 +268,7 @@ class SurvivalMonitor:
         """
         now = time.time()
         transcript_age = None
+        errors: list[str] = []
         transcript_root = (
             TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
         )
@@ -272,8 +280,10 @@ class SurvivalMonitor:
                 )
                 if latest:
                     transcript_age = now - latest
-        except OSError:
+        except OSError as e:
             transcript_age = None
+            errors.append(f"transcript_probe_failed: {e}")
+            LOGGER.warning("L4 transcript 探测失败 (%s): %s", role, e)
 
         workflow_age = None
         try:
@@ -315,12 +325,14 @@ class SurvivalMonitor:
                                     stamps.append(float(value))
                 if stamps:
                     workflow_age = now - max(stamps)
-        except (OSError, sqlite3.Error, ValueError):
+        except (OSError, sqlite3.Error, ValueError) as e:
             workflow_age = None
+            errors.append(f"workflow_probe_failed: {e}")
+            LOGGER.warning("L4 workflow 查询失败 (%s): %s", role, e)
 
         ages = [a for a in (transcript_age, workflow_age) if a is not None]
-        work_evidence = bool(ages) and min(ages) < 900
-        return {
+        work_evidence = bool(ages) and min(ages) < L4_WORK_WINDOW_S
+        result = {
             "available": bool(ages),
             "work_evidence": work_evidence if ages else None,
             "transcript_age_seconds": transcript_age,
@@ -328,6 +340,10 @@ class SurvivalMonitor:
             "detail": (f"transcript_age={transcript_age if transcript_age is None else round(transcript_age)}s "
                        f"workflow_age={workflow_age if workflow_age is None else round(workflow_age)}s"),
         }
+        if errors:
+            # 与 L3 的异常 WARNING 对称：查询失败 ≠ 无证据，调用方据此不误杀。
+            result["error"] = "; ".join(errors)
+        return result
 
     # ── 汇总 ──
 
@@ -342,14 +358,16 @@ class SurvivalMonitor:
         if l1.get("status") != "ALIVE":
             return "unknown"
         work_evidence = bool((l4 or {}).get("work_evidence"))
+        l4_unavailable = (l4 or {}).get("work_evidence") is None and bool((l4 or {}).get("error"))
         # thinking=None（两项信号均未知）→ 跳过 L2，让 L3/L4 定结论
         if l2.get("thinking") is False:
             # pane 静默只说明「此刻没有输出」，而 infinite 常驻角色的空闲是正常态；
             # L3 是落盘事实（bus 产出 600s 内），L4 补 transcript/workflow 进展。
             # 不能把「L3 不可判」当成「没产出」：那会把查不到误杀成 stale。
+            # L4 查询失败同理：证据通道故障 ≠ 无证据，交给 unknown 兜底。
             if l3.get("producing") is True or work_evidence:
                 return "healthy"
-            if l3.get("producing") is None:
+            if l3.get("producing") is None or l4_unavailable:
                 return "unknown"
             return "stale"
         # L2 不确定时看 L3/L4——最近有落盘或工作流进展，仍算 healthy
@@ -512,11 +530,12 @@ class SurvivalMonitor:
                   and now - prev.get("l2_ts", 0) > 120 else prev.get("l2", {}))
             # pane 静默时更依赖 L3/L4 救场，因此 thinking=False 反而要刷新 L3，
             # 不能拿 300s 前的旧值（首轮甚至是空 dict）判 stale。
-            _l3_ttl = 120 if l2.get("thinking") is False else 300
+            _l3_ttl = (L3_CACHE_TTL_ACTIVE_S if l2.get("thinking") is False
+                       else L3_CACHE_TTL_IDLE_S)
             l3 = (self._l3_check(role)
                   if now - prev.get("l3_ts", 0) > _l3_ttl else prev.get("l3", {}))
             l4 = (self._l4_check(role) if l1["status"] == "ALIVE"
-                  and now - prev.get("l4_ts", 0) > 120 else prev.get("l4", {}))
+                  and now - prev.get("l4_ts", 0) > L4_CACHE_TTL_S else prev.get("l4", {}))
             overall = self._overall(l1, l2, l3, l4)
             # R3: 注入 lifecycle（idle 回收判断用）
             _lifecycle = _load_role_lifecycles().get(role, "ondemand")

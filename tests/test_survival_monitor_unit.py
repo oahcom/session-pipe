@@ -241,6 +241,38 @@ class TestL4Check:
         result = monitor._l4_check("qa")
         assert result["work_evidence"] is not True
 
+    def test_l4_bus_anchor_with_exit_messages_is_evidence(self, monitor, tmp_path, monkeypatch):
+        """bus_anchor + exit_messages 是真实匹配产出，算有活。"""
+        import sqlite3
+        db = tmp_path / "workflows.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "create table workflow_instances (instance_id text, status text, assignee text, "
+            "created_at real, step_results text)"
+        )
+        now = time.time()
+        con.execute(
+            "insert into workflow_instances values (?,?,?,?,?)",
+            ("wf_x", "running", "qa", now - 600, json.dumps({"s1": {
+                "status": "step_done_ready",
+                "bus_anchor": now - 60,
+                "exit_messages": [{"text": "s1-complete wf_x"}],
+            }})),
+        )
+        con.commit()
+        con.close()
+        monkeypatch.setattr(sm, "WORKFLOWS_DB", db)
+        result = monitor._l4_check("qa")
+        assert result["work_evidence"] is True
+        assert result["workflow_age_seconds"] < 120
+
+    def test_overall_l4_probe_failure_is_unknown_not_stale(self, monitor):
+        """L4 查询失败（error 存在且 work_evidence=None）不得落 stale。"""
+        assert monitor._overall(
+            {"status": "ALIVE"}, {"thinking": False}, {"producing": False},
+            {"work_evidence": None, "error": "workflow_probe_failed: x"},
+        ) == "unknown"
+
     def test_l4_missing_db_is_unknown_not_false(self, monitor, tmp_path, monkeypatch):
         monkeypatch.setattr(sm, "WORKFLOWS_DB", tmp_path / "missing.db")
         result = monitor._l4_check("qa")
