@@ -1689,8 +1689,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     if _rework_ids:
                         # 返工链回流：等全部终态才决定出口。
                         # 为什么自己查而不走 _scan_tasks 的 subflow_id 通道：那条通道
-                        # 只认 subflow_id 键，返工链记在 rework_ids——两套键，混用会把
-                        # 返工链当子链重复推进（实测 wf_rw_* 全库 0 台，从未回流过）。
+                        # 只认 subflow_id 键，返工链记在 rework_ids——两套键，经该通道
+                        # 回流的 rework 恒为 0 台（注释易误读为"库里没有返工链"：
+                        # 实测全库 37 台 wf_rw_*，回流率 75.7%，全走本处 rework_ids
+                        # 直查；见 wt-launcher scripts/rework_health.py，2026-10-30）。
                         try:
                             _ph = ",".join("?" * len(_rework_ids))
                             _rework_rows = lm.query(
