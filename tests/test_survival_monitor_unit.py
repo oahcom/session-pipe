@@ -42,6 +42,7 @@ def isolate_state(tmp_path, monkeypatch):
     health_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(sm, "SENTINEL_DIR", sentinel_dir)
     monkeypatch.setattr(sm, "HEALTH_DIR", health_dir)
+    monkeypatch.setattr(sm, "TRANSCRIPT_ROOT", tmp_path / "transcripts")
     # lifecycle 也必须隔离：tick() 现在额外枚举 infinite 角色以保证「从未启动」的
     # 角色也进巡检；不隔离会读到生产 personas → 测试驱动 _ensure_role_alive
     # 去拉起/杀真实 tmux 会话（实测 2026-10-20，一次 pytest 尝试重启 10 个角色）。
@@ -190,6 +191,37 @@ class TestL3Check:
         assert result["producing"] is None
 
 
+class TestL4Check:
+    """L4: transcript / workflow 进展 —— bus 静默时的“有活”证据。"""
+
+    def test_l4_workflow_recent_progress(self, monitor, tmp_path, monkeypatch):
+        import sqlite3
+        db = tmp_path / "workflows.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "create table workflow_instances (instance_id text, status text, assignee text, "
+            "created_at real, step_results text)"
+        )
+        con.execute(
+            "insert into workflow_instances values (?,?,?,?,?)",
+            ("wf_x", "running", "qa", time.time() - 600,
+             json.dumps({"s1": {"notified_at": time.time() - 60}})),
+        )
+        con.commit()
+        con.close()
+        monkeypatch.setattr(sm, "WORKFLOWS_DB", db)
+        result = monitor._l4_check("qa")
+        assert result["available"] is True
+        assert result["work_evidence"] is True
+        assert result["workflow_age_seconds"] < 120
+
+    def test_l4_missing_db_is_unknown_not_false(self, monitor, tmp_path, monkeypatch):
+        monkeypatch.setattr(sm, "WORKFLOWS_DB", tmp_path / "missing.db")
+        result = monitor._l4_check("qa")
+        assert result["available"] is False
+        assert result["work_evidence"] is None
+
+
 class TestOverall:
     """_overall 综合判断"""
 
@@ -203,7 +235,25 @@ class TestOverall:
         assert monitor._overall({"status": "UNKNOWN"}, {}, {}) == "unknown"
 
     def test_overall_stale(self, monitor):
-        assert monitor._overall({"status": "ALIVE"}, {"thinking": False}, {}) == "stale"
+        # stale 必须建立在“确定没产出”上；L3={} 是不可判，不是没产出。
+        assert monitor._overall({"status": "ALIVE"}, {"thinking": False},
+                                {"producing": False}) == "stale"
+
+    def test_overall_unavailable_l3_is_not_stale(self, monitor):
+        """L3 不可判（空 dict / producing=None）不得落 stale。
+
+        误报根因：pane 静默时旧缓存跳过 L3，首轮 l3={} → producing=None →
+        兜底 stale。查不到 ≠ 没产出，必须返回 unknown 交给 L4/人工。
+        """
+        assert monitor._overall({"status": "ALIVE"}, {"thinking": False}, {}) == "unknown"
+        assert monitor._overall(
+            {"status": "ALIVE"}, {"thinking": False}, {"producing": None}) == "unknown"
+
+    def test_overall_l4_work_evidence_overrides_stale(self, monitor):
+        """transcript/workflow 仍在进展 → 不得判 stale。"""
+        assert monitor._overall(
+            {"status": "ALIVE"}, {"thinking": False}, {"producing": False},
+            {"work_evidence": True}) == "healthy"
 
     def test_overall_thinking_false_but_recent_output_is_healthy(self, monitor):
         # 回归锁定：pane 静默（thinking=False）不应掩盖最近的 bus 产出。

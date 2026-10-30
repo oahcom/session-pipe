@@ -8,7 +8,7 @@ L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
 集成方式：routing_daemon 每 120s 调 tick()。
 独立于 CCS 侧代码，纯外部观测。
 """
-import json, logging, os, re, subprocess, sys, time
+import json, logging, os, re, sqlite3, subprocess, sys, time
 from pathlib import Path
 from typing import Any
 
@@ -17,17 +17,20 @@ LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 from liveness import tmux_snapshot   # 单次 pane 快照，L1 与 pipeflow 共用一份判据
 
 try:
-    from paths import CCS_SENTINEL_DIR as SENTINEL_DIR, SESSION_ROLES_ROOT
+    from paths import CCS_SENTINEL_DIR as SENTINEL_DIR, SESSION_ROLES_ROOT, WORKFLOWS_DB
     _ROLES_ROOT = SESSION_ROLES_ROOT
 except ImportError:
     SENTINEL_DIR = Path("~/.hermes/run/ccs-sentinels")
     _ROLES_ROOT = Path.home() / "hermes-session-roles"
+    WORKFLOWS_DB = Path.home() / ".hermes" / "state" / "workflows.db"
 
 # 与 liveness.HEALTH_DIR 同一口子：测试/隔离场景可经 CCS_HEALTH_DIR 重定向。
 # 原先 _write_health 硬编码真实目录，导致单测把 survival_* 写进生产
 # ~/.hermes/run/ccs-health/{role}.json（实测 2026-10-16）。
 HEALTH_DIR = Path(os.environ.get(
     "CCS_HEALTH_DIR", str(Path.home() / ".hermes" / "run" / "ccs-health")))
+TRANSCRIPT_ROOT = Path(os.environ.get(
+    "CCS_TRANSCRIPT_ROOT", str(Path.home() / ".claude" / "projects")))
 PERSONAS_DIR = _ROLES_ROOT / "personas" / "session-roles"
 BUS_SCRIPT = Path(os.environ.get(
     "BUS_CLIENT",
@@ -246,9 +249,82 @@ class SurvivalMonitor:
                 "detail": f"L3 异常: {e}",
             }
 
+    # ── L4: 落盘/工作流进展 ──
+
+    def _l4_check(self, role: str) -> dict:
+        """L4: 不依赖 bus 的“有活”证据。
+
+        L3 只看角色自己写 bus；长测试、长文件编辑期间零 bus 写入会被误判 stale。
+        这里补两类廉价证据：transcript 最近写入 + 该角色 running workflow 的
+        最近活性戳。任一在 900s 内即视为有活；查询失败返回 None，不伪造 False。
+        """
+        now = time.time()
+        transcript_age = None
+        transcript_root = (
+            TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
+        )
+        try:
+            if transcript_root.is_dir():
+                latest = max(
+                    (p.stat().st_mtime for p in transcript_root.glob("*.jsonl")),
+                    default=0.0,
+                )
+                if latest:
+                    transcript_age = now - latest
+        except OSError:
+            transcript_age = None
+
+        workflow_age = None
+        try:
+            if not WORKFLOWS_DB.exists():
+                workflow_age = None
+            else:
+                uri = f"file:{WORKFLOWS_DB.as_posix()}?mode=ro"
+                con = sqlite3.connect(uri, uri=True, timeout=3)
+                try:
+                    rows = con.execute(
+                        "SELECT created_at, step_results FROM workflow_instances "
+                        "WHERE status='running' AND assignee=?",
+                        (role,),
+                    ).fetchall()
+                finally:
+                    con.close()
+                stamps = []
+                for created_at, raw in rows:
+                    stamps.append(float(created_at or 0))
+                    try:
+                        data = json.loads(raw or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    for sdata in data.values():
+                        if not isinstance(sdata, dict):
+                            continue
+                        for key, value in sdata.items():
+                            if (key.endswith(("_at", "_ts", "_since", "_check"))
+                                    or key in ("ts", "notified_at")):
+                                if isinstance(value, (int, float)) and value > 0:
+                                    stamps.append(float(value))
+                if stamps:
+                    workflow_age = now - max(stamps)
+        except (OSError, sqlite3.Error, ValueError):
+            workflow_age = None
+
+        ages = [a for a in (transcript_age, workflow_age) if a is not None]
+        work_evidence = bool(ages) and min(ages) < 900
+        return {
+            "available": bool(ages),
+            "work_evidence": work_evidence if ages else None,
+            "transcript_age_seconds": transcript_age,
+            "workflow_age_seconds": workflow_age,
+            "detail": (f"transcript_age={transcript_age if transcript_age is None else round(transcript_age)}s "
+                       f"workflow_age={workflow_age if workflow_age is None else round(workflow_age)}s"),
+        }
+
     # ── 汇总 ──
 
-    def _overall(self, l1: dict, l2: dict, l3: dict) -> str:
+    def _overall(self, l1: dict, l2: dict, l3: dict, l4: dict | None = None) -> str:
         if l1.get("status") == "DEAD":
             return "dead"
         if l1.get("status") == "ORPHAN":
@@ -258,24 +334,25 @@ class SurvivalMonitor:
             return "orphan"
         if l1.get("status") != "ALIVE":
             return "unknown"
-        # thinking=None（两项信号均未知）→ 跳过 L2，让 L3 bus 产出定结论
+        work_evidence = bool((l4 or {}).get("work_evidence"))
+        # thinking=None（两项信号均未知）→ 跳过 L2，让 L3/L4 定结论
         if l2.get("thinking") is False:
             # pane 静默只说明「此刻没有输出」，而 infinite 常驻角色的空闲是正常态；
-            # L3 是落盘事实（bus 产出 600s 内），比 pane 时间推断更权威，不应被推翻。
-            # 实测 2026-10-16：qa 交付 test_report（112 passed/0 failed）后仍被判 stale
-            # —— 因为它在 pane 静默 >300s 时提交了产出。原判据「thinking is False 即
-            # stale」会让监控信号与真实产出反向，同类陷阱见 ccls_daemon 旧版 pane 停滞判据。
-            if l3.get("producing") is True:
+            # L3 是落盘事实（bus 产出 600s 内），L4 补 transcript/workflow 进展。
+            # 不能把「L3 不可判」当成「没产出」：那会把查不到误杀成 stale。
+            if l3.get("producing") is True or work_evidence:
                 return "healthy"
+            if l3.get("producing") is None:
+                return "unknown"
             return "stale"
-        # L2 不确定时看 L3——如果最近有 bus 产出，仍算 healthy
+        # L2 不确定时看 L3/L4——最近有落盘或工作流进展，仍算 healthy
         if l2.get("thinking") is None:
-            if l3.get("producing") is True:
+            if l3.get("producing") is True or work_evidence:
                 return "healthy"
             if l3.get("producing") is False:
                 return "idle"
-            return "unknown"  # 两项信号均无数据
-        if l3.get("producing") is False:
+            return "unknown"  # 信号均无数据
+        if l3.get("producing") is False and not work_evidence:
             return "idle"
         return "healthy"
 
@@ -426,15 +503,21 @@ class SurvivalMonitor:
             l1 = self._l1_check(role)
             l2 = (self._l2_check(role) if l1["status"] == "ALIVE"
                   and now - prev.get("l2_ts", 0) > 120 else prev.get("l2", {}))
-            l3 = (self._l3_check(role) if l2.get("thinking") is not False
-                  and now - prev.get("l3_ts", 0) > 300 else prev.get("l3", {}))
-            overall = self._overall(l1, l2, l3)
+            # pane 静默时更依赖 L3/L4 救场，因此 thinking=False 反而要刷新 L3，
+            # 不能拿 300s 前的旧值（首轮甚至是空 dict）判 stale。
+            _l3_ttl = 120 if l2.get("thinking") is False else 300
+            l3 = (self._l3_check(role)
+                  if now - prev.get("l3_ts", 0) > _l3_ttl else prev.get("l3", {}))
+            l4 = (self._l4_check(role) if l1["status"] == "ALIVE"
+                  and now - prev.get("l4_ts", 0) > 120 else prev.get("l4", {}))
+            overall = self._overall(l1, l2, l3, l4)
             # R3: 注入 lifecycle（idle 回收判断用）
             _lifecycle = _load_role_lifecycles().get(role, "ondemand")
             result = {
                 "l1": l1, "l1_ts": now,
                 "l2": l2, "l2_ts": now if "thinking" in l2 else prev.get("l2_ts", 0),
                 "l3": l3, "l3_ts": now if "producing" in l3 else prev.get("l3_ts", 0),
+                "l4": l4, "l4_ts": now if "work_evidence" in l4 else prev.get("l4_ts", 0),
                 "overall": overall,
                 "lifecycle": _lifecycle,
             }
@@ -446,6 +529,9 @@ class SurvivalMonitor:
                 survival_overall=overall,
                 survival_l2_thinking=l2.get("thinking"),
                 survival_l3_producing=l3.get("producing"),
+                survival_l4_work=l4.get("work_evidence"),
+                survival_transcript_age=l4.get("transcript_age_seconds"),
+                survival_workflow_age=l4.get("workflow_age_seconds"),
                 survival_ts=now,
             )
 
