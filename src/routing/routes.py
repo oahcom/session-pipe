@@ -173,6 +173,10 @@ def _is_noop_report(title: str, evidence: str = "") -> bool:
 # 超过这个年龄的事实不再投递（只 claim）。6h：角色任务生命周期远短于此，
 # 而视图积压是按天算的（8.6k 条 / 7.7k 条 >24h）。
 STALE_AFTER_S = 6 * 3600
+# 同一角色“未运行”告警节流：每 5 分钟一轮路由，原实现每轮同文 warning，
+# 看日志无法区分“一直没人”与“刚掉线”。进程内冷却即可；daemon 重启多报一次可接受。
+_INACTIVE_WARN_COOLDOWN_S = 30 * 60
+_LAST_INACTIVE_WARN: dict[str, float] = {}
 
 
 def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool = True) -> dict:
@@ -466,6 +470,9 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     messages = [m for m in raw_msgs if _is_for_me(m)]
     if not messages or "error" in messages[0]:
         return {"role": role_name, "routed": 0, "total": 0, "dry_run": dry_run, "details": []}
+    # 同优先级内按时间升序：原 SQL 是 ts DESC，窗口被最新消息钉死，老消息永远排不进
+    # 30 条窗口（FIFO 反向），积压越久越投不出去。
+    messages.sort(key=lambda m: (m.get("priority", 99), m.get("ts") or 0))
 
     # 子进程调 ccs.py 发消息，规避 routing 包名冲突
     _launcher_env = {**os.environ, "PYTHONPATH": str(_CCS_CLI.parent)}
@@ -553,8 +560,14 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             # 每次调用只记一条，别按消息条数刷屏。
             if not _noted_dead:
                 _noted_dead = True
-                LOGGER.warning("route_to_ccs: %s 未运行，%d 条消息滞留（不拉起 pane 就永远投不到）",
-                               role_name, len(messages))
+                _now = time.time()
+                if _now - _LAST_INACTIVE_WARN.get(role_name, 0.0) >= _INACTIVE_WARN_COOLDOWN_S:
+                    _LAST_INACTIVE_WARN[role_name] = _now
+                    _oldest = min((m.get("ts") or _now) for m in messages)
+                    LOGGER.warning(
+                        "route_to_ccs: %s 未运行，本轮窗口 %d 条可投（最老 %.0fmin）"
+                        "；消息保留在 bus，30min 内不重复告警",
+                        role_name, len(messages), (_now - _oldest) / 60)
             continue
 
         # 忙检测：角色有活跃工作流 → 跳过推送（消息留 bus 下轮再试）

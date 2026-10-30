@@ -178,7 +178,7 @@ def test_route_to_ccs_not_running_skips(mock_metrics, mock_hb):
     from routing.routes import route_to_ccs
     msgs = [{
         "id": 31, "category": "code_fix", "text": "fix",
-        "priority": 1,
+        "priority": 1, "ts": 1,
     }]
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
          patch("routing.routes._rt_mod") as mock_rt_mod, \
@@ -190,6 +190,49 @@ def test_route_to_ccs_not_running_skips(mock_metrics, mock_hb):
         mock_run.return_value = status_result
         result = route_to_ccs("engineer", dry_run=False)
     assert result["details"][0]["action"] == "skipped"
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_sorts_same_priority_oldest_first(mock_metrics, mock_hb):
+    """同优先级按 ts 升序：避免新消息钉死 30 条窗口，老消息永久饿死。"""
+    from routing import routes as routes_mod
+    msgs = [
+        {"id": 1, "category": "notice", "text": "newer", "priority": 1, "ts": 300},
+        {"id": 2, "category": "notice", "text": "older", "priority": 1, "ts": 100},
+    ]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("subprocess.run") as mock_run:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = "未运行"
+        status_result.returncode = 0
+        mock_run.return_value = status_result
+        result = routes_mod.route_to_ccs("engineer", dry_run=False)
+    assert [d["id"] for d in result["details"]] == [2, 1]
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_to_ccs_inactive_warning_is_throttled(mock_metrics, mock_hb):
+    """同一角色未运行的 warning 30min 内只报一次，避免 journal 每 5min 刷同文。"""
+    from routing import routes as routes_mod
+    routes_mod._LAST_INACTIVE_WARN.clear()
+    msgs = [{"id": 3, "category": "notice", "text": "x", "priority": 1, "ts": 1}]
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("subprocess.run") as mock_run, \
+         patch.object(routes_mod.LOGGER, "warning") as warning:
+        mock_rt_mod.get_router.return_value = MagicMock()
+        status_result = MagicMock()
+        status_result.stdout = "未运行"
+        status_result.returncode = 0
+        mock_run.return_value = status_result
+        routes_mod.route_to_ccs("engineer", dry_run=False)
+        routes_mod.route_to_ccs("engineer", dry_run=False)
+    assert warning.call_count == 1
+    routes_mod._LAST_INACTIVE_WARN.clear()
 
 
 @patch("routing.routes.HEARTBEAT")
