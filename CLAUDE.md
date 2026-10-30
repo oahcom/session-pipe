@@ -50,7 +50,7 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 src/
   routing/
     router.py         ── 路由表 + produce/consume 推导（361 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（643 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（661 行）
     auto.py           ── 自动路由消费 + investigator 分派（260 行）
     polling.py        ── 消息轮询（99 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
@@ -61,11 +61,11 @@ src/
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
     engine.py         ── 编排 + CLI（2070 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（1735 行）
+    step_handler.py   ── 步骤处理（1745 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1201 行）
-    task_generator.py ── 任务生成（1022 行）
+    task_generator.py ── 任务生成（1028 行）
     wf_lifecycle.py   ── 工作流生命周期（2176 行）
-    daemon.py         ── 工作流守护 while 循环（503 行）
+    daemon.py         ── 工作流守护 while 循环（508 行）
     integrity.py      ── 完整性提醒（旁路提醒）
 
   lifecycle/
