@@ -232,6 +232,7 @@ class TestL4Check:
                 "notified_at": now - 30,
                 "poll_since": now - 30,
                 "kick_stalled_at": now - 100,
+                "bus_anchor": now - 30,
             }})),
         )
         con.commit()

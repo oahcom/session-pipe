@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""survival_monitor.py — L1/L2/L3 三层存活检测。
+"""survival_monitor.py — L1/L2/L3/L4 四层存活检测。
 
 L1: 进程存活（一次 pane 快照 + 哨兵文件）
 L2: 思考存活（tmux pane/window 最后活动时间）
 L3: 产出存活（按角色 output_targets 分类查 bus 最近产出）
+L4: 落盘/工作流进展（transcript 最近写入 + running 步骤 completed_at/bus_anchor）
 
 集成方式：routing_daemon 每 120s 调 tick()。
 独立于 CCS 侧代码，纯外部观测。
@@ -304,8 +305,12 @@ class SurvivalMonitor:
                             # 只认角色推进产出的事实。notified_at / poll_since /
                             # kick_stalled_at 是引擎每轮刷新/催办写的——把它们算作
                             # “有活”会让卡得越死越被判 healthy，stale 永久失效。
-                            # completed_at / bus_anchor 才代表该步真的产出了东西。
-                            if key in ("completed_at", "bus_anchor"):
+                            # bus_anchor 在“推进到下一步”时也会被写成 now（等同
+                            # notified_at），只有本步已有 exit_messages 才说明真匹配过产出。
+                            if key == "completed_at":
+                                if isinstance(value, (int, float)) and value > 0:
+                                    stamps.append(float(value))
+                            elif key == "bus_anchor" and sdata.get("exit_messages"):
                                 if isinstance(value, (int, float)) and value > 0:
                                     stamps.append(float(value))
                 if stamps:

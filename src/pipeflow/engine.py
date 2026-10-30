@@ -1670,9 +1670,15 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                                 LOGGER.warning("rejected → 已建返工链 %s/%s: %s",
                                                inst["instance_id"][:12], step_id, _rework_ids)
                                 if _rework_ids:
-                                    # 门禁看“活业务链”，本轮刚建出的就是业务链。
-                                    # 不刷新会让历史系统链占位，单步链永远不 fail-fast。
-                                    _biz_rw = list(_rework_ids)
+                                    # 门禁看“活业务链”；刚建出的链也要过系统链过滤，
+                                    # 否则只有【系统问题】的单步评审会被多放行一轮。
+                                    try:
+                                        _ph1 = ",".join("?" * len(_rework_ids))
+                                        _biz_rw = _biz_rework_ids(lm.query(
+                                            f"SELECT instance_id, template_id FROM workflow_instances "
+                                            f"WHERE instance_id IN ({_ph1})", tuple(_rework_ids)))
+                                    except Exception:
+                                        _biz_rw = list(_rework_ids)
                         except Exception as _rw:
                             LOGGER.warning("rejected 建返工链失败 %s/%s: %s",
                                            inst["instance_id"][:12], step_id, _rw)
@@ -1753,7 +1759,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             inst["instance_id"], status="failed",
                             reason=f"last step {step_id} rejected "
                                    f"(retry={_rej_sr.get('rejected_retry', 0) or 0})"
-                                   + (f": {_rej_txt[:120]}" if _rej_txt else ""))
+                                   + (f": {_reason_line[:120]}" if _reason_line else ""))
                         continue
 
                     # 复用首投路径：清空 status → 下轮 `if not step_status` 重发。
