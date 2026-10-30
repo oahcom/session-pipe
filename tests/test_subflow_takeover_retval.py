@@ -23,9 +23,14 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-_SRC = (Path(__file__).resolve().parent.parent / "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
+_SRC = str((Path(__file__).resolve().parent.parent / "src"))
+# 必须是 str 而不是 Path：importlib 只按字符串匹配 sys.path，插入 Path 对象
+# 等于没插（实测 `/home/administrator/wt-live/src` 以 PosixPath 落进 sys.path 后
+# `import pipeflow` 仍解析到 PYTHONPATH 上的 session-pipeline，12 个用例全在测另一棵树）。
+# 同时强插到最前：本机 PYTHONPATH 已含 session-pipeline/src，不能靠 `not in` 判断。
+if _SRC in sys.path:
+    sys.path.remove(_SRC)
+sys.path.insert(0, _SRC)
 
 import pipeflow.wf_lifecycle as wfl  # noqa: E402
 
@@ -201,6 +206,48 @@ def test_subflow_creation_clears_parent_queue_ledger():
         "建子链未清 queued_since：子链一结束父步就被判「停滞 = 从建链至今」"
 
 
+def test_escalated_parent_step_not_rebuilt():
+    """子链连败已升级（subflow_escalated）→ 不得再造子链，交还父步自投。
+
+    实测 wf_453b6e23c2/s4：subflow_retry=6、subflow_escalated=True，
+    24h 内建出 19 条 reviewer 子链（每条 failed 的时刻 = 下一条 created 的时刻）。
+    task_generator 置这个键就是为了刹车，但本函数从不读它。
+
+    必须注册 _workflows：否则建链分支因模板缺失本就 return False，
+    用例会「通过」而测不到刹车（红绿对照会失效）。
+    """
+
+    class _Cur2:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn2(_FakeConn):
+        def commit(self):
+            pass
+
+        def execute(self, sql, params=()):
+            if "SELECT status FROM workflow_instances" in sql:
+                return _Cur2({"status": "failed"})
+            if "assigner FROM workflow_instances" in sql:
+                return _Cur2({"assigner": "pm"})
+            if "t.title, t.description" in sql:
+                return _Cur2({"title": "需求", "description": "描述"})
+            if "SELECT template_id FROM tasks" in sql:
+                return _Cur2({"template_id": "x"})
+            return super().execute(sql, params)
+
+    sr = {"s1": {"subflow_id": "wf_sub_dead", "subflow_retry": 6, "subflow_escalated": True}}
+    m, lm = _taker(sr, "failed")
+    lm._conn_tx.return_value = _FakeTx(_Conn2(sr, "failed"))
+    step = _step()
+    m._workflows = {"pm_requirements": type("W", (), {"steps": [step]})()}
+    r = m._subflow_takeover(lm, "wf_parent", "wfname", step, -1, {"s1": dict(sr["s1"])}, "s1")
+    assert r is False, f"已升级仍重建子链（返回 {r!r}）—— 会无限建同型子链"
+
+
 if __name__ == "__main__":
     tests = [
         ("建子链清父步排队账本", test_subflow_creation_clears_parent_queue_ledger),
@@ -214,6 +261,7 @@ if __name__ == "__main__":
         ("子链行缺失 → False（保守）", test_missing_subflow_row_returns_false),
         ("空 status → False", test_empty_string_status_returns_false),
         ("无 subflow_id → falsy", test_no_subflow_returns_falsy),
+        ("已升级 → False（不重建）", test_escalated_parent_step_not_rebuilt),
     ]
     passed = failed = 0
     for name, fn in tests:
@@ -230,7 +278,7 @@ if __name__ == "__main__":
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
 
-def test_rejected_child_not_rebuilt():
+def test_escalated_child_not_rebuilt():
     """父步已因驳回重投（rejected_retry），且该步有跑完的旧子链 → 不得再造子链。
 
     实测 wf_0c5e3d807ede/s1：[auto] 任务只有模板简介没有需求，pm 子链三步全零产出

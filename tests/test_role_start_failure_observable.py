@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-_SRC = (Path(__file__).resolve().parent.parent / "src")
+_SRC = str(Path(__file__).resolve().parent.parent / "src")
 _SRC_FILE = Path(_SRC) / "pipeflow" / "role_lifecycle.py"
 
 

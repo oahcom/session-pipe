@@ -1034,6 +1034,15 @@ class WorkflowLifecycleMixin:
                              f'$."{tgt_step.id}".queued_since', wf_id))
                         conn2.commit()
                     return True
+                # 子链连败已升级 → 不再重建。task_generator 在 subflow_retry>3 时置
+                # subflow_escalated 并打算「保留 subflow_id → 本函数返回 False 交还父步
+                # 自投」，但本函数从不读这个键：指针指向终态子链时只穿过活跃白名单，
+                # 落到下面无条件 INSERT，再造一条同型子链。实测 wf_453b6e23c2/s4
+                # subflow_retry=6、escalated=True，24h 内建出 19 条 reviewer 子链
+                # （每条 failed 的时刻就是下一条 created 的时刻）。刹车写在这里才对：
+                # 上面的防重分支只会复用活着的子链，管不了「重建」。
+                if isinstance(_db_sdata, dict) and _db_sdata.get("subflow_escalated"):
+                    return False
                 # 同一父步已有"跑完却没通过"的旧子链 → 不再重建：重建只是把同样的
                 # 空需求再跑一遍。实测 wf_0c5e3d807ede/s1（[auto] 产品交付全流程，
                 # 任务描述只有模板简介、没有用户需求）的子链三步全零产出并自判
