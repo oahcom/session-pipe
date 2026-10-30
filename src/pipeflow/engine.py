@@ -1630,10 +1630,17 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         continue
                     _idx = next((i for i, s in enumerate(wf.steps) if s.id == step_id), -1)
                     _has_next = 0 <= _idx < len(wf.steps) - 1
+                    # 单步模板（如 reviewer_pr_review）没有 next_step，但返工承接方
+                    # 由分类/被审对象决定，不依赖 next_step；_create_rework_subflow
+                    # 的 next_step 形参在函数体内从未使用（wf_lifecycle.py:1309）。
+                    # 因此单步链也应允许建返工链；否则末步直接被判死，正确驳回
+                    # 意见永远无法回到执行者。多步链末步仍保持原 fail-fast 语义。
+                    _single_step = len(wf.steps) == 1
+                    _can_rework = _has_next or _single_step
                     # 系统问题链不算"已建业务返工链"：把它留在集内会让本判据恒假，
                     # 再驳回只重投不返工，直到 retry 封顶（报告 P1 CASE-B 实测）。
                     _biz_rw = _rework_ids
-                    if _has_next and _rework_ids:
+                    if _can_rework and _rework_ids:
                         try:
                             _ph0 = ",".join("?" * len(_rework_ids))
                             _biz_rw = _biz_rework_ids(lm.query(
@@ -1643,11 +1650,13 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             LOGGER.warning("系统链过滤查询失败 %s/%s: %s",
                                            inst["instance_id"][:12], step_id, _q0)
                             _biz_rw = _rework_ids
-                    if _has_next and not _biz_rw:
+                    if _can_rework and not _biz_rw:
                         try:
                             if self._create_rework_subflow(
                                     inst["instance_id"], lm, wf_name, step_id,
-                                    wf.steps[_idx], wf.steps[_idx + 1], results):
+                                    wf.steps[_idx],
+                                    wf.steps[_idx + 1] if _has_next else None,
+                                    results):
                                 # 建链成功：重读 rework_ids 再决出口
                                 try:
                                     _fresh = lm.query_one(
@@ -1716,19 +1725,29 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 一遍（产物不变 → 必然再驳回），封顶后还要等 2h 升级窗口没人接。
                     # 实测 30 天 9 条升级里 7 条 delta 贴着 7200s = 定时器收的，没有一条
                     # 有 coordinator 署名的处置。故直接按 failed 收口，原因进 wf_logs。
-                    if not _has_next:
+                    # 例外：单步链若已建出返工链，必须允许返工回调后重审，不能在这里
+                    # 把仍在进行的返工工作判死。
+                    _rej_txt = " ".join(
+                        str(m.get("text") or "")
+                        for m in (_rej_sr.get("exit_messages") or [])
+                        if isinstance(m, dict)
+                    ).strip()[:400]
+                    _rej_reason = str(_rej_sr.get("rejection_reason") or "").strip()
+                    if not _has_next and not (_single_step and _rework_ids):
                         self._bb.write(
                             "blocker",
                             f"[workflow] {inst['instance_id'][:12]}/{step_id} "
                             f"末步被驳回 → 按 failed 收口（不重投）",
-                            evidence=(f"末步无 next_step，重投只会复写同一驳回。\n"
-                                      f"驳回理由: {(_rej_sr.get('rejection_reason') or '')[:200]}\n"
+                            evidence=(f"末步无 next_step 且无可用返工链。\n"
+                                      f"驳回理由: {(_rej_reason or _rej_txt)[:200]}\n"
+                                      f"驳回原文: {_rej_txt[:200]}\n"
                                       f"已重投 {_rej_sr.get('rejected_retry', 0) or 0} 次"),
                             src="workflow_engine")
                         self._lifecycle.close_wf(
                             inst["instance_id"], status="failed",
                             reason=f"last step {step_id} rejected "
-                                   f"(retry={_rej_sr.get('rejected_retry', 0) or 0})")
+                                   f"(retry={_rej_sr.get('rejected_retry', 0) or 0})"
+                                   + (f": {_rej_txt[:120]}" if _rej_txt else ""))
                         continue
 
                     # 复用首投路径：清空 status → 下轮 `if not step_status` 重发。

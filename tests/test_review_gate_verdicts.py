@@ -184,3 +184,39 @@ def test_last_step_rejection_fails_fast_without_retry(mock_run):
     assert not sr.get("rework_escalated_at"), "不该走 2h 升级窗口"
     assert (sr.get("rejected_retry") or 0) == 0, f"不该重投，retry={sr.get('rejected_retry')}"
 
+
+@patch("pipeflow.engine._sp.run", return_value=MagicMock(
+    returncode=0, stdout="claude\n", stderr=b""))
+def test_last_step_classified_rejection_builds_rework(mock_run):
+    """单步链带分类的驳回 → 建返工链并保持运行，不得直接 failed。
+
+    生产 24h 18 条 reviewer_pr_review 子链都是单步，全部走
+    `last step s1 rejected (retry=0)`，0 条返工链；驳回文案里实际带
+    【业务问题→engineer】，建链能力早已存在，只是被 `_has_next` 门拦住。
+    """
+    d = _make_env()
+    _write_wf(d, "rev_last_rework", [_step("s1", type="review")])
+    _write_wf(d, "engineer_feature", [_step("s1", target_role="engineer")])
+    eng = WorkflowEngine(d)
+    rid = eng.start("rev_last_rework", {})
+
+    eng.run_once()
+    eng._bb.write(
+        "notice",
+        "TOK_S1 — CHANGES_REQUESTED 0 P0 / 1 P1\n"
+        "【业务问题→engineer】\n- P1 | 返回值错误 | chain.py:68",
+        src="test_role",
+    )
+    _ticks(eng, 8)
+
+    s = eng.status(rid)
+    sr = s["results"]["s1"]
+    assert s["status"] != "failed", f"有分类的单步驳回不得直接判死：{s}"
+    assert sr.get("rework_ids"), f"必须建出返工链：{sr}"
+    assert not sr.get("rework_escalated_at"), "刚建链不该进入升级终结期"
+    rows = eng._lifecycle.query(
+        "SELECT instance_id, template_id FROM workflow_instances "
+        "WHERE parent_wf_id=? AND subflow_source_step_id='s1'", (rid,))
+    assert len(rows) == 1, f"应只建一条返工链，实际 {rows}"
+    assert rows[0]["template_id"] == "engineer_feature", rows
+
