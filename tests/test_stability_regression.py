@@ -160,6 +160,26 @@ class TestTimeoutQueuedNotIncremented(_MockTestCase):
         self.assertEqual(sdata.get("queued"), 1,
             "排队路径应递增 queued")
 
+    def test_busy_exit_match_uses_full_quality_gate(self):
+        """忙分支的 exit 匹配必须过 schema+verify，不能只校验 schema。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=True)
+        eng._sync_step_results = MagicMock()
+        eng._check_exit = MagicMock(return_value=(
+            time.time(), [{"id": 1, "text": "s1-complete", "evidence": "x",
+                          "ts": time.time(), "src": "qa"}]))
+        eng._quality_gate_blocks = MagicMock(return_value=True)
+        run = _run()
+        step = _step(target_role="qa", verify="exit 1", exit_condition={
+            "timeout_minutes": 1, "bus_category": "code_fix",
+            "source_contains": "qa", "text_contains": "s1-complete"})
+        run.step_results["s1"] = {"ts": time.time() - 100}
+        with patch.object(eng, "_sync_step_results"), \
+             patch("pipeflow.step_handler.get_conversation_signal", return_value=None):
+            eng._tick(run, step)
+        eng._quality_gate_blocks.assert_called_once()
+        eng._lm.complete_step.assert_not_called()
+
 
 class TestAutoCancelThreshold(_MockTestCase):
     """超限自动 cancel 阈值 = max(max_retries+3, 4)。"""

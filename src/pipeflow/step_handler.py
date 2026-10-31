@@ -810,12 +810,9 @@ class StepHandlerMixin:
                     if getattr(step, "dual_node", False) and not _b_sd.get("node2_approved"):
                         _busy_match_ts = 0.0
                     if _busy_match_ts:
-                        # exit_schema 校验与主路径一致：busy 不绕过文件约束
-                        # （2026-08-12 codex P1：schema 要求不能因忙检测分支成空文）
-                        _schema_ok = True
-                        if step.exit_schema:
-                            _schema_ok, _ = self._validate_exit_schema(step, run)
-                        if _schema_ok:
+                        # 与主路径同一把闸门：只校验 exit_schema 会漏掉 verify，
+                        # 忙分支因此比正常路径松（2026-10-31 R183 审计 3/9 站点）。
+                        if not self._quality_gate_blocks(step, run):
                             run.step_results[step.id] = {
                                 **self._step_sd(run, step),
                                 "bus_anchor": _busy_match_ts,
