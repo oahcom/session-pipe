@@ -121,11 +121,13 @@ def _codex_output_is_clean(out: str) -> bool:
     整行否定式，且全文不得出现任何级别标记。
     """
     _passed = bool(re.search(
-        r"(?im)^\s*(?:no findings|no issues|no problems|no security issues|"
-        r"nothing to report|0 issues|0 problems)\s*[.!。]?\s*$", out))
+        r"(?im)^\s*(?:no|0)\s+(?:findings?|issues?|problems?|security issues?)\b"
+        r"(?:\s+(?:found|detected|to report))?\s*[.!。]?\s*$", out))
+    # 级别标记必须行首（`[P1]` / `P1:` / `- P2`）：裸 `\bp[0-3]\b` 会把
+    # `https://x.dev/p1`、`app.p3` 当成发现，干净审查被判失败（902s 白等）。
     _finding = bool(re.search(
-        r"(?i)(\[p[0-3]\]|\bp[0-3]\b|critical|vulnerability|"
-        r"\bbug\s*:|\btraceback\b)", out))
+        r"(?im)^\s*(?:[-*]\s*)?\[?p[0-3]\]?(?:\s|:|$)|critical|vulnerab|"
+        r"\bbug\s*:|\btraceback\b", out))
     return _passed and not _finding
 
 
@@ -1100,7 +1102,16 @@ class StepHandlerMixin:
                     # evidence 一并带上：驳回分类段【系统问题→x】写在 evidence 里，
                     # 只取标题会让 _parse_review_issues 解析为空（与 :1662 同源）。
                     def _exit_would_match(f) -> bool:
-                        """这条消息走正常 exit 匹配能否命中（与 _check_exit 同口径）。"""
+                        """这条消息走正常 exit 匹配能否命中（只多不少的子集判定）。
+
+                        与 _check_exit 相同的前三道筛（src/文本/严格归属），外加
+                        自述拒绝过滤。**不**声称逐条等价：_check_exit 还有出生
+                        时间与软归属守卫，这里没有；因此判定为"能命中"而严格匹配
+                        实际拒绝时，本 tick 不推进、下一 tick 严格匹配仍拒绝 ——
+                        这是有意的 fail-closed（宁可不推进，也不吞掉拒产/串味消息）。
+                        """
+                        if _refusal_not_verdict(str(f.t or "")):
+                            return False
                         if src_filter and f.src != src_filter and f.src != "claude":
                             if not (eff_role and f.src == eff_role) and not (
                                     _wait_roles and f.src in _wait_roles):
@@ -1149,8 +1160,15 @@ class StepHandlerMixin:
                         # engineer/closer 各 1~2 次），下游拿不到契约件才回头返工。
                         if self._quality_gate_blocks(step, run):
                             return
-                        _got_cat = (_relaxed[0].get("cat") if _relaxed else "") or "空"
-                        _why = ("分类不匹配" if _got_cat != cat else "文本不匹配")
+                        _rc = _relaxed[0]
+                        if _rc.get("cat") != cat:
+                            _why = "分类不匹配"
+                        elif (text_filter
+                              and text_filter not in _rc.get("text", "")):
+                            _why = "文本不匹配"
+                        else:
+                            _why = "实例归属不匹配（标题未含实例 id）"
+                        _got_cat = _rc.get("cat") or "空"
                         LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (%s, %d 条)",
                                     run.workflow_name, step.id, _why, len(_relaxed))
                         run.step_results[step.id] = {
@@ -1162,7 +1180,8 @@ class StepHandlerMixin:
                         self._sync_step_results(run.id, run.step_results)
                         self._bb.write("blocker",
                             f"[workflow] {run.workflow_name}/{step.id} 宽松推进: "
-                            f"{_why}（收到 {_got_cat}，期望 {cat}）",
+                            f"{_why}" + (f"（收到 {_got_cat}，期望 {cat}）"
+                                         if _why == "分类不匹配" else ""),
                             src="workflow_engine")
                         # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
                         _integ_send_bypass(run, step, "relaxed",
