@@ -48,6 +48,19 @@ def _write_seq(n: int, cid: str, path: str, result: str, ts: str | None = None) 
     ]
 
 
+def _edit_seq(n: int, cid: str, path: str, ts: str | None = None) -> list:
+    return [
+        _turn(n, "assistant", [
+            {"type": "tool_use", "id": cid, "name": "Edit",
+             "input": {"file_path": path, "old_string": "a", "new_string": "b"}},
+        ], ts=ts),
+        _turn(n + 1, "user", [
+            {"type": "tool_result", "tool_use_id": cid, "is_error": False,
+             "content": "ok"},
+        ], ts=ts),
+    ]
+
+
 def _make(role_dir: Path, lines: list) -> Path:
     role_dir.mkdir(parents=True, exist_ok=True)
     jf = role_dir / "probe.jsonl"
@@ -952,6 +965,40 @@ def test_birth_negative_age_beyond_tolerance_flagged() -> None:
             pass
 
 
+def test_claude_memory_edit_not_flagged() -> None:
+    """MEMORY.md 由系统注入上下文，没有可 Read 的通道：Edit 不算盲改 (#474312)。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-memoryprobe-role"
+    path = str(Path.home() / ".claude" / "projects" / "-probe-memoryprobe-role"
+               / "memory" / "MEMORY.md")
+    jf = _make(sess, _edit_seq(0, "cm1", path))
+    try:
+        res = TrajectoryQualityChecker().check("memoryprobe", "t")
+        assert res["findings"] == [], f"memory 写入被误判: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_memory_lookalike_still_flagged() -> None:
+    """对照：普通目录下同名 MEMORY.md 仍要先 Read，豁免不能按文件名扩大。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-memlookalike-role"
+    path = str(Path.home() / "memory_probe_not_claude" / "MEMORY.md")
+    jf = _make(sess, _edit_seq(0, "cm2", path))
+    try:
+        res = TrajectoryQualityChecker().check("memlookalike", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"普通 MEMORY.md 未被标记: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -984,6 +1031,8 @@ if __name__ == "__main__":
         test_fresh_record_still_judged,
         test_blob_duplicate_not_resurrected,
         test_blob_duplicate_not_double_counted,
+        test_claude_memory_edit_not_flagged,
+        test_memory_lookalike_still_flagged,
     )
     for _t in _tests:
         _t()

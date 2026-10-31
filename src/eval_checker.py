@@ -981,6 +981,13 @@ class TrajectoryQualityChecker:
             """
             return bool(fp) and os.path.isabs(fp) and _key(fp).startswith(_own_roots)
 
+        def _is_memory(fp: str) -> bool:
+            """Claude Code 的 memory/ 文件由系统注入上下文，角色无法也不需要先 Read。
+            实测 2026-10-31 qa 每次 Edit MEMORY.md 都被报 blind_edit (#474312)。"""
+            p = _key(fp)
+            root = os.path.realpath(os.path.expanduser("~/.claude/projects")) + os.sep
+            return bool(p) and p.startswith(root) and f"{os.sep}memory{os.sep}" in p
+
         def _is_fresh_scratch(fp: str, ts: str) -> bool:
             """/tmp 下的文件必须是**这次写才诞生**的草稿才算豁免。
 
@@ -1189,8 +1196,8 @@ class TrajectoryQualityChecker:
                 # 自有产物的 Write 不算盲改；/tmp 只认"这次写才诞生"的草稿；Edit 照判。
                 # "别的 transcript 也在写"的门曾被试过并回退：本角色自己的多个会话
                 # 重写同一份报告是常态（maintainer 3 份报告即刻变 6 条红灯）。
-                if name == "Write" and (_is_own_ws(fp)
-                                        or _is_fresh_scratch(fp, c.get("ts") or "")):
+                if _is_memory(fp) or (name == "Write" and (
+                        _is_own_ws(fp) or _is_fresh_scratch(fp, c.get("ts") or ""))):
                     _exempt += 1
                     continue
                 if fp and _key(fp) not in read_files and not bash_read:
