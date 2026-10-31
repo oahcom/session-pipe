@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd
+from eval_shared_loader import _load_roles, _check_cmd, _extract_cmd, select_window
 
 
 def _window() -> int:
@@ -38,24 +38,20 @@ def _load_role_criteria(personas_dir: Path) -> list[dict]:
     roles = _load_roles(personas_dir)
     for r in roles:
         role_issues = []
-        role_no_cmd = []
-        window = r["eval_criteria"][:_window()]
+        # 运行时窗口按「可执行判据」取，不再按原始下标：纯文本判据占满窗口会让
+        # 后面唯一的验证命令永远轮不到（knowledge_curator 唯一判据在 idx4）。
+        all_criteria = r["eval_criteria"]
+        window = select_window(all_criteria, _window())
+        # 无命令的判据运行时恒 skipped，按全量统计才有意义（不再只数窗口内前 3 条）。
+        role_no_cmd = [c[:120] for c in all_criteria if _extract_cmd(c) is None]
         for c in window:
             cmd = _extract_cmd(c)
-            if cmd is None:
-                # 抽不出可执行命令 = 运行时恒 skipped（角色永远拿不到这条判据的
-                # 反馈）。旧实现直接 continue 不计数，预检只报 1 条，而实测
-                # 52 条判据里 37 条是这种形态（71%）→ 唯一的预检通道看不见主体。
-                # 单独成列、不并入 incompatible：它恒为真，并进去等于 rc 恒 1，
-                # daemon 每 600s 一条 WARNING（日志风暴）且真不兼容被淹没。
-                role_no_cmd.append(c[:120])
-                continue
             issues = _check_cmd(cmd)
             if issues:
                 role_issues.append({"criterion": c[:120], "issues": issues})
-        results.append({"name": r["name"], "criteria_count": len(r["eval_criteria"]),
+        results.append({"name": r["name"], "criteria_count": len(all_criteria),
                         "window": _window(),
-                        "exec_count": len(window) - len(role_no_cmd) - len(role_issues),
+                        "exec_count": len(window) - len(role_issues),
                         "no_cmd": role_no_cmd, "incompatible": role_issues})
     return results
 

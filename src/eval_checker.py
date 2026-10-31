@@ -1421,12 +1421,8 @@ class TrajectoryQualityChecker:
 
 def _reachable_criteria(role: dict) -> int:
     """该角色在运行期窗口内**真能被执行**的判据数（抽样权重）。"""
-    cnt = 0
-    for c in role["eval_criteria"][:CRITERIA_WINDOW]:
-        _ex = _extract_cmd(c)
-        if _ex is not None and _is_shell_cmd(_ex[0]):
-            cnt += 1
-    return cnt
+    from eval_shared_loader import select_window
+    return len(select_window(role["eval_criteria"], CRITERIA_WINDOW))
 
 
 def _weighted_role_sample(roles: list[dict], k: int) -> list[dict]:
@@ -1480,7 +1476,8 @@ def run_eval_check(role_filter: str | None = None) -> dict:
 
     for role in crit_roles:
         name = role["name"]
-        for c in role["eval_criteria"][:CRITERIA_WINDOW]:
+        from eval_shared_loader import select_window
+        for c in select_window(role["eval_criteria"], CRITERIA_WINDOW):
             extracted = _extract_cmd(c)
             if extracted is None:
                 summary["skipped"] += 1

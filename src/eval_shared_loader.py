@@ -34,6 +34,25 @@ def _check_cmd(cmd: str) -> list[str]:
     return [rejected["stderr"]] if rejected else []
 
 
+def select_window(criteria: list, limit: int) -> list:
+    """取前 limit 条**可执行**判据（运行时真正会跑的窗口）。
+
+    不能按原始下标切片：纯文本判据占满窗口时，后面唯一的可执行判据永远轮不到
+    （knowledge_curator 5 条里唯一带 `验证:` 的在 idx4，窗口 3 → 该角色零判据）。
+    运行时与预检共用本函数，窗口口径不再分叉。
+    """
+    from eval_checker import _extract_cmd as _ec_extract, _is_shell_cmd
+    picked = []
+    for c in criteria:
+        extracted = _ec_extract(c)
+        if not extracted or not _is_shell_cmd(extracted[0]):
+            continue
+        picked.append(c)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
 def _load_roles(personas_dir: Path | None = None) -> list[dict]:
     """加载所有角色 JSON，返回统一格式：[{name, eval_criteria: [criterion...], issues: [...]}]。
 

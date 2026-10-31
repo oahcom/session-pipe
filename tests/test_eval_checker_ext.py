@@ -197,10 +197,10 @@ def test_is_tautology_normalizes_spaces():
 
 
 def test_reachable_criteria_counts_only_runtime_window():
-    """窗口外的可执行判据不算权数：运行时根本不跑（codex 20 维 F1/N1）。"""
+    """窗口按「可执行判据」取：纯文本不占位，第 4 条有命令就该贡献权重。"""
     late = {"name": "late", "eval_criteria": [
         "叙述一", "叙述二", "叙述三", "验证: echo ok 输出 ok"]}
-    assert ec._reachable_criteria(late) == 0, "第 4 条判据在窗口外，不贡献权重"
+    assert ec._reachable_criteria(late) == 1, "纯文本不占窗口，第 4 条可执行判据应计入"
     early = {"name": "early", "eval_criteria": ["验证: echo ok 输出 ok", "叙述"]}
     assert ec._reachable_criteria(early) == 1
 
