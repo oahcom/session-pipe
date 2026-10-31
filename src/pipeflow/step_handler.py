@@ -1136,7 +1136,7 @@ class StepHandlerMixin:
                     # 上一轮遗留的同类消息不该让本步永远等超时。
                     _now = time.time()
                     _consumed_ids = getattr(self, "_consumed_exit_ids", ())
-                    # 下界必须与下面 :1439 的 created_after=last_ts 一致。抬到
+                    # 下界必须与下方主匹配的 created_after=last_ts 一致。抬到
                     # _notified_ts 会让「严格匹配收得下、这里判不合规」的消息留在
                     # _relaxed 里，宽松分支抢在严格匹配前 return，用分类不匹配的
                     # 消息把步骤推完（bus #457649 修的就是这个，抬高即复发）。
