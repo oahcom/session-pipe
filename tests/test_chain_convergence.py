@@ -171,4 +171,11 @@ def test_quality_standards_injected_into_prompt():
     out = eng._fill_prompt_vars(step.prompt_template, step, "quality_wf", "t", "d", {},
                                 wf_id="wf_test")
     assert "质量标准: 产出必须含证据链" in out, out
+    # 非 str（手改模板）不得让整轮 tick 崩掉；超长截断要有省略号
+    assert eng._acceptance_lines(step, ["a", "b"]) == \
+        [x for x in eng._acceptance_lines(step) if not x.startswith("质量标准")], \
+        "非 str 的 quality_standards 必须被忽略"
+    long_line = eng._acceptance_lines(step, "质" * 400)[-1]
+    assert long_line.startswith("质量标准: ") and long_line.endswith("…")
+    assert len(long_line) == len("质量标准: ") + 300
     _cleanup(d)

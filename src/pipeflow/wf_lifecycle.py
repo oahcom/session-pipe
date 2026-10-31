@@ -2101,9 +2101,11 @@ class WorkflowLifecycleMixin:
             _out.append("产出文件: " + ", ".join(_req))
         # quality_standards 是模板必填字段，此前只落库、从不进 prompt：角色看不到
         # 验收质量线，只能猜「完成」标准。注入后工作流自身提出质量要求。
-        _q = " ".join((quality_standards or "").split())
+        # 类型守卫：模板可手改/由 agent 写，非 str 时 .split() 会抛 AttributeError，
+        # 冒到 run_once 的 except 会中断整轮 tick（该实例永久不推进）。
+        _q = " ".join(quality_standards.split()) if isinstance(quality_standards, str) else ""
         if _q:
-            _out.append("质量标准: " + _q[:300])
+            _out.append("质量标准: " + (_q[:299] + "…" if len(_q) > 300 else _q))
         return _out
 
     def _fill_prompt_vars(self, prompt: str, step: Step, wf_name: str,
