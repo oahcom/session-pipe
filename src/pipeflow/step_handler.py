@@ -1136,13 +1136,13 @@ class StepHandlerMixin:
                     # 上一轮遗留的同类消息不该让本步永远等超时。
                     _now = time.time()
                     _consumed_ids = getattr(self, "_consumed_exit_ids", ())
-                    # 步级下限：last_ts 只兜到 run.created_at，而 bus_anchor 可能被旧工作流
-                    # 残留值污染（见 :637）→ 本步通知之前的旧合规消息也算合规，_relaxed 被
-                    # 永久清空，与下面 _relaxed 用的 f.ts > _notified_ts 口径不一致。
-                    _since = max(last_ts, _notified_ts)
+                    # 下界必须与下面 :1439 的 created_after=last_ts 一致。抬到
+                    # _notified_ts 会让「严格匹配收得下、这里判不合规」的消息留在
+                    # _relaxed 里，宽松分支抢在严格匹配前 return，用分类不匹配的
+                    # 消息把步骤推完（bus #457649 修的就是这个，抬高即复发）。
                     _has_compliant = bool(cat) and any(
                         getattr(f, "cat", "") == cat
-                        and f.ts > _since
+                        and f.ts > last_ts
                         and f.ts < _now + 60
                         and f.id not in _consumed_ids
                         and _exit_would_match(f)

@@ -175,18 +175,23 @@ def test_consumed_compliant_does_not_block_relaxed():
         "已消费消息仍被当合规，兜底被永久清空"
 
 
-def test_compliant_before_notified_at_does_not_block_relaxed():
-    """本步通知之前的合规消息不算合规：实例级 last_ts 兜不住这一层。"""
+def test_compliant_inside_strict_window_blocks_relaxed():
+    """[last_ts, notified_at) 里的合规消息必须清空兜底：严格匹配收得下它。
+
+    下界若抬到 _notified_ts，这条消息就被判「不合规」留在 _relaxed 里，
+    宽松分支在严格匹配（:1439 created_after=last_ts）之前 return，用旁边那条
+    分类不匹配的消息把步骤推完 —— bus #457649 的故障原样复发。
+    """
     now = time.time()
     # bus_anchor 被旧工作流残留值污染 → last_ts 退到 run.created_at（now-3600）；
-    # 本步 notify 在 now-2400。这条消息 ts=now-3000：晚于 last_ts、早于本步通知，
-    # 只可能是本实例上一步的产出，不是本步交付 → 不得清空 _relaxed。
-    stale = _Fact(14, "code_review", "reviewer",
-                  f"s6-complete {_WF} — 上一步的旧消息", now - 3000, f"实例 {_WF}")
+    # 本步 notify 在 now-2400。这条 ts=now-3000：严格匹配收得下（>last_ts），
+    # 所以宽松推进必须让位。
+    ok = _Fact(14, "code_review", "reviewer",
+               f"s6-complete {_WF} — 严格窗口内的合规消息", now - 3000, f"实例 {_WF}")
     wrong = _Fact(15, "architecture", "reviewer",
                   f"s6-complete {_WF} — 审查", now - 200, f"实例 {_WF}")
     eng = _mocked_eng()
-    eng._bb.read.return_value = [_anchor(now), stale, wrong]
+    eng._bb.read.return_value = [_anchor(now), ok, wrong]
     eng._check_exit = MagicMock(return_value=(0.0, []))
     eng._send_to_role = MagicMock()
     eng._ensure_role_alive = MagicMock(return_value=True)
@@ -195,8 +200,8 @@ def test_compliant_before_notified_at_does_not_block_relaxed():
     run, step = _run_and_step()
     run.step_results["s6"]["bus_anchor"] = now - 3600
     eng._tick(run, step)
-    assert run.step_results["s6"].get("relaxed_advance"), \
-        "本步通知前的旧合规消息仍清空了兜底（用了实例级 last_ts 而非步级 notified_at）"
+    assert not run.step_results["s6"].get("relaxed_advance"), \
+        "严格匹配收得下的合规消息被兜底抢跑了（_has_compliant 下界比严格路径高）"
 
 
 if __name__ == "__main__":
