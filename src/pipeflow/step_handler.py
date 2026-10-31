@@ -829,15 +829,17 @@ class StepHandlerMixin:
                     if getattr(step, "dual_node", False) and not _b_sd.get("node2_approved"):
                         _busy_match_ts = 0.0
                     if _busy_match_ts:
+                        # 先落 exit_messages 再过闸门：失败时下一轮 tick rescue 能带着
+                        # 已匹配消息重试并累计 gate_block_count，而不是让角色重写已完成的消息。
+                        run.step_results[step.id] = {
+                            **self._step_sd(run, step),
+                            "bus_anchor": _busy_match_ts,
+                            "exit_messages": _busy_match_msgs,
+                        }
+                        self._sync_step_results(run.id, run.step_results)
                         # 与主路径同一把闸门：只校验 exit_schema 会漏掉 verify，
                         # 忙分支因此比正常路径松（2026-10-31 R183 审计 3/9 站点）。
                         if not self._quality_gate_blocks(step, run):
-                            run.step_results[step.id] = {
-                                **self._step_sd(run, step),
-                                "bus_anchor": _busy_match_ts,
-                                "exit_messages": _busy_match_msgs,
-                            }
-                            self._sync_step_results(run.id, run.step_results)
                             # bypass 补发完整性提醒（busy exit-match 直接推进，跳过双节点审查）
                             _integ_send_bypass(run, step, "busy",
                                                send_to_role=self._send_to_role,
@@ -1134,9 +1136,13 @@ class StepHandlerMixin:
                     # 上一轮遗留的同类消息不该让本步永远等超时。
                     _now = time.time()
                     _consumed_ids = getattr(self, "_consumed_exit_ids", ())
+                    # 步级下限：last_ts 只兜到 run.created_at，而 bus_anchor 可能被旧工作流
+                    # 残留值污染（见 :637）→ 本步通知之前的旧合规消息也算合规，_relaxed 被
+                    # 永久清空，与下面 _relaxed 用的 f.ts > _notified_ts 口径不一致。
+                    _since = max(last_ts, _notified_ts)
                     _has_compliant = bool(cat) and any(
                         getattr(f, "cat", "") == cat
-                        and f.ts > last_ts
+                        and f.ts > _since
                         and f.ts < _now + 60
                         and f.id not in _consumed_ids
                         and _exit_would_match(f)

@@ -999,6 +999,42 @@ def test_memory_lookalike_still_flagged() -> None:
             pass
 
 
+def test_memory_topic_file_still_flagged() -> None:
+    """memory/ 目录下的 topic 文件不一定被注入，不能跟着 MEMORY.md 一起放过。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-memorytopic-role"
+    path = str(Path.home() / ".claude" / "projects" / "-probe-memorytopic-role"
+               / "memory" / "topic.md")
+    jf = _make(sess, _edit_seq(0, "cm3", path))
+    try:
+        res = TrajectoryQualityChecker().check("memorytopic", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"memory/topic.md 不该豁免: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
+def test_memory_write_exempt() -> None:
+    """豁免对 Write 同样生效（非新建写普通文件会被判盲改）。"""
+    sess = _TRANSCRIPTS_DIR / "-probe-memorywrite-role"
+    path = str(Path.home() / ".claude" / "projects" / "-probe-memorywrite-role"
+               / "memory" / "MEMORY.md")
+    jf = _make(sess, _write_seq(
+        0, "cm4", path, f"The file {path} has been updated successfully."))
+    try:
+        res = TrajectoryQualityChecker().check("memorywrite", "t")
+        assert res["findings"] == [], f"MEMORY.md 写入被误判: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     _tests = (
         test_created_file_not_flagged,
@@ -1033,6 +1069,8 @@ if __name__ == "__main__":
         test_blob_duplicate_not_double_counted,
         test_claude_memory_edit_not_flagged,
         test_memory_lookalike_still_flagged,
+        test_memory_topic_file_still_flagged,
+        test_memory_write_exempt,
     )
     for _t in _tests:
         _t()

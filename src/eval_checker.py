@@ -982,11 +982,12 @@ class TrajectoryQualityChecker:
             return bool(fp) and os.path.isabs(fp) and _key(fp).startswith(_own_roots)
 
         def _is_memory(fp: str) -> bool:
-            """Claude Code 的 memory/ 文件由系统注入上下文，角色无法也不需要先 Read。
-            实测 2026-10-31 qa 每次 Edit MEMORY.md 都被报 blind_edit (#474312)。"""
+            """Claude Code 注入的 MEMORY.md：内容在系统提示里，角色无法也不需要先 Read。
+            只放行这一个文件名——同目录 topic 文件仍可能没被注入（2026-10-31 #474312）。"""
             p = _key(fp)
             root = os.path.realpath(os.path.expanduser("~/.claude/projects")) + os.sep
-            return bool(p) and p.startswith(root) and f"{os.sep}memory{os.sep}" in p
+            return (bool(p) and p.startswith(root)
+                    and p.endswith(f"{os.sep}memory{os.sep}MEMORY.md"))
 
         def _is_fresh_scratch(fp: str, ts: str) -> bool:
             """/tmp 下的文件必须是**这次写才诞生**的草稿才算豁免。

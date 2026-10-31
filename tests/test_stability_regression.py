@@ -179,6 +179,29 @@ class TestTimeoutQueuedNotIncremented(_MockTestCase):
             eng._tick(run, step)
         eng._quality_gate_blocks.assert_called_once()
         eng._lm.complete_step.assert_not_called()
+        assert run.step_results["s1"].get("exit_messages"), (
+            "闸门失败前要先落 exit_messages，下一轮才能带消息重试")
+
+    def test_busy_exit_match_gate_pass_completes(self):
+        """对照：闸门放行时忙分支照常 complete，证明持久化没把推进路径卡死。"""
+        eng = _eng()
+        eng._is_role_busy = MagicMock(return_value=True)
+        eng._sync_step_results = MagicMock()
+        eng._check_exit = MagicMock(return_value=(
+            time.time(), [{"id": 1, "text": "s1-complete", "evidence": "x",
+                          "ts": time.time(), "src": "qa"}]))
+        eng._quality_gate_blocks = MagicMock(return_value=False)
+        run = _run()
+        step = _step(target_role="qa", verify="exit 1", exit_condition={
+            "timeout_minutes": 1, "bus_category": "code_fix",
+            "source_contains": "qa", "text_contains": "s1-complete"})
+        run.step_results["s1"] = {"ts": time.time() - 100}
+        with patch.object(eng, "_sync_step_results"), \
+             patch("pipeflow.step_handler.get_conversation_signal", return_value=None), \
+             patch("pipeflow.step_handler._integ_send_bypass"):
+            eng._tick(run, step)
+        eng._lm.complete_step.assert_called_once()
+        assert run.step_results["s1"].get("exit_messages"), "推进前也要落 exit_messages"
 
 
 class TestAutoCancelThreshold(_MockTestCase):
