@@ -2087,7 +2087,7 @@ class WorkflowLifecycleMixin:
 
 
     @staticmethod
-    def _acceptance_lines(step) -> list:
+    def _acceptance_lines(step, quality_standards: str = "") -> list:
         """步骤声明的验收判据 → 注入 prompt 的事实行（口径全部来自模板）。"""
         _ec = step.exit_condition or {}
         _out = []
@@ -2099,6 +2099,11 @@ class WorkflowLifecycleMixin:
                 if isinstance(f, str)]
         if _req:
             _out.append("产出文件: " + ", ".join(_req))
+        # quality_standards 是模板必填字段，此前只落库、从不进 prompt：角色看不到
+        # 验收质量线，只能猜「完成」标准。注入后工作流自身提出质量要求。
+        _q = " ".join((quality_standards or "").split())
+        if _q:
+            _out.append("质量标准: " + _q[:300])
         return _out
 
     def _fill_prompt_vars(self, prompt: str, step: Step, wf_name: str,
@@ -2113,7 +2118,11 @@ class WorkflowLifecycleMixin:
         # 推进 prompt 此前只有 [实例]：角色写出的标题差一个前缀
         #（只写 s2-complete，契约是 WF-product_delivery/s2-complete）就永远匹配不上。
         # 模板里的 {id} 之类先洗掉：_need 在变量替换前插值，留着会触发未替换变量守卫。
-        _need = [re.sub(r"\{[a-z_]+\}", "", x) for x in self._acceptance_lines(step)]
+        _wf_def = self._workflows.get(wf_name) or self._workflows.get(
+            re.sub(r"^(?:WL-|WF-)", "", str(wf_name)))
+        _need = [re.sub(r"\{[a-z_]+\}", "", x)
+                 for x in self._acceptance_lines(
+                     step, getattr(_wf_def, "quality_standards", "") or "")]
         if wf_id:
             # 产物归属约定：模板里的上游路径是固定名（~/ccs-workspaces/pm/PRD.md），
             # 而同一角色常有 2+ 条链并发写同名文件 —— 实测 pm 的 PRD.md 被 scout 链

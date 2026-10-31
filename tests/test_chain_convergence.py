@@ -156,3 +156,19 @@ def test_suggestions_only_review_builds_no_rework(_mock):
     assert "rework_ids" not in (json.loads(row["step_results"]).get("s2") or {}), \
         "建议级问题不得建返工链"
     _cleanup(d)
+
+
+def test_quality_standards_injected_into_prompt():
+    """模板 quality_standards 必须进 prompt——此前只落库、角色看不到验收质量线。"""
+    d = _make_env()
+    _write_wf(d, "quality_wf", [_step("s1")])
+    p = d / "quality_wf.json"
+    data = json.loads(p.read_text())
+    data["quality_standards"] = "产出必须含证据链"
+    p.write_text(json.dumps(data, ensure_ascii=False))
+    eng = WorkflowEngine(d)
+    step = eng._workflows["quality_wf"].steps[0]
+    out = eng._fill_prompt_vars(step.prompt_template, step, "quality_wf", "t", "d", {},
+                                wf_id="wf_test")
+    assert "质量标准: 产出必须含证据链" in out, out
+    _cleanup(d)

@@ -1302,7 +1302,8 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                     # 首步同样要给验收判据：7 天内 103 台实例 s1 都因标题写不中契约
                     # 超时重投（推进步那条修法管不到 s1）。
                     _need = [UNMATCHED_VAR_RE.sub("", x)
-                             for x in self._acceptance_lines(step)]
+                             for x in self._acceptance_lines(
+                                 step, getattr(wf, "quality_standards", "") or "")]
                     # 任务上下文注入：把 title/desc 放到 prompt 头部，角色立刻知道干什么
                     task_header = (
                         f"[任务] {task_title}\n"
