@@ -38,6 +38,7 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 ```
 
 ### 禁止操作
+- ❌ **提交前不指定路径的 `git add -A` / `git add .`**：本仓 40 个 worktree 共用一份历史，并发 session 改各自文件却往同一棵树提交。f79a7c0 就是这样把 concurrent session 未提交的 `_since` 一起提交（说明里一个字没提），该行后被判为回归。**只 `git add <本次改的具体路径>`**，提交前用 `git diff --cached --stat` 核一遍暂存清单是否就是你要改的那几个文件。钩子做不到这件事（见下），只能靠这条规则。
 - ❌ 直接调 launcher 的 API（只能用 subprocess ccs.py send）
 - ❌ 修改角色定义（那是 session-roles 的事）
 - ❌ 重启 gateway（SIGKILL 中断长连接）
