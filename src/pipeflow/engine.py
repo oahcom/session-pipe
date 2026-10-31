@@ -170,19 +170,25 @@ def _template_ids(name: str) -> list[str]:
     return [name] if bare == name else [name, bare]
 
 
-def _persist_queue_tick(lm, wf_id: str, step_id: str, queued: int, q_since: float) -> None:
+def _persist_queue_tick(lm, wf_id: str, step_id: str, queued: int, q_since: float,
+                        last_try: float = 0.0) -> None:
     """排队账本按单键写回。
 
     本分支每 tick 都跑；整份回写 results 会把并发路径刚落的 subflow_id /
     rework_ids 一起抹掉（实测 40 条子链里 20 条父步丢了指针，同一步因此连建
-    多条返工链）。单键 json_set 只动这两个键，其余原样留在库里。
+    多条返工链）。单键 json_set 只动这几个键，其余原样留在库里。
+
+    last_try 必须落库：退避判据（见重投分支）下一 tick 从 DB 重读 step_results，
+    只写内存的话读回来永远是 None，退避回落到只增不减的 queued_since → 满 60s 后
+    恒不生效（全库 1244 行 0 条含 last_try、queued_since 175 条，实测）。
     """
     try:
         lm.execute(
             "UPDATE workflow_instances SET step_results="
-            "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?) WHERE instance_id=?",
+            "json_set(COALESCE(step_results,'{}'), ?, ?, ?, ?, ?, ?) WHERE instance_id=?",
             (f'$."{step_id}".queued', queued,
-             f'$."{step_id}".queued_since', q_since, wf_id))
+             f'$."{step_id}".queued_since', q_since,
+             f'$."{step_id}".last_try', last_try or time.time(), wf_id))
     except Exception as _e:
         # 列被写坏（非合法 JSON）时 json_set 会抛，而调用点在 tick 的大 try 里——
         # 抛出去会打断**本轮剩余所有实例**。旧实现整份回写顺手修好了这种行，
@@ -1415,8 +1421,10 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                             "queued_since": _q_sr.get("queued_since") or time.time(),
                         }
                         # 单键写，不整份回写（见 _persist_queue_tick 注释）。
+                        # last_try 一并落库：退避判据下一 tick 从 DB 重读，漏落则恒失效。
                         _persist_queue_tick(lm, inst["instance_id"], step_id, _q_n,
-                                            results[step_id]["queued_since"])
+                                            results[step_id]["queued_since"],
+                                            results[step_id]["last_try"])
                         LOGGER.debug("run_once: %s/%s 角色忙，排队 %s 次，跳过计数",
                                      inst["instance_id"][:12], step_id, _q_n)
                         # 排队上限：按**时长**判，不按 tick 次数。daemon 每 10s 一轮，
@@ -1528,7 +1536,7 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
                         # 下一轮排队会带着旧计数（如 3+1=4）立即满足回收判据 queued>=3，
                         # 使本该"重新排 3 次"的宽限被跳过（2026-10-17 推演确认）。
                         **{k: v for k, v in _existing_sr.items()
-                           if k not in ('status', 'queued_since', 'queued')},
+                           if k not in ('status', 'queued_since', 'queued', 'last_try')},
                         "status": "notified", "ts": time.time(), "notified_at": time.time()
                     }
                     lm.execute(

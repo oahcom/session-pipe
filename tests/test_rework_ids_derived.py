@@ -119,6 +119,28 @@ def test_queue_tick_preserves_sibling_keys(tmp_path):
     assert sd["rework_ids"] == ["wf_rw_x"], f"rework_ids 被抹掉: {sd}"
     assert sd["subflow_id"] == "wf_sub_y", f"subflow_id 被抹掉: {sd}"
 
+
+def test_queue_tick_persists_last_try(tmp_path):
+    """退避用的 last_try 必须落库，否则下一 tick 重读后消失、退避恒失效。
+
+    实测全库 1244 行 0 条含 last_try、queued_since 175 条 —— 同一个 json_set
+    写进去的键都在，排除解析/写入失败。缺这个键时退避回落到只增不减的
+    queued_since，满 60s 后 `time.time() - _q_last < 60` 恒 False。
+    """
+    db = _db(tmp_path)
+    _insert(db, "wf_lt", "running")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE workflow_instances SET step_results=? WHERE instance_id=?",
+                (json.dumps({"s1": {"status": "", "queued": 5, "queued_since": 100.0}}), "wf_lt"))
+    con.commit()
+    con.close()
+    _persist_queue_tick(_Lm(db), "wf_lt", "s1", 6, 100.0, 1790000000.0)
+    con = sqlite3.connect(db)
+    sd = json.loads(con.execute("SELECT step_results FROM workflow_instances WHERE instance_id=?",
+                                ("wf_lt",)).fetchone()[0])["s1"]
+    con.close()
+    assert sd["last_try"] == 1790000000.0, f"last_try 没落库（退避下 tick 读不到）: {sd}"
+
 def test_queue_tick_on_bad_json_does_not_raise(tmp_path):
     """列被写坏（非合法 JSON）时不抛，不打断本轮剩余实例。
 
