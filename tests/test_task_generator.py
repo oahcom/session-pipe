@@ -13,7 +13,40 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pipeflow.engine import WorkflowEngine, WorkflowDef, Step, WorkflowRun
-from pipeflow.task_generator import _event_key, _role_in_text, MAX_RUNNING_PER_ROLE
+from pipeflow.task_generator import (
+    _event_key, _role_in_text, _is_demand_fact, _demand_role_hits, MAX_RUNNING_PER_ROLE,
+)
+
+
+def _fact(src, title, evidence=""):
+    from types import SimpleNamespace
+    return SimpleNamespace(src=src, t=title, e=evidence)
+
+
+def test_task_creation_echo_is_not_demand():
+    """建链回执不能冒充需求信号。
+
+    `create_task` 给总线写的 `[role] 创建任务: <标题>` 标题里带被派角色的名字，
+    混进需求窗口就等于「谁建过任务 → 谁需要干活」。实测 57 条 task_auto 里
+    24 条（42%）只靠这类 echo 过闸；10-30 13:06 的 task_auto_2c9197ff 窗口内
+    3 条命中全是同一份 bug_report 的三次转发。
+    """
+    echo = _fact("knowledge_curator", "[knowledge_curator] 创建任务: [bug_report] 复核 engineer 的 SSRF 修复")
+    assert not _is_demand_fact(echo), "建链 echo 不得计入需求窗口"
+    assert not _demand_role_hits("engineer", [echo]), "只有 echo 时闸门必须判无需求"
+
+
+def test_real_mention_still_passes_gate():
+    """真点名要放过 —— 修复不能让闸门永久关闭。"""
+    assert _demand_role_hits("engineer", [_fact("maintainer", "[@devops] [@engineer] rebuild 排期补一条")])
+    assert _demand_role_hits("pm", [_fact("coordinator", "[@pm] 需求书缺验收条件")])
+
+
+def test_engine_and_loop_noise_excluded():
+    """引擎自产派单回执与 backlog_scan 模板循环都不是需求。"""
+    assert not _is_demand_fact(_fact("workflow_engine", "@engineer 工作流任务: wf_x/s1"))
+    assert not _is_demand_fact(_fact("survival_monitor", "@engineer 存活告警"))
+    assert not _demand_role_hits("closer", [_fact("closer", "closer_close_loop/s1 backlog_scan 44 条")])
 
 
 def test_role_in_text_rejects_substring_false_positive():

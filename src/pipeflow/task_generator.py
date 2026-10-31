@@ -71,6 +71,36 @@ def _role_in_text(role: str, text: str) -> bool:
     return bool(re.search(r"(?<![a-z])" + re.escape(role) + r"(?![a-z])", text))
 
 
+# 需求信号的排除项。`创建任务: <标题>` 是 create_task 写给总线的 echo，
+# 标题里恰好带被派角色的名字 —— 若把它当需求，闸门就在用「谁建过任务」
+# 冒充「谁有需求」。实测 57 条 task_auto 里 24 条（42%）只靠这类 echo 过闸，
+# 10-30 13:06 的 task_auto_2c9197ff 窗口内 3 条命中全是同一份 bug_report
+# 的三次转发。
+_TASK_ECHO_RE = re.compile(r"^\s*\[[^\]]+\]\s*创建任务[:：]")
+
+
+def _is_demand_fact(f) -> bool:
+    """这条 bus 事实能否代表「有人要这个角色干活」。
+
+    引擎自产（workflow_engine / survival_monitor）只是自己的派单回执，
+    backlog_scan 是 closer 的模板循环产物，创建任务 echo 是别人的建链回执。
+    """
+    if f.src in ("workflow_engine", "survival_monitor"):
+        return False
+    if "backlog_scan" in (f.t or ""):
+        return False
+    return not _TASK_ECHO_RE.match(f.t or "")
+
+
+def _demand_role_hits(role: str, facts) -> bool:
+    """需求窗口里 role 是否被点到名。"""
+    text = ""
+    for f in facts:
+        if _is_demand_fact(f):
+            text += (f.t or "") + " " + (f.e or "") + " "
+    return _role_in_text(role, text)
+
+
 def _requires_user_brief(wf) -> bool:
     """首步就委派子链的模板，开工前需要一份真实需求书。
 
@@ -883,10 +913,8 @@ class TaskGeneratorMixin:
             try:
                 _demand = self._bb.read(cat="task_spec", limit=10)
                 for _f in _demand:
-                    if _f.src not in ("workflow_engine", "survival_monitor"):
-                        # closer 周期性 backlog 扫描是模板循环产物，不是真实需求
-                        if "backlog_scan" not in (_f.t or ""):
-                            _demand_text += (_f.t or "") + " " + (_f.e or "") + " "
+                    if _is_demand_fact(_f):
+                        _demand_text += (_f.t or "") + " " + (_f.e or "") + " "
                 _role_hits = _role_in_text(_role, _demand_text)
                 _has_demand = bool(_demand_text) and _role_hits and _demand_text.strip() != ""
                 if not _has_demand:
