@@ -941,6 +941,13 @@ class TrajectoryQualityChecker:
                                 d = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
+                            # Claude Code 把同一请求内容再发一份 type=api-request-blob，
+                            # 无 timestamp。不过滤则旧违规靠副本绕过 24h 窗永久续命，
+                            # 同一 tool_use id 还会被计两次（实测 23/27 重复上报属此）。
+                            # 用精确类型而非白名单：未知记录里可能有引擎注入的 say 行，
+                            # 丢掉会让「收到指令之后」的工具调用窗口切错。
+                            if d.get("type") == "api-request-blob":
+                                continue
                             content = d.get("message", {}).get("content")
                             # 人类/引擎输入是纯字符串；强制子代理指令正落在这类消息里。
                             # 保留其位置，判据才能切出「收到指令之后」的工具调用窗口。
