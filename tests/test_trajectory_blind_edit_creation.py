@@ -692,6 +692,61 @@ def test_fresh_record_still_judged() -> None:
             pass
 
 
+def test_blob_duplicate_not_resurrected() -> None:
+    """api-request-blob 副本（无 ts）不能靠 24h 窗外的原件续命。
+
+    实测 23/27 条重复上报属此：原件已出窗，副本无 timestamp 被当"新鲜"。
+    """
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-blobold-role"
+    path = "/data/probe_blob_old.py"
+    use = {"type": "tool_use", "id": "blob_old", "name": "Edit",
+           "input": {"file_path": path, "old_string": "a", "new_string": "b"}}
+    lines = [
+        _turn(0, "assistant", [use], ts=old_ts),
+        json.dumps({"type": "api-request-blob",
+                    "message": {"role": "assistant", "content": [use]}}),
+        _turn(2, "user", [{"type": "tool_result", "tool_use_id": "blob_old",
+                           "is_error": False, "content": "ok"}], ts=old_ts),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("blobold", "t")
+        assert res["checked_traces"] >= 1, "用例必须真的扫到转录"
+        assert res["findings"] == [], f"blob 副本复活了旧记录: {res['findings']}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
+def test_blob_duplicate_not_double_counted() -> None:
+    """窗口内同一 id 的副本只算一次违规。"""
+    now_ts = datetime.now(timezone.utc).isoformat()
+    sess = _TRANSCRIPTS_DIR / "-probe-blobnew-role"
+    path = "/data/probe_blob_new.py"
+    use = {"type": "tool_use", "id": "blob_fresh", "name": "Edit",
+           "input": {"file_path": path, "old_string": "a", "new_string": "b"}}
+    lines = [
+        _turn(0, "assistant", [use], ts=now_ts),
+        json.dumps({"type": "api-request-blob",
+                    "message": {"role": "assistant", "content": [use]}}),
+        _turn(2, "user", [{"type": "tool_result", "tool_use_id": "blob_fresh",
+                           "is_error": False, "content": "ok"}], ts=now_ts),
+    ]
+    jf = _make(sess, lines)
+    try:
+        res = TrajectoryQualityChecker().check("blobnew", "t")
+        blind = [f for f in res["findings"] if f["issue"] == "blind_edit"]
+        assert len(blind) == 1, f"同一 id 被重复计数: {blind}"
+    finally:
+        jf.unlink(missing_ok=True)
+        try:
+            sess.rmdir()
+        except OSError:
+            pass
+
 def test_scratch_created_now_is_exempt() -> None:
     """这次写才诞生的 /tmp 草稿豁免（诞生时间 ≈ 写时间）。"""
     now = datetime.now(timezone.utc).isoformat()
@@ -927,6 +982,8 @@ if __name__ == "__main__":
         test_underscore_role_workspace_exempt,
         test_stale_record_not_judged,
         test_fresh_record_still_judged,
+        test_blob_duplicate_not_resurrected,
+        test_blob_duplicate_not_double_counted,
     )
     for _t in _tests:
         _t()
