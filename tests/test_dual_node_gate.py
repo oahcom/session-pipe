@@ -167,6 +167,8 @@ def test_codex_clean_parser_is_not_substring():
     assert _codex_output_is_clean("No findings\n2) P2: slow query") is False
     assert _codex_output_is_clean("No findings\n**P1**: token leak") is False
     assert _codex_output_is_clean("No findings\n(见 P1)") is False
+    assert _codex_output_is_clean('No findings\n"P1": token leak') is False
+    assert _codex_output_is_clean("No findings\n`P1` token leak") is False
     assert _codex_output_is_clean("0 issues in README; P1 bug in auth") is False
     # 干净结论里顺带提到 p1/p3 的 URL 文件名不算发现
     assert _codex_output_is_clean("No findings\nref: https://x.dev/p1") is True

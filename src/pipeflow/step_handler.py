@@ -127,7 +127,7 @@ def _codex_output_is_clean(out: str) -> bool:
     # 但要求标记前是空白/括号/星号等边界、标记后跟分隔符 —— 裸 `\bp[0-3]\b`
     # 会把 `https://x.dev/p1`、`app.p3` 当成发现，干净审查被判失败（902s 白等）。
     _finding = bool(re.search(
-        r"(?im)(?:^|[\s\[(*_-])p[0-3](?=[\s:\]\)*.,，。]|$)"
+        r"(?im)(?:^|[\s\[(*_\"'`#{<-])p[0-3](?=[\s:\]\)*.,，。\"'`]|$)"
         r"|\bcritical\b(?![\w_])|\bvulnerab\w*\b|\bbug\s*:|\btraceback\b", out))
     return _passed and not _finding
 
