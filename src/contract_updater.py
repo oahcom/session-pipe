@@ -23,18 +23,18 @@ PERSONAS_DIR = Path(os.environ.get(
 def _apply_suggestion(suggestion: dict) -> bool:
     """应用一条改进建议到角色 JSON。
 
-    目前支持 type=add_verification:
+    目前支持 type=add_verification / add_verification_cmd:
       - 读取角色 JSON
       - 在 eval_criteria 中按文本匹配条目
       - 若条目是纯自然语言字符串且 suggestion 提供了 verification_command:
-        替换为 {"text":, "verifiable":, "expected":}
+        改写成 eval_checker 能解析的 `... | 验证: <cmd> 输出 <expected>`
       - 写回文件
     返回 True 表示成功应用。
     """
     role = suggestion.get("role")
     criterion_text = suggestion.get("criterion")
     stype = suggestion.get("type")
-    if stype != "add_verification" or not role or not criterion_text:
+    if stype not in ("add_verification", "add_verification_cmd") or not role or not criterion_text:
         return False
 
     # 找到对应的角色 JSON 文件
@@ -71,12 +71,14 @@ def _apply_suggestion(suggestion: dict) -> bool:
     verification_cmd = suggestion.get("verification_command")
     if not verification_cmd:
         return False
+    if "验证:" in entry:
+        return False  # 已有验证命令，不叠加第二个（_extract_cmd 只取第一个）
 
-    criteria[idx] = {
-        "text": entry,
-        "verifiable": verification_cmd,
-        "expected": suggestion.get("expected", ""),
-    }
+    # eval_checker 只认字符串判据里的「验证: <cmd>」；写成 dict 会让该判据
+    # 在运行时被静默跳过（_extract_cmd 对 dict 返回 None），等于把验证关掉。
+    expected = suggestion.get("expected", "")
+    criteria[idx] = f"{entry} | 验证: {verification_cmd}" + (
+        f" 输出 {expected}" if expected else "")
 
     try:
         # 备份原文件
