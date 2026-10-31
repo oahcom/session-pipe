@@ -130,6 +130,39 @@ def test_codex_review_prompt_asks_for_approved_marker():
     assert "codex review --uncommitted" in p
 
 
+def test_codex_review_prompt_is_bounded_and_escalates():
+    """角色自审必须**有界**：codex 不可用时重试 8 次烧 1 小时是真实事故
+    （wf_cd24148560c4：scout 8 次 300-900s 尝试后才写 blocked）。"""
+    p = _codex_review_prompt("wf", "s1", "cat")
+    assert "最多 2 轮" in p
+    assert "s1-codex-blocked" in p
+    assert "不要重试第 3 次" in p
+
+
+def test_engine_passed_prompt_does_not_ask_for_second_review():
+    """引擎已审过 → 角色不得再审同一份 diff（重复烧配额，且两处结论可能相反）。"""
+    p = _codex_review_prompt("wf", "s1", "cat", engine_passed=True,
+                             engine_note="No findings")
+    assert "s1-codex-approved" in p
+    assert "codex review --uncommitted" not in p
+    assert "不需要再跑" in p
+    assert "No findings" in p
+
+
+def test_completion_check_injection_is_bounded(tmp_path):
+    """completion_check 站点（可达路径）注入的审查指令必须有界、带负向出口。"""
+    eng = _engine_for_tick(tmp_path)
+    report = tmp_path / "SCOUT_REPORT.md"
+    report.write_text("x" * 600, encoding="utf-8")
+    run, step = _run_and_step()
+    step.exit_condition["completion_check"] = {"file": str(report), "min_size": 500}
+    eng._tick(run, step)
+    sent = eng._send_to_role.call_args[0][1]
+    assert "最多 2 轮" in sent
+    assert "s1-codex-blocked" in sent
+    assert "codex review --uncommitted" in sent
+
+
 # ── 站点 A：completion_check 缺 else（6/9 步的路径） ──
 
 def _engine_for_tick(tmp: Path):

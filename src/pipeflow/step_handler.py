@@ -20,7 +20,6 @@ from pathlib import Path
 # 否则真实驳回被当成拒产丢掉、返工链建不出来（codex 第四轮 P1）。
 from review_gate import REFUSAL_T, is_refusal_not_verdict as _refusal_not_verdict
 from pipeflow import engine as _engine_mod  # 属性访问 _engine_mod._sp，patch("pipeflow.engine._sp") 生效
-from pipeflow.task_generator import _event_key  # DESIGN §2.1 事件去重键（fan-out 第三层）
 from pipeflow.engine import Step, WorkflowRun, _fail_parent_step
 from pipeflow.wf_lifecycle import _value_audit_failed, _role_producing_recently
 from paths import CCS_WORKSPACES as _CCS_WORKSPACES
@@ -79,14 +78,36 @@ _APPROVED_MARK = "-codex-approved"
 _BLOCKED_MARK = "-codex-blocked"
 
 
-def _codex_review_prompt(wf_name: str, step_id: str, cat: str) -> str:
-    """注入给角色的 codex 审查指令（两个完成站点共用，避免文案漂移）。"""
+def _codex_review_prompt(wf_name: str, step_id: str, cat: str,
+                         engine_passed: bool = False,
+                         engine_note: str = "") -> str:
+    """注入给角色的 codex 审查指令（两个完成站点共用，避免文案漂移）。
+
+    engine_passed=True 时引擎已跑过 codex 且通过：再让角色跑一遍是同一份 diff
+    审两次，只多烧一次配额，还会因 9router 抖动得出与引擎相反的结论。此时角色
+    只需写 node2 证据消息。未通过时才要求角色自审，且**有界**（最多 2 轮）——
+    实测 scout 在 codex 不可用时重试 8 次、烧掉 1 小时才上报（wf_cd24148560c4）。
+    """
+    if engine_passed:
+        _note = " ".join(str(engine_note or "").split())[:200]
+        return (
+            "/goal\n## 双节点第二节点：引擎已审通过\n"
+            f"{wf_name}/{step_id} 的产出已由引擎跑过 codex review 且通过"
+            + (f"（{_note}）" if _note else "") + "。\n"
+            "你不需要再跑 codex（同一份 diff 重复审只重复烧配额）。只需：\n"
+            "1. 确认产出已落盘到 workspace（未落则补）\n"
+            f"2. 写 bus cat={cat}，标题含 {step_id}{_APPROVED_MARK}，"
+            "evidence 写产出路径 + md5 + 「引擎 codex: 通过」\n"
+        )
     return (
         "/goal\n## codex CLI 三方审查\n"
         f"对 {wf_name}/{step_id} 的产出执行 codex review --uncommitted：\n"
         "1. 执行 codex review --uncommitted -c model=9router_hermes\n"
-        "2. 若发现问题修复后重跑，直到连续两次零问题\n"
-        "3. 通过后写 bus cat=" + cat + "，标题含 " + step_id + _APPROVED_MARK + "\n"
+        "2. 发现问题→修复→重跑；连续两次零问题即通过，**最多 2 轮**\n"
+        "3. codex 不可用（`unsupported call` / 超时 / 非 0 退出且无结论）时，\n"
+        "   **不要重试第 3 次**，立即写 bus cat=" + cat + "，标题含 " + step_id + _BLOCKED_MARK + "，\n"
+        "   evidence 写失败命令 + 原始输出（诚实上报不罚，谎报通过会被闸门反查）\n"
+        "4. 通过后写 bus cat=" + cat + "，标题含 " + step_id + _APPROVED_MARK + "\n"
         "## 完成\n"
         "写 bus cat=" + cat + "，标题含 " + step_id + _APPROVED_MARK + "。"
     )
@@ -1258,8 +1279,6 @@ class StepHandlerMixin:
                 if getattr(step, 'dual_node', False):
                     _sdata = self._step_sd(run, step)
                     if not _sdata.get("node2_sent"):
-                        _codex_prompt = _codex_review_prompt(
-                            run.workflow_name, step.id, cat)
                         run.step_results[step.id] = {
                             **_sdata,
                             "node1_done": True, "node1_at": time.time(),
@@ -1283,8 +1302,14 @@ class StepHandlerMixin:
                             LOGGER.info("双节点: %s/%s codex review 通过，node2 已批",
                                         run.workflow_name, step.id)
                         else:
-                            LOGGER.warning("双节点: %s/%s codex review 失败: %s，仍发提示让角色人工审查",
+                            LOGGER.warning("双节点: %s/%s codex review 失败: %s，让角色自审（有界 2 轮）",
                                            run.workflow_name, step.id, _codex_result.get("error", "未知错误"))
+                        # 引擎审过 → 角色只写证据消息，不再重复审同一份 diff
+                        _codex_prompt = _codex_review_prompt(
+                            run.workflow_name, step.id, cat,
+                            engine_passed=bool(_codex_result.get("success")),
+                            engine_note=str(_codex_result.get("output")
+                                            or _codex_result.get("error") or ""))
                         self._send_to_role(_eff, _codex_prompt,
                                            wf_id=run.id, step_id=step.id, force=True)
                         return
