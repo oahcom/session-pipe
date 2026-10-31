@@ -163,10 +163,15 @@ def test_codex_clean_parser_is_not_substring():
     # 干净结论 + 任何发现 → 不通过（`_finding` 半边必须也钉住）
     assert _codex_output_is_clean("No findings\nP1: token leak") is False
     assert _codex_output_is_clean("No findings\n- [P2] slow query") is False
+    assert _codex_output_is_clean("No findings\n1. P1: token leak") is False
+    assert _codex_output_is_clean("No findings\n2) P2: slow query") is False
+    assert _codex_output_is_clean("No findings\n**P1**: token leak") is False
+    assert _codex_output_is_clean("No findings\n(见 P1)") is False
     assert _codex_output_is_clean("0 issues in README; P1 bug in auth") is False
     # 干净结论里顺带提到 p1/p3 的 URL 文件名不算发现
     assert _codex_output_is_clean("No findings\nref: https://x.dev/p1") is True
     assert _codex_output_is_clean("No findings\nsee app.p3") is True
+    assert _codex_output_is_clean("No findings\nsee critical_path.py") is True
     assert _codex_output_is_clean("critical vulnerability") is False
     assert _codex_output_is_clean("") is False
 
