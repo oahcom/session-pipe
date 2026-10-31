@@ -236,6 +236,22 @@ def test_completion_check_second_tick_does_not_complete(tmp_path):
         "第二 tick 在无 codex-approved 证据时完成了 → completion_check 仍缺 else"
 
 
+def test_node2_approved_does_not_bypass_exit_schema(tmp_path):
+    """codex 通过 ≠ 退出契约达成：node2 完成路径也必须过 schema/verify 闸门。"""
+    eng = _engine_for_tick(tmp_path)
+    run, step = _run_and_step()
+    step.exit_schema = {"required": ["MISSING_REPORT.md"]}
+    run.step_results["s1"].update({"node1_done": True, "node1_at": 1.0,
+                                   "node2_sent": True, "node2_sent_at": 1.0})
+    approved = {"id": 9001, "t": "s1-codex-approved 通过",
+                "text": "s1-codex-approved 通过", "ts": 2.0,
+                "src": "scout", "cat": "evolution_report", "e": ""}
+    eng._check_exit = MagicMock(return_value=(2.0, [approved]))
+    eng._tick(run, step)
+    assert run.step_results["s1"].get("node2_approved") is True
+    eng._lm.complete_step.assert_not_called()
+
+
 def test_completion_check_advances_after_approved(tmp_path):
     """有 node2_approved 后，第二 tick 必须正常推进（闸门不能变成死锁）。"""
     eng = _engine_for_tick(tmp_path)
