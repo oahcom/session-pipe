@@ -82,73 +82,10 @@ def _reload_decision(now_mtime, seen_mtime, pending_mtime, now_ts, last_reload_t
 _TICK_STACK_DUMP_SEC = _parse_tick_sec("TICK_STACK_DUMP_SEC", 180)
 _TICK_SLOW_SEC = _parse_tick_sec("TICK_SLOW_SEC", 60)
 
-# ── 饥饿检测：工作流长期空转 → 触发食物链重启生产 ──
-# 设计背景：引擎只推进已有工作流，不主动创建；当所有工作流终态且超时未重启，
-# 写 bus 触发 scout 生产新情报，让食物链重新转起来。
-# 冷却机制（三层，2026-08 事故后确立）：
-#   成功冷却（6h）：防止高频骚扰——触发成功后 6h 内不再触发
-#   失败短退避（60s）：防止模板缺失时无限重试刷日志
-#   失败长退避（24h）：连续失败≥5次后切换，退避期内不再尝试（需人工介入）
-# 竞态防护：daemon 饥饿触发与 wf_loop 循环可能同时创建 food_chain_loop，
-#   触发前用 has_active_template 检查 DB 是否已有同模板活跃实例（防双写）
-_STARVE_ROUNDS = 36          # 连续 36 轮（=6 分钟）无活跃工作流
-_STARVE_COOLDOWN = 6 * 3600  # 触发后 6 小时冷却，防止高频骚扰
-from paths import BUS_CLIENT, CCS_CLI, STARVE_STATE
-
-_BUS_SCRIPT = BUS_CLIENT
-_STARVE_STATE = STARVE_STATE
-
-
-def _safe_write_state(state: dict) -> None:
-    """原子写状态文件（临时文件 + rename），避免并发写半截 JSON。"""
-    try:
-        _STARVE_STATE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _STARVE_STATE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state))
-        tmp.replace(_STARVE_STATE)
-    except OSError as e:
-        LOGGER.warning("starve 状态写入失败: %s", e)
-
-
-def _active_count(eng: WorkflowEngine) -> int:
-    """当前活跃工作流数（pending/running/step_done_ready）。"""
-    return eng.active_workflow_count()
-
-
-_STARVE_FAIL_RETRY_INTERVAL = 60  # 未达阈值：失败后短退避 60s 重试窗口
-_STARVE_FAIL_THRESHOLD = 5        # 连续失败阈值，达到后改为每冷却窗口试一轮
-
-
-def _starve_failed(state: dict, consec: int, now: float, why) -> None:
-    """记一次创建失败；刚好到阈值那一次往 bus 留一条。
-
-    WHY 必须留一条：2026-10-26 14:02 连撞 5 次后产线零产出 8h，bus 里没有任何
-    「我不再尝试了」的记录 —— 唯一发现途径是人肉翻状态文件。
-    每过一个冷却窗口重试又连撞 5 次时会再留一条（最多 4 条/天），这是有意的：
-    持续坏掉的生产者每天该有 4 条痕迹，不是 1 条。
-    """
-    state["consecutive_failures"] = consec
-    state["last_failure_ts"] = now
-    _safe_write_state(state)
-    if consec != _STARVE_FAIL_THRESHOLD:
-        return
-    try:
-        subprocess.run(
-            [sys.executable, str(_BUS_SCRIPT), "write", "blocker",
-             f"饥饿自愈连续 {consec} 次创建食物链失败，产线零产出（每 6h 重试一轮）",
-             "--src", "workflow_engine",
-             "--evidence", f"最后一次失败: {why}"[:500]],
-            capture_output=True, timeout=10,
-        )
-    except Exception:
-        pass
-
-
 # 优雅关闭的硬上限：超过就 os._exit，把「关不掉」变成「最多等这么久」。
 # ponytail: 不看事务边界，粗暴退出依赖 SQLite WAL 回滚；要更干净得让 run_once
 # 在循环里轮询 shutdown 标志（改动面大得多）。
 _SHUTDOWN_GRACE_SEC = 10
-
 
 def _force_exit_after(sec: float, done: threading.Event) -> None:
     """到点仍未正常退出才强杀；正常退出后这个线程必须失效。
@@ -163,103 +100,11 @@ def _force_exit_after(sec: float, done: threading.Event) -> None:
     logging.shutdown()
     os._exit(0)
 
+# 引擎只推进已有工作流；空闲不等于有人有需求。饥饿自启（food_chain_loop）
+# 7 天完成率 0/11、58% 卡在 s0、任务描述为空 —— 已删除，工作流只由真实信号创建。
+from paths import BUS_CLIENT
 
-def _starve_signal(eng: WorkflowEngine) -> None:
-    """连续饥饿 → 拉起 scout session + 创建 food_chain_loop 工作流，冷却期内静默。"""
-    now = time.time()
-    state = {}
-    try:
-        if _STARVE_STATE.exists():
-            state = json.loads(_STARVE_STATE.read_text())
-    except (OSError, ValueError):
-        pass
-
-    # ── 冷却检查 ──
-    # 成功触发冷却: 基于 last_fire（6h 防高频骚扰）
-    # 失败退避: 连续失败≥阈值 → 24h 长退避；未达阈值 → 短退避 60s 重试窗口
-    #（失败计数必须能递增到阈值——若失败也走 6h 冷却则计数永远停在 1，退避永不生效）
-    last_fire = state.get("last_fire", 0)
-    last_failure_ts = state.get("last_failure_ts", 0)
-    consec_fails = state.get("consecutive_failures", 0)
-    # 「连续」失败必须真的连续：14:02 连撞 5 次后同一台机器跑完了整条食物链
-    # （21:19 收尾，期间产出 6 条子链），那 5 次失败却把 24h 退避续到次日 14:02
-    # —— 期间额度与 start() 全正常，纯饿 8h。streak 超过一个成功冷却期即视为中断。
-    if last_failure_ts and now - last_failure_ts > _STARVE_COOLDOWN:
-        consec_fails = 0
-    if consec_fails >= _STARVE_FAIL_THRESHOLD:
-        # 达到阈值 → 一个冷却窗口内不再尝试，窗口过后重置计数再试一轮。
-        # 原来这里是 24h 绝对退避：一天里撞够 5 次就静默关掉产线，而失败成因
-        # （DB 锁、额度耗尽、模板抖动）通常几小时就没了 —— 实测 2026-10-26
-        # 14:02 撞够 5 次，之后同一台机器跑完了整条链并产出 6 条子链，产线却
-        # 继续零产出到次日。窗口与成功冷却用同一个（6h），状态机只剩一个间隔概念。
-        if last_failure_ts > 0 and now - last_failure_ts < _STARVE_COOLDOWN:
-            return  # 本轮退避期未过
-        # 退避期已过 → 重置计数重新尝试。缺此重置则失败计数永久 ≥ 阈值，
-        # 每次退避到期都只是再退避一次，饥饿恢复路径永不重试
-        # （实测 2026-10-17：consecutive_failures 卡在 5，last_active_ts 停在 8-08）。
-        consec_fails = 0
-    else:
-        if now - last_fire < _STARVE_COOLDOWN:
-            return  # 成功冷却期内
-        if now - last_failure_ts < _STARVE_FAIL_RETRY_INTERVAL:
-            return  # 失败后短退避（重试窗口内静默）
-
-    # 0) 防双路径竞态：wf_loop 可能在 daemon 触发同时创建了新的 food_chain_loop
-    # 仅真实 WorkflowEngine（类型含 has_active_template）才检查；mock → 跳过
-    if "has_active_template" in type(eng).__dict__:
-        try:
-            if eng.has_active_template("food_chain_loop"):
-                LOGGER.info("饥饿触发跳过: food_chain_loop 已有活跃实例")
-                return
-        except Exception as e:
-            # 竞态检查失败 → 保守跳过（防双实例；失败场景由退避机制兜底）
-            LOGGER.warning("饥饿竞态检查异常，保守跳过: %s", e)
-            return
-
-    # 1) 确保首步角色（scout）session 已启动
-    eng._ensure_role_alive("scout")
-    # reviewer 作为审批方需常驻以接收 code_review/architecture 消息（bus #336293 缺口修复）
-    eng._ensure_role_alive("reviewer")
-
-    # 2) 创建食物链工作流（确定性触发，不依赖 coordinator 转发）
-    try:
-        wf_id = eng.start("food_chain_loop", context={
-            "source": "starve_detector",
-            "reason": "连续6分钟无活跃工作流",
-        })
-    except Exception as e:
-        LOGGER.warning("饥饿创建工作流失败 (连续第 %d 次): %s", consec_fails + 1, e)
-        _starve_failed(state, consec_fails + 1, now, e)
-        return
-    # 类型守卫：mock/非 str 返回值（测试环境污染）禁止写入 bus 与状态文件
-    if not isinstance(wf_id, str) or not wf_id.startswith("wf_"):
-        LOGGER.error("饥饿触发返回值异常，丢弃: %r", wf_id)
-        _starve_failed(state, consec_fails + 1, now, f"返回值异常: {wf_id!r}")
-        return
-    LOGGER.info("饥饿触发: food_chain_loop 已创建 wf=%s", wf_id)
-
-    # 3) 写 bus 供监控审计（非依赖）
-    try:
-        subprocess.run(
-            [sys.executable, str(_BUS_SCRIPT), "write", "scheduler",
-             f"starve-restart:食物链已重启 wf={wf_id}",
-             "--src", "workflow_engine",
-             "--evidence",
-             "工作流引擎饥饿检测：连续 6 分钟无活跃工作流，已创建 food_chain_loop"],
-            capture_output=True, timeout=10,
-        )
-    except Exception:
-        pass
-
-    state["last_fire"] = now
-    state["last_wf"] = wf_id
-    # last_active_ts 曾被遗留为 69 天前的陈旧值（无任何写入点），会被读成
-    # "引擎长期停摆"。这里显式维护为本次触发时刻。
-    state["last_active_ts"] = now
-    state.pop("consecutive_failures", None)  # 成功 → 清零失败计数
-    state.pop("last_failure_ts", None)
-    _safe_write_state(state)
-
+_BUS_SCRIPT = BUS_CLIENT
 
 _TMUX_ALARM_AT = 0.0
 
@@ -409,7 +254,6 @@ def daemon_loop(interval: int):
     LOGGER.info("Workflow Daemon 启动 PID=%d, 间隔 %ds", os.getpid(), interval)
 
     idled = 0
-    starve_rounds = 0
     # ── 源码热加载守卫 ──
     # 本进程启动后永不重读源文件，分支上的修复对运行中的 daemon 完全不生效。
     # 实测 2026-10-19：判活守卫 _role_producing_recently 已写在工作区，daemon
@@ -464,17 +308,6 @@ def daemon_loop(interval: int):
                     idled += 1
                     if idled % 10 == 0:
                         LOGGER.error("连续失败 %d 轮，最后异常: %s", idled, e)
-                # 饥饿检测：连续空转无活跃工作流 → 写 bus 请求生产者重启食物链
-                try:
-                    if _active_count(eng) > 0:
-                        starve_rounds = 0
-                    else:
-                        starve_rounds += 1
-                        if starve_rounds >= _STARVE_ROUNDS:
-                            _starve_signal(eng)
-                            starve_rounds = 0
-                except Exception as e:
-                    LOGGER.warning("饥饿检测异常: %s", e)
                 # 每轮都探。旧写法按"轮次"计数（6 轮一探），而忙机上 run_once 一轮要
                 # 几分钟 → 实测 18:18:43 改 daemon.py、18:26 仍不重启，源码修复不生效。
                 try:

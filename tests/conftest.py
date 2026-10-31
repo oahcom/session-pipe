@@ -30,10 +30,6 @@ _run_dir = tempfile.mkdtemp(prefix="pytest-hermes-run-")
 os.environ["HERMES_RUN_DIR"] = _run_dir
 os.environ["ROUTING_DB_PATH"] = os.path.join(_run_dir, "routing.db")
 os.environ["SESSION_PIPELINE_ACK_DB"] = os.path.join(_run_dir, "ack_tracker.db")
-# 饥饿自愈状态：用假引擎跑 daemon_loop 的用例（tick 看门狗/优雅关闭/tick_paths）
-# 会走到饥饿分支并把「创建失败」记进状态文件。不隔离时一轮 pytest 就把它累到阈值，
-# 生产自愈随即退避 —— 2026-10-26 就是这么把产线饿掉 8h 的（R166）。
-os.environ["SESSION_PIPELINE_STARVE_STATE"] = os.path.join(_run_dir, "wf_starve.json")
 # CCS_WORKSPACES 的 env 必须在这里设，不能等第 3b 节：step_handler / wf_lifecycle 用
 # `from paths import CCS_WORKSPACES` 拷了值（模块级 alias），谁先 import 谁固化。
 # 本文件第 44 行就 import pipeflow 做 _PRISTINE 快照 → 晚设等于没设：测试写临时目录、

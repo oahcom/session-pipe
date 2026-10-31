@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""饥饿检测集成测试 — 真实 WorkflowEngine + 真实 SQLite（mock 仅限 subprocess 外部副作用）。
+"""食物链模板集成测试 — 真实 WorkflowEngine + 真实 SQLite（mock 仅限 subprocess 外部副作用）。
 
 验证链路: eng.start("food_chain_loop") → DB 落库 → has_active_template 识别 → active_workflow_count 计数。
 非 mock 的全链路验证，排除"测试 mock 永远成功"盲区（2026-08-11 事故根因）。
+（daemon 的饥饿自启已删除，见 daemon.py 注释。）
 """
 
-import json
 import sys
 import tempfile
-import time
 import shutil
 from pathlib import Path
 from unittest.mock import patch
@@ -79,56 +78,6 @@ def test_has_active_template_false_after_complete():
         assert eng.has_active_template("food_chain_loop") is True
         eng._lifecycle.close_wf(wf_id, status="cancelled")
         assert eng.has_active_template("food_chain_loop") is False
-
-
-def test_starve_signal_real_engine_pipeline():
-    """端到端: daemon._starve_signal 接真实 engine → DB 出现实例 → 竞态检查拦截第二次。"""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-    from pipeflow import daemon
-    with tempfile.TemporaryDirectory() as tmp:
-        eng = _make_engine(tmp)
-        state_path = Path(tmp) / "starve_state.json"
-        with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(eng, "_ensure_role_alive", return_value=True), \
-             patch("subprocess.run") as mock_run:
-            mock_run.return_value.returncode = 0
-            daemon._starve_signal(eng)
-        # 状态文件记录了 last_wf 且 DB 有对应实例
-        saved = json.loads(state_path.read_text())
-        assert saved["last_wf"].startswith("wf_"), saved
-        rows = eng._lifecycle.query(
-            "SELECT COUNT(*) AS cnt FROM workflow_instances WHERE template_id='food_chain_loop'")
-        assert rows[0]["cnt"] == 1, "应恰好创建 1 个实例"
-        # 冷却期内第二次调用 → 不创建新实例
-        with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(eng, "_ensure_role_alive", return_value=True), \
-             patch("subprocess.run"):
-            daemon._starve_signal(eng)
-        rows = eng._lifecycle.query(
-            "SELECT COUNT(*) AS cnt FROM workflow_instances WHERE template_id='food_chain_loop'")
-        assert rows[0]["cnt"] == 1, "冷却期不应创建新实例"
-
-
-def test_race_guard_real_engine():
-    """真实竞态防护: 已有活跃实例时 _starve_signal 跳过创建。"""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-    from pipeflow import daemon
-    with tempfile.TemporaryDirectory() as tmp:
-        eng = _make_engine(tmp)
-        state_path = Path(tmp) / "starve_state.json"
-        # 先手动创建活跃实例（模拟 wf_loop 已创建）
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.returncode = 0
-            eng.start("food_chain_loop", context={"source": "wf_loop"})
-        # 状态文件模拟冷却已过
-        state_path.write_text(json.dumps({"last_fire": 0}))
-        with patch.object(daemon, "_STARVE_STATE", state_path), \
-             patch.object(eng, "_ensure_role_alive", return_value=True), \
-             patch("subprocess.run"):
-            daemon._starve_signal(eng)
-        rows = eng._lifecycle.query(
-            "SELECT COUNT(*) AS cnt FROM workflow_instances WHERE template_id='food_chain_loop'")
-        assert rows[0]["cnt"] == 1, "已有活跃实例 → 不应再创建"
 
 
 if __name__ == "__main__":
