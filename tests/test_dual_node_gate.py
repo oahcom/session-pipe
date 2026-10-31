@@ -29,6 +29,7 @@ if str(_src) not in sys.path:
 from lifecycle.manager import LifecycleManager  # noqa: E402
 from pipeflow.step_handler import (  # noqa: E402
     _codex_review_prompt, _codex_verdict, _has_codex_approved, _has_codex_blocked,
+    _codex_output_is_clean,
 )
 
 _DUAL_STEPS = [
@@ -147,6 +148,20 @@ def test_engine_passed_prompt_does_not_ask_for_second_review():
     assert "codex review --uncommitted" not in p
     assert "不需要再跑" in p
     assert "No findings" in p
+
+
+def test_codex_clean_parser_is_not_substring():
+    """否定词 + 但是 曾被判通过（`0 issues in README; P1 bug` 命中 `0 issues`）。
+
+    引擎批准会直接置 node2_approved，误判等于免审，所以判据必须 fail-closed。
+    """
+    assert _codex_output_is_clean("No findings") is True
+    assert _codex_output_is_clean("no findings.\n") is True
+    assert _codex_output_is_clean("No security issues") is True
+    assert _codex_output_is_clean("0 issues in README; P1 bug in auth") is False
+    assert _codex_output_is_clean("No findings overall\nP1: token leak") is False
+    assert _codex_output_is_clean("critical vulnerability") is False
+    assert _codex_output_is_clean("") is False
 
 
 def test_completion_check_injection_is_bounded(tmp_path):

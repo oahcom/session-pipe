@@ -54,7 +54,7 @@ def _run_and_step():
     return run, step
 
 
-def _tick_with_facts(facts):
+def _tick_with_facts(facts, require_wf=False):
     eng = _mocked_eng()
     eng._bb.read.return_value = facts
     eng._check_exit = MagicMock(return_value=(0.0, []))  # 本用例只验宽松推进分支
@@ -63,6 +63,8 @@ def _tick_with_facts(facts):
     eng._wait_for_role_ready = MagicMock(return_value=False)
     eng._is_role_busy = MagicMock(return_value=False)
     run, step = _run_and_step()
+    if require_wf:
+        step.exit_condition["require_wf"] = True
     eng._tick(run, step)
     return eng, run
 
@@ -104,6 +106,28 @@ def test_mismatched_text_still_relaxed():
                   f"审查结论已出 {_WF}（标题里没有契约要求的关键词）", now - 200, f"实例 {_WF}")
     eng, run = _tick_with_facts([_anchor(now), wrong])
     assert run.step_results["s6"].get("relaxed_advance"), "文本不匹配时应兜底推进"
+
+
+def test_compliant_plus_mismatched_does_not_relax():
+    """合规消息与不匹配消息并存时，宽松推进仍不得抢跑（原实现只逐条排除）。"""
+    now = time.time()
+    ok = _Fact(5, "code_review", "reviewer",
+               f"s6-complete {_WF} — 通过", now - 200, f"实例 {_WF}")
+    wrong = _Fact(6, "architecture", "reviewer",
+                  f"s6-complete {_WF} — 另一条", now - 200, f"实例 {_WF}")
+    eng, run = _tick_with_facts([_anchor(now), ok, wrong])
+    assert not run.step_results["s6"].get("relaxed_advance"), \
+        "存在合规消息时仍被宽松推进吞下"
+
+
+def test_require_wf_evidence_only_id_still_relaxes():
+    """require_wf 只认标题；实例 id 只写在正文时，正常匹配拒绝 → 兜底必须接住。"""
+    now = time.time()
+    ev = _Fact(7, "code_review", "reviewer",
+               "s6-complete — 通过", now - 200, f"实例 {_WF}")
+    eng, run = _tick_with_facts([_anchor(now), ev], require_wf=True)
+    assert run.step_results["s6"].get("relaxed_advance"), \
+        "严格归属匹配不到、宽松推进又排除 → 两边都不推进（死锁）"
 
 
 if __name__ == "__main__":

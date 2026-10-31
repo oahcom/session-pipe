@@ -113,6 +113,22 @@ def _codex_review_prompt(wf_name: str, step_id: str, cat: str,
     )
 
 
+def _codex_output_is_clean(out: str) -> bool:
+    """codex review 输出是否**只有**零问题结论（fail-closed）。
+
+    裸子串匹配会把 `0 issues in README; P1 bug` 判成通过；`no security issues`
+    又会被 `security issue` 反过来判成有问题。两头都错，所以：干净结论必须是
+    整行否定式，且全文不得出现任何级别标记。
+    """
+    _passed = bool(re.search(
+        r"(?im)^\s*(?:no findings|no issues|no problems|no security issues|"
+        r"nothing to report|0 issues|0 problems)\s*[.!。]?\s*$", out))
+    _finding = bool(re.search(
+        r"(?i)(\[p[0-3]\]|\bp[0-3]\b|critical|vulnerability|"
+        r"\bbug\s*:|\btraceback\b)", out))
+    return _passed and not _finding
+
+
 def _has_codex_approved(matched_msgs: list, step_id: str) -> bool:
     """匹配到的消息里是否真有本步的 codex-approved 结论。
 
@@ -1086,28 +1102,47 @@ class StepHandlerMixin:
                     # 的消息，含 wf_sub_b548 借用 wf_sub_4e63 的完成声明）。
                     # evidence 一并带上：驳回分类段【系统问题→x】写在 evidence 里，
                     # 只取标题会让 _parse_review_issues 解析为空（与 :1662 同源）。
-                    _relaxed = [
-                        {"id": f.id, "text": f.t[:200],
+                    def _exit_would_match(f) -> bool:
+                        """这条消息走正常 exit 匹配能否命中（与 _check_exit 同口径）。"""
+                        if src_filter and f.src != src_filter and f.src != "claude":
+                            if not (eff_role and f.src == eff_role) and not (
+                                    _wait_roles and f.src in _wait_roles):
+                                return False
+                        if text_filter and text_filter not in str(f.t or ""):
+                            return False
+                        if ec.get("require_wf") and _wf_id and not _mentions(
+                                f, _wf_id, fields="t"):
+                            return False
+                        return True
+
+                    # 合规消息存在时整条宽松路径让位：只要 relaxed 里还有别的
+                    # 不匹配消息，它就会抢在正常 exit 之前推进（两条消息并存时
+                    # 原实现照样吞掉合规那条）。
+                    _has_compliant = bool(cat) and any(
+                        getattr(f, "cat", "") == cat and _exit_would_match(f)
+                        for f in _role_msgs)
+                    _relaxed = [] if _has_compliant else [
+                        {"id": f.id, "text": str(f.t or "")[:200],
                          "evidence": (getattr(f, "e", "") or "")[:2000],
-                         "ts": f.ts, "src": f.src, "cat": f.cat}
+                         "ts": f.ts, "src": f.src,
+                         "cat": getattr(f, "cat", "")}
                         for f in _role_msgs
                         if f.src == _eff
                         and f.src != "workflow_engine"  # 排除引擎自产告警，防止误判角色产出
                         and getattr(f, "cat", "") != "blocker"  # 拒产/拒审的 blocker 不是产出（R163）
-                        and not _refusal_not_verdict(f.t)  # 自述拒绝同样不是产出（R163；带结论词的驳回除外）
+                        and not _refusal_not_verdict(str(f.t or ""))  # 自述拒绝同样不是产出（R163；带结论词的驳回除外）
                         and f.ts > _notified_ts
                         and f.ts < time.time() + 60  # 防未来时间戳
                         and _mentions(f, _wf_id)
-                        # 分类与文本都已匹配的消息留给本 tick 后面的正常 exit 匹配。
-                        # 抢在它前面吞掉会把合规完成记成「分类不匹配」，blocker 文案与
-                        # 事实相反（实测 wf_4eaa331e88ed/s6：cat=code_review src=reviewer
-                        # 完全合规，却被宽松推进吞下，下游据此误判 reviewer 失职）。
-                        and not (cat and f.cat == cat
-                                 and (not text_filter or text_filter in f.t))
+                        # 正常 exit 能命中的消息一律留给它，不在宽松路径消费。
+                        # 两边口径必须一致：被这里排除、又被正常匹配拒绝的消息
+                        # 会两边都不推进，只能等超时回收（require_wf 只认标题）。
+                        and not (cat and getattr(f, "cat", "") == cat
+                                 and _exit_would_match(f))
                     ]
                     # task_spec 锚点确认确实是本工作流任务（同样是完整 id，不做前缀匹配）
                     _has_anchor = any(
-                        f.cat == "task_spec" and _mentions(f, _wf_id)
+                        getattr(f, "cat", "") == "task_spec" and _mentions(f, _wf_id)
                         for f in _role_msgs
                     )
                     if _relaxed and _has_anchor:
@@ -1117,8 +1152,10 @@ class StepHandlerMixin:
                         # engineer/closer 各 1~2 次），下游拿不到契约件才回头返工。
                         if self._quality_gate_blocks(step, run):
                             return
-                        LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (cat 不匹配, %d 条)",
-                                    run.workflow_name, step.id, len(_relaxed))
+                        _got_cat = (_relaxed[0].get("cat") if _relaxed else "") or "空"
+                        _why = ("分类不匹配" if _got_cat != cat else "文本不匹配")
+                        LOGGER.info("relaxed-advance %s/%s: 角色已写同工作流 bus 消息 (%s, %d 条)",
+                                    run.workflow_name, step.id, _why, len(_relaxed))
                         run.step_results[step.id] = {
                             **self._step_sd(run, step),
                             "bus_anchor": _relaxed[0]["ts"],
@@ -1127,7 +1164,8 @@ class StepHandlerMixin:
                         }
                         self._sync_step_results(run.id, run.step_results)
                         self._bb.write("blocker",
-                            f"角色写了同工作流消息但分类不匹配（收到 {_relaxed[0].get('cat')}，期望 {cat}）",
+                            f"[workflow] {run.workflow_name}/{step.id} 宽松推进: "
+                            f"{_why}（收到 {_got_cat}，期望 {cat}）",
                             src="workflow_engine")
                         # bypass 补发完整性提醒（relaxed-advance cat 不匹配直接推进）
                         _integ_send_bypass(run, step, "relaxed",
@@ -1372,8 +1410,20 @@ class StepHandlerMixin:
         _dn_sd = self._step_sd(run, step)
         _dn_verdict = (_codex_verdict(_match_msgs, step.id)
                        if (_dn_wide and _match_ts
-                           and not _dn_sd.get("node2_approved")
                            and not _dn_sd.get("node2_blocked")) else None)
+        if _dn_verdict == "blocked" and _dn_sd.get("node2_approved"):
+            # 引擎已批、角色随后报 blocked：不推翻引擎批准（审批权威），但矛盾
+            # 结论不能静默吞掉——否则引擎误判时没有任何人工可见的痕迹。
+            LOGGER.warning("双节点: %s/%s 引擎已批但角色报 blocked，保留批准并留痕",
+                           run.workflow_name, step.id)
+            try:
+                self._bb.write(
+                    "blocker",
+                    f"[workflow] {run.workflow_name}/{step.id} 引擎已批准，角色随后报 codex-blocked",
+                    src="workflow_engine")
+            except (ValueError, KeyError, TypeError):
+                LOGGER.debug("bus write fail: blocked-after-approval")
+            _dn_verdict = None
         if _dn_verdict == "blocked":
             # 负向终态优先于本段其余逻辑：判失败后不得再落 bus_anchor / complete_step。
             self._fail_codex_blocked(run, step, _match_msgs, "role_bus")
@@ -1600,14 +1650,7 @@ class StepHandlerMixin:
                 # 原判据只认 "No issues"/"0 issues"/"0 problems"（全部 0 命中）
                 # → 干净 diff 也被判失败，引擎回落"让角色人工审查"，闸门形同虚设。
                 # 改为：否定词表匹配 + 必须无严重级别标记（两条同时满足才算通过）。
-                _clean = out.lower()
-                _passed_phrase = any(s in _clean for s in (
-                    "no findings", "no issues", "no problems", "0 issues",
-                    "0 problems", "no security issues", "nothing to report"))
-                _has_finding = any(s in _clean for s in (
-                    "[p0]", "[p1]", "[p2]", "critical", "vulnerability",
-                    "security issue", "bug:", "error:"))
-                if _passed_phrase and not _has_finding:
+                if _codex_output_is_clean(out):
                     return {"success": True, "output": out[:500]}
                 return {"success": False, "error": f"codex 发现问题: {out[:300]}", "output": out[:500]}
             else:

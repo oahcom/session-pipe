@@ -94,7 +94,7 @@ def test_message_dicts_always_carry_evidence():
     from pathlib import Path
     import pipeflow.step_handler as sh
     src = Path(sh.__file__).read_text()
-    blocks = re.findall(r'\{"id": _?f\.id, "text": _?f\.t\[:200\][^}]*\}', src, re.S)
+    blocks = re.findall(r'\{"id": _?f\.id, "text": [^}]*?\[:200\][^}]*\}', src, re.S)
     assert len(blocks) >= 3, f"消息构造点少于预期（{len(blocks)}），检查点可能失效"
     bad = [b for b in blocks if "evidence" not in b]
     assert not bad, f"缺 evidence 的消息构造: {bad}"
