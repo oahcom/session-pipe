@@ -130,5 +130,29 @@ def test_require_wf_evidence_only_id_still_relaxes():
         "严格归属匹配不到、宽松推进又排除 → 两边都不推进（死锁）"
 
 
+def test_foreign_src_same_cat_does_not_disable_relaxed():
+    """他角色写同分类消息时，_exit_would_match 不得抛 NameError 吞掉整段兜底。"""
+    now = time.time()
+    foreign = _Fact(8, "code_review", "engineer",
+                    f"s6-complete {_WF} — 别人的同分类消息", now - 200, f"实例 {_WF}")
+    wrong = _Fact(9, "architecture", "reviewer",
+                  f"s6-complete {_WF} — 审查", now - 200, f"实例 {_WF}")
+    eng, run = _tick_with_facts([_anchor(now), foreign, wrong])
+    assert run.step_results["s6"].get("relaxed_advance"), \
+        "他角色消息触发的 NameError 让兜底静默失效"
+
+
+def test_stale_compliant_does_not_block_relaxed():
+    """窗口外（早于 last_ts）的合规消息不得把 relaxed 永久清空。"""
+    now = time.time()
+    stale = _Fact(10, "code_review", "reviewer",
+                  f"s6-complete {_WF} — 上一轮遗留", now - 4000, f"实例 {_WF}")
+    wrong = _Fact(11, "architecture", "reviewer",
+                  f"s6-complete {_WF} — 审查", now - 200, f"实例 {_WF}")
+    eng, run = _tick_with_facts([_anchor(now), stale, wrong])
+    assert run.step_results["s6"].get("relaxed_advance"), \
+        "旧合规消息不在正常 exit 窗口内，却仍禁用了兜底"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

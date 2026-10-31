@@ -123,11 +123,12 @@ def _codex_output_is_clean(out: str) -> bool:
     _passed = bool(re.search(
         r"(?im)^\s*(?:no|0)\s+(?:findings?|issues?|problems?|security issues?)\b"
         r"(?:\s+(?:found|detected|to report))?\s*[.!。]?\s*$", out))
-    # 级别标记必须行首（`[P1]` / `P1:` / `- P2`）：裸 `\bp[0-3]\b` 会把
-    # `https://x.dev/p1`、`app.p3` 当成发现，干净审查被判失败（902s 白等）。
+    # 级别标记：允许行首修饰（`[P1]`、`**P1**`、`1. P1:`、`(见 P1)`），
+    # 但要求标记前是空白/括号/星号等边界、标记后跟分隔符 —— 裸 `\bp[0-3]\b`
+    # 会把 `https://x.dev/p1`、`app.p3` 当成发现，干净审查被判失败（902s 白等）。
     _finding = bool(re.search(
-        r"(?im)^\s*(?:[-*]\s*)?\[?p[0-3]\]?(?:\s|:|$)|critical|vulnerab|"
-        r"\bbug\s*:|\btraceback\b", out))
+        r"(?im)(?:^|[\s\[(*_-])p[0-3](?=[\s:\]\)*.,，。]|$)"
+        r"|\bcritical\b(?![\w_])|\bvulnerab\w*\b|\bbug\s*:|\btraceback\b", out))
     return _passed and not _finding
 
 
@@ -1113,8 +1114,11 @@ class StepHandlerMixin:
                         if _refusal_not_verdict(str(f.t or "")):
                             return False
                         if src_filter and f.src != src_filter and f.src != "claude":
-                            if not (eff_role and f.src == eff_role) and not (
-                                    _wait_roles and f.src in _wait_roles):
+                            # 本分支已要求无 wait_roles；只放行有效执行者。
+                            # 旧写法 eff_role 是未定义局部变量、_wait_roles 直到
+                            # 函数后段才赋值 → 他角色同分类消息一出现就 NameError，
+                            # 被外层 except 吞成 debug，宽松推进整段静默失效。
+                            if not (_eff and f.src == _eff):
                                 return False
                         if text_filter and text_filter not in str(f.t or ""):
                             return False
@@ -1126,8 +1130,16 @@ class StepHandlerMixin:
                     # 合规消息存在时整条宽松路径让位：只要 relaxed 里还有别的
                     # 不匹配消息，它就会抢在正常 exit 之前推进（两条消息并存时
                     # 原实现照样吞掉合规那条）。
+                    # 只认正常 exit 的当前窗口（created_after=last_ts）与未消费消息：
+                    # 上一轮遗留的同类消息不该让本步永远等超时。
+                    _now = time.time()
+                    _consumed_ids = getattr(self, "_consumed_exit_ids", ())
                     _has_compliant = bool(cat) and any(
-                        getattr(f, "cat", "") == cat and _exit_would_match(f)
+                        getattr(f, "cat", "") == cat
+                        and f.ts > last_ts
+                        and f.ts < _now + 60
+                        and f.id not in _consumed_ids
+                        and _exit_would_match(f)
                         for f in _role_msgs)
                     _relaxed = [] if _has_compliant else [
                         {"id": f.id, "text": str(f.t or "")[:200],
