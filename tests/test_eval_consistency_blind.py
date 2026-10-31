@@ -35,7 +35,7 @@ def test_blind_roles_named(monkeypatch, tmp_path, capsys):
 def test_incompatible_criterion_not_counted_as_executable(monkeypatch, tmp_path, capsys):
     """能抽出命令但预检拒绝，不能算可执行 —— 否则盲区名单假绿。"""
     monkeypatch.setattr(ec, "_load_roles", lambda d=None: [
-        {"name": "rejected", "eval_criteria": ["验证: rm -rf / 输出 ok"], "issues": []},
+        {"name": "rejected", "eval_criteria": ["验证: curl -s http://x 输出 ok"], "issues": []},
     ])
     monkeypatch.setattr(ec, "_extract_cmd", lambda c: "rm -rf /")
     monkeypatch.setattr(ec, "_check_cmd", lambda cmd: ["不在白名单"])
@@ -45,11 +45,11 @@ def test_incompatible_criterion_not_counted_as_executable(monkeypatch, tmp_path,
     assert out["blind_roles"] == ["rejected"]
     assert out["incompatible_roles"] == 1
 
-def test_criteria_outside_runtime_window_not_counted(monkeypatch, tmp_path, capsys):
-    """窗口外的判据永远不执行：第 5 条才可执行 ≠ 非盲区（codex 20 维 F1）。
+def test_late_executable_criterion_counts_in_window(monkeypatch, tmp_path, capsys):
+    """窗口按可执行项取：第 5 条才可执行也要跑，不能再判盲区。
 
-    knowledge_curator 实测：5 条判据里唯一可执行的在第 4 条（exec_idx=[4]），
-    旧口径按全表统计 → 判它非盲区，运行时却零判据执行。
+    knowledge_curator 实测：5 条判据里唯一可执行的在 idx4；旧口径按原始下标
+    切片 → 该角色永不执行任何判据，盲区名单与实际一致但永远修不好。
     """
     monkeypatch.setattr(ec, "_load_roles", lambda d=None: [
         {"name": "late_exec",
@@ -58,8 +58,8 @@ def test_criteria_outside_runtime_window_not_counted(monkeypatch, tmp_path, caps
     ])
     ec.main(["--json", "--personas", str(tmp_path)])
     out = json.loads(capsys.readouterr().out)
-    assert out["blind_roles"] == ["late_exec"], "第 5 条判据运行时跑不到，必须算盲区"
-    assert out["exec_total"] == 0
+    assert out["blind_roles"] == [], "第 5 条可执行判据现在会跑，不算盲区"
+    assert out["exec_total"] == 1
 
 def test_json_details_before_summary(monkeypatch, tmp_path, capsys):
     """daemon WARNING 只打前 400 字节：details 必须排在摘要字段之前（codex P2）。"""
