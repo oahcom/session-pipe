@@ -1374,11 +1374,6 @@ class StepHandlerMixin:
                         _integ_send_bypass(run, step, "dual_node_codex_approved",
                                            send_to_role=self._send_to_role,
                                            sync_step_results=self._sync_step_results)
-                        # codex 通过只证明"审过"，不证明退出契约达成：node2 此前
-                        # 直接 complete，exit_schema/verify 全绕过（R119 只堵了
-                        # 宽松推进与抢救，同一类假完成）。
-                        if self._quality_gate_blocks(step, run):
-                            return
                         try:
                             self._lifecycle.complete_step(run.id, step.id)
                         except Exception as _e:
