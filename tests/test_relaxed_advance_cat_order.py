@@ -154,5 +154,50 @@ def test_stale_compliant_does_not_block_relaxed():
         "旧合规消息不在正常 exit 窗口内，却仍禁用了兜底"
 
 
+def test_consumed_compliant_does_not_block_relaxed():
+    """已消费的合规消息不得再把兜底清空——_has_compliant 的第三条判据。"""
+    now = time.time()
+    consumed = _Fact(12, "code_review", "reviewer",
+                     f"s6-complete {_WF} — 上一 tick 已消费", now - 200, f"实例 {_WF}")
+    wrong = _Fact(13, "architecture", "reviewer",
+                  f"s6-complete {_WF} — 审查", now - 200, f"实例 {_WF}")
+    eng = _mocked_eng()
+    eng._bb.read.return_value = [_anchor(now), consumed, wrong]
+    eng._check_exit = MagicMock(return_value=(0.0, []))
+    eng._send_to_role = MagicMock()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=False)
+    eng._is_role_busy = MagicMock(return_value=False)
+    eng._consumed_exit_ids = {12}
+    run, step = _run_and_step()
+    eng._tick(run, step)
+    assert run.step_results["s6"].get("relaxed_advance"), \
+        "已消费消息仍被当合规，兜底被永久清空"
+
+
+def test_compliant_before_notified_at_does_not_block_relaxed():
+    """本步通知之前的合规消息不算合规：实例级 last_ts 兜不住这一层。"""
+    now = time.time()
+    # bus_anchor 被旧工作流残留值污染 → last_ts 退到 run.created_at（now-3600）；
+    # 本步 notify 在 now-2400。这条消息 ts=now-3000：晚于 last_ts、早于本步通知，
+    # 只可能是本实例上一步的产出，不是本步交付 → 不得清空 _relaxed。
+    stale = _Fact(14, "code_review", "reviewer",
+                  f"s6-complete {_WF} — 上一步的旧消息", now - 3000, f"实例 {_WF}")
+    wrong = _Fact(15, "architecture", "reviewer",
+                  f"s6-complete {_WF} — 审查", now - 200, f"实例 {_WF}")
+    eng = _mocked_eng()
+    eng._bb.read.return_value = [_anchor(now), stale, wrong]
+    eng._check_exit = MagicMock(return_value=(0.0, []))
+    eng._send_to_role = MagicMock()
+    eng._ensure_role_alive = MagicMock(return_value=True)
+    eng._wait_for_role_ready = MagicMock(return_value=False)
+    eng._is_role_busy = MagicMock(return_value=False)
+    run, step = _run_and_step()
+    run.step_results["s6"]["bus_anchor"] = now - 3600
+    eng._tick(run, step)
+    assert run.step_results["s6"].get("relaxed_advance"), \
+        "本步通知前的旧合规消息仍清空了兜底（用了实例级 last_ts 而非步级 notified_at）"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
