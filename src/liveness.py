@@ -103,6 +103,53 @@ def tmux_snapshot(max_age: float = 2.0) -> dict | None:
     return _d
 
 
+def tmux_server_cgroup() -> str | None:
+    """tmux server 所在 cgroup。无 server → ""；有 server 但读不到 → None（判不了）。
+
+    tmux 调用失败按「没有 server」处理：ccs stop 走的是同一个 socket 上的
+    kill-session，那条路不通时 stop 本身也是空操作，不存在误杀房东。
+    """
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "#{pid}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    pid = r.stdout.strip()
+    if r.returncode != 0 or not pid.isdigit():
+        return ""
+    try:
+        return Path(f"/proc/{pid}/cgroup").read_text().strip().split("::", 1)[-1]
+    except OSError:
+        return None
+
+
+def unit_control_group(role: str) -> str | None:
+    """unit 的 control group。inactive → ""（没有 cgroup 可连坐）；问不出来 → None。"""
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value",
+                            f"ccs@{role}.service"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def role_hosts_tmux_server(role: str) -> bool:
+    """该角色的 unit 是不是 tmux server 的「房东」。
+
+    tmux server 是进程间单例，cgroup 由创建它的 unit 决定且此后不变；pane 里的
+    claude/bash 全部继承它。停掉房东 = KillMode=control-group 清空整个 cgroup =
+    所有角色一起断（2026-11-01 12:14 实测 9 个 ccs@* unit 连坐重启 66 秒）。
+    判不了按房东处理：误杀成本是全员中断，漏杀只是 idle 角色多活 30 分钟。
+
+    两条杀 session 的路径（routing_daemon 的 G3 stop、survival_monitor 的
+    ondemand idle 回收）共用这一份判据，别再各写一份。
+    """
+    server_cg, role_cg = tmux_server_cgroup(), unit_control_group(role)
+    if server_cg is None or role_cg is None:
+        return True
+    return bool(server_cg) and server_cg == role_cg
+
+
 def _tmux_has_session(role: str, timeout: float = 3.0) -> bool | None:
     """L0: tmux 会话存活。返回 None = 无数据（tmux 不可用），调用方按放行处理。"""
     snap = tmux_snapshot()

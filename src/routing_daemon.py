@@ -30,6 +30,7 @@ _paths_mod = importlib.util.module_from_spec(_paths_spec)
 _paths_spec.loader.exec_module(_paths_mod)
 SENTINEL_DIR = _paths_mod.CCS_SENTINEL_DIR
 
+import liveness
 from routing.auto import route_all, route_all_to_ccs
 from reliability import LOGGER, METRICS
 
@@ -300,48 +301,16 @@ def _tree_behind_main(root: str = "") -> int:
         return 0
 
 
-def _tmux_server_cgroup() -> str | None:
-    """tmux server 所在 cgroup。无 server → ""；有 server 但读不到 → None（判不了）。
-
-    tmux 调用失败按「没有 server」处理：ccs stop 走的是同一个 socket 上的
-    kill-session，那条路不通时 stop 本身也是空操作，不存在误杀房东。
-    """
-    try:
-        r = subprocess.run(["tmux", "display-message", "-p", "#{pid}"],
-                           capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    pid = r.stdout.strip()
-    if r.returncode != 0 or not pid.isdigit():
-        return ""
-    try:
-        return Path(f"/proc/{pid}/cgroup").read_text().strip().split("::", 1)[-1]
-    except OSError:
-        return None
-
-
-def _unit_control_group(role: str) -> str | None:
-    """unit 的 control group。inactive → ""（没有 cgroup 可连坐）；问不出来 → None。"""
-    try:
-        r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value",
-                            f"ccs@{role}.service"], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return r.stdout.strip() if r.returncode == 0 else None
+# 判据本体在 liveness（纯函数模块，survival_monitor 也用它回收 idle 角色）。
+# 保留同名薄壳：既有测试 monkeypatch 的是 routing_daemon.subprocess.run 与
+# routing_daemon._role_hosts_tmux_server，转发一层两边都还能打桩。
+_tmux_server_cgroup = liveness.tmux_server_cgroup
+_unit_control_group = liveness.unit_control_group
 
 
 def _role_hosts_tmux_server(role: str) -> bool:
-    """该角色的 unit 是不是 tmux server 的「房东」。
-
-    tmux server 是进程间单例，cgroup 由创建它的 unit 决定且此后不变；pane 里的
-    claude/bash 全部继承它。停掉房东 = KillMode=control-group 清空整个 cgroup =
-    所有角色一起断（2026-11-01 12:14 实测 9 个 ccs@* unit 连坐重启 66 秒）。
-    判不了按房东处理：误杀成本是全员中断，漏杀只是 idle 角色多活 30 分钟。
-    """
-    server_cg, role_cg = _tmux_server_cgroup(), _unit_control_group(role)
-    if server_cg is None or role_cg is None:
-        return True
-    return bool(server_cg) and server_cg == role_cg
+    """该角色的 unit 是不是 tmux server 的「房东」（判据见 liveness）。"""
+    return liveness.role_hosts_tmux_server(role)
 
 
 def _autostop_idle_roles(proposals: list) -> None:

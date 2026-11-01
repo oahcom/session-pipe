@@ -417,5 +417,49 @@ class TestWriteBus:
         monitor._write_bus("architecture", "test")
 
 
+class TestIdleReclaimTmuxHost:
+    """ondemand idle 回收不得带走 tmux server 的房东 unit（#476559）。
+
+    tmux server 是进程内单例，cgroup 由创建它的 unit 固定。kill 房东的 session →
+    pane 消失 → unit 连带 exit → KillMode=control-group 清空 cgroup → 所有角色连坐
+    （2026-11-01 12:14 实测 9 个 unit 一起重启 66s）。同一 tick 里两个角色都 idle，
+    只差「谁是房东」，用来证明跳过是按角色判的、不是整段停摆。
+    """
+
+    def _idle_tick(self, monitor, monkeypatch, host_role):
+        for _r in ("pm", "qa"):
+            _make_sentinel(_r, sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "_load_role_lifecycles",
+                            lambda: {"pm": "ondemand", "qa": "ondemand"})
+        monkeypatch.setattr(monitor, "_l1_check",
+                            lambda r: {"status": "ALIVE", "tmux_alive": True,
+                                       "has_sentinel": False})
+        monkeypatch.setattr(monitor, "_l2_check", lambda r: {"thinking": False})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": False})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": False})
+        monkeypatch.setattr(monitor, "_overall", lambda *a, **k: "idle")
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: r == host_role,
+                            raising=False)   # 修复前该名字还不存在，红要红在断言上
+        for _r in ("pm", "qa"):
+            monitor._state[_r] = {"idle_count": 5}
+
+        calls = []
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run",
+                            lambda cmd, **kw: calls.append(list(cmd)) or MagicMock(returncode=0))
+        monitor.tick()
+        return [c for c in calls if c[:2] == ["tmux", "kill-session"]]
+
+    def test_host_role_idle_reclaim_is_skipped(self, monitor, monkeypatch):
+        kills = self._idle_tick(monitor, monkeypatch, host_role="pm")
+        assert ["tmux", "kill-session", "-t", "ccs-pm"] not in kills, \
+            f"房东 unit 的 session 被 kill，全员会连坐断线；实际 kills={kills}"
+
+    def test_non_host_idle_role_is_still_reclaimed(self, monitor, monkeypatch):
+        kills = self._idle_tick(monitor, monkeypatch, host_role="pm")
+        assert ["tmux", "kill-session", "-t", "ccs-qa"] in kills, \
+            f"非房东的 ondemand 角色仍须回收；实际 kills={kills}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -15,7 +15,7 @@ from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 
-from liveness import tmux_snapshot   # 单次 pane 快照，L1 与 pipeflow 共用一份判据
+from liveness import role_hosts_tmux_server, tmux_snapshot   # pane 快照 + 房东判据，与 routing_daemon 共用一份
 
 try:
     from paths import CCS_SENTINEL_DIR as SENTINEL_DIR, SESSION_ROLES_ROOT, WORKFLOWS_DB
@@ -715,6 +715,14 @@ class SurvivalMonitor:
                 _idle_n = _prev.get("idle_count", 0) + 1
                 self._state.setdefault(_ir, {})["idle_count"] = _idle_n
                 if _idle_n >= 6:
+                    # 房东 unit 承载 tmux server：kill 它的 session 会让 pane 消失 →
+                    # unit 连带退出 → KillMode=control-group 清空 cgroup → 全部角色连坐断线
+                    # （2026-11-01 12:14 实测 9 个 unit 一起重启 66s）。判不了按房东处理。
+                    # 重置计数，避免每 tick 重复打这条日志；房东身份变了照样从 0 重新累积。
+                    if role_hosts_tmux_server(_ir):
+                        LOGGER.info("角色回收跳过 %s：该 unit 承载 tmux server", _ir)
+                        self._state.setdefault(_ir, {})["idle_count"] = 0
+                        continue
                     LOGGER.info("角色回收: %s 连续 %d 次 idle（ondemand），kill session", _ir, _idle_n)
                     try:
                         subprocess.run(["tmux", "kill-session", "-t", f"ccs-{_ir}"],
