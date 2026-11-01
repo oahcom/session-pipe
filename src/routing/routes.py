@@ -311,9 +311,9 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                         # consume 正是 route_to_ccs 的可见性判据（poll 用 NOT EXISTS
                         # consume），在这里记一笔 = 该角色永远看不到。可投递类自
                         # eb1b300 起已改走这条路，系统类当时没跟着改，黑洞换个方向
-                        # 继续存在：实测 2026-11-01 五条调度脉冲各被 9 个角色同秒 claim、
-                        # 全库转录 0 命中；24h 命中率系统类 0~5%、bug_report 7/7，差异
-                        # 正好落在原先那个 if 的两侧。
+                        # 继续存在：实测 2026-11-01 五条调度脉冲（03:00~11:00）各被
+                        # 9 个角色在同一秒 claim，脉冲戳在全部 15 个角色转录的用户回合里
+                        # 命中 0；同一探针对照串 4577 命中 4，证明探针本身有效。
                         results.append({"role": role, "status": "delegated"})
                         continue
                     # 唯一保留的例外：task_spec 是派发记录（引擎三个写入者写完都自己

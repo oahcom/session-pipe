@@ -209,8 +209,8 @@ def test_directed_task_spec_is_still_claimed():
 def test_system_fact_survives_route_all_for_later_delivery(tmp_path, monkeypatch):
     """route_all 之后，系统类 fact 必须仍留在 route_to_ccs 的候选集里。
 
-    改前实测（2026-11-01）：五条调度脉冲各被 9 个角色同秒 claim，
-    全库转录 0 命中；24h 系统类命中率 0~5%，bug_report 7/7。
+    改前实测（2026-11-01）：五条调度脉冲（03:00~11:00）各被 9 个角色在同一秒
+    claim，脉冲戳在 15 个角色转录的用户回合里命中 0（同探针对照串命中 4）。
     """
     from unittest.mock import MagicMock, patch
     import routing.routes as routes
