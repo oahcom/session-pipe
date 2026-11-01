@@ -174,3 +174,17 @@ def test_quota_audit_cooldown_survives_restart():
     eng2._bb.read.return_value = [fact_old]
     _run(eng2, QUOTA_LINE)
     assert len(_facts(eng2)) == 1, "超过 6h 的旧账不该压住新账"
+
+
+def test_transient_title_does_not_claim_quota_rejection():
+    """else 分支是「非硬限」：标题不得声称被额度拒绝。
+
+    今日 9/9 条该标题的 evidence 全是 upstream connection lost 这类流中断，
+    下游按「额度耗尽」处置会换路由 / 等 1h 探活，方向完全错。
+    """
+    eng = _engine()
+    assert len(_run(eng, "● API Error: upstream connection lost")) == 1
+    facts = _facts(eng)
+    assert facts[0].args[1].startswith("[rate_limit]"), facts
+    assert "被额度拒绝" not in facts[0].args[1], facts[0].args[1]
+    assert "upstream connection lost" in facts[0].kwargs["evidence"], facts

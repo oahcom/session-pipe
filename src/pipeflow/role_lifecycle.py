@@ -729,7 +729,7 @@ class RoleLifecycleMixin:
                 self._bb.write("monitor_audit",
                     (f"[quota] {role} 额度/出口硬限，改 1h 探活（第 {attempt + 1} 次 "
                      f"{time.strftime('%Y-%m-%d %H:%M')}）" if _quota else
-                     f"[rate_limit] {role} 被额度拒绝 → 已发继续"
+                     f"[rate_limit] {role} 非硬限错误（流中断/瞬时限流）→ 已发继续"
                      f"（第 {attempt + 1} 次 {time.strftime('%Y-%m-%d %H:%M:%S')}）"),
                     evidence=(_why or output[-300:])[:300], src="workflow_engine")
                 if _quota:          # 写成功才记账：写失败下轮还能再报
