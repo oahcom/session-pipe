@@ -204,5 +204,23 @@ def test_compliant_inside_strict_window_blocks_relaxed():
         "严格匹配收得下的合规消息被兜底抢跑了（_has_compliant 下界比严格路径高）"
 
 
+
+def test_foreign_src_with_source_contains_does_not_kill_relaxed():
+    """他来源 + 本步配了 source_contains → 不得静默吞掉整段兜底（#475017 缺陷 1）。
+
+    修复前 _exit_would_match 引用未定义局部名 eff_role / _wait_roles，任一他来源
+    消息进入求值就 NameError；外层 except 把它吞成 debug，_relaxed 根本没被赋值
+    → 宽松推进整段失效，日志里也查不到（实测 journal 7 天 0 命中）。
+    """
+    now = time.time()
+    foreign = _Fact(16, "code_review", "engineer",
+                    f"[engineer] 顺口提一句 {_WF} 的审查", now - 500, f"实例 {_WF}")
+    wrong = _Fact(17, "architecture", "reviewer",
+                  f"s6-complete {_WF} — 分类不对的另一条", now - 200, f"实例 {_WF}")
+    eng, run = _tick_with_facts([_anchor(now), foreign, wrong])
+    assert run.step_results["s6"].get("relaxed_advance"), \
+        "他来源消息把 _has_compliant 求值打断，兜底静默失效"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
