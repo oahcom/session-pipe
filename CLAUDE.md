@@ -55,7 +55,7 @@ src/
     auto.py           ── 自动路由消费 + investigator 分派（187 行）
     polling.py        ── 消息轮询（104 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
-    survival_monitor.py ── 四层存活监测 L1/L2/L3/L4（737 行；L4=transcript/workflow 证据）
+    survival_monitor.py ── 四层存活监测 L1/L2/L3/L4（745 行；L4=transcript/workflow 证据）
     consistency.py    ── 路由一致性检查（105 行，生长接入 daemon）
 
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
