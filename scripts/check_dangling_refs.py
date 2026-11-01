@@ -22,14 +22,18 @@ def _defs(src: str) -> set[str]:
 
 
 def _refs(src: str) -> set[str]:
-    """代码引用。注释/文档里提到旧名字不算——本仓大量存在，grep 版因此误报。"""
+    """代码引用。注释/文档里提到旧名字不算——本仓大量存在，grep 版因此误报。
+
+    赋值目标与删除目标（ast.Store / ast.Del）是绑定不是引用：`x = mod.x` 这种
+    模块级别名转发会保留打桩点，不应因原 def 被删就判悬空。
+    """
     try:
         tree = ast.parse(src)
     except SyntaxError:
         return set()
     out: set[str] = set()
     for n in ast.walk(tree):
-        if isinstance(n, ast.Name):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
             out.add(n.id)
         elif isinstance(n, ast.Attribute):
             out.add(n.attr)

@@ -76,4 +76,16 @@ assert dangling_refs(
     {"m.py": "", "n.py": "def keep():\n    return 1\n", "u.py": "from n import keep as k\nk()\n"},
 ) == {}
 
+# 12. 模块级别名转发不是引用：_x = mod.x 的赋值左端是 Store，不算「还在用 _x」
+assert dangling_refs(
+    {"m.py": "def _x():\n    return 1\n", "n.py": "import mod\n"},
+    {"m.py": "import mod\n_x = mod.x\n", "n.py": "import mod\n"},
+) == {}
+
+# 13. 别名转发后，外部通过属性访问 routing_daemon._x 仍算引用 → 必须命中
+assert dangling_refs(
+    {"m.py": "def _x():\n    return 1\n", "n.py": "import m\n"},
+    {"m.py": "import mod\n_x = mod.x\n", "n.py": "import m\nm._x()\n"},
+) == {"_x": {"n.py"}}
+
 print("表征测试全部通过")
