@@ -353,3 +353,37 @@ def test_write_other_workspace_exempts_self_per_role():
     assert not hits("engineer", f"{WS}engineer/x.py"), "engineer 读写自己应豁免"
     assert not hits("maintainer", f"{WS}maintainer/x.py"), "任意角色都该豁免自己"
     assert hits("maintainer", f"{WS}qa/x.py"), "写他人仍须拦截"
+
+
+# ── content_void 词表：合规回复 ≠ 噪音，否定句 ≠ 产出 ──
+
+
+def test_content_void_ignores_mandated_idle_reply():
+    """角色卡强制要求的空唤醒回复不是噪音；引擎唤醒词本身也只有 1 条，两者叠加不应达门槛。"""
+    pane = "[scheduler] coordinator-loop: 调度脉冲\n无待办: inbox exit=0 空"
+    assert not parse_conversation_signals(pane, "x").content_void, \
+        "合规空唤醒回复 + 引擎唤醒词不应判 content_void"
+
+
+def test_content_void_recognizes_written_file_as_production():
+    """旧正则 `写[^了]*文件` 把「写了文件」排除在外，真实产出被当无产出。"""
+    pane = "调度脉冲\n无待办: inbox exit=0 空\n写了文件 RECHECK.md"
+    assert not parse_conversation_signals(pane, "x").content_void, \
+        "「写了文件 X」是产出证据，不应判 content_void"
+
+
+def test_content_void_still_flags_real_noise_loop():
+    """真噪音（4 条命中）仍须判出，防本次修复退化成永不告警。"""
+    pane = "调度脉冲\n[notice] a\n[blocker] b\n轮次完成"
+    assert parse_conversation_signals(pane, "x").content_void, \
+        "纯治理噪音循环仍应判 content_void"
+
+
+def test_negated_file_mention_is_not_production_evidence():
+    """`写[^了]*文件` 会跨行把「写进…」到「未改任何文件」吃成产出证据（devops pane 实测命中），否定句不得算产出。"""
+    pane = ("调度脉冲\n[notice] a\n"
+            "这一条如果被写进看板或告警阈值，会持续产生假信号。\n"
+            " - 本轮只读：未改任何文件")
+    assert parse_conversation_signals(pane, "x").content_void, \
+        "跨行的「写进…未改任何文件」是否定句，不得算产出证据"
+

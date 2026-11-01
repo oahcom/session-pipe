@@ -304,7 +304,7 @@ def parse_conversation_signals(pane_text: str, role: str) -> ConversationSignal:
     # 这是"用内容判断替代流程指标"的关键：pane 有输出变更 ≠ 角色在高质量产出。
     _PRODUCTION_EVIDENCE = [
         r"Goal achieved", r"产出完整|产出齐全", r"step_done_ready",
-        r"写[^了]*文件|创建.*\.py|创建.*\.md|写入.*文件",
+        r"写[了入]?.{0,20}文件|创建.*\.py|创建.*\.md",
         r"\bpytest\b.*passed|\bpy_compile\b.*PASS",
         r"commit|git push|git add",
         r"修复|实现|重构|优化|设计|分析",
@@ -312,7 +312,7 @@ def parse_conversation_signals(pane_text: str, role: str) -> ConversationSignal:
     _NOISE_SIGNS = [
         r"调度脉冲", r"超时.*重推.*升级", r"\[notice\]", r"\[blocker\]",
         r"Interrupted", r"monitor_audit", r"test_exit_schema",
-        r"无.*待办|保持.*待机|无待办", r"snap 已更新|轮次完成",
+        r"snap 已更新|轮次完成",
     ]
     _has_production = any(re.search(p, pane_text) for p in _PRODUCTION_EVIDENCE)
     _noise_count = sum(1 for p in _NOISE_SIGNS if re.search(p, pane_text))
