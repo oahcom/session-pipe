@@ -26,7 +26,7 @@ def _msg(cat):
 
 
 def _run(cat="performance", ack="consumed"):
-    """cat=performance 走 delegated（本地不消费）；cat=code_review 走逐角色消费。"""
+    """非 task_spec 分类走 delegated（本地不消费）；task_spec 走逐角色 consume。"""
     from routing.routes import route_all
     bb = MagicMock()
     _rt = MagicMock()
@@ -58,8 +58,12 @@ def test_consumed_fact_is_claimed():
 
 
 def test_errored_fact_is_left_for_retry():
-    """有角色报错 → 不记接管，下一轮还要重试（否则该条静默丢失）。"""
-    bb = _run("code_review", ack="error")
+    """有角色报错 → 不记接管，下一轮还要重试（否则该条静默丢失）。
+
+    用 task_spec：契约改后它已是**唯一**还走 safe_consume 的分支，别的分类都
+    直接 delegated（不再可能产生 error），拿它们测这条会变成恒绿的空断言。
+    """
+    bb = _run("task_spec", ack="error")
     assert not any(c.args[0] == 4242 for c in bb.mark_consumed.call_args_list), \
         bb.mark_consumed.call_args_list
 
@@ -194,3 +198,56 @@ def test_directed_task_spec_is_still_claimed():
                                  "devops": {"consume": ["task_spec"]}})
     assert "devops" in [c.args[2] for c in sc.call_args_list], sc.call_args_list
     assert any(c.args == (4545, "pipeline") for c in bb.mark_consumed.call_args_list),         bb.mark_consumed.call_args_list
+
+
+# ── 系统类 claim 黑洞（2026-11-01 bus #476243）──────────────────────────
+# route_all 给系统类的每个订阅者同秒打 claim，而 route_to_ccs 的候选集是
+# NOT EXISTS(consume) → 该 fact 对这些角色永久出局。下面这条走**真实 bus 语义**
+# （不 mock safe_consume / mark_consumed），先 route_all 再 route_to_ccs，
+# 断言系统类 fact 仍能被后者看见 —— 改前它已被 claim 掉，poll 返回空。
+
+def test_system_fact_survives_route_all_for_later_delivery(tmp_path, monkeypatch):
+    """route_all 之后，系统类 fact 必须仍留在 route_to_ccs 的候选集里。
+
+    改前实测（2026-11-01）：五条调度脉冲各被 9 个角色同秒 claim，
+    全库转录 0 命中；24h 系统类命中率 0~5%，bug_report 7/7。
+    """
+    from unittest.mock import MagicMock, patch
+    import routing.routes as routes
+    from routing import auto as auto_mod
+
+    bb = MagicMock()
+    bb.unconsumed.side_effect = lambda consumer=None, limit=100: (
+        [MagicMock(id=7777, cat="scheduler", t="调度脉冲 2026-11-01T03:00:19Z",
+                   src="coordinator-loop-timer", ts=time.time(), e="")]
+        if not getattr(bb, "_claimed", False) else [])
+    def _claim(fid, consumer="pipeline"):
+        bb._claimed = True
+    bb.mark_consumed.side_effect = _claim
+    bb._claimed = False
+
+    router = MagicMock()
+    router.routing = {"engineer": {"consume": ["scheduler"]}}
+    msg = {"id": 7777, "category": "scheduler",
+           "text": "调度脉冲 2026-11-01T03:00:19Z", "src": "coordinator-loop-timer",
+           "evidence": "", "priority": 1, "consumers": ["engineer"]}
+
+    # safe_consume 直接写 conn.execute，不经 mark_consumed —— 只 patch
+    # Blackboard 会漏掉真正的 claim，必须从 IDEMPOTENT_CONSUME 这一侧观测。
+    claimed = []
+    with patch.object(auto_mod, "poll_unconsumed", return_value=[msg]), \
+         patch("routing.routes._rt_mod") as rt, \
+         patch("bus_protocol.Blackboard", return_value=bb), \
+         patch("routing.routes.HEARTBEAT"), \
+         patch("routing.routes.METRICS"), \
+         patch.object(routes.IDEMPOTENT_CONSUME, "safe_consume",
+                      side_effect=lambda b, f, r: claimed.append((f, r))
+                      or {"status": "consumed"}):
+        rt.get_router.return_value = router
+        routes.route_all(consumer="pipeline", dry_run=False)
+
+    role_claims = [c for c in claimed if c[1] == "engineer"]
+    assert role_claims == [], (
+        f"route_all 替 engineer 打了 claim {role_claims} —— "
+        "route_to_ccs 的 NOT EXISTS(consume) 视图再也看不到这条脉冲"
+    )

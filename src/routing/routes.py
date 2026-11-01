@@ -307,67 +307,26 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                 cat = assignment["category"]
                 results = []
                 for role in assignment["consumers"]:
-                    try:
-                        if cat not in _SYSTEM_CATEGORIES or assignment.get("directed"):
-                            # 可投递类不在这里消费：consume 会把该 (fact, role) 从
-                            # route_to_ccs 的候选集里删掉（poll 用 NOT EXISTS consume），
-                            # 它那句「忙 → 消息留 bus 下轮再试」就永远轮不到。
-                            # 实测 3h 可投递类 200 条 consume / 51 条进 pane，149 条
-                            # 静默丢失（#436146）。投递与建链都交给发送成功的
-                            # route_to_ccs 做（它本身就近幂等）。
-                            results.append({"role": role, "status": "delegated"})
-                            continue
-                        r = CIRCUIT_BREAKER.call(
-                            lambda f=fid, rl=role: IDEMPOTENT_CONSUME.safe_consume(bb, f, rl)
-                        )
-                        ack_status = r.get("status", "error")
-                        results.append({"role": role, "status": ack_status})
-                        # ACK 记录
-                        ACK_TRACKER.record_ack(fid, role, ack_status, category=cat,
-                                               error=r.get("error", "") if ack_status == "error" else "")
-                        # 消费成功后创建对应角色的工作流（自动推荐模板）
-                        # -- 跳过系统内通知类分类，防止级联风暴 --
-                        # architecture / notice / ccs_health 是路由信号而非任务，
-                        # 为它们创建 workflow 会引发 workflow-engine → blocker 循环。
-                        if ack_status == "consumed" and cat not in _SYSTEM_CATEGORIES:
-                            if cat in SYSTEM_CATEGORIES:
-                                LOGGER.debug("Skipping workflow creation for system category %s", cat)
-                            else:
-                                _t = assignment.get("title", "")
-                                if len(_t) < 8 or not _has_content_words(_t, cat):
-                                    LOGGER.debug("Skipping workflow create: title too short or 无内容性 (%d chars) role=%s", len(_t), role)
-                                elif _is_role_report_title(_t, cat, assignment.get("src", "")):
-                                    # [角色名] 开头的 title 是"某角色的产出汇报"，不是"给某角色的任务"。
-                                    # 实测 72h 内 92/92 个 [角色名] 开头实例都是 fan-out（同 title 多角色），
-                                    # 100% 是噪音。不创建 workflow。
-                                    # INFO 而非 DEBUG：拦截会改变投递行为，需在 journalctl 可见，
-                                    # 否则若某个合法任务被误判，排查时无迹可寻。
-                                    LOGGER.info("Skipping workflow create: role report title (%s) role=%s", _t[:40], role)
-                                elif _is_wf_echo_title(_t, cat):
-                                    # 事件汇报而非新需求：原消息已正常路由给角色，
-                                    # 再 mint 新链只会派生同标题空任务（7 天 372 条）。
-                                    LOGGER.info("Skipping workflow create: wf echo title (%s) role=%s", _t[:40], role)
-                                elif _is_noop_report(_t, assignment.get("body", "")):
-                                    # DESIGN §7 S3：no-op 健康报告是状态而非任务请求，
-                                    # mint 出"为无需动作写方案"的空转实例。INFO 可见。
-                                    # 判据用 body：assignment 从未带 evidence 键，
-                                    # 原来取 evidence 恒为 "" → 只能靠标题命中，永远晚半拍。
-                                    LOGGER.info("Skipping workflow create: no-op report (%s) role=%s", _t[:40], role)
-                                else:
-                                    try:
-                                        _wc = WorkflowClient(role)
-                                        _wc.create_task_v2(_t[:80], assignee=role,
-                                                           initiator_role="system", bus_category=cat,
-                                                           description=assignment.get("body", ""))
-                                        _wc.close()
-                                    except Exception as _e:
-                                        LOGGER.warning("route_all workflow create failed for %s: %s", role, _e)
-                    except Exception as e:
-                        LOGGER.error(f"route consume #{fid}->{role} failed: {e}",
-                                     extra={"trace_id": str(fid)})
-                        METRICS.inc("route_errors_total", labels={"consumer": role})
-                        results.append({"role": role, "status": "error", "error": str(e)})
-                        ACK_TRACKER.record_ack(fid, role, "error", category=cat, error=str(e))
+                    if cat != "task_spec":
+                        # consume 正是 route_to_ccs 的可见性判据（poll 用 NOT EXISTS
+                        # consume），在这里记一笔 = 该角色永远看不到。可投递类自
+                        # eb1b300 起已改走这条路，系统类当时没跟着改，黑洞换个方向
+                        # 继续存在：实测 2026-11-01 五条调度脉冲各被 9 个角色同秒 claim、
+                        # 全库转录 0 命中；24h 命中率系统类 0~5%、bug_report 7/7，差异
+                        # 正好落在原先那个 if 的两侧。
+                        results.append({"role": role, "status": "delegated"})
+                        continue
+                    # 唯一保留的例外：task_spec 是派发记录（引擎三个写入者写完都自己
+                    # ccs send 过正文），route_to_ccs 的 _is_for_me 对「@你 + task_spec」
+                    # 显式返回 False —— 不在这里记一笔，它就既不 claim 也不投，永远留在
+                    # 视图里每 60s 重扫（存量 528 条、中位年龄 100h、最老 111h）。
+                    r = CIRCUIT_BREAKER.call(
+                        lambda f=fid, rl=role: IDEMPOTENT_CONSUME.safe_consume(bb, f, rl)
+                    )
+                    ack_status = r.get("status", "error")
+                    results.append({"role": role, "status": ack_status})
+                    ACK_TRACKER.record_ack(fid, role, ack_status, category=cat,
+                                           error=r.get("error", "") if ack_status == "error" else "")
                 # 路由器已接管该条：poll 的 consumer='pipeline' 视图只认 cat='pipeline'
                 # 的 consume 记录，而上面各角色写的是 cat=<role>。不记这一笔，
                 # 全部事实永久留在该视图里，每轮把最新 100 条重投一遍（实测 10 003 条

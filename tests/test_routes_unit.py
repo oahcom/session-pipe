@@ -674,14 +674,47 @@ def test_route_all_does_not_consume_deliverable_category(mock_metrics, mock_hb):
 
 @patch("routing.routes.HEARTBEAT")
 @patch("routing.routes.METRICS")
-def test_route_all_still_consumes_system_category(mock_metrics, mock_hb):
-    """system 类不走 pane 投递，继续在这里消费（否则永远无人消费、日志告警常亮）。"""
+def test_route_all_delegates_system_categories_too(mock_metrics, mock_hb):
+    """系统类也必须委派给 route_to_ccs，不再在这里打 claim。
+
+    改前这条断言的是反面（"system 类不走 pane 投递，继续在这里消费"）——那句注释
+    正是缺陷本身：claim 让 route_to_ccs 的 NOT EXISTS 视图再也看不到该 fact。
+    实测 2026-11-01 五条调度脉冲各被 9 个角色同秒 claim，全库转录 0 命中。
+    """
     from routing.routes import route_all, _SYSTEM_CATEGORIES
-    cat = sorted(_SYSTEM_CATEGORIES)[0]
+    cat = next(c for c in sorted(_SYSTEM_CATEGORIES) if c != "task_spec")
     msgs = [{"id": 202, "category": cat, "text": "路由信号",
              "priority": 1, "consumers": ["engineer"]}]
     mock_router = MagicMock()
     mock_router.routing = {"engineer": {"consume": [cat]}}
+    with patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod") as mock_rt_mod, \
+         patch("bus_protocol.Blackboard"), \
+         patch("routing.routes.IDEMPOTENT_CONSUME") as mock_idem, \
+         patch("routing.routes.CIRCUIT_BREAKER") as mock_cb:
+        mock_rt_mod.get_router.return_value = mock_router
+        mock_cb.call.side_effect = lambda fn: fn()
+        mock_idem.safe_consume.return_value = {"status": "consumed"}
+        res = route_all(consumer="test", dry_run=False)
+    mock_idem.safe_consume.assert_not_called()
+    assert res["details"][0]["assigned"] == [{"role": "engineer", "status": "delegated"}], \
+        res["details"][0]
+
+
+@patch("routing.routes.HEARTBEAT")
+@patch("routing.routes.METRICS")
+def test_route_all_still_claims_task_spec(mock_metrics, mock_hb):
+    """task_spec 是唯一保留 claim 的系统类：它是派发记录，route_to_ccs 不投它。
+
+    _is_for_me 对「@你 + task_spec」显式返回 False（引擎三个写入者写完都自己
+    ccs send 过正文）。若这里也不 claim，它既不 claim 也不投，永远留在视图里
+    每 60s 重扫 —— 存量 528 条、中位年龄 100h、最老 111h。
+    """
+    from routing.routes import route_all
+    msgs = [{"id": 203, "category": "task_spec", "text": "工作流任务 wf_x",
+             "priority": 1, "consumers": ["engineer"]}]
+    mock_router = MagicMock()
+    mock_router.routing = {"engineer": {"consume": ["task_spec"]}}
     with patch("routing.auto.poll_unconsumed", return_value=msgs), \
          patch("routing.routes._rt_mod") as mock_rt_mod, \
          patch("bus_protocol.Blackboard"), \
