@@ -71,7 +71,7 @@ def _alert_aged_queue(*, now: float | None = None) -> int:
         return 0
     from bus_protocol import Blackboard
     from routing.router import get_router
-    import re as _re
+    from routing.routes import mentions
 
     bb = Blackboard()
     aged: list[tuple[str, int, int, float]] = []
@@ -80,7 +80,7 @@ def _alert_aged_queue(*, now: float | None = None) -> int:
                    if f.cat not in _QUEUE_ALERT_OWNED_CATS
                    and not (f.t or "").startswith(_QUEUE_ALERT_TITLE)
                    and now - f.ts > _QUEUE_ALERT_HOURS * 3600
-                   and role in _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", f.t or "")]
+                   and role in mentions(f.t or "")]
         if pending:
             oldest = min(pending, key=lambda f: f.ts)
             aged.append((role, len(pending), oldest.id, now - oldest.ts))

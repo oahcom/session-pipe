@@ -72,6 +72,20 @@ _CONTENT_WORDS = ("修复", "实现", "设计", "调研", "分析", "测试", "�
 # 模块头注释里已声明的「问题/发现/建议」类：内容本身即待办，不靠动词判定。
 _CONTENT_SIGNAL_CATEGORIES = frozenset({"bug_report", "design_issue", "optimization"})
 
+# ── 定向提及 @role ──
+# 服务名里的 @ 不是提及：`ccs@consumer` / `ccs@pm.service` 被当成 @consumer 后，
+# 路由据此收窄接收者（本文件 :248）并丢弃订阅者（本文件 :439 `return not tags or directed`）。
+# 实测 3000 条事实里误判 13 条，全是 ccs@<role>[.service]；真提及的 @ 前只有
+# 空格 255 / 行首 71 / "[" 57 / "，" 2 / "(" 2 / "→" 1 —— 没有一例是标识符字符。
+# 故：@ 前必须是行首或非标识符字符（标识符含 "."，把 ccs@pm.service 整个算作一个词）。
+MENTION_RE = re.compile(r"(?<![A-Za-z0-9_.])@([a-zA-Z_][a-zA-Z0-9_-]*)")
+
+
+def mentions(text: str) -> list[str]:
+    """正文里被 @ 的角色名（服务名里的 @ 不算）。"""
+    return MENTION_RE.findall(text or "")
+
+
 def _has_content_words(title: str, category: str = "") -> bool:
     """标题是否含内容性动词（防 'ok'/'hi'/'x' 这类纯占位标题生成无意义 workflow）。
 
@@ -210,7 +224,6 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
         details: list[dict] = []
         # 构建分配计划
         assignments: list[dict] = []
-        import re as _re
         for msg in messages:
             if "error" in msg:
                 continue
@@ -232,13 +245,12 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
             consumers = msg.get("consumers", [])
             # @role 定向路由：@target 的消息只给 target，其他角色跳过
             _text = msg.get("text", "")
-            _tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", _text)
+            _tags = mentions(_text)
             if _tags:
                 consumers = [c for c in consumers if c in _tags]
             # 定向派单只认**首行**的 @tag：正文里顺带提到的角色（"见 @engineer 的回复"）
             # 不该被拉进派发。首行 tag 是派单约定（[@devops] / [@devops @ccs-monitor]）。
-            _head_tags = [t for t in _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)",
-                                                 _text.split("\n")[0])
+            _head_tags = [t for t in mentions(_text.split("\n")[0])
                           if t in router.routing]
             if _head_tags:
                 # 定向接收者未必订阅该分类（devops 不订阅 code_review），
@@ -386,7 +398,6 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
     # 消费该角色未消费的消息
     raw_msgs = _poll(consumer=role_name, limit=category_limit * 3)
     # 定向过滤：@target_role 的消息只给 target role，其他角色跳过不消费
-    import re as _re
     # 容错：get_router() 在测试中被 mock 成 MagicMock 时 routing 是 MagicMock，
     # .get(...) 返回 MagicMock 而非 list，in/not in 判断行为不可靠 → 显式校验类型，
     # 非 list 时退化为"不过滤"，保持旧行为（与未加过滤前一致）。
@@ -408,7 +419,7 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
         if _is_self_echo(msg, role_name):
             return False
         text = msg.get("text", "")
-        tags = _re.findall(r"@([a-zA-Z_][a-zA-Z0-9_-]*)", text)
+        tags = mentions(text)
         directed = role_name in tags
         # 定向消息绕过分类过滤：有人明确 @ 你，比你的默认订阅列表优先级高。
         # 实测 24h 内 62 条 @engineer 有 26 条（42%）因分类不在 consume 列表被丢，
