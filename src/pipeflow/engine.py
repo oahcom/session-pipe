@@ -417,7 +417,7 @@ from pipeflow.step_handler import StepHandlerMixin, _queue_budget_sec
 from pipeflow.role_lifecycle import RoleLifecycleMixin, role_erroring
 from pipeflow.task_generator import TaskGeneratorMixin
 from pipeflow.wf_lifecycle import (SYSTEM_REWORK_TPL, WorkflowLifecycleMixin,
-                                   _role_producing_recently)
+                                   _corrected_age_s, _role_producing_recently)
 
 
 # 单 tick 预算：实测 16 个实例一轮 run_once 耗时 399s（2026-10-22 03:31 隔离探针），
@@ -993,9 +993,11 @@ class WorkflowEngine(WorkflowLifecycleMixin, TaskGeneratorMixin, RoleLifecycleMi
         # 最小存活时间保护：创建不足 5 分钟的工作流禁止 cancel。
         # 防止"通知角色后 32 秒即被取消"的误杀（bus #158145：s1 响应窗口仅 32s）。
         # ponytail: 5 分钟是保守值，正式角色多数 5 分钟内会响应；超时取消不受此限制（走 _tick 路径）。
+        # 用校正龄：墙钟前跳后 time.time()-created 会虚增 9h+，本保护被绕过（见 _corrected_age_s）。
         _created = row["created_at"] or 0
-        if time.time() - _created < 300:
-            LOGGER.warning("cancel rejected: %s 创建不足 5 分钟 (age=%.0fs)，拒绝取消", wid, time.time() - _created)
+        _age_s = _corrected_age_s(time.time(), _created)
+        if _age_s < 300:
+            LOGGER.warning("cancel rejected: %s 创建不足 5 分钟 (age=%.0fs)，拒绝取消", wid, _age_s)
             return False
         # 人工取消必须留下"谁、为什么"：05:23:40 六链同秒取消只能靠 /tmp 的脚本
         # 回显反推执行者（coordinator #429916），库里一条理由都没有。

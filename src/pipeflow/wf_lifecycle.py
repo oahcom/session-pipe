@@ -211,6 +211,92 @@ def _resolve_loop_max_iter(max_iter: int, value_gate_file: str, wf_id: str, logg
     return max_iter or 0
 
 
+# ── 墙钟前跳校正 ────────────────────────────────────────────────
+# WSL2 宿主挂起恢复后，guest 墙钟被外部 step（实测 2026-10-30 +8.14h、
+# 2026-11-02 +9.561h），而 CLOCK_MONOTONIC 不计挂起时长。回收器用
+# now - created_at 算年龄，跳变后所有在跑实例年龄一次性放大：
+#   10-30 三条真实龄 3.05h 的链报「运行7h」被杀（bus #469787）
+#   11-02 wf_d0ea6941a0 真实龄 0.40h 报「运行10h」（bus #477117）
+#
+# 不能只跳过跳变当轮：实测下一 tick（+10s）年龄仍是 9.96h，等于把误杀推迟 10 秒。
+# 也不能用 uptime 做上界：开机 6h 后建的 0.3h 实例，min(9.86, 6.3)=6.3h 仍过 2h 阈值。
+#
+# 做法：持久化墙钟跳变事件列表。每 tick 看一次 (墙钟-单调) 偏移，偏移突变即跳变，
+# 记下 (跳变时的墙钟, 增量)。算年龄时只扣**实例创建之后**发生的跳变：
+# 创建前就发生的跳变已经烙进 created_at 本身，再扣一次会少算。
+_CLOCK_ANCHOR_PATH = _paths_mod.HERMES_STATE / "clock-anchor.json"
+_CLOCK_JUMP_TOLERANCE_S = 120.0   # tick 间隔 10s，正常 NTP 微调 << 此值
+_CLOCK_JUMP_KEEP = 50             # 只留最近 50 次，防文件无限增长
+_CLOCK_JUMPS: list[dict] = []
+_CLOCK_JUMPS_LOADED = False
+
+
+def _ensure_jumps_loaded() -> None:
+    """首次用到时把落盘的跳变列表读进内存（daemon 重启后不丢历史事件）。
+
+    自加载而非挂 _observe_clock：engine.cancel() 也要查年龄，但它不在回收器
+    的 tick 路径上，靠 `_observe_clock` 先跑一遍就永远拿不到历史跳变。
+    """
+    global _CLOCK_JUMPS, _CLOCK_JUMPS_LOADED
+    if _CLOCK_JUMPS_LOADED:
+        return
+    try:
+        _d = json.loads(_CLOCK_ANCHOR_PATH.read_text(encoding="utf-8"))
+        _CLOCK_JUMPS = [e for e in _d.get("jumps", []) if isinstance(e, dict)]
+    except (OSError, ValueError, TypeError):
+        _CLOCK_JUMPS = []
+    _CLOCK_JUMPS_LOADED = True
+
+
+def _observe_clock(wall: float, mono: float) -> None:
+    """观测一次 (墙钟, 单调)，把跳变事件记下来。
+
+    每条 tick 调一次。偏移相对上次观测突变超过容忍阈即认定为跳变；
+    单调时钟不会跳，差值全来自墙钟 step。
+    """
+    global _CLOCK_JUMPS
+    _ensure_jumps_loaded()
+
+    _offset = wall - mono
+    try:
+        _prev_off = float(json.loads(
+            _CLOCK_ANCHOR_PATH.read_text(encoding="utf-8")).get("offset", _offset))
+    except (OSError, ValueError, TypeError):
+        _prev_off = _offset          # 首次运行 / 锚点损坏：当无跳变，别让 tick 挂掉
+
+    _delta = _offset - _prev_off
+    if abs(_delta) > _CLOCK_JUMP_TOLERANCE_S:
+        _CLOCK_JUMPS.append({"at": wall, "delta": _delta})
+        del _CLOCK_JUMPS[:-_CLOCK_JUMP_KEEP]
+        LOGGER.warning("检测到墙钟跳变 %.1fs（已记录 %d 次），年龄按校正值计算",
+                       _delta, len(_CLOCK_JUMPS))
+
+    try:
+        _CLOCK_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CLOCK_ANCHOR_PATH.write_text(json.dumps(
+            {"jumps": _CLOCK_JUMPS, "offset": _offset, "wall": wall, "mono": mono}),
+            encoding="utf-8")
+    except OSError as _e:
+        LOGGER.debug("clock anchor 写盘失败: %s", _e)
+
+
+def _corrected_age_s(wall: float, created: float) -> float:
+    """实例年龄（秒），只扣除实例创建**之后**发生的墙钟跳变。
+
+    创建前的跳变已烙进 created_at；再扣一次会让老实例少算年龄 → 永不回收。
+    """
+    if not created:
+        return 0.0
+    _ensure_jumps_loaded()
+    _drift = sum(float(e.get("delta") or 0.0) for e in _CLOCK_JUMPS
+                 if float(e.get("at") or 0.0) > created)
+    # ponytail: 扣过头钳到 0（实例暂时"重生"、回收被推迟），绝不反向虚增；
+    # 大跨度回拨时 at 落在 created 之前扣不到，同样只推迟。天花板 = 只推迟不误杀，
+    # 升级路径 = 若真观测到回拨误判，改存单调时钟基准点替代 at。
+    return max((wall - created) - _drift, 0.0)
+
+
+
 class WorkflowLifecycleMixin:
     """WorkflowEngine 的工作流生命周期 mixin。"""
 
@@ -255,6 +341,11 @@ class WorkflowLifecycleMixin:
         """
         from pipeflow.engine import ZOMBIE_TEMPLATES as _ZOMBIE_TEMPLATES
         now = time.time()
+        # 墙钟被 WSL2 挂起恢复 step 后（实测 2026-10-30 +8.14h、2026-11-02 +9.561h），
+        # now - created_at 会把在跑实例的年龄一次性放大。校正见 _corrected_age_s。
+        _mono_now = time.monotonic()
+        _observe_clock(now, _mono_now)
+
         _recycled: list[tuple[str, str, str]] = []  # (template, wf_id, reason) —— 循环外汇总通知
         try:
             for row in lm.query(
@@ -268,7 +359,8 @@ class WorkflowLifecycleMixin:
                 wf_id = d["instance_id"]
                 tpl = d.get("template_id", "?")
                 created = d.get("created_at", 0)
-                age_h = (now - created) / 3600 if created else 0
+                # 年龄改用校正值：跳变后 now-created 会虚增（见 _corrected_age_s）
+                age_h = _corrected_age_s(now, created) / 3600
                 sr = json.loads(d.get("step_results") or "{}")
 
                 max_tc = max(
@@ -278,7 +370,7 @@ class WorkflowLifecycleMixin:
 
                 # 最小存活时间保护：创建于 5 分钟之内的 workflow 不自动回收。
                 # 防止"刚通知角色就被 stale cleanup 误杀"（bus #158145：32s 被 cancel）。
-                age_s = now - created if created else 0
+                age_s = _corrected_age_s(now, created)
                 if age_s < 300:
                     continue
 
