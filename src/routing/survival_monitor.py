@@ -526,24 +526,35 @@ class SurvivalMonitor:
         for role in roles:
             prev = self._cache.get(role, {})
             l1 = self._l1_check(role)
-            l2 = (self._l2_check(role) if l1["status"] == "ALIVE"
-                  and now - prev.get("l2_ts", 0) > 120 else prev.get("l2", {}))
+            # 探针只在到点时才跑；拿**缓存值**也把 ts 前移会让 TTL 永不成立——
+            # 实测 120 个 tick（60s 间隔、2h）L2/L3/L4 各只跑 1 次，#477193 的
+            # 「最近产出 43390s」因此冻结在 03:48 那次探针上，12:54 告警时仍照抄。
+            # L1 非 ALIVE（无 pane）时 L2/L4 不可测，必须退化为 {}：沿用上次 ALIVE
+            # 的样本会把「pane 消失前 thinking=True」渲染成当前状态（同一条告警）。
+            _alive = l1["status"] == "ALIVE"
+            _run_l2 = _alive and now - prev.get("l2_ts", 0) > 120
+            l2 = self._l2_check(role) if _run_l2 else (
+                prev.get("l2", {}) if _alive else {})
             # pane 静默时更依赖 L3/L4 救场，因此 thinking=False 反而要刷新 L3，
             # 不能拿 300s 前的旧值（首轮甚至是空 dict）判 stale。
             _l3_ttl = (L3_CACHE_TTL_ACTIVE_S if l2.get("thinking") is False
                        else L3_CACHE_TTL_IDLE_S)
-            l3 = (self._l3_check(role)
-                  if now - prev.get("l3_ts", 0) > _l3_ttl else prev.get("l3", {}))
-            l4 = (self._l4_check(role) if l1["status"] == "ALIVE"
-                  and now - prev.get("l4_ts", 0) > L4_CACHE_TTL_S else prev.get("l4", {}))
+            _run_l3 = now - prev.get("l3_ts", 0) > _l3_ttl
+            l3 = self._l3_check(role) if _run_l3 else prev.get("l3", {})
+            _run_l4 = _alive and now - prev.get("l4_ts", 0) > L4_CACHE_TTL_S
+            l4 = self._l4_check(role) if _run_l4 else (
+                prev.get("l4", {}) if _alive else {})
+            _l2_ts = now if _run_l2 else (prev.get("l2_ts", 0) if _alive else 0)
+            _l3_ts = now if _run_l3 else prev.get("l3_ts", 0)
+            _l4_ts = now if _run_l4 else (prev.get("l4_ts", 0) if _alive else 0)
             overall = self._overall(l1, l2, l3, l4)
             # R3: 注入 lifecycle（idle 回收判断用）
             _lifecycle = _load_role_lifecycles().get(role, "ondemand")
             result = {
                 "l1": l1, "l1_ts": now,
-                "l2": l2, "l2_ts": now if "thinking" in l2 else prev.get("l2_ts", 0),
-                "l3": l3, "l3_ts": now if "producing" in l3 else prev.get("l3_ts", 0),
-                "l4": l4, "l4_ts": now if "work_evidence" in l4 else prev.get("l4_ts", 0),
+                "l2": l2, "l2_ts": _l2_ts,
+                "l3": l3, "l3_ts": _l3_ts,
+                "l4": l4, "l4_ts": _l4_ts,
                 "overall": overall,
                 "lifecycle": _lifecycle,
             }

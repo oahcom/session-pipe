@@ -461,5 +461,89 @@ class TestIdleReclaimTmuxHost:
             f"非房东的 ondemand 角色仍须回收；实际 kills={kills}"
 
 
+class TestProbeCacheTTL:
+    """探针缓存必须真的过期——否则整个 daemon 生命周期只探一次（#477193）。"""
+
+    @staticmethod
+    def _clock(monkeypatch, base):
+        monkeypatch.setattr(sm.time, "time", lambda: base)
+
+    def test_cached_probe_values_do_not_renew_their_ttl(self, monitor, monkeypatch):
+        """L2/L3/L4 复用缓存值时 ts 不得前移。
+
+        回归：`"l3_ts": now if "producing" in l3` 对缓存值同样成立（缓存里就有该键），
+        于是每个 tick 都把 ts 刷成 now，`now - ts > TTL` 永不成立。实测 120 个 tick
+        （60s 间隔、2h）L2/L3/L4 各只跑 1 次，「最近产出 43390s 前」冻结在 03:48 那次探针。
+        """
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
+        monkeypatch.setattr(monitor, "_l1_check",
+                            lambda r: {"status": "ALIVE", "tmux_alive": True,
+                                       "has_sentinel": True})
+        calls = {"l2": 0, "l3": 0, "l4": 0}
+
+        def _l2(r):
+            calls["l2"] += 1
+            return {"thinking": False, "detail": "pane_age=1s"}
+
+        def _l3(r):
+            calls["l3"] += 1
+            return {"producing": False, "detail": "最近产出 1s 前"}
+
+        def _l4(r):
+            calls["l4"] += 1
+            return {"work_evidence": False, "detail": "x"}
+
+        monkeypatch.setattr(monitor, "_l2_check", _l2)
+        monkeypatch.setattr(monitor, "_l3_check", _l3)
+        monkeypatch.setattr(monitor, "_l4_check", _l4)
+        monkeypatch.setattr(monitor, "_write_health", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_write_bus", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: True, raising=False)
+
+        base = time.time()
+        for i in range(120):                      # 120 tick × 60s = 2h
+            self._clock(monkeypatch, base + i * 60.0)
+            monitor.tick()
+
+        # 120s TTL / 60s tick → 每 3 tick 一次；120s 窗口共 2h ⇒ 至少 30 次
+        assert calls["l2"] >= 30, f"L2 探针被缓存冻结：2h 只跑 {calls['l2']} 次"
+        assert calls["l4"] >= 30, f"L4 探针被缓存冻结：2h 只跑 {calls['l4']} 次"
+        assert calls["l3"] >= 30, f"L3 探针被缓存冻结：2h 只跑 {calls['l3']} 次"
+
+    def test_l2_cache_not_reported_after_pane_disappears(self, monitor, monkeypatch):
+        """pane 消失后不得沿用上次 ALIVE 的 thinking=True。
+
+        回归：L1 变 ORPHAN 时 `_l2_check` 不再执行，`prev["l2"]` 原样沿用到告警里，
+        #477193 因此渲染成 `pane_age=0s | L2=True`——那是 pane 消失前的样本。
+        """
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        l1 = {"status": "ALIVE", "tmux_alive": True, "has_sentinel": True}
+        monkeypatch.setattr(monitor, "_l1_check", lambda r: l1)
+        monkeypatch.setattr(monitor, "_l2_check",
+                            lambda r: {"thinking": True, "detail": "pane_age=0s"})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": False})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": True})
+        monkeypatch.setattr(monitor, "_write_health", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_write_bus", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(monitor, "_cleanup_dead", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_cleanup_orphan", lambda *a, **k: None)
+
+        base = time.time()
+        self._clock(monkeypatch, base)
+        monitor.tick()
+        assert monitor._cache["qa"]["l2"]["thinking"] is True
+
+        l1 = {"status": "ORPHAN", "tmux_alive": False, "has_sentinel": True}
+        self._clock(monkeypatch, base + 3600)
+        monitor.tick()
+        assert monitor._cache["qa"]["l2"] == {}, \
+            "pane 已消失，L2 不得沿用旧样本：读到 True 会让人以为角色还在思考"
+        assert monitor._cache["qa"]["l2_ts"] == 0
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
