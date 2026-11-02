@@ -328,7 +328,6 @@ class WorkflowLifecycleMixin:
             LOGGER.warning("孤儿任务回收失败: %s", _e)
             return 0
 
-
     def _cleanup_stale_workflows(self, lm):
         """自动取消僵尸 workflow。
 
