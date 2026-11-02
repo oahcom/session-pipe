@@ -227,6 +227,7 @@ def _resolve_loop_max_iter(max_iter: int, value_gate_file: str, wf_id: str, logg
 _CLOCK_ANCHOR_PATH = _paths_mod.HERMES_STATE / "clock-anchor.json"
 _CLOCK_JUMP_TOLERANCE_S = 120.0   # tick 间隔 10s，正常 NTP 微调 << 此值
 _CLOCK_JUMP_KEEP = 50             # 只留最近 50 次，防文件无限增长
+_CLOCK_JUMP_MAX_S = 7 * 24 * 3600  # 超过 7 天必是文件损坏，不是时钟跳变
 _CLOCK_JUMPS: list[dict] = []
 _CLOCK_JUMPS_LOADED = False
 
@@ -242,7 +243,11 @@ def _ensure_jumps_loaded() -> None:
         return
     try:
         _d = json.loads(_CLOCK_ANCHOR_PATH.read_text(encoding="utf-8"))
-        _CLOCK_JUMPS = [e for e in _d.get("jumps", []) if isinstance(e, dict)]
+        # 丢弃不可能的跳变：真实跳变在秒级~小时级，7 天已是极端上界。
+        # 文件被写脏时会出现 delta≈1.8e9 的事件，载入后会把所有实例年龄归零。
+        _CLOCK_JUMPS = [e for e in _d.get("jumps", [])
+                        if isinstance(e, dict)
+                        and abs(float(e.get("delta") or 0.0)) <= _CLOCK_JUMP_MAX_S]
     except (OSError, ValueError, TypeError):
         _CLOCK_JUMPS = []
     _CLOCK_JUMPS_LOADED = True
@@ -265,12 +270,17 @@ def _observe_clock(wall: float, mono: float) -> None:
         _prev_off = _offset          # 首次运行 / 锚点损坏：当无跳变，别让 tick 挂掉
 
     _delta = _offset - _prev_off
-    if abs(_delta) > _CLOCK_JUMP_TOLERANCE_S:
+    # 只认可信输入：offset = wall - mono，真实值必与 wall 同一量级
+    # （差的是开机时长，远小于 epoch 秒数）。文件被写坏（offset=0 等）时
+    # _prev_off 会小几个量级，delta≈wall（~1.8e9）——记进跳变列表会扣掉 56 年。
+    if abs(_delta) > _CLOCK_JUMP_TOLERANCE_S and abs(_delta) <= _CLOCK_JUMP_MAX_S:
         _CLOCK_JUMPS.append({"at": wall, "delta": _delta})
         del _CLOCK_JUMPS[:-_CLOCK_JUMP_KEEP]
         LOGGER.warning("检测到墙钟跳变 %.1fs（已记录 %d 次），年龄按校正值计算",
                        _delta, len(_CLOCK_JUMPS))
-
+    elif abs(_delta) > _CLOCK_JUMP_TOLERANCE_S:
+        LOGGER.error("clock anchor 跳变 %.1fs 超过 %ds 上界，"
+                     "判定为文件损坏而非时钟跳变，已忽略", _delta, _CLOCK_JUMP_MAX_S)
     try:
         _CLOCK_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
         _CLOCK_ANCHOR_PATH.write_text(json.dumps(

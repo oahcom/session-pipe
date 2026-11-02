@@ -166,3 +166,37 @@ def test_corrected_age_self_loads_from_disk(tmp_path, monkeypatch):
     age_h = wf_lifecycle._corrected_age_s(created + 120 + jump, created) / 3600
     assert wf_lifecycle._CLOCK_JUMPS_LOADED is True, "应自加载而不依赖 _observe_clock 先跑"
     assert abs(age_h - 120 / 3600) < 1e-6, f"自加载后应得 0.033h，实得 {age_h:.3f}h"
+
+
+def test_corrupt_anchor_offset_is_not_recorded_as_jump(tmp_path, monkeypatch):
+    """文件被写坏（offset=0）时 delta 会是 wall 本身，绝不能当成跳变记账。
+
+    实测：锚点模板写 offset=0 后，daemon 记下 delta=1.79e9 的事件，
+    它会让全部实例年龄被扣 56 年（年龄钳到 0，所有回收失效）。
+    """
+    anchor = tmp_path / "clock-anchor.json"
+    monkeypatch.setattr(wf_lifecycle, "_CLOCK_ANCHOR_PATH", anchor)
+    _reset([])
+    wall = 1_793_605_000.0
+    anchor.write_text(json.dumps({"jumps": [], "offset": 0.0}), encoding="utf-8")
+
+    wf_lifecycle._observe_clock(wall=wall, mono=100.0)   # offset=wall-100，delta≈wall
+    assert wf_lifecycle._CLOCK_JUMPS == [], \
+        f"损坏的 offset 不得记成跳变，实记录了 {wf_lifecycle._CLOCK_JUMPS}"
+
+
+def test_dirty_jump_events_dropped_on_load(tmp_path, monkeypatch):
+    """载入时丢弃 |delta| >= at 的事件，防止历史污染永久生效。"""
+    anchor = tmp_path / "clock-anchor.json"
+    monkeypatch.setattr(wf_lifecycle, "_CLOCK_ANCHOR_PATH", anchor)
+    anchor.write_text(json.dumps({"jumps": [
+        {"at": 1_000_060.0, "delta": 34_419.6},          # 测试残留（合法形状）
+        {"at": 1_793_601_079.8, "delta": 1_793_585_045.9},  # 损坏（56 年）
+    ]}), encoding="utf-8")
+    wf_lifecycle._CLOCK_JUMPS = []
+    wf_lifecycle._CLOCK_JUMPS_LOADED = False
+
+    wf_lifecycle._ensure_jumps_loaded()
+    assert len(wf_lifecycle._CLOCK_JUMPS) == 1, \
+        f"损坏事件应被丢弃，实得 {wf_lifecycle._CLOCK_JUMPS}"
+
