@@ -21,18 +21,18 @@
   `routes.py` 661 vs 670。
 - systemd drop-in 把两个服务都指向运行树：
   `~/.config/systemd/user/workflow-engine.service.d/20-live-tree.conf:6`
-  `ExecStart=/home/administrator/miniforge3/bin/python3 -u /home/administrator/wt-live/src/pipeflow/daemon.py --interval 10`；
-  `session-pipeline-daemon.service.d/20-live-tree.conf:10` 同样指向 `wt-live/src/routing_daemon.py`。
+  `ExecStart=/home/administrator/miniforge3/bin/python3 -u /home/administrator/~/wt-live/src/pipeflow/daemon.py --interval 10`；
+  `session-pipeline-daemon.service.d/20-live-tree.conf:10` 同样指向 `~/wt-live/src/routing_daemon.py`。
 
 因此本文所有 `file:line` 指向仓库 `0aed2c3`，与线上代码有已知差异。结构性结论（生命周期、
 状态存储、判据体系、跨仓库接口）我在运行树上抽查复核过：
-`_CLOSE_STATUSES`（`wt-live/src/lifecycle/manager.py:672`）、
-`wait_roles` 逐角色补查循环（`wt-live/src/pipeflow/step_handler.py:2220`）、
-pipeline 全树 grep `ALLOWED_ROLES` 与四角色字面量均 0 命中（`wt-live/src` 同结果）。
+`_CLOSE_STATUSES`（`~/wt-live/src/lifecycle/manager.py:672`）、
+`wait_roles` 逐角色补查循环（`~/wt-live/src/pipeflow/step_handler.py:2220`）、
+pipeline 全树 grep `ALLOWED_ROLES` 与四角色字面量均 0 命中（`~/wt-live/src` 同结果）。
 涉及行号与行数的细节以本树为准并注明。
 
 **实测进程状态**（`pgrep -af`，只读）：只有 `pipeflow/daemon.py` 在跑
-（PID 1013237，`/home/administrator/wt-live/src/pipeflow/daemon.py --interval 10`）。
+（PID 1013237，`/home/administrator/~/wt-live/src/pipeflow/daemon.py --interval 10`）。
 `routing_daemon` **没有存活进程**；`~/.config/systemd/user/default.target.wants/` 里
 只有 `workflow-engine.service`，**没有** `session-pipeline-daemon.service`。
 即当前生产上"路由分发"这一半是停的，只有"工作流推进"这一半在跑。
@@ -501,8 +501,8 @@ L4 DB 步骤扫描显示 `busy=True`，**不 short-circuit** 回 `busy=False`（
 
 | 单元 | ExecStart | 判定 | 实测 |
 |---|---|---|---|
-| user `workflow-engine.service` | `wt-live/src/pipeflow/daemon.py --interval 10` | **必需**（唯一推进循环） | 在 `default.target.wants/`；进程在跑（PID 1013237） |
-| user `session-pipeline-daemon.service` | `wt-live/src/routing_daemon.py` | **必需**（唯一路由分发） | **不在 `default.target.wants/`**；**无进程** |
+| user `workflow-engine.service` | `~/wt-live/src/pipeflow/daemon.py --interval 10` | **必需**（唯一推进循环） | 在 `default.target.wants/`；进程在跑（PID 1013237） |
+| user `session-pipeline-daemon.service` | `~/wt-live/src/routing_daemon.py` | **必需**（唯一路由分发） | **不在 `default.target.wants/`**；**无进程** |
 | `/etc/systemd/system/session-pipeline.service` | `pipeflow/daemon.py --interval 10` | **历史遗留** | 文件存在（784B）；不在 `multi-user.target.wants/`；与 user `workflow-engine` 同程序不同树，双启会抢锁 |
 | `/etc/systemd/system/session-routing.service` | — | **已停用** | 是 `/dev/null` 的符号链接；同目录另有 `session-routing.service.disabled`（610B） |
 | user `cron-worker.service` | `~/.hermes/scripts/cron_worker_wrapper.py` | 非 pipeline 所有 | 在 `default.target.wants/` |
