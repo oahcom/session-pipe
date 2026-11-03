@@ -85,3 +85,7 @@ src/
 4. 消息推送前检查 CCS 是否运行
 5. 零外部依赖
 6. 每个修改必须通过测试
+
+---
+## 当前架构（按代码实测）
+`/home/administrator/session-launcher/docs/CCS-CURRENT-ARCHITECTURE.md` — 三仓库依赖方向（本仓对 launcher 只走子进程）、共享 DB schema 漂移、文档生死地图。
