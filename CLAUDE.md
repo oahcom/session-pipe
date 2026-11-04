@@ -65,7 +65,7 @@ src/
     step_handler.py   ── 步骤处理（2246 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1501 行）
     task_generator.py ── 任务生成（1058 行）
-    wf_lifecycle.py   ── 工作流生命周期（2344 行）
+    wf_lifecycle.py   ── 工作流生命周期（2354 行）
 
     daemon.py         ── 工作流守护 while 循环（376 行）
     integrity.py      ── 完整性提醒（旁路提醒）

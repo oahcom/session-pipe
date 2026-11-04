@@ -219,6 +219,8 @@ def _isolate_clock_anchor(tmp_path, monkeypatch):
     # 跳变列表是模块级全局：不重置则前一个用例的假事件泄漏到下一个
     monkeypatch.setattr(_wf, "_CLOCK_JUMPS", [])
     monkeypatch.setattr(_wf, "_CLOCK_JUMPS_LOADED", False)
+    # mtime 也是全局：残留会让「文件没变」判据命中，用旧列表覆盖 _reset() 注入的值
+    monkeypatch.setattr(_wf, "_CLOCK_ANCHOR_MTIME_NS", 0)
 
 
 @pytest.fixture(autouse=True)

@@ -230,17 +230,27 @@ _CLOCK_JUMP_KEEP = 50             # 只留最近 50 次，防文件无限增长
 _CLOCK_JUMP_MAX_S = 7 * 24 * 3600  # 超过 7 天必是文件损坏，不是时钟跳变
 _CLOCK_JUMPS: list[dict] = []
 _CLOCK_JUMPS_LOADED = False
+_CLOCK_ANCHOR_MTIME_NS: int = 0
 
 
 def _ensure_jumps_loaded() -> None:
-    """首次用到时把落盘的跳变列表读进内存（daemon 重启后不丢历史事件）。
+    """首次用到、或落盘锚点被别的进程改过时，把跳变列表读进内存。
 
     自加载而非挂 _observe_clock：engine.cancel() 也要查年龄，但它不在回收器
     的 tick 路径上，靠 `_observe_clock` 先跑一遍就永远拿不到历史跳变。
+
+    只加载一次不够：_observe_clock 只在 pipeflow daemon 里调，survival_monitor
+    跑在 routing_daemon，只读不写。列表若「进程内加载一次就冻结」，运行期
+    发生的挂起跳变永远进不来——实测真实 60s 被读成 34479s（+34419 未扣）。
     """
-    global _CLOCK_JUMPS, _CLOCK_JUMPS_LOADED
-    if _CLOCK_JUMPS_LOADED:
+    global _CLOCK_JUMPS, _CLOCK_JUMPS_LOADED, _CLOCK_ANCHOR_MTIME_NS
+    try:
+        _mtime = _CLOCK_ANCHOR_PATH.stat().st_mtime_ns
+    except OSError:
+        _mtime = 0
+    if _CLOCK_JUMPS_LOADED and _mtime == _CLOCK_ANCHOR_MTIME_NS:
         return
+    _CLOCK_ANCHOR_MTIME_NS = _mtime
     try:
         _d = json.loads(_CLOCK_ANCHOR_PATH.read_text(encoding="utf-8"))
         # 丢弃不可能的跳变：真实跳变在秒级~小时级，7 天已是极端上界。

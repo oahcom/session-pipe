@@ -200,3 +200,32 @@ def test_dirty_jump_events_dropped_on_load(tmp_path, monkeypatch):
     assert len(wf_lifecycle._CLOCK_JUMPS) == 1, \
         f"损坏事件应被丢弃，实得 {wf_lifecycle._CLOCK_JUMPS}"
 
+
+def test_jumps_written_by_another_process_are_seen(tmp_path, monkeypatch):
+    """跳变由别的进程写盘时，本进程必须看得到（跨进程可见性）。
+
+    生产形态：survival_monitor 跑在 routing_daemon，_observe_clock 只在
+    pipeflow daemon 的 _cleanup_stale_workflows 里调。本进程只读不写，
+    若跳变列表「加载一次就冻结」，运行期发生的挂起跳变永远进不来 ——
+    实测：真实 60s 被读成 34479s（+34419 未扣），c4c94c4 的校正在
+    跳变晚于进程启动时完全失效。
+    """
+    anchor = tmp_path / "clock-anchor.json"
+    monkeypatch.setattr(wf_lifecycle, "_CLOCK_ANCHOR_PATH", anchor)
+    created = 1_000_000.0
+    jump = 34419.0
+    anchor.write_text(json.dumps({"jumps": [], "offset": 0.0}), encoding="utf-8")
+    wf_lifecycle._CLOCK_JUMPS = []
+    wf_lifecycle._CLOCK_JUMPS_LOADED = False
+
+    # 本进程先按「无跳变」算一次（触发首次加载）
+    assert wf_lifecycle._corrected_age_s(created + 60, created) == 60.0
+
+    # 另一个进程（pipeflow daemon）观测到跳变并写盘
+    anchor.write_text(json.dumps({"jumps": [{"at": created + 60, "delta": jump}]}),
+                      encoding="utf-8")
+
+    age_s = wf_lifecycle._corrected_age_s(created + 60 + jump + 60, created)
+    assert abs(age_s - 120.0) < 1e-6, \
+        f"跳变由别的进程写盘后必须被本进程看到：应得 120s，实得 {age_s:.0f}s"
+
