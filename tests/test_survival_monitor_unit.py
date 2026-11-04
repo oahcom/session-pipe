@@ -473,7 +473,8 @@ class TestProbeCacheTTL:
 
         回归：`"l3_ts": now if "producing" in l3` 对缓存值同样成立（缓存里就有该键），
         于是每个 tick 都把 ts 刷成 now，`now - ts > TTL` 永不成立。实测 120 个 tick
-        （60s 间隔、2h）L2/L3/L4 各只跑 1 次，「最近产出 43390s 前」冻结在 03:48 那次探针。
+        （60s 间隔、2h）L2/L3/L4 各只跑 1 次，「最近产出 43390s 前」冻结在 11-02
+        11:48:44(CST) 那次探针上（UTC 渲染是 03:48:44，别照抄）。
         """
         _make_sentinel("qa", sm.SENTINEL_DIR)
         monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
