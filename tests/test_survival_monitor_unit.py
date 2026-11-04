@@ -545,6 +545,62 @@ class TestProbeCacheTTL:
         assert monitor._cache["qa"]["l2_ts"] == 0
 
 
+class TestClockJumpAge:
+    """墙钟跳变后，L2/L3/L4 的年龄必须扣掉跳变量（#477554 实测 +34419s）。
+
+    未校正时：真实只过了 100s 的角色被读成「最近产出 34519s 前」→ producing=False
+    → overall=idle/stale。这不是读数陈旧，是年龄口径错误。
+    """
+
+    @staticmethod
+    def _with_jump(monkeypatch, jump_s, ref, real_age):
+        """造一个「ref 之后发生 jump_s 跳变」的时钟锚点，返回墙钟 now。"""
+        from pipeflow import wf_lifecycle as _wf
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS", [{"at": ref + real_age, "delta": jump_s}])
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS_LOADED", True)
+        return ref + real_age + jump_s
+
+    def test_l3_age_after_clock_jump(self, monitor, monkeypatch):
+        """真实 100s（<600s 窗口）→ 跳变 9.56h 后仍须判 producing=True。"""
+        fact_ts = 1_000_000.0
+        now = self._with_jump(monkeypatch, 34419.0, fact_ts, 100.0)
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=lambda **kw: [
+            SimpleNamespace(cat="code_fix", src="qa", ts=fact_ts)]))
+        monkeypatch.setattr(sm.time, "time", lambda: now)
+
+        result = monitor._l3_check("qa")
+        assert abs(result["age_seconds"] - 100.0) < 1e-6, \
+            f"校正后年龄应为 100s，实得 {result['age_seconds']:.0f}s"
+        assert result["producing"] is True, \
+            "真实龄 100s < 600s 窗口，跳变不该把它推成无产出"
+
+    def test_l2_age_after_clock_jump(self, monitor, monkeypatch):
+        """真实 60s（<300s 阈值）→ 跳变后仍须判 thinking=True。"""
+        activity = 1_000_000.0
+        now = self._with_jump(monkeypatch, 34419.0, activity, 60.0)
+        monkeypatch.setattr(sm, "tmux_snapshot",
+                            lambda *a, **k: {"qa": ("1", str(activity))})
+        monkeypatch.setattr(sm.time, "time", lambda: now)
+
+        result = monitor._l2_check("qa")
+        assert abs(result["pane_age_seconds"] - 60.0) < 1e-6, \
+            f"校正后 pane_age 应为 60s，实得 {result['pane_age_seconds']:.0f}s"
+        assert result["thinking"] is True, "真实龄 60s < 300s，跳变不该把它推成静默"
+
+    def test_age_helper_deducts_only_jumps_after_ref(self, monkeypatch):
+        """L4 两处年龄走同一 helper：ref 之后的跳变要扣，之前的不能扣。"""
+        from pipeflow import wf_lifecycle as _wf
+        ref = 1_000_000.0
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS", [
+            {"at": ref + 50.0, "delta": 34419.0},       # ref 之后 → 扣
+            {"at": ref - 500.0, "delta": 8.14 * 3600},  # ref 之前 → 不扣
+        ])
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS_LOADED", True)
+
+        assert abs(sm._age(ref + 100.0 + 34419.0, ref) - 100.0) < 1e-6
+
+
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

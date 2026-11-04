@@ -15,6 +15,24 @@ from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 
+
+def _age(wall: float, ref: float) -> float:
+    """墙钟龄，扣掉 ref 之后发生的墙钟跳变。
+
+    WSL2 宿主挂起恢复时 guest 墙钟被外部 step，CLOCK_MONOTONIC 不计挂起时长
+    （实测 2026-10-30 +8.14h、2026-11-02 +34419s）。直接用 now - ref 会让所有
+    读数一次性虚增：真实只过了 100s 的角色被判「最近产出 34519s 前」→ idle。
+    校正与回收器同源（pipeflow.wf_lifecycle._corrected_age_s），避免两份口径漂移。
+
+    导入失败时退回原始差值并告警：宁可回到旧行为，也不要让探针崩掉。
+    """
+    try:
+        from pipeflow.wf_lifecycle import _corrected_age_s
+        return _corrected_age_s(wall, ref)
+    except (ImportError, AttributeError) as _e:
+        LOGGER.warning("墙钟校正不可用，年龄退回原始差值: %s", _e)
+        return wall - ref
+
 from liveness import role_hosts_tmux_server, tmux_snapshot   # pane 快照 + 房东判据，与 routing_daemon 共用一份
 
 try:
@@ -173,7 +191,7 @@ class SurvivalMonitor:
                 except (TypeError, ValueError):
                     last_activity = 0.0
         # last_activity == 0 表示无数据（非 epoch 0），标记为 unknown(-1)
-        pane_age = now - last_activity if last_activity > 0 else -1
+        pane_age = _age(now, last_activity) if last_activity > 0 else -1
         # pane_age < 0 表示探测不可用，退化为 unknown 让调用方走 L3 fallback
         thinking = None if pane_age < 0 else pane_age < 300
 
@@ -217,7 +235,7 @@ class SurvivalMonitor:
             facts = self._bb.read(src=role, limit=5)
             if facts:
                 recent_ts = max(float(getattr(f, "ts", 0) or 0) for f in facts)
-                age = now - recent_ts
+                age = _age(now, recent_ts)
                 producing = age < 600
 
                 # 分类覆盖度
@@ -279,7 +297,7 @@ class SurvivalMonitor:
                     default=0.0,
                 )
                 if latest:
-                    transcript_age = now - latest
+                    transcript_age = _age(now, latest)
         except OSError as e:
             transcript_age = None
             errors.append(f"transcript_probe_failed: {e}")
@@ -324,7 +342,7 @@ class SurvivalMonitor:
                                 if isinstance(value, (int, float)) and value > 0:
                                     stamps.append(float(value))
                 if stamps:
-                    workflow_age = now - max(stamps)
+                    workflow_age = _age(now, max(stamps))
         except (OSError, sqlite3.Error, ValueError) as e:
             workflow_age = None
             errors.append(f"workflow_probe_failed: {e}")
