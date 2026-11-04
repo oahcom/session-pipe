@@ -229,3 +229,32 @@ def test_jumps_written_by_another_process_are_seen(tmp_path, monkeypatch):
     assert abs(age_s - 120.0) < 1e-6, \
         f"跳变由别的进程写盘后必须被本进程看到：应得 120s，实得 {age_s:.0f}s"
 
+
+def test_failed_reload_keeps_last_known_jumps(tmp_path, monkeypatch):
+    """锚点读到一半（别的进程非原子写）时，不得丢掉已有的校正。
+
+    旧写法先把 mtime 记为「已加载」再读，读失败又把列表清空 —— 该 tick
+    的年龄退回未校正值，且下次文件变化前不会再重试。保留上次列表，
+    不推进 mtime，让下次调用重试。
+    """
+    anchor = tmp_path / "clock-anchor.json"
+    monkeypatch.setattr(wf_lifecycle, "_CLOCK_ANCHOR_PATH", anchor)
+    created = 1_000_000.0
+    jump = 1000.0
+    anchor.write_text(json.dumps({"jumps": [{"at": created + 100, "delta": jump}]}),
+                      encoding="utf-8")
+    wf_lifecycle._CLOCK_JUMPS = []
+    wf_lifecycle._CLOCK_JUMPS_LOADED = False
+    wf_lifecycle._CLOCK_ANCHOR_MTIME_NS = 0
+
+    first = wf_lifecycle._corrected_age_s(created + 100 + jump + 100, created)
+    assert abs(first - 200.0) < 1e-6, f"首次校正应得 200s，实得 {first:.0f}s"
+
+    anchor.write_text("{ this is not json", encoding="utf-8")   # 写到一半
+    wf_lifecycle._CLOCK_ANCHOR_MTIME_NS = 0                      # 强制判为「变了」
+
+    second = wf_lifecycle._corrected_age_s(created + 100 + jump + 100, created)
+    assert abs(second - 200.0) < 1e-6, \
+        f"读失败不得丢掉已有校正：应得 200s，实得 {second:.0f}s"
+    assert len(wf_lifecycle._CLOCK_JUMPS) == 1, "读失败不得清空跳变列表"
+

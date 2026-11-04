@@ -250,7 +250,6 @@ def _ensure_jumps_loaded() -> None:
         _mtime = 0
     if _CLOCK_JUMPS_LOADED and _mtime == _CLOCK_ANCHOR_MTIME_NS:
         return
-    _CLOCK_ANCHOR_MTIME_NS = _mtime
     try:
         _d = json.loads(_CLOCK_ANCHOR_PATH.read_text(encoding="utf-8"))
         # 丢弃不可能的跳变：真实跳变在秒级~小时级，7 天已是极端上界。
@@ -259,7 +258,10 @@ def _ensure_jumps_loaded() -> None:
                         if isinstance(e, dict)
                         and abs(float(e.get("delta") or 0.0)) <= _CLOCK_JUMP_MAX_S]
     except (OSError, ValueError, TypeError):
-        _CLOCK_JUMPS = []
+        # 读失败（别的进程正在非原子写）不能清空已有校正：那会让本 tick 的
+        # 年龄退回未校正值。保留上次列表，且不推进 mtime —— 下次调用重试。
+        return
+    _CLOCK_ANCHOR_MTIME_NS = _mtime
     _CLOCK_JUMPS_LOADED = True
 
 
