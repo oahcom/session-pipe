@@ -461,6 +461,94 @@ class TestIdleReclaimTmuxHost:
             f"非房东的 ondemand 角色仍须回收；实际 kills={kills}"
 
 
+class TestIdleReclaimUnreachable:
+    """钉住：idle 回收分支当前不可达，别把它当成正在生效的止血阀。
+
+    改动的实证价值有两部分，必须分开说，不能混成「修了一个误杀」：
+    1) 原守卫 `has_sentinel and status==ALIVE` 与 ALIVE 定义同义反复，恒真，
+       所以回收分支从未执行。本次把它换成「L2 不可判」——真值表等价（13 个
+       idle 输入格零差异），但让代码不再依赖一条被定义蕴含的条件。
+       **没有修掉任何已发生的误杀**：旧码在这个网格上也不会 kill。
+    2) 真正新增的保护是意念性的：没有它，一旦将来有人把 L2 不可判也算成空闲，
+       就会在 window_activity 读不到时 kill 角色。
+    若将来改 _overall 的 idle 定义、或在没有 L2 数据时也允许回收，本用例会红。
+    本类用例在改动前的代码上同样通过（已验证）——它钉的是「回收不可达」这个
+    性质，不是某次修复。
+    """
+
+    def _run_one_cell(self, monitor, monkeypatch, status, thinking, producing, work, tmp_path):
+        """把一组信号喂给真正的 tick()，返回是否发生了 kill。"""
+        monkeypatch.setattr(sm, "_load_role_lifecycles", lambda: {"qa": "ondemand"})
+        tmux_ent = {"qa": ("1", "0")} if status == "ALIVE" else {}
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: tmux_ent)
+        monkeypatch.setattr(monitor, "_l1_check", lambda r: {
+            "status": status, "tmux_alive": status == "ALIVE", "has_sentinel": True})
+        monkeypatch.setattr(monitor, "_l2_check", lambda r: {"thinking": thinking})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": producing})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": work})
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: False, raising=False)
+        monitor._state["qa"] = {"idle_count": 5}
+        calls = []
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run",
+                            lambda cmd, **kw: calls.append(list(cmd)) or MagicMock(returncode=0))
+        monitor.tick()
+        return [c for c in calls if c[:2] == ["tmux", "kill-session"]], monitor._state["qa"]["idle_count"]
+
+    def test_every_idle_state_is_guarded_so_reclaim_never_fires(self, monkeypatch, tmp_path):
+        """穷举 _overall 能产出 idle 的输入格，逐格跑 tick() 看会不会 kill。
+
+        守卫必须由 tick() 自己执行，不能在测试里重写一遍——重写版在改动前的
+        代码上也是绿的，抓不到任何回归。
+        """
+        unguarded = []
+        idle_cells = 0
+        for status in ("ALIVE", "ORPHAN"):
+            for thinking in (True, False, None):
+                for producing in (True, False, None):
+                    for work in (True, False, None):
+                        cell = (status, thinking, producing, work)
+                        probe = sm.SurvivalMonitor()
+                        l1 = {"status": status, "has_sentinel": True}
+                        if probe._overall(l1, {"thinking": thinking},
+                                          {"producing": producing},
+                                          {"work_evidence": work, "error": ""}) != "idle":
+                            continue                      # 非 idle 格不归本用例管
+                        idle_cells += 1
+                        _make_sentinel("qa", sm.SENTINEL_DIR)
+                        kills, count = self._run_one_cell(
+                            sm.SurvivalMonitor(), monkeypatch,
+                            status, thinking, producing, work, tmp_path)
+                        if kills or count != 0:
+                            unguarded.append((cell, kills, count))
+        assert not unguarded, f"这些 idle 状态会累计到 6 并 kill 角色：{unguarded}"
+        # 钉住格数：idle 分支被收窄或删除时本用例必须红，不能静默变成空循环。
+        assert idle_cells == 13, \
+            f"_overall 的 idle 输入格由 13 变成 {idle_cells}：idle 定义变了，请重查守卫"
+
+    def test_unjudgeable_l2_does_not_reset_then_kill_a_live_role(self, monitor, monkeypatch):
+        """L2 不可判必须重置 idle_count，而不是默默累计到 kill。"""
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "_load_role_lifecycles", lambda: {"qa": "ondemand"})
+        monkeypatch.setattr(monitor, "_l1_check",
+                            lambda r: {"status": "ALIVE", "tmux_alive": True,
+                                       "has_sentinel": True})
+        monkeypatch.setattr(monitor, "_l2_check", lambda r: {"thinking": None})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": False})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": False})
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: False, raising=False)
+        monitor._state["qa"] = {"idle_count": 5}
+
+        calls = []
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run",
+                            lambda cmd, **kw: calls.append(list(cmd)) or MagicMock(returncode=0))
+        monitor.tick()
+        kills = [c for c in calls if c[:2] == ["tmux", "kill-session"]]
+        assert not kills, f"L2 读不到 pane 活动不许当作空闲杀角色；实际 kills={kills}"
+        assert monitor._state["qa"]["idle_count"] == 0, "不可判应重置计数，不是继续累计"
+
+
 class TestProbeCacheTTL:
     """探针缓存必须真的过期——否则整个 daemon 生命周期只探一次（#477193）。"""
 

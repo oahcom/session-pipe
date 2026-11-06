@@ -731,15 +731,24 @@ class SurvivalMonitor:
             _idle_roles = [r for r, h in results.items()
                            if h["overall"] == "idle" and h.get("lifecycle") == "ondemand"]
             for _ir in _idle_roles:
-                _l1 = results[_ir].get("l1", {})
                 _l2 = results[_ir].get("l2", {})
                 _l3 = results[_ir].get("l3", {})
-                # 有 pending 信号（L1 status=ALIVE 但有 unread）、或 L2 thinking、或 L3 producing → 不回收
-                _has_pending = _l1.get("has_sentinel", False) and _l1.get("status") == "ALIVE"
+                # 三路确定且为负才回收。L2 不可判（window_activity 读不到）不等于
+                # 「没在思考」——与 _overall 的 unknown 分支同一口径，拿不可判的信号
+                # kill 角色就是误杀（同 :384「L3 不可判」不当没产出）。
+                # 原 `_has_pending = has_sentinel and status==ALIVE` 与 L1 对 ALIVE 的
+                # 定义 (:154) 同义反复：ALIVE 分支里 has_sentinel 恒真，于是
+                # _has_pending 在 ALIVE 状态下恒真；剩下的 idle 来源只有
+                # ORPHAN+producing=True，被 _producing 拦住。合起来守卫恒真 → :757 的
+                # `_idle_n >= 6` 从未可达。换成「L2 不可判」后真值表逐格等价
+                # （13 个 idle 输入格零差异，与新用例同一网格），但 _idle_n 仍到不了 6：idle 只在
+                # thinking ∈ {True, None} 时出现，两者都被拦下。回收能力仍未生效，
+                # 要启用须先改 _overall 的 idle 定义，那是治理决策不是缺陷修复。
                 _thinking = _l2.get("thinking") is True
                 _producing = _l3.get("producing") is True
-                if _has_pending or _thinking or _producing:
-                    # 有待处理工作 → 重置 idle_count，不回收
+                _l2_unjudgeable = _l2.get("thinking") is None
+                if _thinking or _producing or _l2_unjudgeable:
+                    # 有工作证据或信号不可判 → 重置 idle_count，不回收
                     self._state.setdefault(_ir, {})["idle_count"] = 0
                     continue
                 _prev = self._state.get(_ir, {})
