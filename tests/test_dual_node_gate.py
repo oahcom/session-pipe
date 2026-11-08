@@ -603,9 +603,9 @@ def test_blocked_naming_another_instance_does_not_fail_this_one(tmp_path):
     """一条点名别的实例的 blocked 不得杀掉本实例（判错即不可恢复）。
 
     同模板可以并发跑多条链，ADR 基线里就有 5 条同时卡在 s1。消息点名
-    wf_otherABC 却没点名本实例 → 不是本链的结论。
+    wf_9c2f8b4a71 却没点名本实例 → 不是本链的结论。
     """
-    fact = _Fact(9106, "s1-codex-blocked: 残留 3 条 (wf_otherABC)", ts=1e12 + 10)
+    fact = _Fact(9106, "s1-codex-blocked: 残留 3 条 (wf_9c2f8b4a71)", ts=1e12 + 10)
     eng = _engine_with_bus(tmp_path, [fact])
     run, step = _stuck_run_and_step()
 
