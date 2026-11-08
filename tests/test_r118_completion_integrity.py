@@ -110,8 +110,8 @@ def test_claim_recognizes_chinese_completion_suffix():
     # `完成` 后面接文字的是叙述不是完成声明，仍放行
     assert f("wf_sub_deadbeef0001/s1 完成清单见 README",
              "wf_sub_mine00000001", "pm_requirements", "s1") is False
-    assert f("wf_sub_other/s1.5-complete 完成",
-             "wf_sub_mine", "pm_requirements", "s1") is False
+    assert f("wf_sub_9c2f8b4a71/s1.5-complete 完成",
+             "wf_sub_5a1305523c", "pm_requirements", "s1") is False
 
 
 def test_claim_recognizes_chinese_completion_variants():

@@ -121,9 +121,9 @@ def test_multi_id_without_sibling_still_passes():
     # 样例不含完成声明（`/s2 交付清单` 不算）：多点一个 id 不是串味。
     # 原先用 `wf_other_inst / s2-complete` 靠「斜杠两侧不许有空格」这一漏洞放行，
     # 而空格绕斜杠正是 reviewer 要求拦的形态（该形态在 test_r118 已锁为 True）。
-    text = "wf_other_inst/s2 交付清单见 README，本步由 wf_mine_inst 跟进"
+    text = "wf_9c2f8b4a71/s2 交付清单见 README，本步由 wf_5a1305523c 跟进"
     assert _claims_own_step_and_foreign_instance(
-        text, "wf_mine_inst", "pm_requirements", "s2") is False
+        text, "wf_5a1305523c", "pm_requirements", "s2") is False
 
 
 # ── B-03 ──────────────────────────────────────────────────────────────
