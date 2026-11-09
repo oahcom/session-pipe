@@ -137,7 +137,7 @@ def _is_role_report_title(title: str, category: str = "", src: str = "") -> bool
 # 这类**真实需求**会被误杀（实测 1 条）。带斜杠的 154/364 条全是汇报，
 # 误判方向不对称——漏判只多建一条链，误杀则丢掉用户的活。
 _WF_ECHO_RE = re.compile(
-    r"wf_(?:sub_|rw_)?[0-9a-f]{5,}|/\s*s\d+\s*[-_]?\s*complete", re.I)
+    r"wf_(?:sub_|rw_|verify_)?[0-9a-f]{5,}|/\s*s\d+\s*[-_]?\s*complete", re.I)
 
 
 # bug_report 豁免：qa 的缺陷报告标题天然带 `qa_test_execute/s2-complete wf_sub_xxx`

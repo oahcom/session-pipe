@@ -314,6 +314,8 @@ def test_wf_echo_title_guard():
         "[bug_report] wf_sub_93776/s2 回退19min后自愈",  # 短 id 曾漏网
         "qa_test_execute/s2-complete wf_sub_34d97422b585",
         "[deploy] wf_8b87ab486 产出已部署",
+        # verify_ 前缀：step_handler._WF_ID_RE 早已认，echo 闸门曾漏（#477237 P3）
+        "wf_verify_7bc1bd3f 已完成",
     ]
     real = [
         "给 pm 做一个高质量落地页",
