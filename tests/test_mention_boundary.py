@@ -74,6 +74,35 @@ def test_real_tag_still_narrows():
     assert "devops" in got["assigned"], f"定向接收者被丢弃: {got}"
 
 
+def test_non_role_tag_does_not_empty_receivers():
+    """@media / @human 这类非角色词不是定向：不得把订阅者收窄成空。
+
+    收窄成空 → no_consumer 分支 mark_consumed → 事实永久零投递。
+    """
+    got = _route_all("@media 部署报告：今天的三次构建", ["pm", "consumer"])["details"][0]
+    assert got["assigned"] == ["pm", "consumer"], f"非角色 tag 清空了接收者: {got}"
+
+
+def test_truncated_role_tag_fragment_does_not_empty_receivers():
+    """t[:100] 把 @engineer 切成 @engin 时，残片不是定向，不得清空接收者。"""
+    got = _route_all("修复 #476153，归 @engin", ["pm", "consumer"])["details"][0]
+    assert got["assigned"] == ["pm", "consumer"], f"截断残片清空了接收者: {got}"
+
+
+def test_route_to_ccs_ignores_non_role_tag():
+    """route_to_ccs 同一缺口的下半段：非角色 tag 不得把所有角色挡掉。"""
+    from routing.routes import route_to_ccs
+    router = MagicMock()
+    router.routing = {"pm": {"consume": ["deployment_report"]}}
+    msgs = [{"id": 476153, "category": "deployment_report", "text": "@media 部署报告",
+             "priority": 3, "consumers": ["pm"], "src": "devops"}]
+    with patch("routing.routes.HEARTBEAT"), patch("routing.routes.METRICS"), \
+         patch("routing.auto.poll_unconsumed", return_value=msgs), \
+         patch("routing.routes._rt_mod.get_router", return_value=router):
+        result = route_to_ccs("pm", dry_run=True)
+    assert result["total"] == 1, f"非角色 tag 挡住了订阅者: {result}"
+
+
 def test_route_to_ccs_does_not_treat_service_name_as_directed():
     """route_to_ccs 的 _is_for_me：服务名不该让未订阅该分类的角色收到消息。
 
