@@ -51,7 +51,7 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 src/
   routing/
     router.py         ── 路由表 + produce/consume 推导（361 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（670 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（686 行）
     auto.py           ── 自动路由消费 + investigator 分派（187 行）
     polling.py        ── 消息轮询（104 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
