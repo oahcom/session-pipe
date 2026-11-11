@@ -632,6 +632,47 @@ class TestSoftAttribution(unittest.TestCase):
         self.assertFalse(ts)
 
 
+class TestSharedFactConsumedByOneInstanceOnly(unittest.TestCase):
+    """一条 bus 事实不得闭合两个实例。
+
+    _tick 有两个顶层 exit 匹配块：第一个嵌在完整性分支内，匹配后过滤并登记
+    _consumed_exit_ids；第二个（:1429 的 `if not cat: return` 之后）两者皆无，
+    所以同一条事实能被多个实例各闭合一次。生产实测最近 400 实例有 10 条 fact
+    被 >1 实例消费（fact 439707 -> wf_sub_5a13055…/wf_sub_b0f5817…/wf_sub_db0623…）。
+    """
+
+    def _eng(self):
+        eng = _make_eng()
+        eng._eff_role = lambda run, step: step.target_role
+        eng._sync_step_results = MagicMock()
+        eng._send_to_role = MagicMock()
+        eng._lm = MagicMock()
+        return eng
+
+    def test_second_instance_does_not_consume_consumed_fact(self):
+        eng = self._eng()
+        marker = f"SHARED_{_UNIQUE}"
+        # 裸匹配（无 require_wf）：一条巡检消息对两实例都"合法"，只差去重
+        step = _step(exit_condition={"bus_category": "root_cause_analysis",
+                                     "text_contains": marker})
+        a, b = _run(), _run()
+        a.id = f"wf_shared{int(time.time() * 1000) % 1000000}a"
+        b.id = f"wf_shared{int(time.time() * 1000) % 1000000}b"
+        # 锚点必须早于完成消息：notified_at 缺失时 tick 用 time.time() 兜底，
+        # 会跳过刚写入的 fact（真实实例在上一 tick 已持久化 notified_at）。
+        _anchor = time.time() - 60
+        for _r in (a, b):
+            _r.step_results = {"s1": {"notified_at": _anchor, "poll_since": _anchor}}
+        eng._bb.write("root_cause_analysis", f"[修复] 服务全绿 {marker}", src="maintainer")
+
+        eng._tick(a, step)
+        self.assertTrue(a.step_results["s1"].get("exit_messages"),
+                        "A 应消费这条事实")
+        eng._tick(b, step)
+        self.assertFalse(b.step_results["s1"].get("exit_messages"),
+                         "同一 fact 已被 A 消费，B 不得再闭合")
+
+
 class TestConcurrentInstancesNoCrossClosure(unittest.TestCase):
     """并发夹具：同模板两实例同时推进，各自只认自己的完成消息。
 

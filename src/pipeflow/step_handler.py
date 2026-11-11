@@ -1446,6 +1446,14 @@ class StepHandlerMixin:
                         template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
+        if _match_ts:
+            # 与上方完整性分支同源：一条事实不得被多个实例各消费一次。
+            # 本块在完整性分支之外（非 dual_node 的非完整性子步也走），此前
+            # 不过滤也不登记 → 实测最近 400 实例有 10 条 fact 被 >1 实例消费。
+            _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
+            _match_ts = _match_msgs[0]["ts"] if _match_msgs else 0.0
+        if _match_ts:
+            self._consumed_exit_ids.update(m["id"] for m in _match_msgs)
         _dn_sd = self._step_sd(run, step)
         _dn_verdict = (_codex_verdict(_match_msgs, step.id)
                        if (_dn_wide and _match_ts
