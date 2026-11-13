@@ -61,6 +61,119 @@ _OVERFLOW_ERR_MAX_AGE = 600
 # 目录名把 cwd 路径的每个 `/` 换成 `-`：/home/administrator/ccs-workspaces/<role>。
 _TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
 
+# ── 评估面显式降级（T2D）：引擎判定 + 转录读取面状态（契约 4.5 / 4.2）──
+# 转录读取面一期只支持 claude 布局（~/.claude/projects）。opencode / codex /
+# 未知引擎会话的转录不在该布局下——对其必须显式降级（第三态：降级 ≠ 失败 ≠
+# 成功，带原因的结构化状态），禁止静默假阴（「没被评」被读成「评过且合格」）
+# 或静默假阳（「读不到」被读成「确认无异常」）。
+_BUS_SCRIPT_T2D = Path(_os.environ.get(
+    "BUS_CLIENT", _os.path.expanduser("~/.hermes/scripts/bus_client.py")))
+
+# 引擎判定结果缓存（role → (ts, engine)）：转录读点在每 tick 每角色的热路径上，
+# 不可反复起子进程。引擎是会话身份属性、在途不变（P3 防翻转），缓存不会读到
+# 「翻转」；600s 上界让角色以新引擎重生后最多 10 分钟内被看到。失败结果同样
+# 缓存（含在 TTL 内），避免通道故障时热路径反复撞超时。
+_ENGINE_CACHE_TTL = 600.0
+_ENGINE_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _fetch_status_role(role: str) -> dict:
+    """ccs.py status-role 的 JSON 底座（契约 4.5 的消费通道）。
+
+    走 Popen 而非 _sp.run：既有测试大量把 pipeflow.engine._sp.run 打桩成
+    tmux 模拟器（未知命令回空 stdout），run 级打桩会把状态查询劫持成
+    「通道故障」→ 误降级（实测 test_rate_recovery 两例因此判红）。
+    Popen 直连让查询通道与 tmux 模拟互不干扰；测试伪造 status JSON 时
+    打桩本函数（缝已备好）。
+    """
+    _p = _engine_mod._sp.Popen(
+        ["python3", str(_CCS_CLI), "status-role", role],
+        stdout=_engine_mod._sp.PIPE,
+        stderr=_engine_mod._sp.DEVNULL,
+    )
+    _out, _ = _p.communicate(timeout=10)
+    if _p.returncode != 0:
+        raise RuntimeError(f"ccs.py status-role rc={_p.returncode}")
+    _data = json.loads(_as_bytes(_out).decode("utf-8", "ignore"))
+    if not isinstance(_data, dict):
+        raise ValueError(f"status-role 输出非 JSON 对象: {type(_data).__name__}")
+    return _data
+
+
+def session_engine_for(role: str) -> str:
+    """经 ccs.py status JSON 的 engine 字段判定会话引擎（契约 4.5）。
+
+    返回契约 4.1 取值域字符串（"ccs"/"opencode"/"codex"/…），查询通道不可用
+    时返回 "unknown"。
+    - status JSON 无 engine 字段 → "ccs"（契约 4.2 缺省语义：engine 为可选
+      字段、缺省即 ccs。A 轨未落地 status.engine 时全部会话读作 ccs，
+      ccs 评估路径零改动）。
+    - 查询通道失败（子进程异常/超时/输出非 JSON）→ "unknown"：缺证据不冒充
+      ccs（失败哲学：缺证据 → 显式降级，禁止静默猜测）。
+    """
+    now = time.time()
+    hit = _ENGINE_CACHE.get(role)
+    if hit is not None and now - hit[0] < _ENGINE_CACHE_TTL:
+        return hit[1]
+    eng = "unknown"
+    try:
+        eng = _fetch_status_role(role).get("engine") or "ccs"
+    except Exception as _e:
+        LOGGER.warning("engine 判定通道失败 role=%s: %s（按未知引擎显式降级）", role, _e)
+    _ENGINE_CACHE[role] = (now, eng)
+    return eng
+
+
+def _transcript_face_state(role: str) -> dict:
+    """转录读取面状态：{"state": "ok"|"degraded", "engine": str, "reason": str}。
+
+    engine="ccs" → ok（claude 转录布局受支持，读取/评估走现状逻辑）。
+    其余（opencode/codex/未知引擎/判定通道不可用）→ degraded + 原因文案：
+    凡转录面不支持的引擎都显式降级（一致性要求），调用方看到的是带原因的
+    第三态，而不是被误读为「已检查且无异常」的空结果。
+    """
+    _eng = session_engine_for(role)
+    if _eng == "ccs":
+        return {"state": "ok", "engine": _eng, "reason": ""}
+    if _eng == "unknown":
+        _reason = ("引擎判定通道不可用（ccs.py status-role 查询失败），"
+                   "评估面显式降级（未纳入评估）")
+    else:
+        _reason = (f"{_eng} 会话转录不在 ~/.claude/projects，"
+                   "评估面显式降级（未纳入评估）")
+    return {"state": "degraded", "engine": _eng, "reason": _reason}
+
+
+# 降级标记去重（role → 上次标记 ts）：非 ccs 会话的每个转录读点每 tick 都会
+# 路过降级分支，标记不合并会把日志与 bus 刷爆。600s/角色一条与引擎缓存同窗。
+_DEGRADED_MARK_TS: dict[str, float] = {}
+_DEGRADED_MARK_INTERVAL = 600.0
+
+
+def _mark_transcript_degraded(role: str, state: dict) -> None:
+    """显式降级标记（第三态可见化）：结构化日志 + bus 可见面，每角色600s 去重。
+
+    本函数不产生任何判定结论，只保证「没被评 / 没被读」不会静默地被读成
+    「评过且合格」或「确认无异常」。bus 写入让标记进入健康面板可见面
+    （残余风险对策：标记只写日志会被忽略）。
+    """
+    now = time.time()
+    if now - _DEGRADED_MARK_TS.get(role, 0.0) < _DEGRADED_MARK_INTERVAL:
+        return
+    _DEGRADED_MARK_TS[role] = now
+    LOGGER.warning("[transcript-degraded] role=%s engine=%s %s",
+                   role, state.get("engine"), state.get("reason"))
+    try:
+        _engine_mod._sp.run(
+            ["python3", str(_BUS_SCRIPT_T2D), "write", "notice",
+             f"@ccs-monitor [转录面] 未纳入评估: {role} — engine={state.get('engine')}",
+             "--evidence", str(state.get("reason", ""))[:500],
+             "--src", "pipeline_transcript"],
+            capture_output=True, timeout=30,
+        )
+    except Exception as _e:
+        LOGGER.warning("转录降级标记 bus 写入失败 %s: %s", role, _e)
+
 
 def _read_transcript_tail(role: str, nbytes: int = 65536) -> list[str]:
     """角色最新 transcript 的尾部行（倒序）。取不到一律 []，判据按"无信号"处理。
@@ -68,6 +181,12 @@ def _read_transcript_tail(role: str, nbytes: int = 65536) -> list[str]:
     只读尾部：transcript 实测 7.8MB，全量解析 ×20 角色 ×每轮会把 daemon 拖死。
     64KB 足够覆盖"本轮"错误——角色无法继续产出后，错误必落在文件尾。
     """
+    _st = _transcript_face_state(role)
+    if _st["state"] == "degraded":
+        # 显式降级（T2D）：转录面不支持的引擎不读、不猜——[] 不再是「静默空集」，
+        # 降级原因走结构化标记进可见面；ccs 会话不经此分支，下方逻辑逐字不动。
+        _mark_transcript_degraded(role, _st)
+        return []
     import glob as _glob
     try:
         _d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"
@@ -191,6 +310,13 @@ def _transcript_stalled(role: str, max_age: float = _STOPPED_PROGRESS_SEC) -> bo
     取不到 transcript（路径不存在/权限）→ False：宁可漏判，也不给
     正在干活的角色发 C-u 打断当前轮。
     """
+    _st = _transcript_face_state(role)
+    if _st["state"] == "degraded":
+        # 显式降级（T2D）：非 ccs 引擎无 claude 布局转录可判，False 保持
+        # 「无信号」保守语义（不打断），但降级原因显式进可见面，不冒充
+        # 「已判未卡死」。ccs 会话不经此分支，下方逻辑逐字不动。
+        _mark_transcript_degraded(role, _st)
+        return False
     import glob as _glob
     try:
         d = _TRANSCRIPT_ROOT / f"-home-administrator-ccs-workspaces-{role.replace('_', '-')}"

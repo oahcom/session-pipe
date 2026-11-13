@@ -996,7 +996,23 @@ class TrajectoryQualityChecker:
 
         返回 {passed: bool, findings: list[dict], checked_traces: int}
         无 transcript 文件 → passed=True, checked_traces=0（无可检查对象）。
+        非 ccs 引擎（opencode/codex/未知）→ 显式降级第三态：
+        {passed: None, status: "degraded", reason, note: "未纳入评估"}——
+        降级 ≠ 失败 ≠ 成功，调用方按 status 字段区分，不得计入 passed/failed。
         """
+        from pipeflow.role_lifecycle import (
+            _transcript_face_state as _face_state,
+            _mark_transcript_degraded as _mark_degraded,
+        )
+        _st = _face_state(role)
+        if _st["state"] == "degraded":
+            # 显式降级（T2D）：转录面不支持的引擎不进转录读取——「未纳入评估」
+            # 是带原因的第三态，绝不折成 passed=True（静默假阴）。ccs 会话不经
+            # 此分支，下方现状逻辑逐字不动。
+            _mark_degraded(role, _st)
+            return {"passed": None, "status": "degraded",
+                    "engine": _st["engine"], "reason": _st["reason"],
+                    "note": "未纳入评估", "findings": [], "checked_traces": 0}
         sessions = self._role_sessions(role)
         if not sessions:
             return {"passed": True, "findings": [], "checked_traces": 0}
@@ -1453,14 +1469,16 @@ def run_eval_check(role_filter: str | None = None) -> dict:
     """
     roles = _load_roles()
     if not roles:
-        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
+        return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0,
+                "degraded": 0, "degraded_detail": []}
 
     # 按角色名过滤
     if role_filter:
         filtered = [r for r in roles if r["name"] == role_filter]
         if not filtered:
             LOGGER.warning("role %s not found", role_filter)
-            return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
+            return {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0,
+                "degraded": 0, "degraded_detail": []}
         roles = filtered
 
     n = min(2, len(roles))
@@ -1470,7 +1488,8 @@ def run_eval_check(role_filter: str | None = None) -> dict:
     # 判据检查：按可达判据数加权无放回。
     crit_roles = _weighted_role_sample(roles, n)
 
-    summary = {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0}
+    summary = {"checked": 0, "passed": 0, "failed": 0, "skipped": 0, "notices": 0, "blockers": 0,
+               "degraded": 0, "degraded_detail": []}
 
     score_sum, score_n = 0.0, 0  # 连续 0-1 分累加, 见 _pass_score (DeepEval 范式)
 
@@ -1573,6 +1592,23 @@ def run_eval_check(role_filter: str | None = None) -> dict:
             traj = TrajectoryQualityChecker()
             for role in sampled:
                 traj_result = traj.check(role["name"], f"eval_{role['name']}")
+                # 显式降级第三态（T2D）：未纳入评估 ≠ 失败 ≠ 通过。计入独立的
+                # degraded 计数并写 bus 可见面，绝不折进 passed/failed 任一侧。
+                if traj_result.get("status") == "degraded":
+                    summary["degraded"] = summary.get("degraded", 0) + 1
+                    summary.setdefault("degraded_detail", []).append({
+                        "role": role["name"],
+                        "engine": traj_result.get("engine"),
+                        "reason": traj_result.get("reason"),
+                        "surface": "trajectory",
+                    })
+                    _write_bus(
+                        "notice",
+                        f"@ccs-monitor [eval_checker] 未纳入评估: {role['name']}"
+                        f" — engine={traj_result.get('engine')}",
+                        evidence=traj_result.get("reason", ""),
+                    )
+                    continue
                 # 子代理遵从：观测型，不计入 passed/failed，只落 bus 供人读。
                 # 只有真的派过指令才报，避免给没收到指令的角色刷 0 值噪音。
                 # ponytail: 去重按进程内存，跨角色互不影响；天花板是重启后每人多发
@@ -1631,6 +1667,14 @@ def run_eval_check(role_filter: str | None = None) -> dict:
         summary["failed"], summary["skipped"],
         summary["notices"], summary["blockers"],
     )
+    if summary.get("degraded"):
+        # 显式降级（T2D）：状态可见面 = summary JSON（degraded/degraded_detail）
+        # + 上方 bus notice + 本日志，三处同源同因。
+        LOGGER.warning(
+            "eval_check 显式降级: %d 个会话未纳入评估: %s",
+            summary["degraded"],
+            [(d["role"], d["engine"]) for d in summary["degraded_detail"]],
+        )
     summary["avg_score"] = round(score_sum / score_n, 4) if score_n else 0.0
     return summary
 

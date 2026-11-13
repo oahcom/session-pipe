@@ -180,6 +180,18 @@ def _role_producing_recently(role: str, window: float = 600.0) -> bool:
     """
     if not role:
         return False
+    # 显式降级（T2D）：非 ccs 引擎的转录不在 claude 布局下，产出判活的转录一路
+    # 对其结构性失明。与其把「读不到」静默返回 False 冒充「无产出迹象」，不如
+    # 显式标记「未纳入评估」——返回值仍取 False（= 现状「探测不可用」语义：
+    # 另一路证据缺位，调用方与 pane/DB 判据并列使用），但降级原因进可见面。
+    from pipeflow.role_lifecycle import (
+        _transcript_face_state as _face_state,
+        _mark_transcript_degraded as _mark_degraded,
+    )
+    _st = _face_state(role)
+    if _st["state"] == "degraded":
+        _mark_degraded(role, _st)
+        return False
     try:
         # 目录名由工作区路径转义而来：ccs-workspaces-product-architect（下划线→连字符）。
         # 不做替换时带下划线的角色（product_architect 等）恒找不到目录 → 恒 False，
