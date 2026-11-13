@@ -101,15 +101,13 @@ def _fetch_status_role(role: str) -> dict:
 
 
 def session_engine_for(role: str) -> str:
-    """经 ccs.py status JSON 的 engine 字段判定会话引擎（契约 4.5）。
+    """经 ccs.py status-role JSON 的 engine 字段判定会话引擎（契约 4.5 修正口径）。
 
-    返回契约 4.1 取值域字符串（"ccs"/"opencode"/"codex"/…），查询通道不可用
-    时返回 "unknown"。
-    - status JSON 无 engine 字段 → "ccs"（契约 4.2 缺省语义：engine 为可选
-      字段、缺省即 ccs。A 轨未落地 status.engine 时全部会话读作 ccs，
-      ccs 评估路径零改动）。
-    - 查询通道失败（子进程异常/超时/输出非 JSON）→ "unknown"：缺证据不冒充
-      ccs（失败哲学：缺证据 → 显式降级，禁止静默猜测）。
+    返回契约 4.1 取值域字符串（"ccs"/"opencode"/"codex"/…）或 "unknown"。
+    - engine 缺失/空值/未知值 或 查询通道失败（子进程异常/超时/非 JSON）→
+      "unknown"：**不静默当 ccs**（契约 4.5 修正：缺证据显式降级，禁止静默
+      猜测；A 轨保证每会话补 engine 字段——哨兵读不到时前缀反推并以
+      engine_source 标注——字段缺失即异常态，D 侧只能显式降级）。
     """
     now = time.time()
     hit = _ENGINE_CACHE.get(role)
@@ -117,9 +115,14 @@ def session_engine_for(role: str) -> str:
         return hit[1]
     eng = "unknown"
     try:
-        eng = _fetch_status_role(role).get("engine") or "ccs"
+        _v = _fetch_status_role(role).get("engine")
+        eng = _v if isinstance(_v, str) and _v.strip() else "unknown"
+        if eng not in ("ccs", "opencode", "codex"):
+            LOGGER.warning("engine 未知值/缺失 role=%s: %r（按未知引擎显式降级）", role, _v)
+            eng = "unknown"
     except Exception as _e:
         LOGGER.warning("engine 判定通道失败 role=%s: %s（按未知引擎显式降级）", role, _e)
+        eng = "unknown"
     _ENGINE_CACHE[role] = (now, eng)
     return eng
 
@@ -136,8 +139,8 @@ def _transcript_face_state(role: str) -> dict:
     if _eng == "ccs":
         return {"state": "ok", "engine": _eng, "reason": ""}
     if _eng == "unknown":
-        _reason = ("引擎判定通道不可用（ccs.py status-role 查询失败），"
-                   "评估面显式降级（未纳入评估）")
+        _reason = ("engine 缺失/判定通道不可用（status-role 无 engine 字段或查询失败），"
+                   "缺证据显式降级（未纳入评估）")
     else:
         _reason = (f"{_eng} 会话转录不在 ~/.claude/projects，"
                    "评估面显式降级（未纳入评估）")

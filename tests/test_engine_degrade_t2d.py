@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""T2D 评估面显式降级：三引擎 fixture 冒烟（契约 4.5 引擎判定 / 4.2 缺省语义）。
+"""T2D 评估面显式降级：三引擎 fixture 冒烟（契约 4.5 修正口径：status-role JSON）。
 
-伪造 ccs.py status JSON 与引擎判定通道，验证：
-- opencode / codex / 未知引擎 → 显式降级第三态（status=degraded + 原因 + 未纳入评估）
-- ccs（含 engine 字段缺省）→ 与改动前同型
+伪造 ccs.py status-role JSON 与引擎判定通道，验证：
+- opencode / codex / 未知引擎值 / engine 缺失 → 显式降级第三态（status=degraded + 原因 + 未纳入评估；勿静默当 ccs）
+- ccs（显式 engine=ccs 字段）→ 与改动前同型
 - 降级 ≠ 失败 ≠ 成功：不计入 passed/failed 任一侧
 - 降级标记进可见面（_mark_transcript_degraded 被调用：结构化日志 + bus）
 
@@ -31,7 +31,7 @@ def _clear_caches():
     rl._DEGRADED_MARK_TS.clear()
 
 
-# ── 1. 引擎判定：契约 4.5 消费 status JSON 的 engine 字段 ──
+# ── 1. 引擎判定：契约 4.5 消费 status-role JSON 的 engine 字段 ──
 
 def test_status_json_engine_field_consumed():
     with patch.object(rl, "_fetch_status_role",
@@ -39,11 +39,24 @@ def test_status_json_engine_field_consumed():
         assert rl.session_engine_for("x") == "opencode"
 
 
-def test_status_json_engine_field_absent_defaults_ccs():
-    """契约 4.2 缺省语义：无 engine 字段 → ccs（A 轨未落地时 = 现状零改动）。"""
+def test_status_json_engine_ccs_field_consumed():
+    with patch.object(rl, "_fetch_status_role",
+                      lambda role: {"role": role, "engine": "ccs"}):
+        assert rl.session_engine_for("x") == "ccs"
+
+
+def test_status_json_engine_field_absent_is_unknown():
+    """契约 4.5 修正口径：engine 缺失 ≠ ccs，缺证据显式降级（勿静默当 ccs）。"""
     with patch.object(rl, "_fetch_status_role",
                       lambda role: {"role": role, "alive": True}):
-        assert rl.session_engine_for("x") == "ccs"
+        assert rl.session_engine_for("x") == "unknown"
+
+
+def test_status_json_engine_unknown_value_is_unknown():
+    """取值域外（未知值）同样显式降级，不猜。"""
+    with patch.object(rl, "_fetch_status_role",
+                      lambda role: {"role": role, "engine": "gemini-cli"}):
+        assert rl.session_engine_for("x") == "unknown"
 
 
 def test_engine_channel_failure_is_unknown():
@@ -66,7 +79,7 @@ def test_trajectory_degraded_for_non_ccs(eng, monkeypatch):
     assert res["status"] == "degraded"
     assert res["passed"] is None            # 第三态：非 True（静默通过）非 False（失败）
     assert res["note"] == "未纳入评估"
-    assert "评估面显式降级" in res["reason"]
+    assert "显式降级" in res["reason"] and "未纳入评估" in res["reason"]
     assert res["checked_traces"] == 0
     assert marks and marks[0][1]["state"] == "degraded"
 
