@@ -91,7 +91,15 @@ def _fetch_status_role(role: str) -> dict:
         stdout=_engine_mod._sp.PIPE,
         stderr=_engine_mod._sp.DEVNULL,
     )
-    _out, _ = _p.communicate(timeout=10)
+    try:
+        _out, _ = _p.communicate(timeout=10)
+    except _engine_mod._sp.TimeoutExpired:
+        # 超时后 communicate 不回收子进程（实测 p.poll() 仍为 None）：不 kill
+        # 就是每角色每 10 分钟泄漏一个 python3（含 sqlite 连接 + tmux 调用），
+        # 失败结果还会进 600s 缓存 → 泄漏按 TTL 复发。kill+wait 后再抛。
+        _p.kill()
+        _p.wait()
+        raise
     if _p.returncode != 0:
         raise RuntimeError(f"ccs.py status-role rc={_p.returncode}")
     _data = json.loads(_as_bytes(_out).decode("utf-8", "ignore"))
@@ -108,6 +116,12 @@ def session_engine_for(role: str) -> str:
       "unknown"：**不静默当 ccs**（契约 4.5 修正：缺证据显式降级，禁止静默
       猜测；A 轨保证每会话补 engine 字段——哨兵读不到时前缀反推并以
       engine_source 标注——字段缺失即异常态，D 侧只能显式降级）。
+    - engine_source 非 "sentinel"（A 侧 tmux 前缀反推等）= 推断值，不得冒充
+      事实（契约 4.2）：活会话上按 unknown 降级，否则 D 侧会拿推断出的 ccs
+      去读同角色的旧 ccs 转录并据此下结论（假阴/假阳）。
+      仅在 alive 为真时降级：无活会话时评估对象本就为空，降级只会给每个未启动
+      角色每轮刷一条噪音；危险面只存在于「活会话 + 身份无事实源」。
+      alive 字段缺失按「未知」处理，不降级（同上，保守噪声）。
     """
     now = time.time()
     hit = _ENGINE_CACHE.get(role)
@@ -115,11 +129,19 @@ def session_engine_for(role: str) -> str:
         return hit[1]
     eng = "unknown"
     try:
-        _v = _fetch_status_role(role).get("engine")
+        _d = _fetch_status_role(role)
+        _v = _d.get("engine")
         eng = _v if isinstance(_v, str) and _v.strip() else "unknown"
         if eng not in ("ccs", "opencode", "codex"):
             LOGGER.warning("engine 未知值/缺失 role=%s: %r（按未知引擎显式降级）", role, _v)
             eng = "unknown"
+        else:
+            _src = _d.get("engine_source")
+            if (_d.get("alive") is True and isinstance(_src, str) and _src
+                    and _src != "sentinel"):
+                LOGGER.warning("引擎身份无事实源 role=%s source=%s"
+                               "（活会话显式降级）", role, _src)
+                eng = "unknown"
     except Exception as _e:
         LOGGER.warning("engine 判定通道失败 role=%s: %s（按未知引擎显式降级）", role, _e)
         eng = "unknown"
@@ -279,6 +301,14 @@ def _transcript_progress_after_error(role: str) -> bool:
     只认 tool_use：那才是"重发的那次请求真的跑起来了"。纯文本轮不证明任何进展，
     继续往前找，直到撞上错误轮（返回 False）或带 tool_use 的轮（返回 True）。
     """
+    _st = _transcript_face_state(role)
+    if _st["state"] == "degraded":
+        # 显式降级（T2D）：转录面不支持的引擎读不到任何行 → _saw_error 恒 False
+        # → 底部 `return not _saw_error` 会给出 True（「确认有进展」是肯定性
+        # 结论）。未知不得升格为肯定值：返回 False = 无证据表明有进展，调用方
+        # 只是保留退避状态（安全方向）。ccs 会话不经此分支，下方逻辑逐字不动。
+        _mark_transcript_degraded(role, _st)
+        return False
     _saw_error = False
     for line in _read_transcript_tail(role):
         _c = line.replace(" ", "")

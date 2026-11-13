@@ -11,7 +11,7 @@
 """
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -65,6 +65,50 @@ def test_engine_channel_failure_is_unknown():
         raise RuntimeError("ccs.py status-role 通道故障(fixture)")
     with patch.object(rl, "_fetch_status_role", _boom):
         assert rl.session_engine_for("x") == "unknown"
+
+
+# ── 1b. 契约 4.2：engine_source 非 sentinel = 推断值，不得冒充事实 ──
+
+def test_session_engine_ignores_inferred_source_when_alive():
+    """活会话 + 推断来源 → unknown：否则 D 侧会拿推断的 ccs 去读旧 ccs 转录。"""
+    rl._ENGINE_CACHE.clear()
+    with patch.object(rl, "_fetch_status_role",
+                      lambda role: {"role": role, "engine": "ccs",
+                                    "engine_source": "tmux-prefix-fallback",
+                                    "alive": True}):
+        assert rl.session_engine_for("x") == "unknown"
+
+
+def test_session_engine_keeps_engine_for_dead_role():
+    """无活会话不降级：评估对象本就为空，降级只会刷噪音。"""
+    rl._ENGINE_CACHE.clear()
+    with patch.object(rl, "_fetch_status_role",
+                      lambda role: {"role": role, "engine": "ccs",
+                                    "engine_source": "tmux-prefix-fallback",
+                                    "alive": False}):
+        assert rl.session_engine_for("x") == "ccs"
+
+
+def test_session_engine_trusts_sentinel_source():
+    """sender 事实源（source="sentinel"）+ 活会话 → 原样采信。"""
+    rl._ENGINE_CACHE.clear()
+    with patch.object(rl, "_fetch_status_role",
+                      lambda role: {"role": role, "engine": "opencode",
+                                    "engine_source": "sentinel",
+                                    "alive": True}):
+        assert rl.session_engine_for("x") == "opencode"
+
+
+def test_fetch_status_role_kills_on_timeout():
+    """超时必须 kill+wait 回收，否则每角色每 TTL 泄漏一个 python3 子进程。"""
+    import subprocess
+    proc = MagicMock()
+    proc.communicate.side_effect = subprocess.TimeoutExpired(cmd="status-role", timeout=10)
+    with patch.object(rl._engine_mod._sp, "Popen", return_value=proc):
+        with pytest.raises(subprocess.TimeoutExpired):
+            rl._fetch_status_role("x")
+    assert proc.kill.call_count == 1
+    assert proc.wait.call_count == 1
 
 
 # ── 2. 评估入口：三引擎输出形态 ──
@@ -143,6 +187,16 @@ def test_role_lifecycle_ccs_no_marker(monkeypatch):
                         lambda role, state: marks.append(state))
     assert rl._transcript_stalled("t2d-ccs-nosuch") is False   # 现状语义
     assert marks == []
+
+
+def test_progress_after_error_degraded_returns_false(monkeypatch):
+    """降级时不得返回 True（「确认有进展」是肯定性结论）：无证据 → False。"""
+    monkeypatch.setattr(rl, "session_engine_for", lambda role: "opencode")
+    marks: list = []
+    monkeypatch.setattr(rl, "_mark_transcript_degraded",
+                        lambda role, state: marks.append(state))
+    assert rl._transcript_progress_after_error("t2d-op") is False
+    assert marks and marks[0]["state"] == "degraded"
 
 
 # ── 5. 工作流生命周期读取入口（wf_lifecycle）：同一降级语义 ──
