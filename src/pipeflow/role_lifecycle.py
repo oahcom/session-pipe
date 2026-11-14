@@ -265,6 +265,30 @@ _API_ERROR_AGE = 120
 _RATE_LIMIT_NUDGE = "上一轮 API 错误中断（0 产出）。继续：重发被中断的那次请求，不要重新规划，不要写自检报告。"
 
 
+def _turn_text_starts_with_error(line: str) -> bool:
+    """未标记轮的正文整体是否就是错误文本（strip 后以 _API_ERROR_PATTERNS 开头）。
+
+    只认「整轮开头」，不认「正文里含有」：普通轮会**引用**错误文案——实测 pg
+    会话自然收尾的分析报告引着「15 次失败全是 429 FreeUsageLimitError」，按
+    包含匹配会被判成活限流、连发唤醒让角色重做已完成的请求。上游流中断类错误轮
+    没有 isApiErrorMessage 标记（pane 模式 upstream connection lost 正因此存在），
+    只有「正文整体就是错误前缀」能认。
+    """
+    try:
+        content = json.loads(line).get("message", {}).get("content")
+    except (ValueError, AttributeError):
+        return False
+    if isinstance(content, list):
+        text = "".join(b.get("text") or "" for b in content
+                       if isinstance(b, dict))
+    elif isinstance(content, str):
+        text = content
+    else:
+        return False
+    text = text.strip()
+    return any(text.startswith(p) for p in _API_ERROR_PATTERNS)
+
+
 def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AGE) -> bool:
     """角色**最后一条** assistant 轮是否就是一条 API 错误（这类轮 output_tokens 恒为 0）。
 
@@ -272,14 +296,18 @@ def _transcript_last_turn_is_api_error(role: str, max_age: float = _API_ERROR_AG
     几分钟就滚出视口（实测 24h 1,342 条错误轮，pane 只认出 9 次 = 0.67%；
     maintainer 216→0 / product-architect 119→0 / qa 107→0）。
     WHY 只看最后一条：错误之后只要再来一条正常轮，就说明已自愈，不许再打断它。
+    错误轮判据（满足任一）：① isApiErrorMessage 标记 + 正文含错误词表；
+    ② 未标记但整轮正文以错误前缀开头（流中断类，见 _turn_text_starts_with_error
+    的引文误判案例：报告引用错误文案不算错误轮）。
     """
     for line in _read_transcript_tail(role):
         _c = line.replace(" ", "")
         if '"type":"assistant"' not in _c:
             continue
-        if '"isApiErrorMessage":true' not in _c:
-            return False
-        if not any(p in line for p in _API_ERROR_PATTERNS):
+        if '"isApiErrorMessage":true' in _c:
+            if not any(p in line for p in _API_ERROR_PATTERNS):
+                return False
+        elif not _turn_text_starts_with_error(line):
             return False
         try:
             _dt = datetime.strptime(json.loads(line)["timestamp"],
@@ -517,13 +545,17 @@ class RoleLifecycleMixin:
             # 错误轮不再产新轮时 120s 后谓词翻 False → 清状态 → attempt 恒 1 →
             # 退避曲线失效（24h 实测 614 次注入、相邻间隔 median 248s = 120s 重置
             # 再等 120s 的形状，<120s 占 17.6%；attempt 从未爬到 5 档封顶）。
-            # pane 门（前半）不变：真恢复的角色照样立刻清状态、不被拖到 1800s 起步。
+            # _pane_err 不参与触发判定，仅保留 pane 错误信号供诊断
+            # （下方 Retrying/terminal 类判定直接扫 _recent，不用本变量）。
             _pane_err = any(p in _recent for p in self._RATE_LIMIT_PATTERNS)
-            # 错误信号 = pane 文案 或 转录最后一条就是错误轮。两者都没有时
-            # 必须直接跳过：ccebbcf 把判据换成"错误后有进展"后，健康角色
-            # （pane 干净、转录为空）progress=False 会落到下面的发送分支，
+            # 触发只认转录错误轮，pane 不再单独触发：pane 里的错误文案可能只是产出
+            # 在**引用**（报告/日志摘录），误判成活限流会让自然结束的会话被连发唤醒、
+            # 角色重做已完成的请求（实测 pg 分析报告引 429 文案后被两次 nudge）。
+            # 错误轮的权威判据是转录（实测 1,342:9，pane 只认出 0.67%），pane 只用于
+            # 分型。无错误信号时必须直接跳过：ccebbcf 把判据换成"错误后有进展"后，
+            # 健康角色（pane 干净、转录为空）progress=False 会落到下面的发送分支，
             # 每个 tick 给健康角色发一句「继续」（6 个 rate_recovery 用例红）。
-            if not _pane_err and not _transcript_last_turn_is_api_error(
+            if not _transcript_last_turn_is_api_error(
                     role, max_age=float("inf")):
                 # 无错误信号：只在"确认已恢复"时清退避（错误轮后只落了纯文本
                 # 半成品不算恢复，清了会让 429 退避从第 1 档重来）。
@@ -539,7 +571,7 @@ class RoleLifecycleMixin:
             # → 漏检 → 误发「继续」（06:31:32 日志）。
             if any("Retrying" in ln and "attempt" in ln for ln in _recent.splitlines()):
                 continue
-            # 能走到这里说明 pane 或转录已给出错误信号（上方前置过滤），
+            # 能走到这里说明转录已给出错误信号（上方前置过滤），
             # 所以只需再判"生成中且 transcript 停滞"：两者同时成立才是卡死。
             # 纯生成中的长推理（consumer 813s、maintainer 686s）在前面就退出了。
             if any("esc to interrupt" in ln for ln in _tail):

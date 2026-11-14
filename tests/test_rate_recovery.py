@@ -31,10 +31,15 @@ def _engine():
     return eng
 
 
-def test_no_workflow_role_recovered_via_tmux():
-    """不在任何工作流里、但 tmux 会话存在的角色，403 时也要被恢复。"""
+def test_no_workflow_role_recovered_via_tmux(tmp_path):
+    """不在任何工作流里、但 tmux 会话存在的角色，403 时也要被恢复。
+
+    触发判据已收窄为转录错误轮（pane 只用于分型）：错误轮写进转录。
+    """
     eng = _engine()
     sent = []
+    _write_turn(tmp_path, "curator", age_sec=30)
+    _write_turn(tmp_path, "maintainer", age_sec=30)
 
     def fake_run(cmd, *a, **k):
         if "list-sessions" in cmd:
@@ -54,14 +59,18 @@ def test_no_workflow_role_recovered_via_tmux():
     assert resumed == {"curator", "maintainer"}, f"应恢复两个孤儿角色, got {sent}"
 
 
-def test_upstream_connection_lost_is_recovered():
+def test_upstream_connection_lost_is_recovered(tmp_path):
     """pane 停在 "API Error: upstream connection lost" 也要恢复。
 
     实测 curator 12:39 起 21min 无产出：进程活着、pane 停在错误，
     恢复词表里没有这一种 → 引擎视而不见。
+    触发判据已收窄为转录错误轮：该类错误轮常无 isApiErrorMessage 标记，
+    以未标记纯错误轮写入（正文整体以 API Error: 开头）。
     """
     eng = _engine()
     sent = []
+    _write_turn(tmp_path, "curator", age_sec=30, err=False,
+                text="API Error: upstream connection lost")
 
     def fake_run(cmd, *a, **k):
         if "list-sessions" in cmd:
@@ -201,12 +210,15 @@ def test_client_retry_in_progress_not_interrupted(tmp_path):
     assert sent == [], f"429 客户端重试中不应被打断, got {sent}"
 
 
-def test_recovery_resets_backoff_after_healthy_tick():
+def test_recovery_resets_backoff_after_healthy_tick(tmp_path):
     """403 → 恢复 → 再次 403：第二次仍从 attempt=1 起步，而不是累加到 2。
 
     不清退避时档位只增不减，反复的间歇性 403 会把等待推到 1800s 封顶，
-    恢复一次要等半小时。
+    恢复一次要等半小时。触发判据已收窄为转录错误轮：转录随三相演化
+    （错误轮 → tool_use 进展轮 → 新错误轮），恢复=错误后出现真进展。
     """
+    import json as _json
+    from datetime import datetime, timezone, timedelta
     eng = _engine()
     state = {"mode": "403"}
 
@@ -219,22 +231,37 @@ def test_recovery_resets_backoff_after_healthy_tick():
             return MagicMock(returncode=0, stdout="✻ Cogitated for 3m\n❯ ")
         return MagicMock(returncode=0, stdout="")
 
+    def _write_tool_turn(role, age_sec):
+        d = tmp_path / f"-home-administrator-ccs-workspaces-{role}"
+        d.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc) - timedelta(seconds=age_sec)
+        rec = {"type": "assistant",
+               "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+               "message": {"role": "assistant", "content": [
+                   {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}}
+        with open(d / "sess.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(rec) + "\n")
+
+    _write_turn(tmp_path, "lr", age_sec=120)         # 首次 403：错误轮
     with patch("pipeflow.engine._sp.run", side_effect=fake_run):
         eng._recover_rate_limited_roles()            # 首次 403 → attempt=1
         assert eng._last_rate_recover["lr"][1] == 1
+        _write_tool_turn("lr", age_sec=90)           # 恢复：错误后出现 tool_use 进展
         state["mode"] = "ok"
         eng._recover_rate_limited_roles()            # 恢复 → 清退避
         assert "lr" not in eng._last_rate_recover, "恢复后应清掉退避状态"
+        _write_turn(tmp_path, "lr", age_sec=1)       # 再次 403：新的错误轮
         state["mode"] = "403"
         eng._recover_rate_limited_roles()            # 再次 403
 
     assert eng._last_rate_recover["lr"][1] == 1, "退避应重新从第 1 档起步"
 
 
-def test_backoff_blocks_immediate_retry():
+def test_backoff_blocks_immediate_retry(tmp_path):
     """第二次调用落在退避窗口内 → 不再发。"""
     eng = _engine()
     sent = []
+    _write_turn(tmp_path, "lr", age_sec=30)
 
     def fake_run(cmd, *a, **k):
         if "list-sessions" in cmd:
@@ -253,7 +280,7 @@ def test_backoff_blocks_immediate_retry():
     assert len(resumed) == 1, f"退避窗口内应只发 1 次, got {len(resumed)}"
 
 
-def test_audit_title_carries_time_so_rows_dont_merge():
+def test_audit_title_carries_time_so_rows_dont_merge(tmp_path):
     """审计行标题必须带时刻：bus 按标题 UPSERT 且保留首次 ts。
 
     attempt 随退避重置反复从 1 起算，同一标题会把今天的注入覆盖到昨天那行上——
@@ -262,6 +289,7 @@ def test_audit_title_carries_time_so_rows_dont_merge():
     eng = _engine()
     titles = []
     eng._bb.write.side_effect = lambda cat, t, **k: titles.append(t)
+    _write_turn(tmp_path, "lr", age_sec=30)
 
     def fake_run(cmd, *a, **k):
         if "list-sessions" in cmd:
@@ -340,15 +368,18 @@ def test_send_negative_rc_or_none_is_failure():
         assert not eng._bb.write.called, f"rc=({_r1},{_r2}) 却写了「已发继续」"
 
 
-def test_request_rejected_429_is_recovered():
+def test_request_rejected_429_is_recovered(tmp_path):
     """9router 现行 429 文案 `Request rejected (429)` 必须命中恢复词表。
 
     2026-10-21 实测 closer/maintainer 的 pane 停在这一行，旧词表
     ("API Error: 429" / "Rate limit exceeded") 一条不中 → 恢复分支整条不可达，
     两角色各空等 16min，当日 [rate_limit] 审计 0 条（#432582）。
+    触发判据已收窄为转录错误轮：该错误轮写进转录。
     """
     eng = _engine()
     sent = []
+    _write_turn(tmp_path, "closer", age_sec=30,
+                text="API Error: Request rejected (429) · [ollama/gpt-oss:120b]")
 
     def fake_run(cmd, *a, **k):
         if "list-sessions" in cmd:
@@ -479,3 +510,57 @@ def test_reset_predicate_ignores_error_turn_age():
         f"重置判据仍在用时效窗口 {seen}：错误轮过期会被当成已恢复"
     assert "curator" in eng._last_rate_recover, "错误轮未变老就清掉了退避状态"
     assert eng._last_rate_recover["curator"][1] >= 3, "attempt 被重置，退避曲线失效"
+
+
+# ── 引文误判 / 未标记错误轮：触发只认转录，pane 不再单独触发 ──
+# 实测 pg 会话：任务 17:23:45 自然收尾（产出一份分析报告），报告里引用了
+# 历史失败「今天那 15 次失败全是 opencode 线的 429 FreeUsageLimitError」。
+# pane 末 20 行命中错误词表 → _pane_err=True 绕过转录判据，17:24:05 与
+# 17:25:37 两次向已收尾的会话发 nudge，角色被迫重做已完成的报告。
+# 错误轮的权威判据是转录（24h 实测 1,342 条错误轮 pane 只认出 9 次 = 0.67%），
+# pane 只用于分型（配额/瞬时/终态）。
+
+def test_pane_quoted_error_completed_turn_no_nudge(tmp_path, monkeypatch):
+    """pane 含错误文案（报告引用）但转录末轮是正常完成轮 → 不发 nudge。
+
+    报告/日志摘录**引用**错误文案不是活限流；旧代码（pane OR 转录）此例必红。
+    """
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    rl._ENGINE_CACHE.clear()          # 照 test_engine_degrade_t2d 惯例清引擎缓存
+    _write_turn(tmp_path, "pg", age_sec=30, err=False,
+                text="分析报告：今天那 15 次失败全是 opencode 线的 429 FreeUsageLimitError，"
+                     "均为出口 IP 限流，处理结论见上文。")
+    sent = _run_recovery(_engine(), {"pg": "❯ 今天那 15 次失败全是 429 FreeUsageLimitError\n"})
+    rl._ENGINE_CACHE.clear()
+    assert not any("继续" in " ".join(c) for c in sent), \
+        f"报告引用错误文案不是活限流，自然收尾的会话不得被唤醒重做: {sent}"
+
+
+def test_unflagged_error_turn_still_nudges(tmp_path, monkeypatch):
+    """无 isApiErrorMessage 标记、正文整体就是错误文本（流中断形态）→ 发 nudge。
+
+    「上游流中断」类错误轮没有 isApiErrorMessage 标记（pane 模式 upstream
+    connection lost 正因此存在）。旧 judge 只认标记 → 旧代码此例应红。
+    """
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    rl._ENGINE_CACHE.clear()
+    _write_turn(tmp_path, "curator", age_sec=30, err=False,
+                text="API Error: upstream connection lost")
+    sent = _run_recovery(_engine(), {"curator": "❯ \n"})
+    rl._ENGINE_CACHE.clear()
+    assert any("继续" in " ".join(c) for c in sent), \
+        f"未标记的纯错误轮（流中断）必须触发恢复: {sent}"
+
+
+def test_flagged_error_turn_nudges_unchanged(tmp_path, monkeypatch):
+    """isApiErrorMessage:true 的错误轮 → 发 nudge（既有行为回归锚）。"""
+    from pipeflow import role_lifecycle as rl
+    monkeypatch.setattr(rl, "_TRANSCRIPT_ROOT", tmp_path)
+    rl._ENGINE_CACHE.clear()
+    _write_turn(tmp_path, "qa", age_sec=30)   # 默认即标记错误轮
+    sent = _run_recovery(_engine(), {"qa": "❯ \n"})
+    rl._ENGINE_CACHE.clear()
+    assert any("继续" in " ".join(c) for c in sent), \
+        f"标记错误轮必须照旧触发恢复: {sent}"
