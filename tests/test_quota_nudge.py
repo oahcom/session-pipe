@@ -57,8 +57,14 @@ def _facts(eng):
     return [c for c in eng._bb.write.call_args_list]
 
 
-def test_quota_nudges_once_an_hour_and_reports_once():
-    """配额态：仍探活（额度会回来），但 1h 内不重复敲，6h 内不重复记账。"""
+def test_quota_nudges_once_an_hour_and_reports_once(tmp_path, monkeypatch):
+    """配额态：仍探活（额度会回来），但 1h 内不重复敲，6h 内不重复记账。
+
+    触发判据已收窄为转录错误轮（pane 只用于分型）：错误轮写进转录。
+    """
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: Request rejected (429) · "
+                                      "FreeUsageLimitError: Free usage limit reached")
     eng = _engine()
     assert len(_run(eng, QUOTA_LINE)) == 1, "首次应发一次「继续」探活"
     assert len(_run(eng, QUOTA_LINE)) == 0, "1h 内第二次不应再敲（_QUOTA_RETRY_SEC）"
@@ -72,8 +78,10 @@ def test_quota_nudges_once_an_hour_and_reports_once():
     assert "FreeUsageLimitError" in facts[0].kwargs["evidence"], "审计必须带错误原文"
 
 
-def test_transient_429_still_uses_backoff_curve():
+def test_transient_429_still_uses_backoff_curve(tmp_path, monkeypatch):
     """非配额 429 保持原语义：发「继续」并记 [rate_limit]。"""
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: 429 Too Many Requests")
     eng = _engine()
     assert len(_run(eng, TRANSIENT_LINE)) == 1
     facts = _facts(eng)
@@ -118,9 +126,13 @@ def test_quota_from_transcript_when_pane_is_clean(monkeypatch, tmp_path):
     assert _facts(eng)[0].args[1].startswith("[quota]"), _facts(eng)
 
 
-def test_egress_short_limit_stays_transient():
+def test_egress_short_limit_stays_transient(tmp_path, monkeypatch):
     """`Free usage limit reached on the current egress` 是短窗口限流（原文让按提示重试），
     不能被 1h 硬限闸门压住。"""
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: Request rejected (429) · FreeUsageLimitError: "
+                                      "Free usage limit reached on the current egress. "
+                                      "Retry after the indicated delay")
     eng = _engine()
     line = ("● API Error: Request rejected (429) · FreeUsageLimitError: Free usage limit "
             "reached on the current egress. Retry after the indicated delay")
@@ -128,19 +140,27 @@ def test_egress_short_limit_stays_transient():
     assert _facts(eng)[0].args[1].startswith("[rate_limit]"), _facts(eng)
 
 
-def test_latest_error_line_wins_over_stale_quota_line():
-    """窗口上方残留的旧配额行不该覆盖下方新的 403：取最新命中行。"""
+def test_latest_error_line_wins_over_stale_quota_line(tmp_path, monkeypatch):
+    """窗口上方残留的旧配额行不该覆盖下方新的 403：取最新命中行。
+
+    转录错误轮同为新 403（不是旧配额行），否则 _last_api_error_text 回填会翻案。
+    """
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "Please run /login · API Error: 403")
     eng = _engine()
     pane = "\n".join([QUOTA_LINE, "✻ 工作中", "● Please run /login · API Error: 403"])
     assert len(_run(eng, pane)) == 1
     assert _facts(eng)[0].args[1].startswith("[rate_limit]"), _facts(eng)
 
 
-def test_failed_audit_is_retried_not_remembered():
+def test_failed_audit_is_retried_not_remembered(tmp_path, monkeypatch):
     """写 bus 失败不能记 6h 冷却：否则一次 bus 抖动让这个角色 6h 没有配额审计。
 
     反向：把 `_rep[role] = now` 移到 write 之前，本用例必须红（第二次不再尝试写）。
     """
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: Request rejected (429) · "
+                                      "FreeUsageLimitError: Free usage limit reached")
     eng = _engine()
     eng._bb.write.side_effect = RuntimeError("bus down")
     with patch.object(_rl, "_QUOTA_RETRY_SEC", 0):
@@ -154,8 +174,11 @@ def test_failed_audit_is_retried_not_remembered():
         _run(eng2, QUOTA_LINE)
     assert eng2._bb.write.call_count == 1, "写成功后 6h 内不再重复记账"
 
-def test_quota_audit_cooldown_survives_restart():
+def test_quota_audit_cooldown_survives_restart(tmp_path, monkeypatch):
     """重启（新引擎实例=空字典）后仍受 6h 冷却约束：从 bus 回填最近一条 [quota]。"""
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: Request rejected (429) · "
+                                      "FreeUsageLimitError: Free usage limit reached")
     now = _rl.time.time()
     fact = MagicMock()
     fact.ts = now - 600                      # 10 分钟前刚记过账
@@ -176,12 +199,14 @@ def test_quota_audit_cooldown_survives_restart():
     assert len(_facts(eng2)) == 1, "超过 6h 的旧账不该压住新账"
 
 
-def test_transient_title_does_not_claim_quota_rejection():
+def test_transient_title_does_not_claim_quota_rejection(tmp_path, monkeypatch):
     """else 分支是「非硬限」：标题不得声称被额度拒绝。
 
     今日 9/9 条该标题的 evidence 全是 upstream connection lost 这类流中断，
     下游按「额度耗尽」处置会换路由 / 等 1h 探活，方向完全错。
     """
+    monkeypatch.setattr(_rl, "_TRANSCRIPT_ROOT", tmp_path)
+    _write_transcript(tmp_path, ROLE, "API Error: upstream connection lost")
     eng = _engine()
     assert len(_run(eng, "● API Error: upstream connection lost")) == 1
     facts = _facts(eng)
