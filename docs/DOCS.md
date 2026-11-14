@@ -1,6 +1,6 @@
 # 文档治理
 
-> 更新: 2026-10-22
+> 更新: 2026-11-14
 
 ## 文档职责分工
 
@@ -21,6 +21,9 @@
 | **docs/WORKFLOW_TEMPLATE_SPEC.md** | 模板开发者 | 模板 Schema、prompt 三段式、subflow 规则、校验命令 |
 | **docs/collab-modes-implementation.md** | 模板开发者 | 步骤级协作声明 `guard` / `wait_roles` 与 persona 注入 |
 | **docs/ADR-APPROVAL-AUTHORITY.md** | 排障者 | 审批权威性高于文本判驳的决策记录 |
+| **docs/opencode需求全链归档-20261114.md** | 维护者 | opencode 需求（2026-11 七块）总入口：全链总览、文档落位表、已知限制汇总 |
+| **docs/opencode接入三项目-六维度终审裁决.md** | 维护者 | 引擎一等化（P1–P6）终审裁决：本仓 3 提交（`2231f83`/`15fcf40`/`0282708`）改动清单与已知限制 |
+| **docs/交付-误判修复与不记名角色.md** | 排障者 | rate-recovery 引文误判修复（本仓 `ab8ef33`）交付记录：根因/修法/提交/待裁决（需求归档，非一次性审查产物） |
 | **docs/DOCS.md** | 维护者 | 本文档（索引 + 规则单源声明） |
 
 ## 核心规则单源
