@@ -461,5 +461,234 @@ class TestIdleReclaimTmuxHost:
             f"非房东的 ondemand 角色仍须回收；实际 kills={kills}"
 
 
+class TestIdleReclaimUnreachable:
+    """钉住：idle 回收分支当前不可达，别把它当成正在生效的止血阀。
+
+    改动的实证价值有两部分，必须分开说，不能混成「修了一个误杀」：
+    1) 原守卫 `has_sentinel and status==ALIVE` 与 ALIVE 定义同义反复，恒真，
+       所以回收分支从未执行。本次把它换成「L2 不可判」——真值表等价（13 个
+       idle 输入格零差异），但让代码不再依赖一条被定义蕴含的条件。
+       **没有修掉任何已发生的误杀**：旧码在这个网格上也不会 kill。
+    2) 真正新增的保护是意念性的：没有它，一旦将来有人把 L2 不可判也算成空闲，
+       就会在 window_activity 读不到时 kill 角色。
+    若将来改 _overall 的 idle 定义、或在没有 L2 数据时也允许回收，本用例会红。
+    本类用例在改动前的代码上同样通过（已验证）——它钉的是「回收不可达」这个
+    性质，不是某次修复。
+    """
+
+    def _run_one_cell(self, monitor, monkeypatch, status, thinking, producing, work, tmp_path):
+        """把一组信号喂给真正的 tick()，返回是否发生了 kill。"""
+        monkeypatch.setattr(sm, "_load_role_lifecycles", lambda: {"qa": "ondemand"})
+        tmux_ent = {"qa": ("1", "0")} if status == "ALIVE" else {}
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: tmux_ent)
+        monkeypatch.setattr(monitor, "_l1_check", lambda r: {
+            "status": status, "tmux_alive": status == "ALIVE", "has_sentinel": True})
+        monkeypatch.setattr(monitor, "_l2_check", lambda r: {"thinking": thinking})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": producing})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": work})
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: False, raising=False)
+        monitor._state["qa"] = {"idle_count": 5}
+        calls = []
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run",
+                            lambda cmd, **kw: calls.append(list(cmd)) or MagicMock(returncode=0))
+        monitor.tick()
+        return [c for c in calls if c[:2] == ["tmux", "kill-session"]], monitor._state["qa"]["idle_count"]
+
+    def test_every_idle_state_is_guarded_so_reclaim_never_fires(self, monkeypatch, tmp_path):
+        """穷举 _overall 能产出 idle 的输入格，逐格跑 tick() 看会不会 kill。
+
+        守卫必须由 tick() 自己执行，不能在测试里重写一遍——重写版在改动前的
+        代码上也是绿的，抓不到任何回归。
+        """
+        unguarded = []
+        idle_cells = 0
+        for status in ("ALIVE", "ORPHAN"):
+            for thinking in (True, False, None):
+                for producing in (True, False, None):
+                    for work in (True, False, None):
+                        cell = (status, thinking, producing, work)
+                        probe = sm.SurvivalMonitor()
+                        l1 = {"status": status, "has_sentinel": True}
+                        if probe._overall(l1, {"thinking": thinking},
+                                          {"producing": producing},
+                                          {"work_evidence": work, "error": ""}) != "idle":
+                            continue                      # 非 idle 格不归本用例管
+                        idle_cells += 1
+                        _make_sentinel("qa", sm.SENTINEL_DIR)
+                        kills, count = self._run_one_cell(
+                            sm.SurvivalMonitor(), monkeypatch,
+                            status, thinking, producing, work, tmp_path)
+                        if kills or count != 0:
+                            unguarded.append((cell, kills, count))
+        assert not unguarded, f"这些 idle 状态会累计到 6 并 kill 角色：{unguarded}"
+        # 钉住格数：idle 分支被收窄或删除时本用例必须红，不能静默变成空循环。
+        assert idle_cells == 13, \
+            f"_overall 的 idle 输入格由 13 变成 {idle_cells}：idle 定义变了，请重查守卫"
+
+    def test_unjudgeable_l2_does_not_reset_then_kill_a_live_role(self, monitor, monkeypatch):
+        """L2 不可判必须重置 idle_count，而不是默默累计到 kill。"""
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "_load_role_lifecycles", lambda: {"qa": "ondemand"})
+        monkeypatch.setattr(monitor, "_l1_check",
+                            lambda r: {"status": "ALIVE", "tmux_alive": True,
+                                       "has_sentinel": True})
+        monkeypatch.setattr(monitor, "_l2_check", lambda r: {"thinking": None})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": False})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": False})
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: False, raising=False)
+        monitor._state["qa"] = {"idle_count": 5}
+
+        calls = []
+        monkeypatch.setattr("routing.survival_monitor.subprocess.run",
+                            lambda cmd, **kw: calls.append(list(cmd)) or MagicMock(returncode=0))
+        monitor.tick()
+        kills = [c for c in calls if c[:2] == ["tmux", "kill-session"]]
+        assert not kills, f"L2 读不到 pane 活动不许当作空闲杀角色；实际 kills={kills}"
+        assert monitor._state["qa"]["idle_count"] == 0, "不可判应重置计数，不是继续累计"
+
+
+class TestProbeCacheTTL:
+    """探针缓存必须真的过期——否则整个 daemon 生命周期只探一次（#477193）。"""
+
+    @staticmethod
+    def _clock(monkeypatch, base):
+        monkeypatch.setattr(sm.time, "time", lambda: base)
+
+    def test_cached_probe_values_do_not_renew_their_ttl(self, monitor, monkeypatch):
+        """L2/L3/L4 复用缓存值时 ts 不得前移。
+
+        回归：`"l3_ts": now if "producing" in l3` 对缓存值同样成立（缓存里就有该键），
+        于是每个 tick 都把 ts 刷成 now，`now - ts > TTL` 永不成立。实测 120 个 tick
+        （60s 间隔、2h）L2/L3/L4 各只跑 1 次，「最近产出 43390s 前」冻结在 11-02
+        11:48:44(CST) 那次探针上（UTC 渲染是 03:48:44，别照抄）。
+        """
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        monkeypatch.setattr(sm, "tmux_snapshot", lambda *a, **k: {"qa": ("1", "0")})
+        monkeypatch.setattr(monitor, "_l1_check",
+                            lambda r: {"status": "ALIVE", "tmux_alive": True,
+                                       "has_sentinel": True})
+        calls = {"l2": 0, "l3": 0, "l4": 0}
+
+        def _l2(r):
+            calls["l2"] += 1
+            return {"thinking": False, "detail": "pane_age=1s"}
+
+        def _l3(r):
+            calls["l3"] += 1
+            return {"producing": False, "detail": "最近产出 1s 前"}
+
+        def _l4(r):
+            calls["l4"] += 1
+            return {"work_evidence": False, "detail": "x"}
+
+        monkeypatch.setattr(monitor, "_l2_check", _l2)
+        monkeypatch.setattr(monitor, "_l3_check", _l3)
+        monkeypatch.setattr(monitor, "_l4_check", _l4)
+        monkeypatch.setattr(monitor, "_write_health", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_write_bus", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(sm, "role_hosts_tmux_server", lambda r: True, raising=False)
+
+        base = time.time()
+        for i in range(120):                      # 120 tick × 60s = 2h
+            self._clock(monkeypatch, base + i * 60.0)
+            monitor.tick()
+
+        # 120s TTL / 60s tick → 每 3 tick 一次；120s 窗口共 2h ⇒ 至少 30 次
+        assert calls["l2"] >= 30, f"L2 探针被缓存冻结：2h 只跑 {calls['l2']} 次"
+        assert calls["l4"] >= 30, f"L4 探针被缓存冻结：2h 只跑 {calls['l4']} 次"
+        assert calls["l3"] >= 30, f"L3 探针被缓存冻结：2h 只跑 {calls['l3']} 次"
+
+    def test_l2_cache_not_reported_after_pane_disappears(self, monitor, monkeypatch):
+        """pane 消失后不得沿用上次 ALIVE 的 thinking=True。
+
+        回归：L1 变 ORPHAN 时 `_l2_check` 不再执行，`prev["l2"]` 原样沿用到告警里，
+        #477193 因此渲染成 `pane_age=0s | L2=True`——那是 pane 消失前的样本。
+        """
+        _make_sentinel("qa", sm.SENTINEL_DIR)
+        l1 = {"status": "ALIVE", "tmux_alive": True, "has_sentinel": True}
+        monkeypatch.setattr(monitor, "_l1_check", lambda r: l1)
+        monkeypatch.setattr(monitor, "_l2_check",
+                            lambda r: {"thinking": True, "detail": "pane_age=0s"})
+        monkeypatch.setattr(monitor, "_l3_check", lambda r: {"producing": False})
+        monkeypatch.setattr(monitor, "_l4_check", lambda r: {"work_evidence": True})
+        monkeypatch.setattr(monitor, "_write_health", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_write_bus", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_rescue_failed_units", lambda: None)
+        monkeypatch.setattr(monitor, "_cleanup_dead", lambda *a, **k: None)
+        monkeypatch.setattr(monitor, "_cleanup_orphan", lambda *a, **k: None)
+
+        base = time.time()
+        self._clock(monkeypatch, base)
+        monitor.tick()
+        assert monitor._cache["qa"]["l2"]["thinking"] is True
+
+        l1 = {"status": "ORPHAN", "tmux_alive": False, "has_sentinel": True}
+        self._clock(monkeypatch, base + 3600)
+        monitor.tick()
+        assert monitor._cache["qa"]["l2"] == {}, \
+            "pane 已消失，L2 不得沿用旧样本：读到 True 会让人以为角色还在思考"
+        assert monitor._cache["qa"]["l2_ts"] == 0
+
+
+class TestClockJumpAge:
+    """墙钟跳变后，L2/L3/L4 的年龄必须扣掉跳变量（#477554 实测 +34419s）。
+
+    未校正时：真实只过了 100s 的角色被读成「最近产出 34519s 前」→ producing=False
+    → overall=idle/stale。这不是读数陈旧，是年龄口径错误。
+    """
+
+    @staticmethod
+    def _with_jump(monkeypatch, jump_s, ref, real_age):
+        """造一个「ref 之后发生 jump_s 跳变」的时钟锚点，返回墙钟 now。"""
+        from pipeflow import wf_lifecycle as _wf
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS", [{"at": ref + real_age, "delta": jump_s}])
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS_LOADED", True)
+        return ref + real_age + jump_s
+
+    def test_l3_age_after_clock_jump(self, monitor, monkeypatch):
+        """真实 100s（<600s 窗口）→ 跳变 9.56h 后仍须判 producing=True。"""
+        fact_ts = 1_000_000.0
+        now = self._with_jump(monkeypatch, 34419.0, fact_ts, 100.0)
+        monkeypatch.setattr(monitor, "_bb", SimpleNamespace(read=lambda **kw: [
+            SimpleNamespace(cat="code_fix", src="qa", ts=fact_ts)]))
+        monkeypatch.setattr(sm.time, "time", lambda: now)
+
+        result = monitor._l3_check("qa")
+        assert abs(result["age_seconds"] - 100.0) < 1e-6, \
+            f"校正后年龄应为 100s，实得 {result['age_seconds']:.0f}s"
+        assert result["producing"] is True, \
+            "真实龄 100s < 600s 窗口，跳变不该把它推成无产出"
+
+    def test_l2_age_after_clock_jump(self, monitor, monkeypatch):
+        """真实 60s（<300s 阈值）→ 跳变后仍须判 thinking=True。"""
+        activity = 1_000_000.0
+        now = self._with_jump(monkeypatch, 34419.0, activity, 60.0)
+        monkeypatch.setattr(sm, "tmux_snapshot",
+                            lambda *a, **k: {"qa": ("1", str(activity))})
+        monkeypatch.setattr(sm.time, "time", lambda: now)
+
+        result = monitor._l2_check("qa")
+        assert abs(result["pane_age_seconds"] - 60.0) < 1e-6, \
+            f"校正后 pane_age 应为 60s，实得 {result['pane_age_seconds']:.0f}s"
+        assert result["thinking"] is True, "真实龄 60s < 300s，跳变不该把它推成静默"
+
+    def test_age_helper_deducts_only_jumps_after_ref(self, monkeypatch):
+        """L4 两处年龄走同一 helper：ref 之后的跳变要扣，之前的不能扣。"""
+        from pipeflow import wf_lifecycle as _wf
+        ref = 1_000_000.0
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS", [
+            {"at": ref + 50.0, "delta": 34419.0},       # ref 之后 → 扣
+            {"at": ref - 500.0, "delta": 8.14 * 3600},  # ref 之前 → 不扣
+        ])
+        monkeypatch.setattr(_wf, "_CLOCK_JUMPS_LOADED", True)
+
+        assert abs(sm._age(ref + 100.0 + 34419.0, ref) - 100.0) < 1e-6
+
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

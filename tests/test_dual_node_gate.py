@@ -603,9 +603,9 @@ def test_blocked_naming_another_instance_does_not_fail_this_one(tmp_path):
     """一条点名别的实例的 blocked 不得杀掉本实例（判错即不可恢复）。
 
     同模板可以并发跑多条链，ADR 基线里就有 5 条同时卡在 s1。消息点名
-    wf_otherABC 却没点名本实例 → 不是本链的结论。
+    wf_9c2f8b4a71 却没点名本实例 → 不是本链的结论。
     """
-    fact = _Fact(9106, "s1-codex-blocked: 残留 3 条 (wf_otherABC)", ts=1e12 + 10)
+    fact = _Fact(9106, "s1-codex-blocked: 残留 3 条 (wf_9c2f8b4a71)", ts=1e12 + 10)
     eng = _engine_with_bus(tmp_path, [fact])
     run, step = _stuck_run_and_step()
 
@@ -618,10 +618,15 @@ def test_blocked_naming_another_instance_does_not_fail_this_one(tmp_path):
 
 
 def test_blocked_naming_own_instance_still_fails(tmp_path):
-    """点名了本实例的 blocked 必须照常判失败——归属校验不能变成永不触发。"""
-    fact = _Fact(9107, "s1-codex-blocked: 残留 3 条 (wf_dn_tick)", ts=1e12 + 10)
+    """点名了本实例的 blocked 必须照常判失败——归属校验不能变成永不触发。
+
+    实例 id 必须是真实 hex 形态（wf_ + 8~12 位 hex），否则 _WF_ID_RE 抽不到 id，
+    断言退化到「无 id 放行」分支，删掉 own_wf_id 校验也照样通过。
+    """
+    fact = _Fact(9107, "s1-codex-blocked: 残留 3 条 (wf_5a1305523c)", ts=1e12 + 10)
     eng = _engine_with_bus(tmp_path, [fact])
     run, step = _stuck_run_and_step()
+    run.id = "wf_5a1305523c"
 
     eng._tick(run, step)
 

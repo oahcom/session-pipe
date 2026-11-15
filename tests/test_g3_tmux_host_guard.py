@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import liveness  # noqa: E402
 import routing_daemon  # noqa: E402
 
 _HOST_CG = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-ccs.slice/ccs@pm.service"
@@ -22,7 +23,12 @@ class _R:
 
 
 def _fake_run(server_pid="1092103", control_group=_HOST_CG, raise_on=None):
-    """按命令形状回放 tmux / systemctl 的输出，其它子命令一律 rc=1。"""
+    """按命令形状回放 tmux / systemctl 的输出，其它子命令一律 rc=1。
+
+    只能用于测 fail-safe（探针读不到就按房东处理）：server_pid 指向的进程不存在，
+    tmux_server_cgroup() 读到 None，判据直接短路。要测 cgroup 相等分支用
+    _patch_cgroups，否则测试绿/红都不代表比较逻辑被验过。
+    """
     calls = []
 
     def run(cmd, **kw):
@@ -38,26 +44,29 @@ def _fake_run(server_pid="1092103", control_group=_HOST_CG, raise_on=None):
     return run, calls
 
 
+def _patch_cgroups(monkeypatch, server_cg, role_cg):
+    """直接给两个 cgroup 探针定值 —— 判据本身只是字符串比较。"""
+    monkeypatch.setattr(liveness, "tmux_server_cgroup", lambda: server_cg)
+    monkeypatch.setattr(liveness, "unit_control_group", lambda role: role_cg)
+
+
 def _patch_run(monkeypatch, run):
     monkeypatch.setattr(routing_daemon.subprocess, "run", run)
 
 
 def test_host_role_is_skipped(monkeypatch):
-    run, _ = _fake_run(control_group=_HOST_CG)
-    _patch_run(monkeypatch, run)
+    _patch_cgroups(monkeypatch, _HOST_CG, _HOST_CG)
     assert routing_daemon._role_hosts_tmux_server("pm") is True
 
 
 def test_non_host_role_is_stopped(monkeypatch):
-    run, _ = _fake_run(control_group=_OTHER_CG)
-    _patch_run(monkeypatch, run)
+    _patch_cgroups(monkeypatch, _HOST_CG, _OTHER_CG)
     assert routing_daemon._role_hosts_tmux_server("qa") is False
 
 
 def test_inactive_unit_has_no_cgroup_to_take_down(monkeypatch):
     """unit 已 inactive → ControlGroup 为空串 → 停它连坐不了谁，可以 stop。"""
-    run, _ = _fake_run(control_group="")
-    _patch_run(monkeypatch, run)
+    _patch_cgroups(monkeypatch, _HOST_CG, "")
     assert routing_daemon._role_hosts_tmux_server("consumer") is False
 
 

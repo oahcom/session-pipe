@@ -207,6 +207,23 @@ def _isolate_role_transcripts(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_clock_anchor(tmp_path, monkeypatch):
+    """墙钟锚点必须落到 tmp：默认路径在 ~/.hermes/state/，是全机器的生产文件。
+
+    _cleanup_stale_workflows 每 tick 都写它，而多个测试直接调这个方法；
+    未隔离时用例里造的假跳变（at=1000060.0）会被写进生产锚点，
+    后续所有真实算龄都扣一个不存在的 9.561h。
+    """
+    from pipeflow import wf_lifecycle as _wf
+    monkeypatch.setattr(_wf, "_CLOCK_ANCHOR_PATH", tmp_path / "clock-anchor.json")
+    # 跳变列表是模块级全局：不重置则前一个用例的假事件泄漏到下一个
+    monkeypatch.setattr(_wf, "_CLOCK_JUMPS", [])
+    monkeypatch.setattr(_wf, "_CLOCK_JUMPS_LOADED", False)
+    # mtime 也是全局：残留会让「文件没变」判据命中，用旧列表覆盖 _reset() 注入的值
+    monkeypatch.setattr(_wf, "_CLOCK_ANCHOR_MTIME_NS", 0)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_probes_and_cooldowns(request, monkeypatch):
     """投递预检与告警冷却默认不跨用例共享。
 

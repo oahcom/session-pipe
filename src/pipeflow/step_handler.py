@@ -235,7 +235,12 @@ def _mentions(fact, wf_id: str, fields: str = "te") -> bool:
     return bool(re.search(pat, body))
 
 
-_WF_ID_RE = re.compile(r'(?<![\w-])(wf_[A-Za-z0-9_]+)(?![\w-])')
+# 只认真实实例 id 的形态（wf_ + 8~12 位 hex，可带 sub_/rw_/verify_ 前缀）。
+# 旧式 `wf_[A-Za-z0-9_]+` 把文件名 wf_health.py、字段名 wf_id、前缀字面量 wf_rw_
+# 都当成实例 id，实测把 fact 411719 的正常完成判成串味（ADR-soft-attribution-body-caliber §决策2）。
+# ponytail: 天花板 = 未来换 id 生成器（非 hex 或新前缀）会漏判；届时扩 character class，
+# 不要退回 [A-Za-z0-9_]+ —— 那是把误伤一起放回来。
+_WF_ID_RE = re.compile(r'(?<![\w-])(wf_(?:sub_|rw_|verify_)?[0-9a-f]{8,12})(?![\w-])')
 
 # 自述拒绝判据的唯一真相源在 review_gate（wf_lifecycle 的 stale rescue 也用同一份）。
 _REFUSAL_T = REFUSAL_T
@@ -1441,6 +1446,14 @@ class StepHandlerMixin:
                         template=run.workflow_name, step_id=step.id,
                         wait_roles=getattr(step, "wait_roles", None),
                         eff_role=_eff)
+        if _match_ts:
+            # 与上方完整性分支同源：一条事实不得被多个实例各消费一次。
+            # 本块在完整性分支之外（非 dual_node 的非完整性子步也走），此前
+            # 不过滤也不登记 → 实测最近 400 实例有 10 条 fact 被 >1 实例消费。
+            _match_msgs = [m for m in _match_msgs if m["id"] not in self._consumed_exit_ids]
+            _match_ts = _match_msgs[0]["ts"] if _match_msgs else 0.0
+        if _match_ts:
+            self._consumed_exit_ids.update(m["id"] for m in _match_msgs)
         _dn_sd = self._step_sd(run, step)
         _dn_verdict = (_codex_verdict(_match_msgs, step.id)
                        if (_dn_wide and _match_ts
@@ -2186,10 +2199,13 @@ class StepHandlerMixin:
             # wf_sub_ad604 的 s2 完成消息闭合了 wf_sub_7afc1 的 s2，自有产出晚 7min）。
             # 不改成 require_wf=true 的原因：105/164 条历史裸匹配完成消息本就不带
             # 实例 id（no-op 巡检），硬校验会让它们全部超时。
-            # 只读标题（f.t）不读 evidence：实测改读正文会新拦 47 条真实完成消息
-            # （reviewer 30 / product_architect 6 / engineer 4 / devops 2 / writer 2 /
-            # security_auditor 2 / knowledge_curator 1），它们的正文提到别实例 id 是
-            # 记账不是串味 → 那些步骤会全卡到超时。判据边界待 product_architect 裁定。
+            # 只读标题（f.t）不读 evidence：实测改读正文不是单调变严 —— 全量 1544 个
+            # 唯一三元组：标题拦 9 / 标题+正文拦 8，**少了 2 条**（414122、431795）。
+            # 因为 own-id 早退（:314 `if wf_id in ids: return False`）会被正文里的本实例
+            # id 激活，把标题里已经成立的串味判否。多拦的 1 条（415671）是健康报告正文
+            # 引用他实例 id，不是串味。净收益为负，且每 tick 要多跑一遍正文正则。
+            # 裁定见 ~/ccs-workspaces/product_architect/ADR-soft-attribution-body-caliber.md。
+            # 复算：python3 -I ~/ccs-workspaces/engineer/recount_soft_hits.py
             if not wf_id and _claims_own_step_and_foreign_instance(
                     f.t, own_wf_id, template, step_id, siblings=_siblings):
                 continue

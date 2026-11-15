@@ -543,35 +543,35 @@ class TestSoftAttribution(unittest.TestCase):
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
         eng._bb.write("system_design",
-                      f"SYSTEM_DESIGN: 磁盘清理方案 {marker} — 实例 wf_sibling999 / arch/s2 完成",
+                      f"SYSTEM_DESIGN: 磁盘清理方案 {marker} — 实例 wf_6b241a9c7d / arch/s2 完成",
                       src="product_architect")
         ts, _ = eng._check_exit("system_design", "product_architect", marker,
-                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+                                own_wf_id="wf_5a1305523c", template="arch", step_id="s2")
         self.assertFalse(ts, "兄弟实例声称完成本步，不得闭合本实例")
 
     def test_own_instance_claiming_own_step_matched(self):
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
-        eng._bb.write("system_design", f"设计完成 {marker} 实例 wf_mine111 / arch/s2 完成",
+        eng._bb.write("system_design", f"设计完成 {marker} 实例 wf_5a1305523c / arch/s2 完成",
                       src="product_architect")
         ts, _ = eng._check_exit("system_design", "product_architect", marker,
-                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+                                own_wf_id="wf_5a1305523c", template="arch", step_id="s2")
         self.assertTrue(ts)
 
     def test_combined_report_with_own_and_foreign_ids_matched(self):
         """多实例合并报告（本实例 id + 别实例 id）必须放行（codex 第 13 轮 P1）。
 
         生产标题形如
-        「full_dev_pipeline/s2-complete + engineer_feature/s1-complete … (父链 wf_mine111/s2)」，
+        「full_dev_pipeline/s2-complete + engineer_feature/s1-complete … (父链 wf_5a1305523c/s2)」，
         模板名 + 本步 id 是正常形态；一刀切会把它从所有实例上丢掉 → 空等到超时。
         """
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
         eng._bb.write("system_design",
-                      f"SYSTEM_DESIGN: {marker} arch/s2-complete + dev/s1-complete（父链 wf_mine111/s2）",
+                      f"SYSTEM_DESIGN: {marker} arch/s2-complete + dev/s1-complete（父链 wf_5a1305523c/s2）",
                       src="product_architect")
         ts, _ = eng._check_exit("system_design", "product_architect", marker,
-                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+                                own_wf_id="wf_5a1305523c", template="arch", step_id="s2")
         self.assertTrue(ts, "带本实例 id 的合并报告不得被判串味")
 
     def test_foreign_instance_claiming_own_step_still_blocked_with_own_id(self):
@@ -579,10 +579,10 @@ class TestSoftAttribution(unittest.TestCase):
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
         eng._bb.write("system_design",
-                      f"SYSTEM_DESIGN: {marker} wf_other222/s2-complete 交付给 wf_mine111",
+                      f"SYSTEM_DESIGN: {marker} wf_9c2f8b4a71/s2-complete 交付给 wf_5a1305523c",
                       src="product_architect")
         ts, _ = eng._check_exit("system_design", "product_architect", marker,
-                                own_wf_id="wf_mine111", template="arch", step_id="s2")
+                                own_wf_id="wf_5a1305523c", template="arch", step_id="s2")
         self.assertFalse(ts)
 
     def test_no_instance_id_still_matched(self):
@@ -591,27 +591,86 @@ class TestSoftAttribution(unittest.TestCase):
         marker = f"SOFT_{_UNIQUE}"
         eng._bb.write("root_cause_analysis", f"[修复] 服务全绿零僵尸 {marker}", src="maintainer")
         ts, _ = eng._check_exit("root_cause_analysis", "maintainer", marker,
-                                own_wf_id="wf_mine111", template="maint", step_id="s2")
+                                own_wf_id="wf_5a1305523c", template="maint", step_id="s2")
         self.assertTrue(ts, "无实例 id 的完成消息必须放行")
+
+    def test_wf_health_token_not_treated_as_foreign_instance(self):
+        """wf_health / wf_id 是文件名与字段名，不是实例 id。
+
+        生产 #411719 的真实完成消息（标题里 `wf_health c407f0f…`）被旧正则
+        `wf_[A-Za-z0-9_]+` 当成别实例点名，判成串味；_WF_ID_RE 收紧为真实 id
+        形态后放行（ADR-soft-attribution-body-caliber §决策2）。
+        """
+        eng = _make_eng()
+        marker = f"SOFT_{_UNIQUE}"
+        eng._bb.write("qa_test_execute",
+                      f"[test_report] qa_test_execute/s1-complete {marker}: 用例14 pass10 "
+                      f"fail4=71.4%; wf_health c407f0f 修复前后对比确证生效",
+                      src="qa")
+        ts, _ = eng._check_exit("qa_test_execute", "qa", marker,
+                                own_wf_id="wf_5a1305523c",
+                                template="qa_test_execute", step_id="s1")
+        self.assertTrue(ts, "wf_health 是文件名不是实例 id —— 不得判串味")
 
     def test_foreign_id_without_step_claim_still_matched(self):
         """派发/建任务类消息天然提到别的工作流 id，不是串味。"""
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
-        eng._bb.write("task_spec", f"[closer] 创建任务 {marker} 审计 wf_other222/s2 产出",
+        eng._bb.write("task_spec", f"[closer] 创建任务 {marker} 审计 wf_9c2f8b4a71/s2 产出",
                       src="closer")
         ts, _ = eng._check_exit("task_spec", "closer", marker,
-                                own_wf_id="wf_mine111", template="closer_close_loop", step_id="s1")
+                                own_wf_id="wf_5a1305523c", template="closer_close_loop", step_id="s1")
         self.assertTrue(ts, "只引用别实例、未声称本步完成 → 放行")
 
     def test_reverse_attribution_not_applied_when_require_wf(self):
         """require_wf 已是硬校验，软归属不重复生效。"""
         eng = _make_eng()
         marker = f"SOFT_{_UNIQUE}"
-        eng._bb.write("code_fix", f"{marker} 实例 wf_other222 / t/s1 完成", src="engineer")
-        ts, _ = eng._check_exit("code_fix", "engineer", marker, wf_id="wf_mine111",
-                                own_wf_id="wf_mine111", template="t", step_id="s1")
+        eng._bb.write("code_fix", f"{marker} 实例 wf_9c2f8b4a71 / t/s1 完成", src="engineer")
+        ts, _ = eng._check_exit("code_fix", "engineer", marker, wf_id="wf_5a1305523c",
+                                own_wf_id="wf_5a1305523c", template="t", step_id="s1")
         self.assertFalse(ts)
+
+
+class TestSharedFactConsumedByOneInstanceOnly(unittest.TestCase):
+    """一条 bus 事实不得闭合两个实例。
+
+    _tick 有两个顶层 exit 匹配块：第一个嵌在完整性分支内，匹配后过滤并登记
+    _consumed_exit_ids；第二个（:1429 的 `if not cat: return` 之后）两者皆无，
+    所以同一条事实能被多个实例各闭合一次。生产实测最近 400 实例有 10 条 fact
+    被 >1 实例消费（fact 439707 -> wf_sub_5a13055…/wf_sub_b0f5817…/wf_sub_db0623…）。
+    """
+
+    def _eng(self):
+        eng = _make_eng()
+        eng._eff_role = lambda run, step: step.target_role
+        eng._sync_step_results = MagicMock()
+        eng._send_to_role = MagicMock()
+        eng._lm = MagicMock()
+        return eng
+
+    def test_second_instance_does_not_consume_consumed_fact(self):
+        eng = self._eng()
+        marker = f"SHARED_{_UNIQUE}"
+        # 裸匹配（无 require_wf）：一条巡检消息对两实例都"合法"，只差去重
+        step = _step(exit_condition={"bus_category": "root_cause_analysis",
+                                     "text_contains": marker})
+        a, b = _run(), _run()
+        a.id = f"wf_shared{int(time.time() * 1000) % 1000000}a"
+        b.id = f"wf_shared{int(time.time() * 1000) % 1000000}b"
+        # 锚点必须早于完成消息：notified_at 缺失时 tick 用 time.time() 兜底，
+        # 会跳过刚写入的 fact（真实实例在上一 tick 已持久化 notified_at）。
+        _anchor = time.time() - 60
+        for _r in (a, b):
+            _r.step_results = {"s1": {"notified_at": _anchor, "poll_since": _anchor}}
+        eng._bb.write("root_cause_analysis", f"[修复] 服务全绿 {marker}", src="maintainer")
+
+        eng._tick(a, step)
+        self.assertTrue(a.step_results["s1"].get("exit_messages"),
+                        "A 应消费这条事实")
+        eng._tick(b, step)
+        self.assertFalse(b.step_results["s1"].get("exit_messages"),
+                         "同一 fact 已被 A 消费，B 不得再闭合")
 
 
 class TestConcurrentInstancesNoCrossClosure(unittest.TestCase):

@@ -51,21 +51,21 @@ python3 ~/session-launcher/src/wf.py -r maintainer stats
 src/
   routing/
     router.py         ── 路由表 + produce/consume 推导（361 行）
-    routes.py         ── 路由表定义 + route_all + route_to_ccs（670 行）
+    routes.py         ── 路由表定义 + route_all + route_to_ccs（686 行）
     auto.py           ── 自动路由消费 + investigator 分派（187 行）
     polling.py        ── 消息轮询（104 行；游标已退役）
     rdb.py            ── 路由表 SQLite 持久化 + 审计（293 行）
-    survival_monitor.py ── 四层存活监测 L1/L2/L3/L4（745 行；L4=transcript/workflow 证据）
+    survival_monitor.py ── 四层存活监测 L1/L2/L3/L4（785 行；L4=transcript/workflow 证据）
     consistency.py    ── 路由一致性检查（105 行，生长接入 daemon）
 
   liveness.py         ── 角色存活/忙检测统一模块 L0-L4（消费 survival 写的 health 文件）
 
   pipeflow/  ── engine.py 已拆分为以下 mixin，不再有单体 engine
-    engine.py         ── 编排 + CLI（2214 行，导入下方 mixin）
-    step_handler.py   ── 步骤处理（2246 行）
+    engine.py         ── 编排 + CLI（2216 行，导入下方 mixin）
+    step_handler.py   ── 步骤处理（2262 行）
     role_lifecycle.py ── 角色投递生命周期 + _send_to_role（1532 行）
     task_generator.py ── 任务生成（1058 行）
-    wf_lifecycle.py   ── 工作流生命周期（2243 行）
+    wf_lifecycle.py   ── 工作流生命周期（2356 行）
 
     daemon.py         ── 工作流守护 while 循环（376 行）
     integrity.py      ── 完整性提醒（旁路提醒）

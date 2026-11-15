@@ -86,6 +86,16 @@ def mentions(text: str) -> list[str]:
     return MENTION_RE.findall(text or "")
 
 
+def role_mentions(text: str, routing: dict) -> list[str]:
+    """正文里被 @ 且**真是路由表角色**的名字。
+
+    WHY: `mentions()` 会把 @media / @human / @staticmethod 以及 t[:100] 截断
+    造出的残片（@engin、@pro）一并返回。它们不是定向，拿它们收窄接收者
+    会把集合收成空 —— 下游 no_consumer 分支 mark_consumed 后零投递。
+    """
+    return [t for t in mentions(text) if t in routing]
+
+
 def _has_content_words(title: str, category: str = "") -> bool:
     """标题是否含内容性动词（防 'ok'/'hi'/'x' 这类纯占位标题生成无意义 workflow）。
 
@@ -137,7 +147,7 @@ def _is_role_report_title(title: str, category: str = "", src: str = "") -> bool
 # 这类**真实需求**会被误杀（实测 1 条）。带斜杠的 154/364 条全是汇报，
 # 误判方向不对称——漏判只多建一条链，误杀则丢掉用户的活。
 _WF_ECHO_RE = re.compile(
-    r"wf_(?:sub_|rw_)?[0-9a-f]{5,}|/\s*s\d+\s*[-_]?\s*complete", re.I)
+    r"wf_(?:sub_|rw_|verify_)?[0-9a-f]{5,}|/\s*s\d+\s*[-_]?\s*complete", re.I)
 
 
 # bug_report 豁免：qa 的缺陷报告标题天然带 `qa_test_execute/s2-complete wf_sub_xxx`
@@ -243,15 +253,18 @@ def route_all(consumer: str = "pipeline", dry_run: bool = False, parallel: bool 
                     LOGGER.warning("route claim (stale) failed #%s: %s", msg["id"], _se)
                 continue
             consumers = msg.get("consumers", [])
-            # @role 定向路由：@target 的消息只给 target，其他角色跳过
+            # @role 定向路由：@target 的消息只给 target，其他角色跳过。
+            # 只有**真是路由角色的 tag** 才算定向：@media / @human / t[:100] 截断
+            # 残片(@engin/@pro) 都不是，拿它们收窄会把 consumers 收成空 → 走
+            # no_consumer 分支 mark_consumed 后零投递（实测 3000 条窗口内 23 条真事实
+            # 被静默丢弃，其中 11 条是截断把真角色名切断）。
             _text = msg.get("text", "")
-            _tags = mentions(_text)
+            _tags = role_mentions(_text, router.routing)
             if _tags:
                 consumers = [c for c in consumers if c in _tags]
             # 定向派单只认**首行**的 @tag：正文里顺带提到的角色（"见 @engineer 的回复"）
             # 不该被拉进派发。首行 tag 是派单约定（[@devops] / [@devops @ccs-monitor]）。
-            _head_tags = [t for t in mentions(_text.split("\n")[0])
-                          if t in router.routing]
+            _head_tags = role_mentions(_text.split("\n")[0], router.routing)
             if _head_tags:
                 # 定向接收者未必订阅该分类（devops 不订阅 code_review），
                 # 只按分类求交会把定向派单整条丢掉 —— 实测 #439736。
@@ -413,13 +426,16 @@ def route_to_ccs(role_name: str, dry_run: bool = False) -> dict: # noqa: C901
             _my_cats = []
     except Exception:
         _configured = False
+        _router_d = None
         _my_cats = []
     def _is_for_me(msg):
         # 回声抑制：role 自己写的消息不推回给它自己（与 route_all 同语义）。
         if _is_self_echo(msg, role_name):
             return False
         text = msg.get("text", "")
-        tags = mentions(text)
+        # 只有真是路由角色的 tag 才算「给我的」：非角色 tag 既不是「给我」也不是
+        # 「给别人」，用它把所有角色挡掉会让消息永久零投递（只修 route_all 等于半修）。
+        tags = role_mentions(text, _router_d) if isinstance(_router_d, dict) else mentions(text)
         directed = role_name in tags
         # 定向消息绕过分类过滤：有人明确 @ 你，比你的默认订阅列表优先级高。
         # 实测 24h 内 62 条 @engineer 有 26 条（42%）因分类不在 consume 列表被丢，

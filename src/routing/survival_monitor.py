@@ -15,6 +15,24 @@ from typing import Any
 
 LOGGER = logging.getLogger("session-pipeline.survival_monitor")
 
+
+def _age(wall: float, ref: float) -> float:
+    """墙钟龄，扣掉 ref 之后发生的墙钟跳变。
+
+    WSL2 宿主挂起恢复时 guest 墙钟被外部 step，CLOCK_MONOTONIC 不计挂起时长
+    （实测 2026-10-30 +8.14h、2026-11-02 +34419s）。直接用 now - ref 会让所有
+    读数一次性虚增：真实只过了 100s 的角色被判「最近产出 34519s 前」→ idle。
+    校正与回收器同源（pipeflow.wf_lifecycle._corrected_age_s），避免两份口径漂移。
+
+    导入失败时退回原始差值并告警：宁可回到旧行为，也不要让探针崩掉。
+    """
+    try:
+        from pipeflow.wf_lifecycle import _corrected_age_s
+        return _corrected_age_s(wall, ref)
+    except (ImportError, AttributeError) as _e:
+        LOGGER.warning("墙钟校正不可用，年龄退回原始差值: %s", _e)
+        return wall - ref
+
 from liveness import role_hosts_tmux_server, tmux_snapshot   # pane 快照 + 房东判据，与 routing_daemon 共用一份
 
 try:
@@ -173,7 +191,7 @@ class SurvivalMonitor:
                 except (TypeError, ValueError):
                     last_activity = 0.0
         # last_activity == 0 表示无数据（非 epoch 0），标记为 unknown(-1)
-        pane_age = now - last_activity if last_activity > 0 else -1
+        pane_age = _age(now, last_activity) if last_activity > 0 else -1
         # pane_age < 0 表示探测不可用，退化为 unknown 让调用方走 L3 fallback
         thinking = None if pane_age < 0 else pane_age < 300
 
@@ -217,7 +235,7 @@ class SurvivalMonitor:
             facts = self._bb.read(src=role, limit=5)
             if facts:
                 recent_ts = max(float(getattr(f, "ts", 0) or 0) for f in facts)
-                age = now - recent_ts
+                age = _age(now, recent_ts)
                 producing = age < 600
 
                 # 分类覆盖度
@@ -279,7 +297,7 @@ class SurvivalMonitor:
                     default=0.0,
                 )
                 if latest:
-                    transcript_age = now - latest
+                    transcript_age = _age(now, latest)
         except OSError as e:
             transcript_age = None
             errors.append(f"transcript_probe_failed: {e}")
@@ -324,7 +342,7 @@ class SurvivalMonitor:
                                 if isinstance(value, (int, float)) and value > 0:
                                     stamps.append(float(value))
                 if stamps:
-                    workflow_age = now - max(stamps)
+                    workflow_age = _age(now, max(stamps))
         except (OSError, sqlite3.Error, ValueError) as e:
             workflow_age = None
             errors.append(f"workflow_probe_failed: {e}")
@@ -526,24 +544,37 @@ class SurvivalMonitor:
         for role in roles:
             prev = self._cache.get(role, {})
             l1 = self._l1_check(role)
-            l2 = (self._l2_check(role) if l1["status"] == "ALIVE"
-                  and now - prev.get("l2_ts", 0) > 120 else prev.get("l2", {}))
+            # 探针只在到点时才跑；拿**缓存值**也把 ts 前移会让 TTL 永不成立——
+            # 实测 120 个 tick（60s 间隔、2h）L2/L3/L4 各只跑 1 次。#477193 的
+            # 「最近产出 43390s」是 11-02 11:48:44(CST) 那次探针的读数，此后 65min
+            # 未刷新（告警时真实龄已降到 2277s）。43390 本身算得对：
+            # 11:48:44 − 11-01 23:45:34 = 43390s。
+            # L1 非 ALIVE（无 pane）时 L2/L4 不可测，必须退化为 {}：沿用上次 ALIVE
+            # 的样本会把「pane 消失前 thinking=True」渲染成当前状态（同一条告警）。
+            _alive = l1["status"] == "ALIVE"
+            _run_l2 = _alive and now - prev.get("l2_ts", 0) > 120
+            l2 = self._l2_check(role) if _run_l2 else (
+                prev.get("l2", {}) if _alive else {})
             # pane 静默时更依赖 L3/L4 救场，因此 thinking=False 反而要刷新 L3，
             # 不能拿 300s 前的旧值（首轮甚至是空 dict）判 stale。
             _l3_ttl = (L3_CACHE_TTL_ACTIVE_S if l2.get("thinking") is False
                        else L3_CACHE_TTL_IDLE_S)
-            l3 = (self._l3_check(role)
-                  if now - prev.get("l3_ts", 0) > _l3_ttl else prev.get("l3", {}))
-            l4 = (self._l4_check(role) if l1["status"] == "ALIVE"
-                  and now - prev.get("l4_ts", 0) > L4_CACHE_TTL_S else prev.get("l4", {}))
+            _run_l3 = now - prev.get("l3_ts", 0) > _l3_ttl
+            l3 = self._l3_check(role) if _run_l3 else prev.get("l3", {})
+            _run_l4 = _alive and now - prev.get("l4_ts", 0) > L4_CACHE_TTL_S
+            l4 = self._l4_check(role) if _run_l4 else (
+                prev.get("l4", {}) if _alive else {})
+            _l2_ts = now if _run_l2 else (prev.get("l2_ts", 0) if _alive else 0)
+            _l3_ts = now if _run_l3 else prev.get("l3_ts", 0)
+            _l4_ts = now if _run_l4 else (prev.get("l4_ts", 0) if _alive else 0)
             overall = self._overall(l1, l2, l3, l4)
             # R3: 注入 lifecycle（idle 回收判断用）
             _lifecycle = _load_role_lifecycles().get(role, "ondemand")
             result = {
                 "l1": l1, "l1_ts": now,
-                "l2": l2, "l2_ts": now if "thinking" in l2 else prev.get("l2_ts", 0),
-                "l3": l3, "l3_ts": now if "producing" in l3 else prev.get("l3_ts", 0),
-                "l4": l4, "l4_ts": now if "work_evidence" in l4 else prev.get("l4_ts", 0),
+                "l2": l2, "l2_ts": _l2_ts,
+                "l3": l3, "l3_ts": _l3_ts,
+                "l4": l4, "l4_ts": _l4_ts,
                 "overall": overall,
                 "lifecycle": _lifecycle,
             }
@@ -700,15 +731,24 @@ class SurvivalMonitor:
             _idle_roles = [r for r, h in results.items()
                            if h["overall"] == "idle" and h.get("lifecycle") == "ondemand"]
             for _ir in _idle_roles:
-                _l1 = results[_ir].get("l1", {})
                 _l2 = results[_ir].get("l2", {})
                 _l3 = results[_ir].get("l3", {})
-                # 有 pending 信号（L1 status=ALIVE 但有 unread）、或 L2 thinking、或 L3 producing → 不回收
-                _has_pending = _l1.get("has_sentinel", False) and _l1.get("status") == "ALIVE"
+                # 三路确定且为负才回收。L2 不可判（window_activity 读不到）不等于
+                # 「没在思考」——与 _overall 的 unknown 分支同一口径，拿不可判的信号
+                # kill 角色就是误杀（同 :384「L3 不可判」不当没产出）。
+                # 原 `_has_pending = has_sentinel and status==ALIVE` 与 L1 对 ALIVE 的
+                # 定义 (:154) 同义反复：ALIVE 分支里 has_sentinel 恒真，于是
+                # _has_pending 在 ALIVE 状态下恒真；剩下的 idle 来源只有
+                # ORPHAN+producing=True，被 _producing 拦住。合起来守卫恒真 → :757 的
+                # `_idle_n >= 6` 从未可达。换成「L2 不可判」后真值表逐格等价
+                # （13 个 idle 输入格零差异，与新用例同一网格），但 _idle_n 仍到不了 6：idle 只在
+                # thinking ∈ {True, None} 时出现，两者都被拦下。回收能力仍未生效，
+                # 要启用须先改 _overall 的 idle 定义，那是治理决策不是缺陷修复。
                 _thinking = _l2.get("thinking") is True
                 _producing = _l3.get("producing") is True
-                if _has_pending or _thinking or _producing:
-                    # 有待处理工作 → 重置 idle_count，不回收
+                _l2_unjudgeable = _l2.get("thinking") is None
+                if _thinking or _producing or _l2_unjudgeable:
+                    # 有工作证据或信号不可判 → 重置 idle_count，不回收
                     self._state.setdefault(_ir, {})["idle_count"] = 0
                     continue
                 _prev = self._state.get(_ir, {})
